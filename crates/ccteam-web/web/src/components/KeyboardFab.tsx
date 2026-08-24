@@ -1,13 +1,18 @@
+import { tr, type Lang } from "../lib/i18n";
+
 interface Props {
+  lang: Lang;
   keyboardOpen: boolean;
   onToggle: () => void;
 }
 
-export function KeyboardFab({ keyboardOpen, onToggle }: Props) {
+export function KeyboardFab({ lang, keyboardOpen, onToggle }: Props) {
   return (
     <button
       type="button"
-      aria-label={keyboardOpen ? "Close keyboard" : "Open keyboard"}
+      aria-label={keyboardOpen
+        ? tr(lang, "关闭键盘", "Close keyboard", "Закрыть клавиатуру")
+        : tr(lang, "打开键盘", "Open keyboard", "Открыть клавиатуру")}
       onClick={onToggle}
       className="absolute right-3 bottom-3 z-10 w-10 h-10 rounded-full bg-surface-800/90 border border-surface-700/30 text-text-secondary flex items-center justify-center shadow-lg backdrop-blur-sm active:scale-95"
     >

@@ -40,7 +40,7 @@ import {
   type SessionView as SessionSummary,
 } from "../lib/sessionsApi";
 import { toastBus } from "../lib/toastBus";
-import { t, tStopped } from "../lib/i18n";
+import { t, tr, tStopped } from "../lib/i18n";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useAgentsEvents } from "../hooks/useAgentsEvents";
 import { useMe } from "../hooks/useMe";
@@ -399,16 +399,14 @@ export default function ChatConsole() {
         const res = await deleteProject(slug);
         const stopped = res.sessions_stopped.length;
         toastBus.handler?.info(
-          lang === "en"
-            ? `Removed ${slug} from ccteam (${stopped} live session${stopped === 1 ? "" : "s"} stopped) — files on disk untouched.`
-            : `已从 ccteam 移除 ${slug}(停止 ${stopped} 个 live 会话)—— 磁盘文件未动。`,
+          tr(lang, `已从 ccteam 移除 ${slug}(停止 ${stopped} 个 live 会话)—— 磁盘文件未动。`, `Removed ${slug} from ccteam (${stopped} live session${stopped === 1 ? "" : "s"} stopped) — files on disk untouched.`, `Проект ${slug} удалён из ccteam (${stopped} live-сессий остановлено) — файлы на диске не затронуты.`),
         );
         projectsStore.refresh();
         return true;
       } catch (e) {
         if (!(e instanceof Error && e.message === "UNAUTHENTICATED")) {
           toastBus.handler?.error(
-            `${lang === "en" ? "Remove failed" : "移除失败"}: ${e instanceof Error ? e.message : "unknown"}`,
+            `${tr(lang, "移除失败", "Remove failed", "Не удалось удалить")}: ${e instanceof Error ? e.message : "unknown"}`,
           );
         }
         return false;

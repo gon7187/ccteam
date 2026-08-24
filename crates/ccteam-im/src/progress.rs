@@ -43,27 +43,27 @@ struct Category {
 
 const CAT_READ: Category = Category {
     emoji: "📖",
-    label: "read",
+    label: "чтение",
 };
 const CAT_BASH: Category = Category {
     emoji: "🔧",
-    label: "bash",
+    label: "команда",
 };
 const CAT_EDIT: Category = Category {
     emoji: "✏️",
-    label: "edit",
+    label: "правка",
 };
 const CAT_WEB: Category = Category {
     emoji: "🔎",
-    label: "web",
+    label: "веб",
 };
 const CAT_TASK: Category = Category {
     emoji: "🤖",
-    label: "task",
+    label: "задача",
 };
 const CAT_TODO: Category = Category {
     emoji: "📝",
-    label: "todo",
+    label: "план",
 };
 
 /// Map a raw tool name (Claude `ToolCall.name`, or a Codex tool) to a
@@ -83,7 +83,7 @@ fn tool_category(name: &str) -> Category {
             // in general, but tool names from the adapter live long
             // enough; we copy into the count label as an owned String, so
             // the &'static here is only the fallback emoji bucket).
-            label: "tool",
+            label: "инструмент",
         },
     }
 }
@@ -245,7 +245,7 @@ impl ProgressFold {
 
     fn bump(&mut self, cat: Category, raw_name: &str) {
         // Unknown tools fold under the wrench but keep their own label.
-        let label: String = if cat.label == "tool" {
+        let label: String = if cat.label == "инструмент" {
             raw_name.to_lowercase()
         } else {
             cat.label.to_string()
@@ -366,21 +366,28 @@ impl ProgressFold {
 
     fn head(&self) -> &'static str {
         if self.drafting {
-            "✍️ drafting…"
+            "✍️ формирование ответа…"
         } else if self.buckets.is_empty() && self.thinking {
-            "💭 thinking…"
+            "💭 обдумывание…"
         } else {
-            "⏳ working…"
+            "⏳ работа…"
         }
+    }
+
+    fn done_summary(&self) -> String {
+        format!(
+            "✅ Готово · {} {} · {} {}",
+            self.tool_total,
+            russian_count_word(self.tool_total, "инструмент", "инструмента", "инструментов"),
+            self.file_total,
+            russian_count_word(self.file_total, "файл", "файла", "файлов")
+        )
     }
 
     /// Render the current status text (≤ [`MAX_LINES`] lines).
     pub fn render(&self) -> String {
         if self.done {
-            return format!(
-                "✅ done · {} tools · {} files",
-                self.tool_total, self.file_total
-            );
+            return self.done_summary();
         }
         let mut header = self.head().to_string();
         let summary = self.counts_summary();
@@ -394,6 +401,18 @@ impl ProgressFold {
         }
         lines.truncate(MAX_LINES);
         lines.join("\n")
+    }
+}
+
+fn russian_count_word<'a>(count: usize, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
+    let remainder = count % 100;
+    if (11..=14).contains(&remainder) {
+        return many;
+    }
+    match count % 10 {
+        1 => one,
+        2..=4 => few,
+        _ => many,
     }
 }
 
@@ -434,9 +453,9 @@ mod tests {
         assert!(f.apply(&started_tool("t2", "Read", json!({"file_path": "/b"}))));
         assert!(f.apply(&started_tool("t3", "Bash", json!({"command": "ls"}))));
         let r = f.render();
-        assert!(r.contains("📖 read ×2"), "got: {r}");
-        assert!(r.contains("🔧 bash ×1"), "got: {r}");
-        assert!(r.starts_with("⏳ working…"), "got: {r}");
+        assert!(r.contains("📖 чтение ×2"), "got: {r}");
+        assert!(r.contains("🔧 команда ×1"), "got: {r}");
+        assert!(r.starts_with("⏳ работа…"), "got: {r}");
     }
 
     #[test]
@@ -448,7 +467,7 @@ mod tests {
         f.apply(&started_tool("t2", "Read", json!({"file_path": "/b"})));
         f.apply(&started_tool("t3", "Bash", json!({"command": "ls"})));
         // `/status`-shaped: labels + counts only, joined by `·`, no emoji/space.
-        assert_eq!(f.compact_counts().as_deref(), Some("read×2·bash×1"));
+        assert_eq!(f.compact_counts().as_deref(), Some("чтение×2·команда×1"));
     }
 
     #[test]
@@ -457,7 +476,7 @@ mod tests {
         assert!(f.apply(&started_tool("t1", "Bash", json!({"command": "ls"}))));
         // The matching completion carries the same id → must NOT recount.
         assert!(!f.apply(&completed_tool("t1", "Bash")));
-        assert!(f.render().contains("🔧 bash ×1"));
+        assert!(f.render().contains("🔧 команда ×1"));
     }
 
     #[test]
@@ -489,7 +508,7 @@ mod tests {
         };
         assert!(f.apply(&ev));
         assert!(!f.apply(&ev)); // second reasoning is a no-op
-        assert!(f.render().starts_with("💭 thinking…"));
+        assert!(f.render().starts_with("💭 обдумывание…"));
         assert!(f.has_activity());
     }
 
@@ -515,8 +534,8 @@ mod tests {
             },
         });
         let r = f.render();
-        assert!(r.contains("🔧 bash ×1"), "got: {r}");
-        assert!(r.contains("✏️ edit ×1"), "got: {r}");
+        assert!(r.contains("🔧 команда ×1"), "got: {r}");
+        assert!(r.contains("✏️ правка ×1"), "got: {r}");
     }
 
     #[test]
@@ -525,7 +544,31 @@ mod tests {
         f.apply(&started_tool("t1", "Bash", json!({"command": "ls"})));
         f.apply(&started_tool("t2", "Edit", json!({"file_path": "/a"})));
         f.mark_done();
-        assert_eq!(f.render(), "✅ done · 2 tools · 1 files");
+        assert_eq!(f.render(), "✅ Готово · 2 инструмента · 1 файл");
+    }
+
+    #[test]
+    fn done_count_words_follow_russian_plural_rules() {
+        assert_eq!(
+            russian_count_word(1, "инструмент", "инструмента", "инструментов"),
+            "инструмент"
+        );
+        assert_eq!(
+            russian_count_word(2, "инструмент", "инструмента", "инструментов"),
+            "инструмента"
+        );
+        assert_eq!(
+            russian_count_word(5, "инструмент", "инструмента", "инструментов"),
+            "инструментов"
+        );
+        assert_eq!(
+            russian_count_word(11, "инструмент", "инструмента", "инструментов"),
+            "инструментов"
+        );
+        assert_eq!(
+            russian_count_word(21, "инструмент", "инструмента", "инструментов"),
+            "инструмент"
+        );
     }
 
     // ----- v0.8.19 shared activity summarizer -----

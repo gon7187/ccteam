@@ -368,7 +368,7 @@ impl RejectedSenderNotifier {
 
 fn rejected_sender_notice(sender_id: &str) -> String {
     format!(
-        "此 IM 身份尚未绑定，消息未交给任何 agent。\n绑定 ID: {sender_id}\n请用此 bot 所属的 ccteam 账号打开「设置 → 接入」，绑定该 ID 后重试。"
+        "Этот IM-идентификатор ещё не привязан, сообщение не передано агенту.\nID для привязки: {sender_id}\nОткройте в аккаунте ccteam, которому принадлежит этот бот, «Настройки → Подключение», привяжите этот ID и повторите попытку."
     )
 }
 
@@ -802,7 +802,7 @@ mod tests {
         assert_eq!(outbox[0].recipient, "339498819");
         assert_eq!(
             outbox[0].content,
-            "此 IM 身份尚未绑定，消息未交给任何 agent。\n绑定 ID: 339498819\n请用此 bot 所属的 ccteam 账号打开「设置 → 接入」，绑定该 ID 后重试。"
+            "Этот IM-идентификатор ещё не привязан, сообщение не передано агенту.\nID для привязки: 339498819\nОткройте в аккаунте ccteam, которому принадлежит этот бот, «Настройки → Подключение», привяжите этот ID и повторите попытку."
         );
 
         let lines = tokio::fs::read_to_string(&probe_path).await.unwrap();

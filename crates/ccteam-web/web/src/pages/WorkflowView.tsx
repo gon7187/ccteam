@@ -45,7 +45,7 @@ export default function WorkflowView({
 } = {}) {
   const lang = langProp ?? "zh";
   const t = makeT(lang);
-  const zh = lang !== "en";
+  const zh = lang === "zh";
   const [localTab, setLocalTab] = useState<TabId>("skills");
   const tab: TabId = isTab(routeTab) ? routeTab : localTab;
   const setTab = (next: TabId) => {
@@ -112,7 +112,7 @@ export default function WorkflowView({
     const command = mcpForm.command.trim();
     if (!slug || !name || (!url && !command)) {
       toastBus.handler?.error(
-        tr(lang, "填写 name + url(或 command)", "Fill name + url (or command)"),
+        tr(lang, "填写 name + url(或 command)", "Fill name + url (or command)", "Заполните name и url (или command)"),
       );
       return;
     }
@@ -127,7 +127,7 @@ export default function WorkflowView({
       setMcpForm({ name: "", url: "", command: "", args: "" });
       setMcp(await getMcpServers(slug));
       toastBus.handler?.info(
-        tr(lang, `已写入 .mcp.json:${name}(vendor 下次启动生效)`, `Wrote .mcp.json: ${name}`),
+        tr(lang, `已写入 .mcp.json:${name}(vendor 下次启动生效)`, `Wrote .mcp.json: ${name}`, `Записано в .mcp.json: ${name}`),
       );
     } catch (e) {
       toastBus.handler?.error(e instanceof Error ? e.message : String(e));
@@ -145,7 +145,7 @@ export default function WorkflowView({
         className="btn ghost"
         style={{ padding: "6px 10px", fontSize: 12.5 }}
       >
-        {projects.length === 0 ? <option value="">{tr(lang, "(无项目)", "(no projects)")}</option> : null}
+        {projects.length === 0 ? <option value="">{tr(lang, "(无项目)", "(no projects)", "(нет проектов)")}</option> : null}
         {projects.map((p) => (
           <option key={p} value={p}>
             {p}

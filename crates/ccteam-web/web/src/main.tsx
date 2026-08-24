@@ -16,7 +16,6 @@ import { createRoot } from "react-dom/client";
 import "./lib/token";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App";
-import { ToastBusBridge, ToastProvider } from "./components/Toasts";
 import { installFetchErrorToasts } from "./lib/fetchInterceptor";
 import "./index.css";
 
@@ -24,11 +23,8 @@ installFetchErrorToasts();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <ToastProvider>
-      <ToastBusBridge />
-      <BrowserRouter basename="/app">
-        <App />
-      </BrowserRouter>
-    </ToastProvider>
+    <BrowserRouter basename="/app">
+      <App />
+    </BrowserRouter>
   </StrictMode>,
 );

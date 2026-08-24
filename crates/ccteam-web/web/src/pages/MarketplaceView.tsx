@@ -61,7 +61,7 @@ import {
   needsProjectTarget,
   skillLibraryStatusLabel,
 } from "../lib/marketplaceFormat";
-import { makeT, type Lang } from "../lib/i18n";
+import { makeT, tr, type Lang } from "../lib/i18n";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { toastBus } from "../lib/toastBus";
 
@@ -214,8 +214,8 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
           // the project) — its toast names the library, not `→ project`.
           toastBus.handler?.info(
             plugin.type === "skill"
-              ? `${t("skillInstalledToast")}: ${res.id}${res.overwrote ? (lang === "en" ? " (updated)" : "（已更新）") : ""}`
-              : `已安装 ${res.id} → ${project}${res.overwrote ? "（已更新）" : ""}`,
+              ? `${t("skillInstalledToast")}: ${res.id}${res.overwrote ? tr(lang, "（已更新）", " (updated)", " (обновлено)") : ""}`
+              : tr(lang, `已安装 ${res.id} → ${project}${res.overwrote ? "（已更新）" : ""}`, `Installed ${res.id} → ${project}${res.overwrote ? " (updated)" : ""}`, `Установлено ${res.id} → ${project}${res.overwrote ? " (обновлено)" : ""}`),
           );
           // Re-fetch the decorated catalog so the card flips to 已装 — quietly
           // (no loading flash; only the resolved result updates the grid).
@@ -225,7 +225,7 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
         .catch((e) => {
           if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
           toastBus.handler?.error(
-            `安装失败: ${e instanceof Error ? e.message : "unknown"}`,
+            `${tr(lang, "安装失败", "Installation failed", "Не удалось установить")}: ${e instanceof Error ? e.message : "unknown"}`,
           );
         })
         .finally(() => setInstalling(null));
@@ -240,10 +240,9 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
           <div className="flex-1 min-w-0" />
         ) : (
           <div className="flex-1 min-w-0">
-            <h2 className="text-base font-semibold text-text-primary">插件市场</h2>
+            <h2 className="text-base font-semibold text-text-primary">{tr(lang, "插件市场", "Marketplace", "Маркетплейс")}</h2>
             <p className="mt-1 text-sm text-text-secondary">
-              浏览 + 一键装 role/agent、skill、workflow。来源 ccteam-hub（自建）+ agency-agents
-              等开源。skill 装入全局库,agent/plugin 按所选项目安装。
+              {tr(lang, "浏览 + 一键装 role/agent、skill、workflow。来源 ccteam-hub（自建）+ agency-agents 等开源。skill 装入全局库,agent/plugin 按所选项目安装。", "Browse and install roles, agents, skills, and workflows from ccteam-hub and open source.", "Просматривайте и устанавливайте роли, агентов, навыки и workflow из ccteam-hub и open source.")}
             </p>
           </div>
         )}
@@ -251,11 +250,11 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
           type="button"
           onClick={() => reload(true)}
           disabled={refreshing || state.kind === "loading"}
-          title="刷新目录（重新拉 hub index）"
+          title={tr(lang, "刷新目录（重新拉 hub index）", "Refresh catalog (reload hub index)", "Обновить каталог (загрузить hub index)")}
           className="shrink-0 h-8 px-2.5 rounded-md text-xs flex items-center gap-1.5 border border-surface-700/60 text-text-secondary hover:text-text-primary hover:bg-surface-800 disabled:opacity-40"
         >
           <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? "animate-spin" : ""}`} />
-          刷新目录
+          {tr(lang, "刷新目录", "Refresh catalog", "Обновить каталог")}
         </button>
       </div>
 
@@ -285,12 +284,13 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
         </div>
 
         <Combobox
+          lang={lang}
           value={source}
           onChange={setSource}
           options={sourceOptions}
           searchable={sources.length > 8}
-          searchPlaceholder="搜索来源…"
-          ariaLabel="来源筛选"
+          searchPlaceholder={tr(lang, "搜索来源…", "Search sources…", "Поиск источников…")}
+          ariaLabel={tr(lang, "来源筛选", "Filter sources", "Фильтр источников")}
           className="min-w-[140px]"
           buttonClassName="h-8 text-xs"
         />
@@ -298,8 +298,8 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="搜索插件（id / 名称 / 描述 / tag）…"
-          aria-label="搜索插件"
+          placeholder={tr(lang, "搜索插件（id / 名称 / 描述 / tag）…", "Search plugins (id / name / description / tag)…", "Поиск плагинов (id / имя / описание / tag)…")}
+          aria-label={tr(lang, "搜索插件", "Search plugins", "Поиск плагинов")}
           className="flex-1 min-w-[140px] h-8 rounded-md bg-surface-800 border border-surface-700 px-3 text-xs text-text-primary placeholder:text-text-dim outline-none focus:border-brand-500"
         />
       </div>
@@ -623,6 +623,7 @@ export function PluginDrawer({
 
   return (
     <Dialog
+      lang={lang}
       open
       onClose={onClose}
       placement="end"
@@ -635,7 +636,7 @@ export function PluginDrawer({
           <button
             type="button"
             onClick={onClose}
-            aria-label="关闭"
+            aria-label={tr(lang, "关闭", "Close", "Закрыть")}
             className="text-text-dim hover:text-text-primary p-1"
           >
             <X className="h-4 w-4" />
@@ -675,13 +676,13 @@ export function PluginDrawer({
 
           <div className="pt-1">
             <div className="text-[11px] uppercase tracking-wide text-text-dim mb-1.5">
-              正文预览（装前 review）
+              {tr(lang, "正文预览（装前 review）", "Content preview (review before install)", "Предпросмотр содержимого (проверка перед установкой)")}
             </div>
             {body.kind === "loading" ? (
-              <div className="text-xs text-text-dim py-4">加载正文中…</div>
+              <div className="text-xs text-text-dim py-4">{tr(lang, "加载正文中…", "Loading content…", "Загрузка содержимого…")}</div>
             ) : body.kind === "error" ? (
               <div role="alert" className="text-xs text-status-error py-2">
-                加载正文失败: {body.message}
+                {tr(lang, "加载正文失败", "Failed to load content", "Не удалось загрузить содержимое")}: {body.message}
               </div>
             ) : (
               <div
@@ -704,15 +705,16 @@ export function PluginDrawer({
               data-testid="market-project-picker"
               className="flex items-center gap-1.5 text-xs text-text-dim min-w-0"
             >
-              安装到
+              {tr(lang, "安装到", "Install to", "Установить в")}
               <Combobox
+                lang={lang}
                 value={project}
                 onChange={(v) => onProjectChange?.(v)}
                 options={projectOptions}
                 searchable={projects.length > 8}
-                placeholder="（无项目 · 仅浏览）"
-                searchPlaceholder="搜索项目…"
-                ariaLabel="安装目标项目"
+                placeholder={tr(lang, "（无项目 · 仅浏览）", "(no project · browse only)", "(нет проекта · только просмотр)")}
+                searchPlaceholder={tr(lang, "搜索项目…", "Search projects…", "Поиск проектов…")}
+                ariaLabel={tr(lang, "安装目标项目", "Installation target project", "Проект для установки")}
                 className="min-w-[140px]"
                 buttonClassName="h-8 text-xs"
               />
@@ -721,17 +723,17 @@ export function PluginDrawer({
             <span className="text-[11px] text-text-dim truncate">
               {project ? (
                 <>
-                  安装到 <span className="font-mono text-text-secondary">{project}</span>
+                  {tr(lang, "安装到", "Install to", "Установить в")} <span className="font-mono text-text-secondary">{project}</span>
                 </>
               ) : (
-                "无可用项目"
+                tr(lang, "无可用项目", "No available project", "Нет доступного проекта")
               )}
             </span>
           )}
           <span className="flex-1" />
           {plugin.installed_status === "installed" ? (
             <span className="text-[11px] font-medium px-2 py-1 rounded-md bg-status-running/15 text-status-running">
-              {isSkill ? skillLibraryStatusLabel("installed", lang) : "已装"}
+              {isSkill ? skillLibraryStatusLabel("installed", lang) : tr(lang, "已装", "Installed", "Установлено")}
             </span>
           ) : (
             <button
@@ -741,12 +743,12 @@ export function PluginDrawer({
               className="h-8 px-3 rounded-md text-sm bg-brand-500 text-surface-950 hover:bg-brand-400 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {installing
-                ? "安装中…"
+                ? tr(lang, "安装中…", "Installing…", "Установка…")
                 : isSkill
                   ? skillLibraryStatusLabel(plugin.installed_status ?? "not_installed", lang)
                   : plugin.installed_status === "update_available"
-                    ? `更新到 ${project || "项目"}`
-                    : `安装到 ${project || "项目"}`}
+                    ? tr(lang, `更新到 ${project || "项目"}`, `Update to ${project || "project"}`, `Обновить в ${project || "проект"}`)
+                    : tr(lang, `安装到 ${project || "项目"}`, `Install to ${project || "project"}`, `Установить в ${project || "проект"}`)}
             </button>
           )}
         </div>

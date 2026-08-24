@@ -192,21 +192,21 @@ fn format_gateway_user_error(err: &anyhow::Error) -> String {
     let raw = err.to_string();
     if let Some(rest) = raw.strip_prefix("spawn failed: ") {
         return format!(
-            "会话启动失败: {rest}。下一步: 请检查项目和角色后重试 /new；如果仍失败，重启 ccteam start 后再试。"
+            "Не удалось запустить сессию: {rest}. Проверьте проект и роль, затем повторите /new; если ошибка останется, перезапустите ccteam start."
         );
     }
     if let Some(rest) = raw.strip_prefix("submit failed: ") {
         return format!(
-            "发送失败: {rest}。下一步: 请重试；如果仍失败，发送 /sessions 确认会话还在，或重新 /new。"
+            "Не удалось отправить сообщение: {rest}. Повторите попытку; если ошибка останется, проверьте сессию через /sessions или создайте её через /new."
         );
     }
     if let Some(project) = raw.strip_prefix("unknown project: ") {
         return format!(
-            "项目不存在: {project}。下一步: 发送 /projects 查看可用项目，或先运行 ccteam init 注册项目。"
+            "Проект не найден: {project}. Посмотрите доступные через /projects или сначала зарегистрируйте проект командой ccteam init."
         );
     }
     format!(
-        "操作失败: {raw}。下一步: 请重试；如果仍失败，发送 /projects 检查项目，或重启 ccteam start。"
+        "Операция не выполнена: {raw}. Повторите попытку; если ошибка останется, проверьте проект через /projects или перезапустите ccteam start."
     )
 }
 
@@ -1801,9 +1801,15 @@ async fn send_gateway_outbound(
     // best-effort UX notice.
     if !failed_parts.is_empty() {
         let body = if failed_parts.len() == 1 {
-            format!("⚠️ 部分消息发送失败 (part {}/{total})", failed_parts[0])
+            format!(
+                "⚠️ Не удалось отправить часть сообщения (часть {}/{total})",
+                failed_parts[0]
+            )
         } else {
-            format!("⚠️ 部分消息发送失败 ({}/{total} parts)", failed_parts.len())
+            format!(
+                "⚠️ Не удалось отправить части сообщения ({}/{total} шт.)",
+                failed_parts.len()
+            )
         };
         let notice =
             SendMessage::new(body, message.recipient.clone()).in_thread(message.thread_ts.clone());

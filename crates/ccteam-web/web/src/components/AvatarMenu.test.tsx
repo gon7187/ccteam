@@ -25,10 +25,11 @@ vi.hoisted(() => {
 
 import { renderToString } from "react-dom/server";
 import AvatarMenu, { AvatarPopover } from "./AvatarMenu";
+import type { Lang } from "../lib/i18n";
 
 const noop = () => {};
 
-function popover(lang: "zh" | "en", avatar = "#f59e0b", handle: string | null = "alice") {
+function popover(lang: Lang, avatar = "#f59e0b", handle: string | null = "alice") {
   return renderToString(
     <AvatarPopover
       lang={lang}
@@ -46,6 +47,14 @@ function popover(lang: "zh" | "en", avatar = "#f59e0b", handle: string | null = 
 }
 
 describe("AvatarPopover (pure)", () => {
+  it("renders Russian labels and selects Russian", () => {
+    const html = popover("ru");
+    expect(html).toContain("Русский");
+    expect(html).toContain('data-testid="lang-ru"');
+    const russianControl = html.slice(html.indexOf('data-testid="lang-ru"'));
+    expect(russianControl).toContain('aria-pressed="true"');
+  });
+
   it("renders the personal-settings popover in Chinese by default", () => {
     const html = popover("zh");
     expect(html).toContain('data-testid="avatar-popover"');

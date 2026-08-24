@@ -85,7 +85,7 @@ fn spawn_program() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os(DAEMON_BIN_ENV) {
         return Ok(PathBuf::from(p));
     }
-    ccteam_core::current_ccteam_bin().context("resolve daemon binary to detach")
+    ccteam_core::current_ccteam_bin().context("определить бинарник демона для запуска")
 }
 
 fn start_spec(
@@ -113,16 +113,16 @@ fn effective_dsh_web_bind(web_bind: &str, dsh_web_bind: Option<&str>) -> Result<
         Some(value) if value.eq_ignore_ascii_case("off") => Ok("off".to_string()),
         Some(value) => {
             let _: std::net::SocketAddr = value.parse().with_context(|| {
-                format!("--dsh-web-bind {value} is not a valid socket address or `off`")
+                format!("--dsh-web-bind {value} не является корректным адресом сокета или `off`")
             })?;
             Ok(value.to_string())
         }
         None => {
-            let web: std::net::SocketAddr = web_bind
-                .parse()
-                .with_context(|| format!("--web-bind {web_bind} is not a valid socket address"))?;
+            let web: std::net::SocketAddr = web_bind.parse().with_context(|| {
+                format!("--web-bind {web_bind} не является корректным адресом сокета")
+            })?;
             let port = web.port().checked_add(1).context(
-                "--dsh-web-bind default cannot be derived because --web-bind uses port 65535",
+                "значение --dsh-web-bind по умолчанию нельзя вывести: --web-bind использует порт 65535",
             )?;
             Ok(std::net::SocketAddr::new(web.ip(), port).to_string())
         }
@@ -147,8 +147,8 @@ pub(crate) fn takeover_pre_step() {
         Ok(legacy_takeover::TakeoverOutcome::NothingToDo) => {}
         Ok(legacy_takeover::TakeoverOutcome::Migrated { unit, actions }) => {
             eprintln!(
-                "ccteam daemon: migrated from systemd/launchd to ccteam self-managed \
-                 (installer-written unit {} taken over):",
+                "ccteam daemon: выполнен переход с systemd/launchd на самостоятельное управление ccteam \
+                 (перехвачен созданный установщиком unit {}):",
                 unit.display()
             );
             for action in actions {
@@ -157,14 +157,13 @@ pub(crate) fn takeover_pre_step() {
         }
         Ok(legacy_takeover::TakeoverOutcome::ForeignUnitPresent { unit }) => {
             eprintln!(
-                "ccteam daemon: found a service unit at {} that was NOT written by the ccteam \
-                 installer — leaving it alone. ccteam treats an instance it supervises as \
-                 \"not managed\"; remove the unit yourself if you want ccteam self-management.",
+                "ccteam daemon: найден unit службы {} не от установщика ccteam — он оставлен без изменений. \
+                 ccteam считает такой экземпляр \"not managed\"; удалите unit вручную для самостоятельного управления ccteam.",
                 unit.display()
             );
         }
         Err(err) => {
-            eprintln!("ccteam daemon: legacy service takeover failed (continuing): {err:#}");
+            eprintln!("ccteam daemon: не удалось перехватить старую службу (продолжаю): {err:#}");
         }
     }
 }
@@ -176,8 +175,8 @@ fn web_hint(web_bind: &str) -> String {
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "localhost".to_string());
     format!(
-        "web console: http://{host}:{port}/  (run `ccteam status` for the tokenized login link)\n\
-         logs:        ccteam daemon logs -f"
+        "веб-консоль: http://{host}:{port}/  (выполните `ccteam status` для ссылки входа с токеном)\n\
+         логи:        ccteam daemon logs -f"
     )
 }
 
@@ -196,7 +195,7 @@ pub fn run_daemon_start(web_bind: &str, dsh_web_bind: Option<&str>, json: bool) 
                 json,
                 serde_json::json!({ "status": "started", "pid": pid, "version": version }),
                 &format!(
-                    "ccteam daemon started (pid {pid}, version {v}).\n{}",
+                    "ccteam daemon запущен (pid {pid}, версия {v}).\n{}",
                     web_hint(web_bind)
                 ),
             );
@@ -206,7 +205,7 @@ pub fn run_daemon_start(web_bind: &str, dsh_web_bind: Option<&str>, json: bool) 
             emit(
                 json,
                 serde_json::json!({ "status": "alreadyRunning", "version": version }),
-                &format!("ccteam daemon already running (version {v})."),
+                &format!("ccteam daemon уже запущен (версия {v})."),
             );
         }
         Err(err) => fail(json, error_code(&err), &format!("{err:#}")),
@@ -226,10 +225,10 @@ pub fn run_daemon_stop(force: bool, json: bool) -> Result<()> {
                 json,
                 serde_json::json!({ "status": "stopped", "pid": pid }),
                 &format!(
-                    "ccteam daemon stopped (pid {pid}). Agent sessions are NOT killed: idle ones \
-                     exit on their own; a session mid-turn keeps working and the next `ccteam \
-                     daemon start` picks it up by its body record (waits for it, then recovers \
-                     its answer) — never a second process for the same session."
+                    "ccteam daemon остановлен (pid {pid}). Сессии агентов НЕ завершаются: незанятые \
+                     завершатся сами; сессия в ходе ответа продолжит работу, а следующий `ccteam \
+                     daemon start` найдёт её по записи процесса, дождётся и восстановит ответ — \
+                     второго процесса для той же сессии не будет."
                 ),
             );
         }
@@ -237,7 +236,7 @@ pub fn run_daemon_stop(force: bool, json: bool) -> Result<()> {
             emit(
                 json,
                 serde_json::json!({ "status": "notRunning" }),
-                "no managed ccteam daemon is running.",
+                "нет запущенного управляемого демона ccteam.",
             );
         }
         Ok(dcore::StopVerdict::RefusedNotManaged { hint }) => {
@@ -245,16 +244,16 @@ pub fn run_daemon_stop(force: bool, json: bool) -> Result<()> {
         }
         Ok(dcore::StopVerdict::TimedOut { pid }) => {
             let extra = if force {
-                "even SIGKILL did not reap it; inspect the process manually"
+                "даже SIGKILL не завершил его; проверьте процесс вручную"
             } else {
-                "retry with `ccteam daemon stop --force` to escalate to SIGKILL \
-                 (daemon process only; agent session bodies are never touched — the next \
-                 start finds them by their body records)"
+                "повторите `ccteam daemon stop --force`, чтобы перейти к SIGKILL \
+                 (только процесс демона; процессы сессий агентов не затрагиваются — следующий \
+                 запуск найдёт их по записям процессов)"
             };
             fail(
                 json,
                 "stopTimeout",
-                &format!("daemon pid {pid} is still alive after the stop wait; {extra}"),
+                &format!("процесс демона {pid} всё ещё работает после ожидания остановки; {extra}"),
             );
         }
         Err(err) => fail(json, error_code(&err), &format!("{err:#}")),
@@ -338,7 +337,12 @@ fn restart_started_action(
     RestartCommandAction::Emit {
         machine: serde_json::json!({ "status": status, "pid": pid, "version": version }),
         human: format!(
-            "ccteam daemon {status} (pid {pid}, version {v}).\n{}",
+            "ccteam daemon {} (pid {pid}, версия {v}).\n{}",
+            if status == "restarted" {
+                "перезапущен"
+            } else {
+                "запущен"
+            },
             web_hint(web_bind)
         ),
     }
@@ -359,20 +363,18 @@ fn restart_command_action(
         }
         RestartOutcome::AlreadyServing { version } => RestartCommandAction::Emit {
             machine: serde_json::json!({ "status": "alreadyRunning", "version": version }),
-            human: "a daemon is already serving the socket (not spawned by this restart)."
-                .to_string(),
+            human: "сокет уже обслуживает демон (он не был запущен этим перезапуском).".to_string(),
         },
         RestartOutcome::NotManaged { hint } if if_managed => {
             let hint = format!(
-                "{hint}; the newly installed binary is NOT live until you restart that daemon \
-                 yourself"
+                "{hint}; новый установленный бинарник НЕ начнёт работать, пока вы не перезапустите этот демон вручную"
             );
             RestartCommandAction::Emit {
                 machine: serde_json::json!({
                     "status": "skippedNotManaged",
                     "hint": hint,
                 }),
-                human: format!("warning: {hint}"),
+                human: format!("предупреждение: {hint}"),
             }
         }
         RestartOutcome::NotManaged { hint } => RestartCommandAction::Fail {
@@ -382,8 +384,8 @@ fn restart_command_action(
         RestartOutcome::StopTimedOut { pid } => RestartCommandAction::Fail {
             code: "stopTimeout",
             message: format!(
-                "daemon pid {pid} did not exit within the stop wait; restart aborted \
-                 (`ccteam daemon stop --force` can escalate)"
+                "процесс демона {pid} не завершился за время ожидания; перезапуск отменён \
+                 (`ccteam daemon stop --force` может перейти к SIGKILL)"
             ),
         },
     }
@@ -424,47 +426,47 @@ pub fn run_daemon_status(json: bool) -> Result<()> {
         "socket": report.socket.display().to_string(),
     });
 
-    let mut human = String::from("ccteam daemon status\n");
+    let mut human = String::from("статус демона ccteam\n");
     human.push_str(&format!(
-        "  ready:   {}  ({})\n",
-        if report.ready { "yes" } else { "no" },
+        "  готов:   {}  ({})\n",
+        if report.ready { "да" } else { "нет" },
         report.socket.display()
     ));
     match (&report.record, report.managed) {
         (Some(r), true) => human.push_str(&format!(
-            "  managed: yes  (pid {}, started {})\n",
+            "  управляемый: да  (pid {}, запущен {})\n",
             r.pid, r.started_at
         )),
         (Some(_), false) if report.ready => human.push_str(
-            "  managed: no   (stale pid record; the serving instance was not started by \
+            "  управляемый: нет  (устаревшая запись pid; обслуживающий экземпляр не был запущен через \
              `ccteam daemon start`)\n",
         ),
-        (Some(_), false) => human.push_str("  managed: no   (stale pid record)\n"),
+        (Some(_), false) => human.push_str("  управляемый: нет  (устаревшая запись pid)\n"),
         (None, _) if report.ready => human.push_str(
-            "  managed: no   (foreground `ccteam start` or a self-supervised instance)\n",
+            "  управляемый: нет  (foreground `ccteam start` или самостоятельный экземпляр)\n",
         ),
-        (None, _) => human.push_str("  managed: no\n"),
+        (None, _) => human.push_str("  управляемый: нет\n"),
     }
     match &report.running_version {
         Some(v) if v == binary_version => {
             human.push_str(&format!(
-                "  version: running {v} / binary {binary_version}\n"
+                "  версия: запущена {v} / бинарник {binary_version}\n"
             ));
         }
         Some(v) => {
             human.push_str(&format!(
-                "  version: running {v} / binary {binary_version}  \
-                 (RESTART NEEDED: `ccteam daemon restart` to load the new binary)\n"
+                "  версия: запущена {v} / бинарник {binary_version}  \
+                 (ТРЕБУЕТСЯ ПЕРЕЗАПУСК: `ccteam daemon restart` для загрузки нового бинарника)\n"
             ));
         }
         None => {
             human.push_str(&format!(
-                "  version: running -  / binary {binary_version}\n"
+                "  версия: запущена -  / бинарник {binary_version}\n"
             ));
         }
     }
     if !report.ready {
-        human.push_str("  hint:    start it with `ccteam daemon start`\n");
+        human.push_str("  подсказка: запустите через `ccteam daemon start`\n");
     }
     emit(json, machine, human.trim_end());
     Ok(())
@@ -474,14 +476,14 @@ pub fn run_daemon_logs(lines: usize, follow: bool, json: bool) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     let path = dcore::daemon_log_path(&paths);
     if follow && json {
-        fail(json, "badArgs", "--json cannot be combined with --follow");
+        fail(json, "badArgs", "--json нельзя сочетать с --follow");
     }
     if !path.exists() {
         emit(
             json,
             serde_json::json!({ "path": path.display().to_string(), "lines": [] }),
             &format!(
-                "no daemon log yet at {} (it appears on the first `ccteam daemon start`).",
+                "лога демона пока нет в {} (он появится после первого `ccteam daemon start`).",
                 path.display()
             ),
         );
@@ -505,7 +507,7 @@ pub fn run_daemon_logs(lines: usize, follow: bool, json: bool) -> Result<()> {
 
     // Follow: poll for appended bytes until the process is interrupted.
     let mut file =
-        std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        std::fs::File::open(&path).with_context(|| format!("открыть {}", path.display()))?;
     let mut offset = file.metadata().map(|m| m.len()).unwrap_or(0);
     loop {
         std::thread::sleep(Duration::from_millis(250));
@@ -539,7 +541,8 @@ pub fn run_daemon_logs(lines: usize, follow: bool, json: bool) -> Result<()> {
 /// daemon log is unrotated and can grow large).
 fn tail_lines(path: &std::path::Path, n: usize) -> Result<Vec<String>> {
     const WINDOW: u64 = 1024 * 1024;
-    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("открыть {}", path.display()))?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(WINDOW);
     file.seek(SeekFrom::Start(start))?;
@@ -592,14 +595,12 @@ mod tests {
                 "missing original hint: {rendered}"
             );
             assert!(
-                rendered.contains(
-                    "the newly installed binary is NOT live until you restart that daemon yourself"
-                ),
+                rendered.contains("новый установленный бинарник НЕ начнёт работать"),
                 "missing deploy-drift warning: {rendered}"
             );
         }
         assert!(
-            human.starts_with("warning:"),
+            human.starts_with("предупреждение:"),
             "warning must be loud: {human}"
         );
     }
@@ -630,12 +631,24 @@ mod tests {
             assert_eq!(machine["status"], expected_status);
             assert_eq!(machine["pid"], expected_pid);
             assert_eq!(machine["version"], expected_version);
-            assert!(human.starts_with(&format!(
-                "ccteam daemon {expected_status} (pid {expected_pid}, version {expected_version})."
-            )));
-            assert!(human.contains("web console:"));
-            assert!(human.contains("logs:        ccteam daemon logs -f"));
+            assert!(human.contains(&format!("pid {expected_pid}, версия {expected_version}")));
+            assert!(human.contains("веб-консоль:"));
+            assert!(human.contains("логи:        ccteam daemon logs -f"));
         }
+    }
+
+    #[test]
+    fn restart_success_uses_russian_human_diagnostics() {
+        let (_, human) = emitted(restart_command_action(
+            RestartOutcome::Started {
+                pid: 42,
+                version: Some("0.10.1".to_string()),
+            },
+            true,
+            "127.0.0.1:7331",
+        ));
+        assert!(human.starts_with("ccteam daemon запущен"));
+        assert!(human.contains("веб-консоль:"));
     }
 
     #[test]
@@ -649,8 +662,8 @@ mod tests {
         assert_eq!(code, "stopTimeout");
         assert_eq!(
             message,
-            "daemon pid 99 did not exit within the stop wait; restart aborted \
-             (`ccteam daemon stop --force` can escalate)"
+            "процесс демона 99 не завершился за время ожидания; перезапуск отменён \
+             (`ccteam daemon stop --force` может перейти к SIGKILL)"
         );
     }
 

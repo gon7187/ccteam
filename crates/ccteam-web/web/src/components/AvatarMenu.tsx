@@ -61,12 +61,12 @@ export function AvatarPopover({
     >
       <div className="flex items-baseline justify-between gap-2">
         <div className="text-xs font-semibold text-text-primary">
-          {tr(lang, "个人设置", "Personal settings")}
+          {tr(lang, "个人设置", "Personal settings", "Личные настройки")}
         </div>
         {handle ? (
           <span
             data-testid="avatar-handle"
-            title={tr(lang, `当前登录:${handle}`, `Signed in as ${handle}`)}
+            title={tr(lang, `当前登录:${handle}`, `Signed in as ${handle}`, `Выполнен вход: ${handle}`)}
             className="truncate text-[11px] font-mono text-text-secondary"
           >
             @{handle}
@@ -75,18 +75,18 @@ export function AvatarPopover({
       </div>
 
       <label className="mt-2 block text-[11px] text-text-dim">
-        {tr(lang, "显示名", "Display name")}
+        {tr(lang, "显示名", "Display name", "Отображаемое имя")}
       </label>
       <input
         data-testid="avatar-name-input"
         value={displayName}
         onChange={(e) => onName(e.target.value)}
-        placeholder={tr(lang, "你的名字", "Your name")}
+        placeholder={tr(lang, "你的名字", "Your name", "Ваше имя")}
         className="mt-1 w-full rounded-md border border-surface-700/60 bg-surface-900 px-2 py-1 text-sm text-text-primary placeholder:text-text-dim focus:outline-none focus:ring-1 focus:ring-brand-500"
       />
 
       <div className="mt-3 flex items-center gap-1.5">
-        <span className="mr-auto text-[11px] text-text-dim">{tr(lang, "头像", "Avatar")}</span>
+        <span className="mr-auto text-[11px] text-text-dim">{tr(lang, "头像", "Avatar", "Аватар")}</span>
         {AVATARS.map((a) => (
           <button
             key={a}
@@ -106,8 +106,21 @@ export function AvatarPopover({
       </div>
 
       <div className="mt-3 flex items-center gap-2">
-        <span className="text-[11px] text-text-dim">{tr(lang, "界面语言", "Language")}</span>
+        <span className="text-[11px] text-text-dim">{tr(lang, "界面语言", "Language", "Язык")}</span>
         <div className="ml-auto inline-flex overflow-hidden rounded-md border border-surface-700/60 text-xs">
+          <button
+            type="button"
+            data-testid="lang-ru"
+            onClick={() => onLanguage("ru")}
+            aria-pressed={lang === "ru"}
+            className={`px-2 py-1 ${
+              lang === "ru"
+                ? "bg-brand-500/20 text-brand-400"
+                : "text-text-secondary hover:text-text-primary"
+            }`}
+          >
+            Русский
+          </button>
           <button
             type="button"
             data-testid="lang-zh"
@@ -138,13 +151,13 @@ export function AvatarPopover({
       </div>
 
       <div className="mt-3 flex items-center gap-2">
-        <span className="text-[11px] text-text-dim">{tr(lang, "主题", "Theme")}</span>
+        <span className="text-[11px] text-text-dim">{tr(lang, "主题", "Theme", "Тема")}</span>
         <button
           type="button"
           data-testid="theme-toggle"
           onClick={onTheme}
-          aria-label={tr(lang, "切换明暗", "Toggle theme")}
-          title={tr(lang, "切换明暗", "Toggle theme")}
+          aria-label={tr(lang, "切换明暗", "Toggle theme", "Переключить тему")}
+          title={tr(lang, "切换明暗", "Toggle theme", "Переключить тему")}
           className="ml-auto grid h-7 w-7 place-items-center rounded-md border border-surface-700/60 text-text-secondary hover:bg-surface-800 hover:text-text-primary"
         >
           {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
@@ -158,7 +171,7 @@ export function AvatarPopover({
         className="mt-3 flex w-full items-center gap-1.5 border-t border-surface-800 pt-2 text-left text-[11px] text-status-error hover:text-status-error/80"
       >
         <LogOut className="h-3.5 w-3.5" />
-        {tr(lang, "登出（清你的 token）", "Log out (clears your token)")}
+        {tr(lang, "登出（清你的 token）", "Log out (clears your token)", "Выйти (очистить token)")}
       </button>
     </div>
   );
@@ -194,10 +207,10 @@ export default function AvatarMenu() {
         onClick={() => setOpen((o) => !o)}
         aria-label={
           handle
-            ? tr(lang, `个人设置(${handle})`, `Personal settings (${handle})`)
-            : tr(lang, "个人设置", "Personal settings")
+            ? tr(lang, `个人设置(${handle})`, `Personal settings (${handle})`, `Личные настройки (${handle})`)
+            : tr(lang, "个人设置", "Personal settings", "Личные настройки")
         }
-        title={handle ? tr(lang, `当前登录:${handle}`, `Signed in as ${handle}`) : undefined}
+        title={handle ? tr(lang, `当前登录:${handle}`, `Signed in as ${handle}`, `Выполнен вход: ${handle}`) : undefined}
         style={{ backgroundColor: avatarColor(settings.avatar) }}
         className="grid h-8 w-8 place-items-center rounded-full text-[11px] font-semibold text-surface-950 ring-1 ring-surface-700/60 hover:ring-brand-500/60"
       >
@@ -208,7 +221,7 @@ export default function AvatarMenu() {
           {/* click-away backdrop */}
           <button
             type="button"
-            aria-label={tr(lang, "关闭", "Close")}
+            aria-label={tr(lang, "关闭", "Close", "Закрыть")}
             onClick={() => setOpen(false)}
             className="fixed inset-0 z-40 cursor-default"
           />

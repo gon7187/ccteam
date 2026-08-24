@@ -356,6 +356,7 @@ export function ExternalAgentCard({ lang }: { lang: Lang }) {
                 styled trigger is the control), so it carries `ariaLabel`. */}
             <Label>{t("accessMcpScopeLabel")}</Label>
             <Combobox
+              lang={lang}
               data-testid="access-mcp-scope"
               name="enroll-scope"
               ariaLabel={t("accessMcpScopeLabel")}

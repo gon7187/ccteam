@@ -641,14 +641,16 @@ impl Channel for TelegramChannel {
                             Ok(Some(att)) => attachments.push(att),
                             Ok(None) => {
                                 rejected_notice = Some(format!(
-                                    "⚠️ 附件 {} 超过 20MB 上限,已拒收",
+                                    "⚠️ Вложение {} превышает лимит 20 МБ и отклонено",
                                     pending.file_name
                                 ));
                             }
                             Err(err) => {
                                 tracing::warn!(cid = %cid, error = %err, "telegram: attachment download failed");
-                                rejected_notice =
-                                    Some(format!("⚠️ 附件 {} 下载失败", pending.file_name));
+                                rejected_notice = Some(format!(
+                                    "⚠️ Не удалось скачать вложение {}",
+                                    pending.file_name
+                                ));
                             }
                         }
                     }

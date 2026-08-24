@@ -78,6 +78,7 @@ describe("relativeTime (language switch)", () => {
     const secondsAgo = (s: number) => new Date(Date.now() - s * 1000).toISOString();
     expect(relativeTime("zh", secondsAgo(5 * 60))).toBe("5分钟前");
     expect(relativeTime("en", secondsAgo(5 * 60))).toBe("5m");
+    expect(relativeTime("ru", secondsAgo(5 * 60))).toBe("5 мин назад");
   });
 });
 

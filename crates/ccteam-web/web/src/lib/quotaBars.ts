@@ -5,7 +5,7 @@
 // the component passes `new Date()`. Local timezone + app language come from
 // `Date` / explicit `lang` — never from the browser locale alone.
 
-import type { Lang } from "./i18n";
+import { WEB_LOCALE, type Lang } from "./i18n";
 import type { QuotaWindow, QuotaWindowKind, VendorQuota } from "./vendorQuotaApi";
 
 /** The 5-cell bar: round(percent/20) filled cells, clamped to [0, 5]. */
@@ -16,8 +16,8 @@ export function quotaBar(usedPercent: number): string {
 
 function windowLabel(kind: QuotaWindowKind, lang: Lang): string {
   if (kind === "five_hour") return "5h";
-  if (kind === "weekly") return lang === "en" ? "Week" : "周";
-  return lang === "en" ? "Month" : "月";
+  if (kind === "weekly") return lang === "ru" ? "Неделя" : lang === "en" ? "Week" : "周";
+  return lang === "ru" ? "Месяц" : lang === "en" ? "Month" : "月";
 }
 
 /** Compact duration: `42m` / `3h12m` / `2d05h`; negative clamps to `0m`. */
@@ -44,17 +44,21 @@ export function resetHint(
   const at = new Date(resetsAt);
   if (Number.isNaN(at.getTime())) return null;
   const diff = at.getTime() - now.getTime();
-  const locale = lang === "en" ? "en-US" : "zh-CN";
-  if (diff <= 0) return lang === "en" ? "resets soon" : "即将重置";
+  const locale = WEB_LOCALE[lang];
+  if (diff <= 0) return lang === "ru" ? "скоро сброс" : lang === "en" ? "resets soon" : "即将重置";
   if (diff < 24 * 3_600_000) {
+    if (lang === "ru") {
+      const total = Math.max(0, Math.round(diff / 60_000));
+      return `сброс через ${Math.floor(total / 60)} ч ${total % 60} мин`;
+    }
     return lang === "en" ? `resets in ${compactDuration(diff)}` : `${compactDuration(diff)}后重置`;
   }
   if (diff < 7 * 24 * 3_600_000) {
     const weekday = at.toLocaleDateString(locale, { weekday: "short" });
-    return lang === "en" ? `resets ${weekday}` : `${weekday}重置`;
+    return lang === "ru" ? `сброс ${weekday}` : lang === "en" ? `resets ${weekday}` : `${weekday}重置`;
   }
   const date = at.toLocaleDateString(locale, { month: "short", day: "numeric" });
-  return lang === "en" ? `resets ${date}` : `${date}重置`;
+  return lang === "ru" ? `сброс ${date}` : lang === "en" ? `resets ${date}` : `${date}重置`;
 }
 
 /** One window's render line: `5h ▓▓░░░ 42% · resets in 3h12m`. */

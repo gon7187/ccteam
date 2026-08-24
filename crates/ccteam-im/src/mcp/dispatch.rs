@@ -7058,9 +7058,15 @@ mod session_tool_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(notes.len(), 1, "one boundary notification, no flood");
-        assert!(notes[0].user.contains("is now IDLE"), "{}", notes[0].user);
         assert!(
-            notes[0].user.contains("1 interim note(s)"),
+            notes[0].user.contains("ожидает следующую задачу"),
+            "{}",
+            notes[0].user
+        );
+        assert!(
+            notes[0]
+                .user
+                .contains("1 промежуточное сообщение этого запуска осталось в журнале"),
             "pump folds the narration count: {}",
             notes[0].user
         );
