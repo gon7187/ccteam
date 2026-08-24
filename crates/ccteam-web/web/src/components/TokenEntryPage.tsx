@@ -63,7 +63,7 @@ export function TokenEntryPage({ onSubmit }: Props) {
     if (loading) return;
     const token = shapeToken(value);
     if (!token) {
-      setError("请粘贴访问令牌。");
+      setError("Вставьте токен доступа.");
       inputRef.current?.focus();
       return;
     }
@@ -116,10 +116,10 @@ export function TokenEntryPage({ onSubmit }: Props) {
 
           {/* Tagline */}
           <h1 className="text-center text-[15px] font-medium text-text-primary mb-1.5">
-            管理你的多 Agent 团队
+            Управляйте своей командой агентов
           </h1>
           <p className="text-center text-xs text-text-muted mb-4 leading-relaxed">
-            一个控制台，统一调度下列编码 Agent
+            Одна консоль для управления агентами разработки
           </p>
 
           {/* Vendor chips */}
@@ -140,7 +140,7 @@ export function TokenEntryPage({ onSubmit }: Props) {
               htmlFor="ccteam-token"
               className="block text-xs text-text-muted mb-2 font-medium"
             >
-              访问令牌
+              Токен доступа
             </label>
             <input
               ref={inputRef}
@@ -157,7 +157,7 @@ export function TokenEntryPage({ onSubmit }: Props) {
               autoCorrect="off"
               spellCheck={false}
               className="w-full px-3.5 py-3 bg-surface-900 border border-surface-700/60 rounded-xl text-text-primary text-sm font-mono placeholder:text-text-dim focus:outline-none focus:ring-2 focus:ring-brand-600 focus:border-transparent disabled:opacity-50 transition-colors"
-              placeholder="粘贴令牌（hex）"
+              placeholder="Вставьте токен (hex)"
             />
           </div>
 
@@ -198,17 +198,17 @@ export function TokenEntryPage({ onSubmit }: Props) {
                     d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
                   />
                 </svg>
-                连接中…
+                Подключение…
               </>
             ) : (
-              "登录"
+              "Войти"
             )}
           </button>
 
           <p className="mt-5 text-center text-[11px] text-text-dim leading-relaxed">
-            令牌由终端运行{" "}
+            Токен выводит команда{" "}
             <code className="font-mono text-text-muted">ccteam status</code>{" "}
-            时打印 · 登录状态保留 7 天
+            · вход сохраняется на 7 дней
           </p>
         </form>
       </div>

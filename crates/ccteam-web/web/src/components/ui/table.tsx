@@ -8,6 +8,7 @@
 import type { HTMLAttributes, TdHTMLAttributes, ThHTMLAttributes } from "react";
 import { ChevronDown, ChevronsUpDown, ChevronUp } from "lucide-react";
 import { cn } from "../../lib/utils";
+import { tr, type Lang } from "../../lib/i18n";
 
 export function Table({ className, ...props }: HTMLAttributes<HTMLTableElement>) {
   return (
@@ -62,12 +63,14 @@ export type SortDirection = "asc" | "desc" | false;
  *  `getToggleSortingHandler()` to `onSort` and `getIsSorted()` to `sorted`.
  *  Renders inside its own <th> (the `cell` is the visible header content). */
 export function SortableHeader({
+  lang,
   children,
   sorted,
   onSort,
   align = "left",
   className,
 }: {
+  lang: Lang;
   children: React.ReactNode;
   sorted: SortDirection;
   onSort?: ((event: unknown) => void) | undefined;
@@ -91,7 +94,7 @@ export function SortableHeader({
           align === "right" ? "flex-row-reverse" : "",
           !onSort && "cursor-default",
         )}
-        aria-label="排序"
+        aria-label={tr(lang, "排序", "Sort", "Сортировать")}
       >
         {children}
         <Icon

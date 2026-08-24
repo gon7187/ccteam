@@ -32,12 +32,14 @@ import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
 import { BackToLiveButton } from "./BackToLiveButton";
 import { KeyboardFab } from "./KeyboardFab";
 import { ViewportFullscreenFab } from "./ViewportFullscreenFab";
+import { tr, type Lang } from "../lib/i18n";
 import "@wterm/dom/css";
 
 const SCROLL_HINT_SEEN_KEY = "ccteam-mobile-scroll-hint-seen";
 const SCROLL_HINT_TIMEOUT_MS = 8000;
 
 interface Props {
+  lang: Lang;
   /** Project slug. Workflow projects: required and sufficient. */
   slug: string;
   /**
@@ -49,7 +51,7 @@ interface Props {
   className?: string;
 }
 
-export function TerminalView({ slug, sid, className }: Props) {
+export function TerminalView({ lang, slug, sid, className }: Props) {
   const {
     containerRef,
     termRef,
@@ -245,18 +247,18 @@ export function TerminalView({ slug, sid, className }: Props) {
       {!state.connected && state.reconnecting && (
         <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
           <span className="text-xs text-status-waiting">
-            Reconnecting in {state.retryCountdown}s... ({state.retryCount}/7)
+            {tr(lang, `将在 ${state.retryCountdown} 秒后重连… (${state.retryCount}/7)`, `Reconnecting in ${state.retryCountdown}s... (${state.retryCount}/7)`, `Переподключение через ${state.retryCountdown} с… (${state.retryCount}/7)`)}
           </span>
         </div>
       )}
       {!state.connected && !state.reconnecting && state.retryCount >= 7 && (
         <div className="bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
-          <span className="text-xs text-status-error">Connection lost</span>
+          <span className="text-xs text-status-error">{tr(lang, "连接已断开", "Connection lost", "Соединение потеряно")}</span>
           <button
             onClick={manualReconnect}
             className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline"
           >
-            Retry
+            {tr(lang, "重试", "Retry", "Повторить")}
           </button>
         </div>
       )}
@@ -278,13 +280,13 @@ export function TerminalView({ slug, sid, className }: Props) {
               <span aria-hidden="true" className="text-base leading-none">
                 {"⇅"}
               </span>
-              Swipe to scroll
+              {tr(lang, "滑动滚动", "Swipe to scroll", "Листайте свайпом")}
             </span>
           </div>
         )}
 
         {isMobile && state.isInScrollback && (
-          <BackToLiveButton onClick={exitScrollback} topOffset="top-3" />
+          <BackToLiveButton lang={lang} onClick={exitScrollback} topOffset="top-3" />
         )}
 
         {isMobile && state.connected && (
@@ -301,6 +303,7 @@ export function TerminalView({ slug, sid, className }: Props) {
 
       {isMobile && state.connected && (
         <MobileTerminalToolbar
+          lang={lang}
           sendData={sendData}
           termRef={termRef}
           keyboardHeight={keyboardHeight}

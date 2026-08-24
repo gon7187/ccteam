@@ -13,6 +13,7 @@ import ChatConsole from "./pages/ChatConsole";
 import { TokenEntryPage } from "./components/TokenEntryPage";
 import { useAuthState } from "./hooks/useAuthState";
 import { useWebSettings } from "./hooks/useWebSettings";
+import { ToastBusBridge, ToastProvider } from "./components/Toasts";
 
 /** Keep the `<html>` `.dark` class in sync with the chosen theme (light is
  *  the product default — `:root` tokens). The inline script in index.html
@@ -39,8 +40,11 @@ function TokenEntryGate({ children }: { children: React.ReactNode }) {
 }
 
 export default function App() {
+  const { settings } = useWebSettings();
   useThemeClass();
   return (
+    <ToastProvider lang={settings.language}>
+      <ToastBusBridge />
     <TokenEntryGate>
       <Routes>
         <Route path="/" element={<ChatConsole />} />
@@ -65,5 +69,6 @@ export default function App() {
         <Route path="*" element={<ChatConsole />} />
       </Routes>
     </TokenEntryGate>
+    </ToastProvider>
   );
 }

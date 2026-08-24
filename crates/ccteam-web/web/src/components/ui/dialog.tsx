@@ -26,6 +26,7 @@ import {
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { cn } from "../../lib/utils";
+import { tr, type Lang } from "../../lib/i18n";
 
 // SSR-safe "are we on the client yet?" — the server snapshot is `false`, the
 // client snapshot `true`, so the first client paint hydrates with the same
@@ -40,6 +41,7 @@ const useMounted = () =>
   );
 
 export interface DialogProps {
+  lang: Lang;
   open: boolean;
   onClose: () => void;
   /** Accessible name; rendered as the panel header unless `header` is given. */
@@ -69,6 +71,7 @@ function focusable(root: HTMLElement): HTMLElement[] {
 }
 
 export function Dialog({
+  lang,
   open,
   onClose,
   title,
@@ -176,7 +179,7 @@ export function Dialog({
             <button
               type="button"
               onClick={onClose}
-              aria-label="关闭"
+              aria-label={tr(lang, "关闭", "Close", "Закрыть")}
               className="ml-auto grid h-7 w-7 place-items-center rounded-md text-text-dim transition-colors hover:bg-surface-800 hover:text-text-primary"
             >
               <X className="h-4 w-4" />

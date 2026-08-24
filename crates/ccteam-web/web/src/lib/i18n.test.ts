@@ -6,8 +6,9 @@ import { I18N, WEB_LOCALE, makeT, navLabel, t, tHostsCount, tr, tShowMore, tStop
 
 describe("i18n", () => {
   it("tr defaults to zh and picks en when chosen", () => {
-    expect(tr("zh", "主机", "Hosts")).toBe("主机");
-    expect(tr("en", "主机", "Hosts")).toBe("Hosts");
+    expect(tr("zh", "主机", "Hosts", "Хосты")).toBe("主机");
+    expect(tr("en", "主机", "Hosts", "Хосты")).toBe("Hosts");
+    expect(tr("ru", "主机", "Hosts", "Хосты")).toBe("Хосты");
   });
 
   it("navLabel returns the per-language nav label", () => {

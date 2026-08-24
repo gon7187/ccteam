@@ -2,7 +2,7 @@
 //
 // Modeled on the prototype's `I18N` object (ui-prototype.html): one zh/en
 // table + `t(lang, key)`, plus parameterized helpers for count/sid phrases.
-// The older `tr(lang, zh, en)` inline helper and `navLabel` stay for the
+// The older `tr(lang, zh, en, ru)` inline helper and `navLabel` stay for the
 // long-tail of embedded panels that still carry their strings inline.
 
 export type Lang = "ru" | "zh" | "en";
@@ -14,8 +14,8 @@ export const WEB_LOCALE: Record<Lang, string> = {
 };
 
 /** Pick the right string for the current language (`zh` is the default). */
-export function tr(lang: Lang, zh: string, en: string): string {
-  return lang === "en" ? en : zh;
+export function tr(lang: Lang, zh: string, en: string, ru: string): string {
+  return lang === "ru" ? ru : lang === "en" ? en : zh;
 }
 
 /** Whole-shell dictionary — keys follow the prototype's `I18N` object. */

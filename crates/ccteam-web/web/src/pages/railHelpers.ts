@@ -4,6 +4,7 @@
 // tested directly).
 
 import type { Lang } from "../lib/i18n";
+import { tr } from "../lib/i18n";
 
 /** Display label for a rail / history / recent session row (v0.8.22 P1
  *  session-title system): the user-facing title when set, else the role, else
@@ -25,25 +26,18 @@ export function renameToastText(
     vendor_sync?: { state: "pushed" | "deferred" | "unsupported"; detail?: string };
   },
 ): string {
-  const head =
-    lang === "en"
-      ? `Renamed ${result.sid} → “${result.title}”`
-      : `已重命名 ${result.sid} →「${result.title}」`;
+  const head = tr(lang, `已重命名 ${result.sid} →「${result.title}」`, `Renamed ${result.sid} → “${result.title}”`, `Переименовано ${result.sid} → «${result.title}»`);
   const sync = result.vendor_sync;
   if (!sync) return head;
   const vendor = result.vendor || "vendor";
   if (sync.state === "pushed") {
-    return lang === "en"
-      ? `${head} · synced to ${vendor}`
-      : `${head} · 已同步到 ${vendor}`;
+    return tr(lang, `${head} · 已同步到 ${vendor}`, `${head} · synced to ${vendor}`, `${head} · синхронизировано с ${vendor}`);
   }
   const why =
     sync.state === "unsupported"
-      ? lang === "en"
-        ? `${vendor} has no session-title API`
-        : `${vendor} 无会话标题接口`
-      : sync.detail || (lang === "en" ? "vendor not reachable" : "vendor 暂不可达");
-  return lang === "en" ? `${head} · ccteam-side only (${why})` : `${head} · 仅 ccteam 侧(${why})`;
+      ? tr(lang, `${vendor} 无会话标题接口`, `${vendor} has no session-title API`, `${vendor}: нет API заголовка сессии`)
+      : sync.detail || tr(lang, "vendor 暂不可达", "vendor not reachable", "vendor недоступен");
+  return tr(lang, `${head} · 仅 ccteam 侧(${why})`, `${head} · ccteam-side only (${why})`, `${head} · только в ccteam (${why})`);
 }
 
 /** Chinese relative-time phrase for an RFC3339 timestamp — mirrors
@@ -87,5 +81,22 @@ export function relativeTimeEn(iso: string | null | undefined): string {
 
 /** Language-aware relative time for the recents grid. */
 export function relativeTime(lang: Lang, iso: string | null | undefined): string {
+  if (lang === "ru") {
+    if (!iso) return "—";
+    const then = Date.parse(iso);
+    if (Number.isNaN(then)) return "—";
+    const secs = Math.max(0, Math.floor((Date.now() - then) / 1000));
+    if (secs < 60) return "только что";
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return `${mins} мин назад`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours} ч назад`;
+    const days = Math.floor(hours / 24);
+    if (days === 1) return "вчера";
+    if (days < 7) return `${days} дн. назад`;
+    const weeks = Math.floor(days / 7);
+    if (weeks < 5) return `${weeks} нед. назад`;
+    return new Date(then).toISOString().slice(0, 10);
+  }
   return lang === "en" ? relativeTimeEn(iso) : relativeTimeZh(iso);
 }

@@ -21,7 +21,7 @@ import StatusView from "./StatusView";
 import { UserManagementSection } from "./SettingsPage";
 import AccessView from "./AccessView";
 import { copyText } from "../lib/clipboard";
-import { makeT, type Lang } from "../lib/i18n";
+import { makeT, tr, type Lang } from "../lib/i18n";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useMe } from "../hooks/useMe";
 import { clearToken, getToken, saveToken } from "../lib/token";
@@ -291,14 +291,12 @@ export function AccountPanel({
       saveToken(wire_token);
       setTokenBump((n) => n + 1); // re-render the masked token field
       toastBus.handler?.info(
-        lang === "en"
-          ? "Web token rotated — this browser already uses the new one."
-          : "web token 已重置 —— 本浏览器已自动换用新 token,无需重登。",
+        tr(lang, "web token 已重置 —— 本浏览器已自动换用新 token,无需重登。", "Web token rotated — this browser already uses the new one.", "Web token обновлён — этот браузер уже использует новый."),
       );
     } catch (e) {
       if (!(e instanceof Error && e.message === "UNAUTHENTICATED")) {
         toastBus.handler?.error(
-          `${lang === "en" ? "Reset failed" : "重置失败"}: ${e instanceof Error ? e.message : "unknown"}`,
+          `${tr(lang, "重置失败", "Reset failed", "Не удалось сбросить")}: ${e instanceof Error ? e.message : "unknown"}`,
         );
       }
     } finally {
@@ -313,13 +311,13 @@ export function AccountPanel({
   const copyToken = () => {
     const token = getToken();
     if (!token) {
-      toastBus.handler?.info(lang === "en" ? "No token stored in this browser" : "本浏览器未存 token");
+      toastBus.handler?.info(tr(lang, "本浏览器未存 token", "No token stored in this browser", "В этом браузере нет token"));
       return;
     }
     void copyText(token).then((ok) =>
       ok
-        ? toastBus.handler?.info(lang === "en" ? "Token copied" : "token 已复制")
-        : toastBus.handler?.error(lang === "en" ? "Copy failed" : "复制失败"),
+        ? toastBus.handler?.info(tr(lang, "token 已复制", "Token copied", "Token скопирован"))
+        : toastBus.handler?.error(tr(lang, "复制失败", "Copy failed", "Не удалось скопировать")),
     );
   };
   return (
@@ -378,7 +376,7 @@ export function AccountPanel({
           <span className="hint">{t("accTokenHint")}</span>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
             <button type="button" className="btn ghost mini" onClick={copyToken}>
-              {lang === "en" ? "Copy token" : "复制 token"}
+              {tr(lang, "复制 token", "Copy token", "Скопировать token")}
             </button>
             <button
               type="button"
@@ -387,17 +385,7 @@ export function AccountPanel({
               disabled={resetBusy}
               onClick={() => void doReset()}
             >
-              {resetBusy
-                ? lang === "en"
-                  ? "Rotating…"
-                  : "重置中…"
-                : resetArmed
-                  ? lang === "en"
-                    ? "Confirm reset? (old token dies at once)"
-                    : "确认重置?(旧 token 立即失效)"
-                  : lang === "en"
-                    ? "Reset token"
-                    : "重置 web token"}
+              {resetBusy ? tr(lang, "重置中…", "Rotating…", "Обновление…") : resetArmed ? tr(lang, "确认重置?(旧 token 立即失效)", "Confirm reset? (old token dies at once)", "Подтвердить сброс? Старый token сразу перестанет работать") : tr(lang, "重置 web token", "Reset token", "Сбросить token")}
             </button>
             {resetArmed && !resetBusy ? (
               <button
@@ -406,7 +394,7 @@ export function AccountPanel({
                 data-testid="account-reset-cancel"
                 onClick={() => setResetArmed(false)}
               >
-                {lang === "en" ? "Cancel" : "取消"}
+                {tr(lang, "取消", "Cancel", "Отмена")}
               </button>
             ) : null}
           </div>

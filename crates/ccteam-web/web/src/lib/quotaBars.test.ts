@@ -43,6 +43,7 @@ describe("resetHint", () => {
   it("is relative under 24h, weekday under 7d, a short date beyond", () => {
     expect(resetHint("2026-08-17T15:12:00Z", NOW, "en")).toBe("resets in 3h12m");
     expect(resetHint("2026-08-17T15:12:00Z", NOW, "zh")).toBe("3h12m后重置");
+    expect(resetHint("2026-08-17T15:12:00Z", NOW, "ru")).toBe("сброс через 3 ч 12 мин");
     // 3 days out → weekday (derived with the same formatter, tz-independent).
     const at = new Date("2026-08-20T00:00:00Z");
     const weekday = at.toLocaleDateString("en-US", { weekday: "short" });

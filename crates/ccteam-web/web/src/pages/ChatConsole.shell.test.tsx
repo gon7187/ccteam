@@ -63,9 +63,9 @@ describe("ChatConsole shell (prototype .app layout)", () => {
     expect(html).toContain('data-testid="app-shell"');
     expect(html).toContain('data-testid="home-view"');
     // 开工吧! + the ctx-bar + the composer's 随心输入 placeholder.
-    expect(html).toMatch(/开工吧|Let's build/);
+    expect(html).toMatch(/开工吧|Let's build|За работу/);
     expect(html).toContain('data-testid="ctx-bar"');
-    expect(html).toContain("随心输入");
+    expect(html).toMatch(/随心输入|Введите сообщение/);
     // The retired NewSessionModal must be gone.
     expect(html).not.toContain("创建并切过去");
     expect(html).not.toContain("新建 session");
@@ -75,7 +75,7 @@ describe("ChatConsole shell (prototype .app layout)", () => {
     const html = routed("/chat/s/s9");
     expect(html).toContain('data-testid="conversation-view"');
     // conv composer placeholder (only the conversation view emits it).
-    expect(html).toContain("Enter 发送");
+    expect(html).toMatch(/Enter 发送|Enter — отправить/);
     // sid chip in the conv-head meta.
     expect(html).toContain(">s9<");
     // Home's landing is NOT rendered simultaneously (views are exclusive).
@@ -116,13 +116,13 @@ describe("ChatConsole shell (prototype .app layout)", () => {
     expect(mini.length).toBeGreaterThan(0);
     const order = [
       'data-testid="side-expand"',
-      "搜索会话",
-      "新建会话",
-      "工作流",
-      "团队",
+      "Поиск сессий",
+      "Новая сессия",
+      "Рабочие процессы",
+      "Команда",
       "mini-blank",
       'class="avatar"',
-      "设置",
+      "Настройки",
     ];
     let cursor = 0;
     for (const needle of order) {

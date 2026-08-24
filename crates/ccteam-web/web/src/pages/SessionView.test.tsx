@@ -416,14 +416,22 @@ describe("SessionView paged history", () => {
     try {
       const PagedSessionView = (await import("./SessionView")).default;
       const renderPagedView = () =>
-        harness.render(() => PagedSessionView({ sid: "s9", session: SESSION }));
+        harness.render(() => PagedSessionView({ sid: "s9", session: SESSION, lang: "ru" }));
 
       renderPagedView();
       await Promise.resolve();
       let tree = renderPagedView();
       const loadEarlier = findByTestId(tree, "load-earlier");
       expect(loadEarlier).not.toBeNull();
+      expect(collectElementText(loadEarlier)).toContain("Загрузить ранее");
       expect(history).toHaveBeenNthCalledWith(1, "s9");
+
+      const chatScroll = findByTestId(tree, "chat-scroll");
+      const scrollRef = chatScroll?.props.ref as { current: HTMLElement | null };
+      if (scrollRef) scrollRef.current = { scrollHeight: 1000, scrollTop: 0, clientHeight: 100 } as HTMLElement;
+      (chatScroll?.props.onScroll as () => void)();
+      tree = renderPagedView();
+      expect(collectElementText(tree)).toContain("К последним");
 
       (loadEarlier?.props.onClick as () => void)();
       await Promise.resolve();
@@ -722,6 +730,11 @@ describe("RowTime date visibility", () => {
     // zh locale carries the date too.
     const zhHtml = renderToString(<RowTime ts={yesterday.toISOString()} lang="zh" />);
     expect(textOf(zhHtml)).toMatch(/\d{2}\/\d{2}/);
+
+    const locale = vi.spyOn(Date.prototype, "toLocaleString");
+    renderToString(<RowTime ts={yesterday.toISOString()} lang="ru" />);
+    expect(locale).toHaveBeenCalledWith("ru-RU", expect.any(Object));
+    locale.mockRestore();
   });
 
   it("renders nothing for absent or unparseable ts", () => {
