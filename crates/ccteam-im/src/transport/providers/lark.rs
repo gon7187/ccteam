@@ -847,7 +847,7 @@ impl LarkChannel {
                             Ok(None) => {
                                 let mb = LARK_MAX_ATTACHMENT_BYTES / (1024 * 1024);
                                 let _ = self.send(&SendMessage::new(
-                                    format!("⚠️ 附件 {} 超过 {mb}MB 上限,已拒收", p.file_name),
+                                    format!("⚠️ Вложение {} превышает лимит {mb} МБ и отклонено", p.file_name),
                                     channel_msg.reply_target.clone(),
                                 )).await;
                                 if channel_msg.content.is_empty() { continue; }
@@ -855,7 +855,7 @@ impl LarkChannel {
                             Err(e) => {
                                 tracing::warn!(message_id = %raw_message_id, error = %e, "Lark: attachment download failed");
                                 let _ = self.send(&SendMessage::new(
-                                    format!("⚠️ 附件 {} 下载失败", p.file_name),
+                                    format!("⚠️ Не удалось скачать вложение {}", p.file_name),
                                     channel_msg.reply_target.clone(),
                                 )).await;
                                 if channel_msg.content.is_empty() { continue; }

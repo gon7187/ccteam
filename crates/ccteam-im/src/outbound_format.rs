@@ -53,7 +53,7 @@ pub fn should_prefix_with_handle(bots: &[BotRegistration], bot: &BotRegistration
 /// `@handle:` as a mention parse trigger; plain `from handle:` stays
 /// inert.
 pub fn prefix_with_handle(handle: &str, content: &str) -> String {
-    format!("from {}:\n{}", handle, content)
+    format!("от {}:\n{}", handle, content)
 }
 
 #[cfg(test)]
@@ -129,20 +129,20 @@ mod tests {
         // the resolved handle string from the caller. This test pins
         // the contract by exercising the wrapper.
         let out = prefix_with_handle("curie", "Hello, world!");
-        assert_eq!(out, "from curie:\nHello, world!");
+        assert_eq!(out, "от curie:\nHello, world!");
     }
 
     #[test]
     fn prefix_preserves_multiline_body() {
         let body = "line one\nline two\nline three";
         let out = prefix_with_handle("galileo", body);
-        assert_eq!(out, "from galileo:\nline one\nline two\nline three");
+        assert_eq!(out, "от galileo:\nline one\nline two\nline three");
     }
 
     #[test]
     fn prefix_has_no_leading_at_to_avoid_mention_parse() {
         let out = prefix_with_handle("curie", "hi");
         assert!(!out.starts_with('@'));
-        assert!(out.starts_with("from "));
+        assert!(out.starts_with("от "));
     }
 }

@@ -41,7 +41,7 @@ use crate::BotRegistration;
 /// returns `anyhow::Result`, so this is surfaced via `anyhow::Error` and the
 /// web handler recovers it with `downcast_ref::<RoleNotFound>()`.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("role 不存在:.claude/agents/{role}.md 未找到;先用 /role <已存在的角色> 或 `ccteam role add {role}` 创建")]
+#[error("Роль не найдена: отсутствует .claude/agents/{role}.md; используйте /role <существующая_роль> или `ccteam role add {role}`")]
 pub struct RoleNotFound {
     /// The role stem that was requested but has no persona file.
     pub role: String,
@@ -1738,37 +1738,37 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     GatewayCommandSpec {
         name: "/status",
         arg_hint: None,
-        help: "fleet health — per-session idle/working/stuck + model·ctx",
+        help: "состояние сессий: ожидание/работа/зависание + модель·контекст",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/sessions",
         arg_hint: Some("[all]"),
-        help: "list this project's sessions (`all` = every project)",
+        help: "список сессий проекта (`all` = все проекты)",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/mcp",
         arg_hint: None,
-        help: "check this session's ccteam tool face (and what restores it)",
+        help: "проверить инструменты ccteam этой сессии (и как их восстановить)",
         in_menu: false,
     },
     GatewayCommandSpec {
         name: "/inbox",
         arg_hint: Some("[<time> <text>|cancel <dN>]"),
-        help: "list, schedule, or cancel delayed user messages",
+        help: "показать, запланировать или отменить отложенное сообщение",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/projects",
         arg_hint: None,
-        help: "list projects",
+        help: "список проектов",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/new",
         arg_hint: Some("[claude|codex|grok|opencode|kimi|pi|dsh] [role] [hitl] [model=<id>] [effort=<level>] [mode=<mode>]"),
-        help: "start a new session (`hitl` = approve tools in IM; model=/effort= go to the vendor as typed)",
+        help: "создать сессию (`hitl` = подтверждать инструменты в IM; параметры model=/effort= передаются провайдеру без изменений)",
         in_menu: true,
     },
     GatewayCommandSpec {
@@ -1777,7 +1777,7 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         // v0.8.23 review §3.2-5 — `@role` is a shorthand for "the most
         // recently active session with that role" (silent recency tie-break;
         // an unmatched role lists what IS available).
-        help: "switch to a session (`@role` = most-recent session with that role)",
+        help: "переключиться на сессию (`@role` = последняя сессия с этой ролью)",
         // v0.8.23 review §3.2-4 — the navigation verbs were menu-invisible
         // (only zero-arg commands were advertised), hiding most of the
         // multi-session workflow behind `/help`. Arg-bearing commands still
@@ -1789,43 +1789,43 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     GatewayCommandSpec {
         name: "/cd",
         arg_hint: Some("<project>"),
-        help: "switch project",
+        help: "переключить проект",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/role",
         arg_hint: Some("<role>"),
-        help: "switch the current session to a fresh agent role",
+        help: "сменить роль текущей сессии на новую",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/stop",
         arg_hint: Some("<id>"),
-        help: "stop (destroy) a session by id",
+        help: "остановить (удалить) сессию по id",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/interrupt",
         arg_hint: Some("[id]"),
-        help: "interrupt the running turn (keeps the session; bare = current)",
+        help: "прервать выполняющийся запрос (сессия сохранится; без id = текущая)",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/rename",
         arg_hint: Some("[<id>] <title>"),
-        help: "rename a session (bare = current; syncs the vendor's own title)",
+        help: "переименовать сессию (без id = текущая; синхронизирует заголовок провайдера)",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/newproject",
         arg_hint: Some("<slug> <path>"),
-        help: "scaffold + register a project, then switch into it",
+        help: "создать и зарегистрировать проект, затем переключиться на него",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/help",
         arg_hint: None,
-        help: "show gateway commands",
+        help: "показать команды шлюза",
         in_menu: true,
     },
 ];
@@ -1876,8 +1876,8 @@ fn command_menu_description(c: &GatewayCommandSpec) -> String {
 /// vendor passthroughs (`/model`, `/compact`, …) are not gateway commands and
 /// never reach this. Web is unaffected — its control face (`submit_web_sid`)
 /// does not call this, and web navigates by GUI.
-const NEXT_HINT_STATUS: &str = "↓ 查看状态 → /status";
-const NEXT_HINT_SESSIONS: &str = "↓ 本项目会话 → /sessions";
+const NEXT_HINT_STATUS: &str = "↓ Статус → /status";
+const NEXT_HINT_SESSIONS: &str = "↓ Сессии проекта → /sessions";
 
 fn command_next_hint(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
@@ -2766,7 +2766,7 @@ impl Gateway {
         internal: bool,
     ) -> Result<(String, String)> {
         let Some(detached) = self.detached.get(sid) else {
-            return Err(anyhow!("session {sid} is not detached"));
+            return Err(anyhow!("Сессия {sid} не отсоединена"));
         };
         crate::pending_turns::enqueue_pending_turn(
             &detached.cwd,
@@ -3373,7 +3373,7 @@ impl Gateway {
         // Commands parse on the raw text; attachments don't apply to them.
         if text.split_whitespace().next() == Some("/inbox") && !attachments.is_empty() {
             return Err(anyhow!(
-                "/inbox scheduled messages do not support files or skills"
+                "Отложенные сообщения /inbox не поддерживают файлы или skills"
             ));
         }
         if let Some(mut reply) = self.handle_command(&chat, text).await? {
@@ -3404,7 +3404,7 @@ impl Gateway {
                     .unwrap()
                     .insert(chat.clone(), session_id);
                 if payload.is_empty() && attachments.is_empty() {
-                    return Ok(vec![format!("using @{handle}")]);
+                    return Ok(vec![format!("Выбран @{handle}")]);
                 }
                 let turn =
                     wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
@@ -3417,7 +3417,7 @@ impl Gateway {
                     .unwrap()
                     .insert(chat.clone(), session_id);
                 if payload.is_empty() && attachments.is_empty() {
-                    return Ok(vec![format!("using @{handle}")]);
+                    return Ok(vec![format!("Выбран @{handle}")]);
                 }
                 let turn =
                     wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
@@ -3644,10 +3644,10 @@ impl Gateway {
                 let role = parts
                     .next()
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow!("用法: /role <role>"))?
+                    .ok_or_else(|| anyhow!("Использование: /role <role>"))?
                     .to_string();
                 let sid = self.switch_current_role(chat, role.clone()).await?;
-                Ok(Some(format!("switched session {sid} to role {role}")))
+                Ok(Some(format!("Сессия {sid} переключена на роль {role}")))
             }
             "/rename" => {
                 // Raw remainder (like `/newproject`'s path arg) — a title may
@@ -3657,7 +3657,7 @@ impl Gateway {
                 let rest = it.next().unwrap_or("").trim();
                 if rest.is_empty() {
                     return Err(anyhow!(
-                        "用法: /rename [<sid>] <新标题>(省略 sid = 重命名当前会话)"
+                        "Использование: /rename [<sid>] <новый заголовок> (без sid = текущая сессия)"
                     ));
                 }
                 // `[<sid>] <title>` — same leading-id convention as
@@ -3675,8 +3675,8 @@ impl Gateway {
                             .cloned()
                             .ok_or_else(|| {
                                 anyhow!(
-                                    "/rename 需要一个活动会话:先 /new 或发条消息,\
-                                     也可以 /rename <sid> <新标题> 指名重命名。"
+                                    "Для /rename нужна активная сессия: сначала /new или отправьте сообщение; \
+                                     либо укажите сессию: /rename <sid> <новый заголовок>."
                                 )
                             })?;
                         (sid, rest)
@@ -3686,7 +3686,7 @@ impl Gateway {
                 // too) — same visibility rule every other sid-addressed
                 // command applies.
                 if !self.chat_can_access_sid(chat, &sid) {
-                    return Ok(Some(format!("unknown session for this chat: {sid}")));
+                    return Ok(Some(format!("Сессия {sid} недоступна этому чату")));
                 }
                 let renamed = self.rename_session(&sid, raw_title).await?;
                 Ok(Some(render_rename_receipt(&renamed)))
@@ -3694,7 +3694,7 @@ impl Gateway {
             "/use" => {
                 let arg = parts
                     .next()
-                    .ok_or_else(|| anyhow!("/use requires a session id or @role"))?;
+                    .ok_or_else(|| anyhow!("Для /use нужен id сессии или @role"))?;
                 // v0.8.23 review §3.2-5 — `/use @<role>` shorthand: resolve to
                 // the chat-visible session with that role, most recently
                 // active wins (silent recency tie-break). Only matches LIVE
@@ -3726,7 +3726,9 @@ impl Gateway {
                 let sid = parts
                     .next()
                     .ok_or_else(|| {
-                        anyhow!("/stop 必须带 session id:/stop <sid>(安全起见不支持裸 /stop)")
+                        anyhow!(
+                            "Для /stop нужен id сессии: /stop <sid> (без id команда небезопасна)"
+                        )
                     })?
                     .to_string();
                 // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own session.
@@ -3740,16 +3742,16 @@ impl Gateway {
                         self.is_session_detached(&sid) && self.chat_can_access_sid(chat, &sid)
                     });
                 if !accessible {
-                    return Ok(Some(format!("unknown session for this chat: {sid}")));
+                    return Ok(Some(format!("Сессия {sid} недоступна этому чату")));
                 }
                 let was_detached = self.is_session_detached(&sid);
                 self.stop_session(&sid).await?;
                 if was_detached {
                     return Ok(Some(format!(
-                        "stopped session {sid} (its body from before the restart was ended)"
+                        "Сессия {sid} остановлена (её процесс до перезапуска завершён)"
                     )));
                 }
-                Ok(Some(format!("stopped session {sid}")))
+                Ok(Some(format!("Сессия {sid} остановлена")))
             }
             "/interrupt" => {
                 // Interrupt the session's CURRENTLY-RUNNING turn WITHOUT
@@ -3772,7 +3774,7 @@ impl Gateway {
                         .get(chat)
                         .cloned()
                         .ok_or_else(|| {
-                            anyhow!("/interrupt 需要一个活动会话(或 /interrupt <sid>)")
+                            anyhow!("Для /interrupt нужна активная сессия (или /interrupt <sid>)")
                         })?,
                 };
                 // Own-only ACL — identical to /stop (a chat can interrupt only
@@ -3783,17 +3785,17 @@ impl Gateway {
                     .map(|s| self.chat_can_access(chat, s))
                     .unwrap_or(false);
                 if !accessible {
-                    return Ok(Some(format!("unknown session for this chat: {sid}")));
+                    return Ok(Some(format!("Сессия {sid} недоступна этому чату")));
                 }
                 self.interrupt_session(&sid).await?;
                 Ok(Some(format!(
-                    "已中断 session {sid} 当前 turn(会话保留,可继续 /model 等)"
+                    "Текущий turn сессии {sid} прерван (сессия сохранена; можно продолжить /model и др.)"
                 )))
             }
             "/cd" => {
                 let project = parts
                     .next()
-                    .ok_or_else(|| anyhow!("/cd requires a project"))?;
+                    .ok_or_else(|| anyhow!("Для /cd нужен проект"))?;
                 // The switch itself lives in `change_project` (shared with the
                 // clickable project picker's `nav:cd:<slug>` button tap).
                 self.change_project(chat, project).map(Some)
@@ -3807,12 +3809,12 @@ impl Gateway {
                 let slug = it
                     .next()
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow!("用法: /newproject <slug> <项目路径>"))?;
+                    .ok_or_else(|| anyhow!("Использование: /newproject <slug> <путь_проекта>"))?;
                 let path = it
                     .next()
                     .map(str::trim)
                     .filter(|p| !p.is_empty())
-                    .ok_or_else(|| anyhow!("用法: /newproject <slug> <项目路径>"))?;
+                    .ok_or_else(|| anyhow!("Использование: /newproject <slug> <путь_проекта>"))?;
                 // v0.8.20 convergence — own the project by the CANONICAL identity
                 // (`user:<tenant>` for a tenant bot), so the tenant's web console
                 // sees the IM-bot-created project too (web ACL is project-owned).
@@ -3858,7 +3860,7 @@ impl Gateway {
                     let cur = self.current_project_label(chat);
                     self.emit_list_options(
                         chat,
-                        format!("📁 项目(点击切换,✓ = 当前 {cur}):"),
+                        format!("📁 Проекты (нажмите для переключения, ✓ = текущий {cur}):"),
                         options,
                     );
                     Ok(None)
@@ -3867,7 +3869,7 @@ impl Gateway {
                 }
             }
             "/help" => Ok(Some(format!(
-                "📁 当前项目: {}\n\n{}",
+                "📁 Текущий проект: {}\n\n{}",
                 self.current_project_label(chat),
                 render_help()
             ))),
@@ -3888,12 +3890,12 @@ impl Gateway {
             items.sort_by(crate::scheduled::scheduled_order);
             if items.is_empty() {
                 return Ok(format!(
-                    "📥 /inbox is empty (daemon timezone: {})",
+                    "📥 /inbox пуст (часовой пояс daemon: {})",
                     crate::scheduled::daemon_timezone_label()
                 ));
             }
             let mut lines = vec![format!(
-                "📥 scheduled messages (daemon timezone: {})",
+                "📥 Отложенные сообщения (часовой пояс daemon: {})",
                 crate::scheduled::daemon_timezone_label()
             )];
             for item in items {
@@ -3904,8 +3906,8 @@ impl Gateway {
                 let state = match item.status {
                     crate::scheduled::ScheduledStatus::Pending => String::new(),
                     crate::scheduled::ScheduledStatus::Failed => format!(
-                        " [failed: {}]",
-                        item.fail_reason.as_deref().unwrap_or("unknown error")
+                        " [ошибка: {}]",
+                        item.fail_reason.as_deref().unwrap_or("неизвестная ошибка")
                     ),
                 };
                 lines.push(format!(
@@ -3924,18 +3926,18 @@ impl Gateway {
             let mut parts = rest["cancel".len()..].split_whitespace();
             let id = parts
                 .next()
-                .ok_or_else(|| anyhow!("usage: /inbox cancel <dN>"))?;
+                .ok_or_else(|| anyhow!("Использование: /inbox cancel <dN>"))?;
             if parts.next().is_some() {
-                return Err(anyhow!("usage: /inbox cancel <dN>"));
+                return Err(anyhow!("Использование: /inbox cancel <dN>"));
             }
             let entry = self
                 .scheduled_items
                 .get(id)
                 .cloned()
                 .filter(|entry| self.chat_can_access_scheduled_entry(chat, entry))
-                .ok_or_else(|| anyhow!("unknown scheduled message for this chat: {id}"))?;
+                .ok_or_else(|| anyhow!("Отложенное сообщение {id} недоступно этому чату"))?;
             self.cancel_scheduled_message(&entry.item.sid, id)?;
-            return Ok(format!("cancelled {id}"));
+            return Ok(format!("Отложенное сообщение {id} отменено"));
         }
 
         let (when, text) = parse_inbox_create_args(rest)?;
@@ -3947,7 +3949,7 @@ impl Gateway {
             .get(chat)
             .cloned()
             .ok_or_else(|| {
-                anyhow!("/inbox needs a current session; use /sessions then /use <sid>")
+                anyhow!("Для /inbox нужна текущая сессия; используйте /sessions, затем /use <sid>")
             })?;
         let visible_pending = self
             .scheduled_items
@@ -3967,7 +3969,7 @@ impl Gateway {
             visible_pending,
         )?;
         Ok(format!(
-            "scheduled {} → {} at {} ({})",
+            "Отложено {} → {} на {} ({})",
             item.id,
             item.sid,
             item.send_at
@@ -4005,15 +4007,15 @@ impl Gateway {
         // admin's project by typing its slug. A hidden or nonexistent slug reads
         // identically ("unknown project"), disclosing nothing.
         if !self.can_see_project(chat, project) {
-            return Err(anyhow!("unknown project: {project}"));
+            return Err(anyhow!("Неизвестный проект: {project}"));
         }
         self.current_project
             .insert(chat.clone(), project.to_string());
         let adopted = self.adopt_session_in_project(chat, project);
         self.persist_routing()?;
         Ok(match adopted {
-            Some(sid) => format!("project set to {project} (switched to {sid})"),
-            None => format!("project set to {project} (next message starts a session there)"),
+            Some(sid) => format!("Выбран проект {project} (переключено на {sid})"),
+            None => format!("Выбран проект {project} (следующее сообщение создаст там сессию)"),
         })
     }
 
@@ -4042,7 +4044,7 @@ impl Gateway {
                 .map(|(slug, _, meta)| self.project_session_owner_visible(chat, &slug, &meta.owner))
                 .unwrap_or(false);
             if !acl_ok {
-                return Ok(format!("unknown session for this chat: {id}"));
+                return Ok(format!("Сессия {id} недоступна этому чату"));
             }
             let caller_identity = canonical_owner(chat).identity();
             // IM already owner-checked above, so no project-slug binding is
@@ -4057,9 +4059,9 @@ impl Gateway {
                         let proj = s.project.clone();
                         self.current_project.insert(chat.clone(), proj);
                     }
-                    return Ok(format!("resumed session {resumed_sid}"));
+                    return Ok(format!("Сессия {resumed_sid} возобновлена"));
                 }
-                Err(_) => return Ok(format!("unknown session for this chat: {id}")),
+                Err(_) => return Ok(format!("Сессия {id} недоступна этому чату")),
             }
         }
         let session = live_session.expect("checked above");
@@ -4077,7 +4079,7 @@ impl Gateway {
             .unwrap()
             .insert(chat.clone(), sid.clone());
         self.persist_routing()?;
-        Ok(format!("using session {sid}"))
+        Ok(format!("Используется сессия {sid}"))
     }
 
     /// Resolve a `nav:` switch-button tap (`cd:<slug>` / `use:<sid>`) by
@@ -4100,7 +4102,7 @@ impl Gateway {
             }
             return Ok(vec![reply]);
         }
-        Ok(vec!["invalid selection".to_string()])
+        Ok(vec!["Некорректный выбор".to_string()])
     }
 
     /// Whether a channel renders message `options` as tappable inline-keyboard
@@ -4306,13 +4308,13 @@ impl Gateway {
         let paths = self
             .project_paths
             .clone()
-            .ok_or_else(|| anyhow!("project creation is not configured on this daemon"))?;
+            .ok_or_else(|| anyhow!("Создание проектов не настроено в этом daemon"))?;
         let slug = validate_slug_format(slug)?;
         // (v0.8.5) Detect a slug already registered in config.yaml even if it's
         // not yet in our in-memory cache, so /newproject can't clobber it.
         self.ensure_project_loaded(&slug);
         if self.projects.contains_key(&slug) {
-            return Err(anyhow!("project already exists: {slug}"));
+            return Err(anyhow!("Проект уже существует: {slug}"));
         }
         let abs = expand_project_path(raw_path)?;
         bootstrap_project_at_dir(&paths, &abs, &slug, "(created from web/IM chat)", "dev")
@@ -4360,7 +4362,7 @@ impl Gateway {
             tracing::warn!(error = %err, "ccteam-im: persist after /newproject failed");
         }
         Ok(format!(
-            "✅ 已创建并切换到 {slug}\n   📁 {}\n   发条消息即在此开一个会话(或 /new)",
+            "✅ Создан и выбран проект {slug}\n   📁 {}\n   Отправьте сообщение, чтобы создать здесь сессию (или /new)",
             abs.display()
         ))
     }
@@ -4481,11 +4483,11 @@ impl Gateway {
     fn new_session_receipt(outcome: &StartOutcome) -> String {
         let id = &outcome.id;
         let suffix = if outcome.permission_mode.is_hitl() {
-            " (hitl: non-allowlist tools need IM approval)"
+            " (hitl: инструменты вне allowlist требуют подтверждения в IM)"
         } else {
             ""
         };
-        format!("created session {id}{suffix}")
+        format!("Создана сессия {id}{suffix}")
     }
 
     /// v0.8.10 — codex `/clear`: recycle the current codex session and start a
@@ -5048,7 +5050,9 @@ impl Gateway {
             .unwrap()
             .get(chat)
             .cloned()
-            .ok_or_else(|| anyhow!("/role 需要一个活动会话:先 /new 或发条消息再切换。"))?;
+            .ok_or_else(|| {
+                anyhow!("Для /role нужна активная сессия: сначала /new или отправьте сообщение.")
+            })?;
         let old = self
             .sessions
             .get(&sid)
@@ -5100,7 +5104,7 @@ impl Gateway {
             Ok(Some(detail)) => detail,
             Ok(None) | Err(_) => {
                 return Err(anyhow!(
-                    "role 不存在:.claude/agents/{role}.md 未找到;用 /role <已存在的角色>"
+                    "Роль не найдена: отсутствует .claude/agents/{role}.md; используйте /role <существующая_роль>"
                 ));
             }
         };
@@ -6761,14 +6765,16 @@ impl Gateway {
         visible_pending: usize,
     ) -> Result<crate::scheduled::ScheduledItem> {
         if text.trim().is_empty() {
-            return Err(anyhow!("scheduled message text cannot be empty"));
+            return Err(anyhow!("Текст отложенного сообщения не может быть пустым"));
         }
         let now = chrono::Utc::now();
         if send_at <= now {
-            return Err(anyhow!("scheduled time must be in the future"));
+            return Err(anyhow!("Время отложенного сообщения должно быть в будущем"));
         }
         if send_at.signed_duration_since(now) > crate::scheduled::MAX_HORIZON {
-            return Err(anyhow!("scheduled time must be within 7 days"));
+            return Err(anyhow!(
+                "Время отложенного сообщения должно быть не дальше 7 дней"
+            ));
         }
         let (project, project_dir) = self.scheduled_target(sid)?;
         let sid_pending = self
@@ -6948,7 +6954,7 @@ impl Gateway {
             if now.signed_duration_since(entry.item.send_at) > crate::scheduled::MAX_CATCH_UP_AGE {
                 self.fail_scheduled(
                     &entry.item.id,
-                    "catch-up is older than 24 hours".to_string(),
+                    "Отложенная отправка просрочена более чем на 24 часа".to_string(),
                 );
                 continue;
             }
@@ -6980,7 +6986,9 @@ impl Gateway {
             .await?
         {
             SubmitResult::Turn { .. } | SubmitResult::Queued { .. } => Ok(()),
-            SubmitResult::Directive(_) => Err(anyhow!("scheduled body was parsed as a directive")),
+            SubmitResult::Directive(_) => Err(anyhow!(
+                "Текст отложенного сообщения распознан как directive"
+            )),
         }
     }
 
@@ -7023,7 +7031,7 @@ impl Gateway {
                 chat_id: chat_id.clone(),
                 thread_ts: None,
                 content: format!(
-                    "⏰ {} failed to send to {}: {} (kept in /inbox for 24h)",
+                    "⏰ Не удалось отправить {} в {}: {} (сохранено в /inbox на 24 ч)",
                     entry.item.id, entry.item.sid, reason
                 ),
                 kind: GatewayEventKind::Answer,
@@ -7639,7 +7647,7 @@ impl Gateway {
         let not_live = match self.sessions.get(session_id) {
             Some(s) => !s.adapter.thread_is_live(&s.thread),
             None => {
-                return Err(anyhow!("current session missing: {session_id}"));
+                return Err(anyhow!("Текущая сессия не найдена: {session_id}"));
             }
         };
         if not_live {
@@ -7647,17 +7655,16 @@ impl Gateway {
                 let s = self
                     .sessions
                     .get(session_id)
-                    .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+                    .ok_or_else(|| anyhow!("Текущая сессия не найдена: {session_id}"))?;
                 if let Ok(mut target) = s.reply_to.lock() {
                     *target = chat.clone();
                 }
                 (s.project.clone(), chat.channel.clone())
             };
-            let cwd = self
-                .projects
-                .get(&project)
-                .cloned()
-                .ok_or_else(|| anyhow!("unknown project for pending turn: {project}"))?;
+            let cwd =
+                self.projects.get(&project).cloned().ok_or_else(|| {
+                    anyhow!("Неизвестный проект для отложенного запуска: {project}")
+                })?;
             crate::pending_turns::enqueue_pending_turn(
                 &cwd,
                 session_id,
@@ -7682,7 +7689,7 @@ impl Gateway {
         let session = self
             .sessions
             .get(session_id)
-            .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+            .ok_or_else(|| anyhow!("Текущая сессия не найдена: {session_id}"))?;
         // Replies for this turn go back to whoever sent it.
         if let Ok(mut target) = session.reply_to.lock() {
             *target = chat.clone();
@@ -8016,7 +8023,7 @@ impl Gateway {
                 }
             }
             if replies.is_empty() {
-                replies.push(format!("submitted turn {turn_id}"));
+                replies.push(format!("Запуск отправлен: {turn_id}"));
             }
             Ok(replies)
         }
@@ -8078,7 +8085,7 @@ impl Gateway {
     /// never leaves the gateway.
     async fn resolve_selection(&self, chat: &ChatKey, data: &str) -> Result<Vec<String>> {
         let Some((token, idx)) = split_callback(data) else {
-            return Ok(vec!["invalid selection".to_string()]);
+            return Ok(vec!["Некорректный выбор".to_string()]);
         };
         let taken = {
             let mut pend = self.pending.lock().await;
@@ -8091,10 +8098,10 @@ impl Gateway {
             pend.take_by_token(&token)
         };
         let Some(p) = taken else {
-            return Ok(vec!["this choice has expired".to_string()]);
+            return Ok(vec!["Этот выбор больше недоступен".to_string()]);
         };
         let Some(opt) = p.prompt.options.get(idx) else {
-            return Ok(vec!["invalid choice".to_string()]);
+            return Ok(vec!["Некорректный вариант выбора".to_string()]);
         };
         let selection = ChoiceSelection {
             token,
@@ -8251,20 +8258,22 @@ impl Gateway {
     /// have done it. See [`ccteam_harness::ToolSurfaceRebuild`].
     async fn rebuild_tool_surface(&self, chat: &ChatKey) -> Result<String> {
         let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
-            return Ok("当前没有会话可重连;先 /new 或 /use <sid>".to_string());
+            return Ok("Нет сессии для переподключения; сначала /new или /use <sid>".to_string());
         };
         let Some(session) = self.sessions.get(&session_id) else {
             return Ok(format!(
-                "会话 {session_id} 不在活跃列表里;/sessions 查看现有会话"
+                "Сессия {session_id} не активна; посмотрите доступные через /sessions"
             ));
         };
         let adapter = Arc::clone(&session.adapter);
         let thread = session.thread.clone();
         match adapter.rebuild_tool_surface(&thread).await {
-            Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason }) => {
-                Ok(format!("🔌 {session_id} 无法原地重连:{reason}"))
-            }
-            Err(err) => Ok(format!("🔌 {session_id} 查询工具面失败:{err}")),
+            Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason }) => Ok(format!(
+                "🔌 Не удалось переподключить {session_id}: {reason}"
+            )),
+            Err(err) => Ok(format!(
+                "🔌 Не удалось проверить инструменты {session_id}: {err}"
+            )),
         }
     }
 
@@ -8272,7 +8281,7 @@ impl Gateway {
     /// pending choice (v0.8.5 D3).
     async fn resolve_numeric(&self, chat: &ChatKey, n: usize) -> Result<Vec<String>> {
         let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
-            return Ok(vec!["no choice to answer".to_string()]);
+            return Ok(vec!["Нет выбора, на который можно ответить".to_string()]);
         };
         let key = pending_key(chat, &session_id);
         let mut pend = self.pending.lock().await;
@@ -8281,14 +8290,19 @@ impl Gateway {
         pend.drain_expired(Instant::now());
         let (token, id) = {
             let Some(prompt) = pend.prompt_for(&key) else {
-                return Ok(vec!["no choice to answer".to_string()]);
+                return Ok(vec!["Нет выбора, на который можно ответить".to_string()]);
             };
             let Some(idx) = n.checked_sub(1) else {
-                return Ok(vec!["invalid choice".to_string()]);
+                return Ok(vec!["Некорректный вариант выбора".to_string()]);
             };
             match prompt.options.get(idx) {
                 Some(opt) => (prompt.token.clone(), opt.id.clone()),
-                None => return Ok(vec![format!("please reply 1–{}", prompt.options.len())]),
+                None => {
+                    return Ok(vec![format!(
+                        "Ответьте числом от 1 до {}",
+                        prompt.options.len()
+                    )])
+                }
             }
         };
         let p = pend.take(&key).expect("pending present under lock");
@@ -8394,7 +8408,7 @@ impl Gateway {
     /// slug for the banner.
     fn current_project_label(&self, chat: &ChatKey) -> String {
         self.current_project_for(chat)
-            .unwrap_or_else(|| "(无项目)".to_string())
+            .unwrap_or_else(|| "(нет проекта)".to_string())
     }
 
     /// The project a spawn must land in, or a directed error. Guests and
@@ -8404,10 +8418,10 @@ impl Gateway {
         self.current_project_for(chat).ok_or_else(|| {
             if matches!(self.principal(chat), Principal::Guest(_)) {
                 anyhow!(
-                    "这个 chat 还没有绑定到 ccteam —— 把它加入 bot 的允许列表(web 设置 → 接入 → 捕获 chat id),或让 owner 建一个用户给你"
+                    "Этот чат ещё не привязан к ccteam — добавьте его в allowlist бота (web: Настройки → Подключение → получить chat id) или попросите владельца создать вам пользователя"
                 )
             } else {
-                anyhow!("你还没有可用的项目 —— 用 /newproject <slug> <path> 建一个")
+                anyhow!("У вас нет доступных проектов — создайте через /newproject <slug> <path>")
             }
         })
     }
@@ -8749,10 +8763,10 @@ impl Gateway {
             available.sort_unstable();
             available.dedup();
             return Err(if available.is_empty() {
-                anyhow!("没有可按 role 匹配的会话 —— 用 /use <sid>,或先 /new 一个")
+                anyhow!("Нет сессии с такой ролью — используйте /use <sid> или сначала /new")
             } else {
                 anyhow!(
-                    "未找到 role `{role}` 的会话 —— 可用: {}",
+                    "Не найдена сессия с ролью `{role}` — доступны: {}",
                     available.join(", ")
                 )
             });
@@ -8856,10 +8870,10 @@ impl Gateway {
         if visible.is_empty() && detached_here == 0 {
             if elsewhere > 0 {
                 return format!(
-                    "📁 当前项目: {cur}\n本项目暂无会话 —— ↓ 其他项目还有 {elsewhere} 个 → /sessions all"
+                    "📁 Текущий проект: {cur}\nВ этом проекте нет сессий — ↓ в других проектах: {elsewhere} → /sessions all"
                 );
             }
-            return format!("📁 当前项目: {cur}\n暂无会话 —— /new 开一个");
+            return format!("📁 Текущий проект: {cur}\nНет сессий — создайте через /new");
         }
         // Render each visible session's row (async `thread_status`) once,
         // keyed by sid for the IM tree; web keeps the flat bare-row feed.
@@ -8992,7 +9006,7 @@ impl Gateway {
                 tree_rows.push(row.clone());
             }
         }
-        let mut out = format!("📁 当前项目: {cur}\n{}", tree_rows.join("\n"));
+        let mut out = format!("📁 Текущий проект: {cur}\n{}", tree_rows.join("\n"));
         // One sid, one body: sessions whose body from before a restart is still
         // finishing its turn are real and this chat's — list them, say what
         // they are, and name the two things that can be done about them.
@@ -9014,7 +9028,7 @@ impl Gateway {
         }
         if elsewhere > 0 {
             out.push_str(&format!(
-                "\n↓ 其他项目还有 {elsewhere} 个会话 → /sessions all"
+                "\n↓ В других проектах ещё {elsewhere} сессий → /sessions all"
             ));
         }
         out
@@ -9163,7 +9177,7 @@ impl Gateway {
             .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .collect();
         if visible.is_empty() {
-            return "no sessions — start one with /new".to_string();
+            return "Нет сессий — создайте через /new".to_string();
         }
         // /status = the chat's CURRENT (focused) session in DEPTH; /sessions is
         // the full fleet list. Resolve the focused sid; if none is set (or it has
@@ -9184,10 +9198,10 @@ impl Gateway {
             let in_proj = visible.iter().filter(|s| s.project == cur).count();
             return if in_proj > 0 {
                 format!(
-                    "📁 当前项目: {cur}\n无当前会话 —— /use <id> 选一个驱动(本项目 {in_proj} 个;/sessions 看全部)"
+                    "📁 Текущий проект: {cur}\nНет текущей сессии — выберите через /use <id> (в проекте: {in_proj}; все — /sessions)"
                 )
             } else {
-                format!("📁 当前项目: {cur}\n本项目暂无会话 —— 发条消息开一个(或 /new)")
+                format!("📁 Текущий проект: {cur}\nВ этом проекте нет сессий — отправьте сообщение или /new")
             };
         };
 
@@ -9230,19 +9244,19 @@ impl Gateway {
         // ([`Gateway::live_turn`]) — this line only dresses it with durations.
         let live = self.live_turn(s, Instant::now());
         let (state, detail) = match live {
-            None => ("🟢", "idle".to_string()),
+            None => ("🟢", "ожидание".to_string()),
             // Running subagents ⇒ definitively working (overrides silence).
             Some(l) if l.is_stuck() && !turn_scoped_running => (
                 "🔴",
                 format!(
-                    "STUCK {} silent",
+                    "ЗАВИСАНИЕ: нет событий {}",
                     humanize_dur(std::time::Duration::from_secs(l.silent_seconds))
                 ),
             ),
             Some(l) => (
                 "🔵",
                 format!(
-                    "working {}",
+                    "работает {}",
                     humanize_dur(std::time::Duration::from_secs(l.elapsed_seconds))
                 ),
             ),
@@ -9257,7 +9271,7 @@ impl Gateway {
         // the two surfaces read identically.
         let title = self.session_title(s);
         let mut out = format!(
-            "🧭 {}\n📍 当前会话 {} · {} · {} · {role} · {state} {detail}",
+            "🧭 {}\n📍 Текущая сессия {} · {} · {} · {role} · {state} {detail}",
             context_echo_line(&s.project, &s.id, &s.role, title.as_deref()),
             s.id,
             s.project,
@@ -9288,8 +9302,8 @@ impl Gateway {
             .and_then(|st| st.context.as_ref())
             .and_then(|c| c.pct())
         {
-            Some(pct) => format!("ctx {pct:.0}%"),
-            None => "ctx —".to_string(),
+            Some(pct) => format!("контекст {pct:.0}%"),
+            None => "контекст —".to_string(),
         };
         // The REAL `--resume` id (Anthropic session uuid), shown in full so it
         // can be matched against `tmux ls` / `claude --resume`; `—` for a
@@ -9340,7 +9354,7 @@ impl Gateway {
         if !direct_children.is_empty() {
             direct_children.sort_by_key(|child| session_index(&child.id));
             let child_activity = self.session_activity_snapshot(&direct_children);
-            out.push_str("\n   👥 直接子会话:");
+            out.push_str("\n   👥 Прямые дочерние сессии:");
             for child in &direct_children {
                 let activity = child_activity
                     .get(&child.id)
@@ -9375,7 +9389,7 @@ impl Gateway {
             }
             let deeper = descendants.len().saturating_sub(direct_children.len());
             if deeper > 0 {
-                out.push_str(&format!("\n      … 另有 {deeper} 个更深后代"));
+                out.push_str(&format!("\n      … ещё {deeper} более глубоких потомков"));
             }
         }
 
@@ -9387,14 +9401,14 @@ impl Gateway {
             .filter(|o| o.project == s.project && o.id != s.id)
             .count();
         if same > 0 {
-            out.push_str(&format!("\n   ↓ 本项目其他 {same} 个会话 → /sessions"));
+            out.push_str(&format!("\n   ↓ Другие сессии проекта: {same} → /sessions"));
         }
         // Owner req — the last line points at the full project list (with a live
         // count), replacing the old cross-project `/sessions all` fleet pointer.
         // Count only the projects THIS chat may see (same ACL as `/projects`), so
         // the pointer never advertises another owner's projects.
         let nproj = self.visible_project_slugs(chat).len();
-        out.push_str(&format!("\n   ↓ 所有 {nproj} 个项目 → /projects"));
+        out.push_str(&format!("\n   ↓ Все проекты: {nproj} → /projects"));
         out
     }
 
@@ -11918,7 +11932,7 @@ impl Gateway {
                     .unwrap_or_else(web_api_chat);
                 Some(reply.identity())
             } else {
-                return Err(anyhow!("unknown session: {sid}"));
+                return Err(anyhow!("Неизвестная сессия: {sid}"));
             }
         };
         if let Some(identity) = absent_resume_identity {
@@ -12063,7 +12077,7 @@ impl Gateway {
                 .sessions
                 .get(sid)
                 .cloned()
-                .ok_or_else(|| anyhow!("current session missing: {sid}"))?;
+                .ok_or_else(|| anyhow!("Текущая сессия не найдена: {sid}"))?;
             let chat = guard
                 .tenant_project_owner_reply_target(&session.project)
                 .unwrap_or_else(|| reply_target_for_owner(&session.owner));
@@ -12148,7 +12162,7 @@ impl Gateway {
                             return Ok(vec![text]);
                         }
                     }
-                    Ok(vec![format!("submitted turn {}", turn_id.0)])
+                    Ok(vec![format!("Запуск отправлен: {}", turn_id.0)])
                 }
             }
             DirectiveOutcome::Done { receipt } => Ok(vec![receipt]),
@@ -12496,7 +12510,7 @@ impl Gateway {
             pend.take_by_token(token)
         };
         let Some(p) = taken else {
-            return Err(anyhow!("unknown or expired token"));
+            return Err(anyhow!("Неизвестный или истёкший токен"));
         };
         // Validate the chosen id against the prompt's real option set, so a
         // bogus selection is rejected rather than silently denied. (If the id
@@ -12508,7 +12522,9 @@ impl Gateway {
             // is treated as no valid choice → drop, which makes an External
             // hook observe RecvError → its own fail-safe deny. We surface a
             // 4xx to the web caller.
-            return Err(anyhow!("invalid option id for this prompt"));
+            return Err(anyhow!(
+                "Некорректный идентификатор варианта для этого запроса"
+            ));
         }
         let selection = ChoiceSelection {
             token: token.to_string(),
@@ -12873,11 +12889,11 @@ fn strip_vendor_prefix<'a>(vendor: &str, model: &'a str) -> &'a str {
 
 fn activity_marker(activity: &str) -> &'static str {
     match activity {
-        "working" => "🟡 working",
-        "idle" => "🟢 idle",
-        "stale" => "🟠 stale",
-        "stuck" => "🔴 stuck",
-        _ => "⚪ unknown",
+        "working" => "🟡 работает",
+        "idle" => "🟢 ожидание",
+        "stale" => "🟠 устарело",
+        "stuck" => "🔴 зависание",
+        _ => "⚪ неизвестно",
     }
 }
 
@@ -12899,14 +12915,17 @@ fn split_leading_sid(rest: &str) -> Option<(&str, &str)> {
 /// that only exists ccteam-side must not read as though the vendor adopted it.
 fn render_rename_receipt(r: &SessionRename) -> String {
     let mut out = match r.previous.as_deref().filter(|p| !p.is_empty()) {
-        Some(prev) => format!("已重命名 {} 「{prev}」→「{}」", r.sid, r.title),
-        None => format!("已重命名 {} →「{}」", r.sid, r.title),
+        Some(prev) => format!("Переименована {}: «{prev}» → «{}»", r.sid, r.title),
+        None => format!("Переименована {} → «{}»", r.sid, r.title),
     };
     out.push('\n');
     out.push_str(&match &r.vendor_sync {
-        TitleSync::Pushed => format!("· 已同步到 {} 自己的会话标题", r.vendor),
-        TitleSync::Deferred(reason) => format!("· 仅 ccteam 侧({reason})"),
-        TitleSync::Unsupported => format!("· 仅 ccteam 侧({} 无会话标题接口)", r.vendor),
+        TitleSync::Pushed => format!("· Синхронизировано с заголовком сессии {}", r.vendor),
+        TitleSync::Deferred(reason) => format!("· Только в ccteam ({reason})"),
+        TitleSync::Unsupported => format!(
+            "· Только в ccteam ({} не поддерживает заголовки сессий)",
+            r.vendor
+        ),
     });
     out
 }
@@ -13255,7 +13274,7 @@ fn emit_turn_stall_warning(
         .lock()
         .ok()
         .and_then(|g| *g)
-        .map(|start| format!(" (running {})", humanize_dur(start.elapsed())))
+        .map(|start| format!(" (выполняется {})", humanize_dur(start.elapsed())))
         .unwrap_or_default();
     let last_seen = session
         .latest_activity
@@ -13263,14 +13282,15 @@ fn emit_turn_stall_warning(
         .ok()
         .and_then(|g| g.clone())
         .filter(|a| !a.trim().is_empty())
-        .map(|a| format!(" Last observed activity: {a}."))
-        .unwrap_or_else(|| " No activity was ever observed for this turn.".into());
+        .map(|a| format!(" Последняя активность: {a}."))
+        .unwrap_or_else(|| " Для этого запуска активность не наблюдалась.".into());
     let content = format!(
-        "⏱️ turn {turn_id} went silent for {timeout:?} for {session_id}{elapsed} — no tokens, \
-         tool calls or progress.{last_seen} Heads-up only — the watchdog does NOT interrupt it \
-         (a long command like a benchmark legitimately emits no events, and a vendor stuck in \
-         its own retry loop reports nothing either). If it is truly stuck, `/stop` the session; \
-         tune the window via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = off)."
+        "⏱️ Запуск {turn_id} в сессии {session_id}{elapsed} не проявлял активности {timeout:?}: \
+         нет токенов, вызовов инструментов или сообщений о ходе выполнения.{last_seen} Это только \
+         уведомление: watchdog не прерывает запуск (долгая команда, например benchmark, может \
+         корректно не выдавать событий; поставщик в собственном цикле повторов тоже ничего не \
+         сообщает). Если запуск действительно завис, остановите сессию через `/stop`; окно \
+         настраивается CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = отключено)."
     );
     let _ = tx.send(GatewayEvent {
         id: format!("gateway-timeout-{session_id}-{turn_id}"),
@@ -13290,11 +13310,11 @@ fn emit_turn_stall_warning(
 /// template: ask the user to pick a handle instead of guessing.
 fn format_ambiguous_dm_reply(available: &[String]) -> String {
     if available.is_empty() {
-        return "No bots available in this chat.".to_string();
+        return "В этом чате нет доступных ботов.".to_string();
     }
     let mentions: Vec<String> = available.iter().map(|h| format!("@{h}")).collect();
     format!(
-        "Multiple bots in this chat. Specify one: {}",
+        "В этом чате несколько ботов. Укажите одного: {}",
         mentions.join(" ")
     )
 }
@@ -13832,15 +13852,15 @@ fn format_running_tasks(running: &[RunningTask]) -> String {
         kinds.push(format!("workflow ({workflows})"));
     }
     if bg_shells > 0 {
-        kinds.push(format!("后台任务 ({bg_shells})"));
+        kinds.push(format!("фоновые задачи ({bg_shells})"));
     }
-    let mut out = format!("\n   🤖 在跑 {}:", kinds.join(" + "));
+    let mut out = format!("\n   🤖 Выполняется: {}", kinds.join(" + "));
     let mut tasks: Vec<&RunningTask> = running.iter().collect();
     tasks.sort_by_key(|t| t.started);
     for t in tasks {
         let kind = match t.task_type.as_str() {
             "local_workflow" => "workflow",
-            "local_bash" => "后台",
+            "local_bash" => "фон",
             _ if t.kind.is_empty() => "subagent",
             _ => t.kind.as_str(),
         };
@@ -13861,7 +13881,7 @@ fn format_running_tasks(running: &[RunningTask]) -> String {
 }
 
 /// Render [`AccountUsage`] as the `/status` dashboard usage line:
-/// `⚡ 用量: 5h 17% (→19:00) · 周 78%⚠ (→06/29) · 额度 46% · max`. Each field is
+/// `⚡ Использование: 5h 17% (→19:00) · неделя 78%⚠ (→06/29) · лимит 46% · max`. Each field is
 /// omitted when the vendor didn't report it; an empty result = nothing to show.
 fn format_account_usage(u: &AccountUsage) -> String {
     // Short reset hint from an ISO-8601 `resets_at`: HH:MM for the 5-hour window,
@@ -13889,10 +13909,13 @@ fn format_account_usage(u: &AccountUsage) -> String {
         } else {
             ""
         };
-        parts.push(format!("周 {p}%{warn}{}", reset_md(&u.weekly_resets_at)));
+        parts.push(format!(
+            "неделя {p}%{warn}{}",
+            reset_md(&u.weekly_resets_at)
+        ));
     }
     if let Some(p) = u.credits_pct {
-        parts.push(format!("额度 {p}%"));
+        parts.push(format!("лимит {p}%"));
     }
     if parts.is_empty() {
         return String::new();
@@ -13900,7 +13923,7 @@ fn format_account_usage(u: &AccountUsage) -> String {
     if let Some(sub) = u.subscription.as_deref() {
         parts.push(sub.to_string());
     }
-    format!("⚡ 用量: {}", parts.join(" · "))
+    format!("⚡ Использование: {}", parts.join(" · "))
 }
 
 fn humanize_dur(d: std::time::Duration) -> String {
@@ -14091,14 +14114,14 @@ fn render_choice_text(prompt: &ChoicePrompt) -> String {
 
 /// Render the `/help` body from [`GATEWAY_COMMANDS`].
 fn render_help() -> String {
-    let mut s = String::from("Gateway commands:");
+    let mut s = String::from("Команды шлюза:");
     for c in GATEWAY_COMMANDS {
         match c.arg_hint {
             Some(hint) => s.push_str(&format!("\n{} {} — {}", c.name, hint, c.help)),
             None => s.push_str(&format!("\n{} — {}", c.name, c.help)),
         }
     }
-    s.push_str("\n\nAny other /command is forwarded to the current session's agent.");
+    s.push_str("\n\nЛюбая другая /command передаётся агенту текущей сессии.");
     s
 }
 
@@ -14111,7 +14134,7 @@ fn parse_inbox_create_args(rest: &str) -> Result<(String, String)> {
     }
 
     let (first, after_first) =
-        take_word(rest).ok_or_else(|| anyhow!("usage: /inbox <time> <text>"))?;
+        take_word(rest).ok_or_else(|| anyhow!("Использование: /inbox <time> <text>"))?;
     let needs_second = first == "今天"
         || first == "明天"
         || (first.len() == 10
@@ -14119,13 +14142,13 @@ fn parse_inbox_create_args(rest: &str) -> Result<(String, String)> {
             && first.as_bytes().get(7) == Some(&b'-'));
     let (when, text) = if needs_second {
         let (second, body) =
-            take_word(after_first).ok_or_else(|| anyhow!("usage: /inbox <time> <text>"))?;
+            take_word(after_first).ok_or_else(|| anyhow!("Использование: /inbox <time> <text>"))?;
         (format!("{first} {second}"), body)
     } else {
         (first.to_string(), after_first)
     };
     if text.trim().is_empty() {
-        return Err(anyhow!("scheduled message text cannot be empty"));
+        return Err(anyhow!("Текст отложенного сообщения не может быть пустым"));
     }
     Ok((when, text.to_string()))
 }
@@ -14167,7 +14190,7 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor> {
         "kimi" => Ok(AgentVendor::Kimi),
         "pi" => Ok(AgentVendor::Pi),
         "dsh" => Ok(AgentVendor::Dsh),
-        other => Err(anyhow!("unknown vendor: {other}")),
+        other => Err(anyhow!("Неизвестный провайдер: {other}")),
     }
 }
 
@@ -14218,7 +14241,7 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
             let value = value.trim();
             if value.is_empty() {
                 return Err(anyhow!(
-                    "/new: `{tok}` has no value — write `{key}=<value>`\nsyntax: {NEW_COMMAND_SYNTAX}"
+                    "У параметра /new `{tok}` нет значения — укажите `{key}=<значение>`\nСинтаксис: {NEW_COMMAND_SYNTAX}"
                 ));
             }
             match key {
@@ -14227,7 +14250,7 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
                 "mode" => tuning.mode = Some(value.to_string()),
                 other => {
                     return Err(anyhow!(
-                        "/new: unknown option `{other}=` (accepts model=<id> / m=, effort=<level> / e=, mode=<mode>)\nsyntax: {NEW_COMMAND_SYNTAX}"
+                        "Неизвестный параметр /new `{other}=` (поддерживаются model=<id> / m=, effort=<level> / e=, mode=<mode>)\nСинтаксис: {NEW_COMMAND_SYNTAX}"
                     ));
                 }
             }
@@ -14246,7 +14269,7 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
             }
             other => {
                 return Err(anyhow!(
-                    "/new: unexpected token `{other}` (role `{role}` was already given)\nsyntax: {NEW_COMMAND_SYNTAX}"
+                    "Неожиданный аргумент `{other}` (роль `{role}` уже указана)\nСинтаксис: {NEW_COMMAND_SYNTAX}"
                 ));
             }
         }
@@ -14276,15 +14299,18 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
 fn expand_project_path(raw: &str) -> Result<PathBuf> {
     let expanded = if let Some(rest) = raw.strip_prefix("~/") {
         dirs::home_dir()
-            .ok_or_else(|| anyhow!("cannot resolve home directory for ~"))?
+            .ok_or_else(|| anyhow!("Не удалось определить домашний каталог для пути ~"))?
             .join(rest)
     } else if raw == "~" {
-        dirs::home_dir().ok_or_else(|| anyhow!("cannot resolve home directory for ~"))?
+        dirs::home_dir()
+            .ok_or_else(|| anyhow!("Не удалось определить домашний каталог для пути ~"))?
     } else {
         PathBuf::from(raw)
     };
     if !expanded.is_absolute() {
-        return Err(anyhow!("项目路径必须是绝对路径(或 ~ 开头): {raw}"));
+        return Err(anyhow!(
+            "Путь проекта для /newproject должен быть абсолютным (или начинаться с ~): {raw}"
+        ));
     }
     Ok(expanded)
 }
@@ -14307,7 +14333,7 @@ fn event_text(evt: &ThreadEvent) -> Option<String> {
             ThreadItemDetails::AgentMessage(text) if !text.is_empty() => Some(text.clone()),
             _ => None,
         },
-        ThreadEvent::TurnCompleted { turn_id, .. } => Some(format!("turn completed {turn_id}")),
+        ThreadEvent::TurnCompleted { turn_id, .. } => Some(format!("Запуск завершён: {turn_id}")),
         ThreadEvent::TurnFailed { err, .. } | ThreadEvent::Error(err) => Some(err.message.clone()),
         ThreadEvent::ItemUpdated { .. }
         | ThreadEvent::ThreadStarted { .. }
@@ -14439,13 +14465,18 @@ mod tests {
     #[test]
     fn new_command_rejects_unknown_keys_with_an_honest_syntax_line() {
         let err = parse_new("claude modle=opus").unwrap_err().to_string();
-        assert!(err.contains("unknown option `modle=`"), "{err}");
+        assert!(err.contains("Неизвестный параметр /new `modle=`"), "{err}");
         assert!(err.contains("model=<id>"), "{err}");
         assert!(err.contains("effort=<level>"), "{err}");
+        assert!(err.contains("mode=<mode>"), "{err}");
         assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
 
         let err = parse_new("claude model=").unwrap_err().to_string();
-        assert!(err.contains("has no value"), "{err}");
+        assert!(
+            err.contains("У параметра /new `model=` нет значения"),
+            "{err}"
+        );
+        assert!(err.contains("model=<id>"), "{err}");
         assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
 
         // A second bare token is still the pre-existing "one role" error, now
@@ -14453,7 +14484,15 @@ mod tests {
         let err = parse_new("claude reviewer auditor")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("unexpected token `auditor`"), "{err}");
+        assert!(err.contains("Неожиданный аргумент `auditor`"), "{err}");
+        assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
+
+        let err = parse_new("nonesuch").unwrap_err().to_string();
+        assert!(err.contains("Неизвестный провайдер: nonesuch"), "{err}");
+
+        let err = parse_new("claude reviewer bogus").unwrap_err().to_string();
+        assert!(err.contains("Неожиданный аргумент `bogus`"), "{err}");
+        assert!(err.contains("hitl|skip"), "{err}");
         assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
     }
 
@@ -14470,6 +14509,33 @@ mod tests {
         assert!(hint.contains("model=<id>"), "{hint}");
         assert!(hint.contains("effort=<level>"), "{hint}");
         assert!(NEW_COMMAND_SYNTAX.contains("dsh"), "{NEW_COMMAND_SYNTAX}");
+    }
+
+    #[test]
+    fn telegram_menu_keeps_tokens_and_uses_russian_copy() {
+        let specs = menu_command_specs();
+        assert!(specs.iter().any(|spec| spec.name == "/projects"));
+        assert!(specs.iter().any(|spec| spec.name == "/new"));
+        assert!(specs.iter().any(|spec| {
+            spec.name == "/projects" && spec.description == "список проектов"
+        }));
+        assert!(specs.iter().any(|spec| {
+            spec.name == "/new" && spec.description.contains("создать сессию")
+        }));
+        assert!(specs.iter().all(|spec| {
+            ![
+                "list ",
+                "switch ",
+                "show ",
+                "start ",
+                "vendor",
+                "turn",
+                "model·ctx",
+            ]
+            .iter()
+            .any(|english| spec.description.contains(english))
+        }));
+        assert!(render_help().contains("Команды шлюза:"));
     }
 
     #[test]
@@ -16275,7 +16341,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        assert_eq!(created, vec!["created session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(created, vec!["Создана сессия s1\n↓ Статус → /status"]);
 
         let replies = gateway
             .handle_text("mock", "chat-1", "alice", "hi")
@@ -17395,7 +17461,8 @@ mod tests {
             .unwrap();
         assert_eq!(reply.len(), 1);
         assert!(
-            reply[0].contains("已中断 session s1") && reply[0].contains("会话保留"),
+            reply[0].contains("Текущий turn сессии s1 прерван")
+                && reply[0].contains("сессия сохранена"),
             "interrupt receipt: {:?}",
             reply[0]
         );
@@ -17411,7 +17478,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(used, vec!["Используется сессия s1\n↓ Статус → /status"]);
 
         // Bare `/interrupt` targets the CURRENT session (s1) — non-destructive,
         // so no explicit sid is required (unlike /stop).
@@ -17419,7 +17486,11 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/interrupt")
             .await
             .unwrap();
-        assert!(bare[0].contains("已中断 session s1"), "bare: {:?}", bare[0]);
+        assert!(
+            bare[0].contains("Текущий turn сессии s1 прерван"),
+            "bare: {:?}",
+            bare[0]
+        );
         assert_eq!(
             fake.interrupts.lock().await.len(),
             2,
@@ -17435,7 +17506,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             foreign,
-            vec!["unknown session for this chat: s1\n↓ 查看状态 → /status"]
+            vec!["Сессия s1 недоступна этому чату\n↓ Статус → /status"]
         );
         assert_eq!(
             fake.interrupts.lock().await.len(),
@@ -18565,7 +18636,9 @@ mod tests {
         );
         let status = gateway.render_status(&tenant).await;
         assert!(
-            status.contains(&format!("👥 直接子会话:\n      · {child} · claude")),
+            status.contains(&format!(
+                "👥 Прямые дочерние сессии:\n      · {child} · claude"
+            )),
             "the tenant's /status must list its project's delegated children: {status}"
         );
     }
@@ -19866,7 +19939,7 @@ mod tests {
         assert_eq!(receipt.len(), 1);
         assert_eq!(
             receipt[0],
-            "created session s2 (hitl: non-allowlist tools need IM approval)\n↓ 查看状态 → /status",
+            "Создана сессия s2 (hitl: инструменты вне allowlist требуют подтверждения в IM)\n↓ Статус → /status",
             "F1: a fresh hitl session is spawned + honestly reported, got: {receipt:?}"
         );
 
@@ -19898,7 +19971,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            receipt[0].contains("non-allowlist tools need IM approval"),
+            receipt[0].contains("инструменты вне allowlist требуют подтверждения в IM"),
             "a fresh hitl spawn must report hitl: {receipt:?}"
         );
         assert_eq!(
@@ -19935,7 +20008,10 @@ mod tests {
                 "/new claude reviewer bogus",
             )
             .await;
-        assert!(res.is_err(), "a bad permission token must be rejected");
+        let err = res.expect_err("a bad permission token must be rejected");
+        let err = err.to_string();
+        assert!(err.contains("Неожиданный аргумент `bogus`"), "{err}");
+        assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
         assert_eq!(
             fake.starts.load(Ordering::SeqCst),
             0,
@@ -20317,7 +20393,7 @@ mod tests {
             "a button-capable /projects returns no inline reply: {replies:?}"
         );
         let ev = recv_answer(&mut events).await;
-        assert!(ev.content.contains("项目"), "header: {}", ev.content);
+        assert!(ev.content.contains("Проекты"), "header: {}", ev.content);
         let datas: Vec<&str> = ev.options.iter().map(|o| o.data.as_str()).collect();
         assert!(datas.contains(&"nav:cd:alpha"), "options: {datas:?}");
         assert!(datas.contains(&"nav:cd:beta"), "options: {datas:?}");
@@ -20564,7 +20640,7 @@ mod tests {
         assert_eq!(
             replies,
             vec![
-                "project set to beta (next message starts a session there)\n↓ 本项目会话 → /sessions"
+                "Выбран проект beta (следующее сообщение создаст там сессию)\n↓ Сессии проекта → /sessions"
             ]
         );
         assert_eq!(gateway.current_project_for(&chat).as_deref(), Some("beta"));
@@ -20585,7 +20661,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replies, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(replies, vec!["Используется сессия s1\n↓ Статус → /status"]);
         assert_eq!(gateway.current_project_for(&chat).as_deref(), Some("alpha"));
         assert_eq!(
             gateway.current_session.read().unwrap().get(&chat).cloned(),
@@ -20607,7 +20683,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replies, vec!["invalid selection"]);
+        assert_eq!(replies, vec!["Некорректный выбор"]);
     }
 
     /// `strip_vendor_prefix` drops a leading `{vendor}` + separator from a
@@ -20639,7 +20715,7 @@ mod tests {
         assert_eq!(strip_vendor_prefix("claude", "claude-"), "claude-");
     }
 
-    /// P3 — `/sessions` appends each session's model + ctx from
+    /// P3 — `/sessions` appends each session's model + контекст from
     /// `thread_status`. With a `[1m]` model the window is 1M; with no
     /// status reported the legacy `id:project:vendor:role` row is unchanged.
     #[tokio::test]
@@ -20661,7 +20737,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(bare, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(bare, vec!["📁 Текущий проект: alpha\ns1 claude"]);
 
         // Now report a model + effort + usage → suffix appears with the
         // TOTAL window (absolute, via `format_tokens`) + percent — no project
@@ -20683,7 +20759,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             with_status,
-            vec!["📁 当前项目: alpha\ns1 claude.opus-4-8[1m].max.1M(19%)"]
+            vec!["📁 Текущий проект: alpha\ns1 claude.opus-4-8[1m].max.1M(19%)"]
         );
 
         // A non-[1m] model, no effort, renders against the 200k baseline.
@@ -20704,7 +20780,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             baseline,
-            vec!["📁 当前项目: alpha\ns1 claude.sonnet-4-5.200k(94%)"]
+            vec!["📁 Текущий проект: alpha\ns1 claude.sonnet-4-5.200k(94%)"]
         );
     }
 
@@ -20765,7 +20841,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(before, vec!["📁 当前项目: alpha\ns2 claude\ns1 claude"]);
+        assert_eq!(
+            before,
+            vec!["📁 Текущий проект: alpha\ns2 claude\ns1 claude"]
+        );
 
         // Tag s1 (the OLDER session) with an outstanding approval.
         let token = "pwaitpin001";
@@ -20784,7 +20863,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             after,
-            vec!["📁 当前项目: alpha\n⏳ s1 claude\ns2 claude"],
+            vec!["📁 Текущий проект: alpha\n⏳ s1 claude\ns2 claude"],
             "s1 pinned to the top + ⏳-marked despite being less recent"
         );
     }
@@ -20837,8 +20916,8 @@ mod tests {
     /// - in flight + a recent event ⇒ 🔵 working (with elapsed).
     /// - in flight + last event stale past the idle window ⇒ 🔴 STUCK (matching
     ///   the watchdog's "silent for a full window" definition).
-    /// Also asserts model · effort · ctx come from the real `thread_status`,
-    /// and `ctx —` when no context is reported.
+    /// Also asserts model · effort · контекст come from the real `thread_status`,
+    /// and `контекст —` when no context is reported.
     #[tokio::test]
     async fn gateway_status_renders_idle_working_stuck() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -20847,7 +20926,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        // A model + effort + context so the model·effort·ctx tail is exercised.
+        // A model + effort + context so the model·effort·контекст tail is exercised.
         fake.set_status(ThreadStatus {
             model: Some("claude-opus-4-8".into()),
             context: Some(ContextUsage::known(
@@ -20866,21 +20945,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(idle.len(), 1, "one message: {idle:?}");
-        // /status = the CURRENT session deep view (📍 当前会话), NOT the fleet
+        // /status = the CURRENT session deep view (📍 Текущая сессия), NOT the fleet
         // list. The fake adapter's handle carries no `vendor_uuid` → `resume —`.
         assert!(
-            idle[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
+            idle[0].contains("📍 Текущая сессия s1 · alpha · claude · reviewer · 🟢 ожидание"),
             "current-session header: {idle:?}"
         );
         assert!(
-            idle[0].contains("claude-opus-4-8 · max · ctx 41% · resume —"),
+            idle[0].contains("claude-opus-4-8 · max · контекст 41% · resume —"),
             "model·effort·ctx·resume line: {idle:?}"
         );
         // Owner req — /status ends by pointing at the full project list with a
         // live count (this gateway has one project, `alpha`), replacing the old
         // `/sessions all` cross-project pointer.
         assert!(
-            idle[0].contains("↓ 所有 1 个项目 → /projects"),
+            idle[0].contains("↓ Все проекты: 1 → /projects"),
             "/status footer points at /projects with a count: {idle:?}"
         );
 
@@ -20897,11 +20976,11 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            working[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔵 working "),
+            working[0].contains("📍 Текущая сессия s1 · alpha · claude · reviewer · 🔵 работает "),
             "working state: {working:?}"
         );
         assert!(
-            working[0].contains("ctx 41%"),
+            working[0].contains("контекст 41%"),
             "ctx still shown: {working:?}"
         );
 
@@ -20924,10 +21003,15 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            stuck[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔴 STUCK "),
+            stuck[0].contains(
+                "📍 Текущая сессия s1 · alpha · claude · reviewer · 🔴 ЗАВИСАНИЕ: нет событий "
+            ),
             "stuck state: {stuck:?}"
         );
-        assert!(stuck[0].contains("silent"), "silent duration: {stuck:?}");
+        assert!(
+            stuck[0].contains("нет событий 6m"),
+            "silent duration: {stuck:?}"
+        );
 
         // (4) A FRESHLY submitted turn whose `last_event_at` still holds the
         // PREVIOUS turn's last event (the pump only writes that cell) must read
@@ -20944,7 +21028,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            fresh[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔵 working "),
+            fresh[0].contains("📍 Текущая сессия s1 · alpha · claude · reviewer · 🔵 работает "),
             "a just-submitted turn with a pre-turn stale event is working, not stuck: {fresh:?}"
         );
     }
@@ -20995,7 +21079,7 @@ mod tests {
             .unwrap();
         assert!(
             out[0].contains(
-                "👥 直接子会话:\n      · s2 · claude · 🟡 working · delegated investigation"
+                "👥 Прямые дочерние сессии:\n      · s2 · claude · 🟡 работает · delegated investigation"
             ),
             "working child is visible from its root status: {out:?}"
         );
@@ -21071,7 +21155,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            torn[0].contains(&format!("· {child} · claude · 🟡 working ·")),
+            torn[0].contains(&format!("· {child} · claude · 🟡 работает ·")),
             "a torn line elsewhere in the stream must not blind the child row: {torn:?}"
         );
 
@@ -21090,7 +21174,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            silent[0].contains(&format!("· {child} · claude · 🟡 working ·")),
+            silent[0].contains(&format!("· {child} · claude · 🟡 работает ·")),
             "an in-flight turn outranks a stream that says nothing: {silent:?}"
         );
 
@@ -21105,7 +21189,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            idle[0].contains(&format!("· {child} · claude · 🟢 idle ·")),
+            idle[0].contains(&format!("· {child} · claude · 🟢 ожидание ·")),
             "no open turn ⇒ the file verdict stands: {idle:?}"
         );
     }
@@ -21125,12 +21209,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            out,
-            vec![format!(
-                "🧭 → alpha/s1 (reviewer)\n📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle\n   📁 {}\n   — · — · ctx — · resume —\n   ↓ 所有 1 个项目 → /projects",
-                proj.path().display()
-            )]
-        );
+           out,
+           vec![format!(
+                "🧭 → alpha/s1 (reviewer)\n📍 Текущая сессия s1 · alpha · claude · reviewer · 🟢 ожидание\n   📁 {}\n   — · — · контекст — · resume —\n   ↓ Все проекты: 1 → /projects",
+               proj.path().display()
+           )]
+       );
     }
 
     /// v0.8.19 `/status` — a roleless session shows `—` for the role, and a
@@ -21150,11 +21234,11 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("📍 当前会话 s1 · alpha · claude · — · 🟢 idle"),
+            out[0].contains("📍 Текущая сессия s1 · alpha · claude · — · 🟢 ожидание"),
             "roleless → role shows —, vendor still shown: {out:?}"
         );
         assert!(
-            out[0].contains("— · — · ctx — · resume —"),
+            out[0].contains("— · — · контекст — · resume —"),
             "statusless + no-uuid → placeholders, never fabricated: {out:?}"
         );
     }
@@ -21176,7 +21260,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].starts_with("🧭 → alpha/s1 (reviewer)\n📍 当前会话"),
+            out[0].starts_with("🧭 → alpha/s1 (reviewer)\n📍 Текущая сессия"),
             "leads with the you-are-here header before the existing body: {out:?}"
         );
     }
@@ -21190,7 +21274,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
             .unwrap();
-        assert_eq!(out, vec!["no sessions — start one with /new"]);
+        assert_eq!(out, vec!["Нет сессий — создайте через /new"]);
     }
 
     /// v0.8.20 /status v2 ③ — the account-usage line renders 5h / weekly /
@@ -21209,8 +21293,8 @@ mod tests {
         };
         let s = format_account_usage(&u);
         assert!(s.contains("5h 17% (→19:00)"), "{s}");
-        assert!(s.contains("周 78%⚠ (→06/29)"), "{s}");
-        assert!(s.contains("额度 46%"), "{s}");
+        assert!(s.contains("неделя 78%⚠ (→06/29)"), "{s}");
+        assert!(s.contains("лимит 46%"), "{s}");
         assert!(s.ends_with("· max"), "{s}");
         assert_eq!(format_account_usage(&AccountUsage::default()), "");
     }
@@ -21235,7 +21319,7 @@ mod tests {
         // Subagents only → the pre-workflow header, kind from subagent_type.
         let subs = [task("a1", "code-reviewer", "review auth", "local_agent")];
         let s = format_running_tasks(&subs);
-        assert!(s.contains("在跑 subagent (1):"), "{s}");
+        assert!(s.contains("Выполняется: subagent (1)"), "{s}");
         assert!(s.contains("code-reviewer「review auth」"), "{s}");
         // Mixed → both kinds counted in the header; the workflow row is labeled
         // "workflow" even though its subagent_type is empty.
@@ -21244,13 +21328,16 @@ mod tests {
             task("w1", "", "audit the codebase", "local_workflow"),
         ];
         let s = format_running_tasks(&mixed);
-        assert!(s.contains("在跑 subagent (1) + workflow (1):"), "{s}");
+        assert!(
+            s.contains("Выполняется: subagent (1) + workflow (1)"),
+            "{s}"
+        );
         assert!(s.contains("subagent「find bugs」"), "{s}");
         assert!(s.contains("workflow「audit the codebase」"), "{s}");
         // Workflows only (e.g. an idle session with a background run).
         let wf = [task("w1", "", "migrate call sites", "local_workflow")];
         let s = format_running_tasks(&wf);
-        assert!(s.contains("在跑 workflow (1):"), "{s}");
+        assert!(s.contains("Выполняется: workflow (1)"), "{s}");
         // Background shells (`local_bash` — Bash run_in_background / Monitor)
         // get their own bucket + row label; an idle session with an in-flight
         // `make test` renders it instead of a bare `🟢 idle`.
@@ -21260,9 +21347,12 @@ mod tests {
             task("a1", "code-reviewer", "review auth", "local_agent"),
         ];
         let s = format_running_tasks(&bg);
-        assert!(s.contains("在跑 subagent (1) + 后台任务 (2):"), "{s}");
-        assert!(s.contains("后台「make test full suite」"), "{s}");
-        assert!(s.contains("后台「watch /tmp/maketest.log」"), "{s}");
+        assert!(
+            s.contains("Выполняется: subagent (1) + фоновые задачи (2)"),
+            "{s}"
+        );
+        assert!(s.contains("фон「make test full suite」"), "{s}");
+        assert!(s.contains("фон「watch /tmp/maketest.log」"), "{s}");
     }
 
     /// The outlives-turn vocabulary the working-signal check shares with the
@@ -21313,13 +21403,13 @@ mod tests {
             .handle_text("telegram", "tg-2", "bob", "/status")
             .await
             .unwrap();
-        assert_eq!(foreign, vec!["no sessions — start one with /new"]);
+        assert_eq!(foreign, vec!["Нет сессий — создайте через /new"]);
         // The web console (shared pool) DOES NOT see an IM-created session.
         let web = gateway
             .handle_text("web", "web-chat", "web-user", "/status")
             .await
             .unwrap();
-        assert_eq!(web, vec!["no sessions — start one with /new"]);
+        assert_eq!(web, vec!["Нет сессий — создайте через /new"]);
         // The owner sees its own session.
         let owner = gateway
             .handle_text("telegram", "tg-1", "rob", "/status")
@@ -21327,7 +21417,7 @@ mod tests {
             .unwrap();
         assert_eq!(owner.len(), 1);
         assert!(
-            owner[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
+            owner[0].contains("📍 Текущая сессия s1 · alpha · claude · reviewer · 🟢 ожидание"),
             "got: {owner:?}"
         );
     }
@@ -21361,7 +21451,7 @@ mod tests {
             "the real --resume uuid must show in the deep view: {out:?}"
         );
         assert!(
-            out[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
+            out[0].contains("📍 Текущая сессия s1 · alpha · claude · reviewer · 🟢 ожидание"),
             "got: {out:?}"
         );
     }
@@ -21382,7 +21472,7 @@ mod tests {
             .unwrap();
         // Dispatched as a command (the friendly empty-fleet reply), and the fake
         // adapter never received a turn submission.
-        assert_eq!(out, vec!["no sessions — start one with /new"]);
+        assert_eq!(out, vec!["Нет сессий — создайте через /new"]);
         assert!(
             fake.submissions.lock().await.is_empty(),
             "/status must not submit a turn"
@@ -21562,7 +21652,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            format!("{guest:#}").contains("绑定"),
+            format!("{guest:#}").contains("не привязан к ccteam"),
             "guest is told to get bound: {guest:#}"
         );
 
@@ -21779,7 +21869,7 @@ mod tests {
             .change_project(&tenant, "admin-proj")
             .expect_err("tenant must not /cd into the admin's project");
         assert!(
-            err.to_string().contains("unknown project"),
+            err.to_string().contains("Неизвестный проект"),
             "expected an unknown-project error, got {err}"
         );
         assert!(
@@ -21999,7 +22089,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             denied,
-            vec!["unknown session for this chat: s1\n↓ 查看状态 → /status".to_string()]
+            vec!["Сессия s1 недоступна этому чату\n↓ Статус → /status".to_string()]
         );
         assert!(
             !gateway.session_views().iter().any(|v| v.sid == "s1"),
@@ -22013,7 +22103,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             resumed,
-            vec!["resumed session s1\n↓ 查看状态 → /status".to_string()]
+            vec!["Сессия s1 возобновлена\n↓ Статус → /status".to_string()]
         );
         assert!(
             gateway.session_views().iter().any(|v| v.sid == "s1"),
@@ -22097,7 +22187,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             used,
-            vec!["using session s1\n↓ 查看状态 → /status".to_string()]
+            vec!["Используется сессия s1\n↓ Статус → /status".to_string()]
         );
     }
 
@@ -22124,7 +22214,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             used,
-            vec!["using session s2\n↓ 查看状态 → /status".to_string()],
+            vec!["Используется сессия s2\n↓ Статус → /status".to_string()],
             "ambiguous role resolves to the most-recently-active session"
         );
     }
@@ -22195,7 +22285,10 @@ mod tests {
             .handle_text("mock", "chat-2", "bob", "/sessions")
             .await
             .unwrap();
-        assert_eq!(seen, vec!["📁 当前项目: alpha\n暂无会话 —— /new 开一个"]);
+        assert_eq!(
+            seen,
+            vec!["📁 Текущий проект: alpha\nНет сессий — создайте через /new"]
+        );
 
         // …and cannot ADDRESS it: /use is refused for a non-owner and reads as
         // unknown (no existence leak).
@@ -22205,7 +22298,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             used,
-            vec!["unknown session for this chat: s1\n↓ 查看状态 → /status"]
+            vec!["Сессия s1 недоступна этому чату\n↓ Статус → /status"]
         );
 
         // The OWNER still sees + uses its own session.
@@ -22213,12 +22306,15 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(owner_sees, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(owner_sees, vec!["📁 Текущий проект: alpha\ns1 claude"]);
         let owner_uses = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(owner_uses, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(
+            owner_uses,
+            vec!["Используется сессия s1\n↓ Статус → /status"]
+        );
     }
 
     /// v0.8.18 柱2 档0 (regression fix) — the web console is a SHARED operator
@@ -22256,12 +22352,12 @@ mod tests {
             "/sessions",
         )
         .await;
-        assert_eq!(seen, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(seen, vec!["📁 Текущий проект: alpha\ns1 claude"]);
         let used = gateway
             .handle_text("telegram", "339498819", "rob", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(used, vec!["Используется сессия s1\n↓ Статус → /status"]);
     }
 
     /// v0.8.20 web↔IM convergence — a tenant's web console and their OWN IM bot
@@ -22337,11 +22433,11 @@ mod tests {
         )
         .await;
         // Isolated down to the BANNER: ubbb owns nothing, so it reads
-        // "(无项目)" instead of borrowing uaaa's slug — the project name of
+        // "(нет проекта)" instead of borrowing uaaa's slug — the project name of
         // another tenant used to leak here through the default-project fallback.
         assert_eq!(
             other,
-            vec!["📁 当前项目: (无项目)\n暂无会话 —— /new 开一个"],
+            vec!["📁 Текущий проект: (нет проекта)\nНет сессий — создайте через /new"],
             "ubbb's bot is isolated from uaaa"
         );
     }
@@ -22393,7 +22489,7 @@ mod tests {
         // project (`ops`), never the tenant's `alpha`.
         assert_eq!(
             seen,
-            vec!["📁 当前项目: ops\n暂无会话 —— /new 开一个"],
+            vec!["📁 Текущий проект: ops\nНет сессий — создайте через /new"],
             "a tenant's web session must not reach the admin/global IM bot: {seen:?}"
         );
 
@@ -22406,7 +22502,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             used,
-            vec!["unknown session for this chat: s1\n↓ 查看状态 → /status"]
+            vec!["Сессия s1 недоступна этому чату\n↓ Статус → /status"]
         );
 
         // Another TENANT's web console is equally blind to it.
@@ -22520,9 +22616,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            cd,
-            vec!["project set to beta (next message starts a session there)\n↓ 本项目会话 → /sessions"]
-        );
+           cd,
+            vec!["Выбран проект beta (следующее сообщение создаст там сессию)\n↓ Сессии проекта → /sessions"]
+       );
 
         gateway
             .handle_text("mock", "chat-1", "alice", "/new codex api")
@@ -22538,13 +22634,19 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 当前项目: beta\ns2 claude\ns1 codex"]);
+        assert_eq!(
+            sessions,
+            vec!["📁 Текущий проект: beta\ns2 claude\ns1 codex"]
+        );
 
         let use_first = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(use_first, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(
+            use_first,
+            vec!["Используется сессия s1\n↓ Статус → /status"]
+        );
         let replies = gateway
             .handle_text("mock", "chat-1", "alice", "ping")
             .await
@@ -22614,7 +22716,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions,
-            vec!["📁 当前项目: beta\ns4 claude\ns3 codex\ns2 codex\ns1 claude"]
+            vec!["📁 Текущий проект: beta\ns4 claude\ns3 codex\ns2 codex\ns1 claude"]
         );
         let projects = gateway
             .handle_text("mock", "chat-1", "alice", "/projects")
@@ -22788,7 +22890,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             replies,
-            vec!["已切换 model → opus（live）\n↓ 查看状态 → /status"]
+            vec!["已切换 model → opus（live）\n↓ Статус → /status"]
         );
     }
 
@@ -23085,14 +23187,17 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 当前项目: beta\ns2 claude\ns1 claude"]);
+        assert_eq!(
+            sessions,
+            vec!["📁 Текущий проект: beta\ns2 claude\ns1 claude"]
+        );
 
         assert_eq!(
             restored
                 .handle_text("mock", "chat-1", "alice", "/use s1")
                 .await
                 .unwrap(),
-            vec!["using session s1\n↓ 查看状态 → /status"]
+            vec!["Используется сессия s1\n↓ Статус → /status"]
         );
         let reply_s1 = restored
             .handle_text("mock", "chat-1", "alice", "after restart")
@@ -23105,7 +23210,7 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/use s2")
                 .await
                 .unwrap(),
-            vec!["using session s2\n↓ 查看状态 → /status"]
+            vec!["Используется сессия s2\n↓ Статус → /status"]
         );
         let reply_s2 = restored
             .handle_text("mock", "chat-1", "alice", "after restart two")
@@ -23156,14 +23261,14 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1 claude"]);
+        assert_eq!(sessions, vec!["📁 Текущий проект: beta\ns1 claude"]);
 
         assert_eq!(
             restored
                 .handle_text("mock", "chat-1", "alice", "/use s1")
                 .await
                 .unwrap(),
-            vec!["using session s1\n↓ 查看状态 → /status"]
+            vec!["Используется сессия s1\n↓ Статус → /status"]
         );
         let reply = restored
             .handle_text("mock", "chat-1", "alice", "after routing.json loss")
@@ -23489,7 +23594,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             ambiguous,
-            vec!["Multiple bots in this chat. Specify one: @lead @reviewer"]
+            vec!["В этом чате несколько ботов. Укажите одного: @lead @reviewer"]
         );
 
         let reply = gateway
@@ -23544,7 +23649,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reply.iter().any(|r| r.contains("project set to dev-gamma")),
+            reply.iter().any(|r| r.contains("Выбран проект dev-gamma")),
             "expected /cd to resolve the config-only project, got {reply:?}"
         );
     }
@@ -23623,7 +23728,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(before, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(before, vec!["📁 Текущий проект: alpha\ns1 claude"]);
 
         // /cd to beta, where no session exists yet, clears the active session.
         let cd = gateway
@@ -23632,7 +23737,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             cd,
-            vec!["project set to beta (next message starts a session there)\n↓ 本项目会话 → /sessions"]
+            vec!["Выбран проект beta (следующее сообщение создаст там сессию)\n↓ Сессии проекта → /sessions"]
         );
 
         // The next plain message must route into a beta session, not back s1.
@@ -23655,7 +23760,7 @@ mod tests {
         // `session_switch_options`); s1 never sent a plain message, so it is
         // untitled either way. s2 is roleless → empty role field
         // (`s2 claude.beta`).
-        assert_eq!(after, vec!["📁 当前项目: beta\ns2 claude\ns1 claude"]);
+        assert_eq!(after, vec!["📁 Текущий проект: beta\ns2 claude\ns1 claude"]);
     }
 
     #[tokio::test]
@@ -23687,7 +23792,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             cd_back,
-            vec!["project set to alpha (switched to s1)\n↓ 本项目会话 → /sessions"]
+            vec!["Выбран проект alpha (переключено на s1)\n↓ Сессии проекта → /sessions"]
         );
 
         let reply = gateway
@@ -23801,13 +23906,13 @@ mod tests {
         let usage = gateway
             .handle_text("mock", "chat-1", "alice", "/newproject demo")
             .await;
-        assert!(format!("{:#}", usage.unwrap_err()).contains("用法"));
+        assert!(format!("{:#}", usage.unwrap_err()).contains("Использование"));
         // Valid args, but project creation is not configured on this gateway.
         let err = gateway
             .handle_text("mock", "chat-1", "alice", "/newproject demo /tmp/demo")
             .await
             .expect_err("expected not-configured error");
-        assert!(format!("{err:#}").contains("not configured"));
+        assert!(format!("{err:#}").contains("не настроено"));
         assert!(Gateway::is_gateway_command("/newproject demo /x"));
     }
 
@@ -23817,7 +23922,13 @@ mod tests {
             expand_project_path("/srv/code/app").unwrap(),
             std::path::PathBuf::from("/srv/code/app")
         );
-        assert!(expand_project_path("relative/dir").is_err());
+        let relative = expand_project_path("relative/dir").unwrap_err().to_string();
+        assert!(
+            relative.contains("Путь проекта для /newproject должен быть абсолютным"),
+            "{relative}"
+        );
+        assert!(relative.contains("relative/dir"), "{relative}");
+        assert!(relative.contains("~"), "{relative}");
         let home = expand_project_path("~/code/app").unwrap();
         assert!(home.is_absolute());
         assert!(home.ends_with("code/app"));
@@ -23861,7 +23972,7 @@ mod tests {
             .handle_text("web", "web-chat", "web-user", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["unknown session for this chat: s1"]);
+        assert_eq!(used, vec!["Сессия s1 недоступна этому чату"]);
 
         // A different Telegram chat in the same default project also does NOT
         // see it (the same-project sharing leak is gone). On Telegram the list
@@ -23875,7 +23986,10 @@ mod tests {
             "/sessions",
         )
         .await;
-        assert_eq!(other, vec!["📁 当前项目: alpha\n暂无会话 —— /new 开一个"]);
+        assert_eq!(
+            other,
+            vec!["📁 Текущий проект: alpha\nНет сессий — создайте через /new"]
+        );
 
         // The OWNER (tg-1) still sees AND addresses its own session — isolation
         // doesn't break the owner's own flow.
@@ -23896,7 +24010,10 @@ mod tests {
             .handle_text("telegram", "tg-1", "rob", "/use s1")
             .await
             .unwrap();
-        assert_eq!(owner_uses, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(
+            owner_uses,
+            vec!["Используется сессия s1\n↓ Статус → /status"]
+        );
     }
 
     #[tokio::test]
@@ -23919,7 +24036,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude assistant")
             .await
             .unwrap();
-        assert_eq!(first, vec!["created session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(first, vec!["Создана сессия s1\n↓ Статус → /status"]);
         // Same project + role → a SECOND, distinct session s2 (no reuse).
         let again = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude assistant")
@@ -23927,7 +24044,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             again,
-            vec!["created session s2\n↓ 查看状态 → /status"],
+            vec!["Создана сессия s2\n↓ Статус → /status"],
             "F1: a repeat /new of the same role must mint a NEW sid, not reuse s1"
         );
         // A third /new (different role) → s3.
@@ -23935,7 +24052,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        assert_eq!(other_role, vec!["created session s3\n↓ 查看状态 → /status"]);
+        assert_eq!(other_role, vec!["Создана сессия s3\n↓ Статус → /status"]);
 
         // Three sessions tracked — two same-role (s1, s2) + one (s3).
         let listing = gateway
@@ -23973,7 +24090,7 @@ mod tests {
             .await
             .expect_err("/role with no active session should error");
         assert!(
-            format!("{no_session:#}").contains("活动会话"),
+            format!("{no_session:#}").contains("активная сессия"),
             "expected the no-active-session hint: {no_session:#}"
         );
 
@@ -23995,7 +24112,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             switched,
-            vec!["switched session s1 to role reviewer\n↓ 查看状态 → /status"]
+            vec!["Сессия s1 переключена на роль reviewer\n↓ Статус → /status"]
         );
 
         // A follow-up turn now routes to the reviewer pane under the SAME sid.
@@ -24012,14 +24129,14 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(listing, vec!["📁 Текущий проект: alpha\ns1 claude"]);
 
         // `/use s1` still resolves the same (now-reviewer) session.
         let used = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(used, vec!["Используется сессия s1\n↓ Статус → /status"]);
 
         // /help advertises /role.
         assert!(
@@ -24066,7 +24183,7 @@ mod tests {
             .expect_err("/role to a missing role should error");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("role 不存在") && msg.contains("ghost.md"),
+            msg.contains("Роль не найдена") && msg.contains("ghost.md"),
             "expected the missing-role hint naming the file: {msg}"
         );
         // No teardown + re-spawn happened on the bad role.
@@ -24082,7 +24199,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(listing, vec!["📁 Текущий проект: alpha\ns1 claude"]);
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
             .handle_text("mock", "chat-1", "alice", "still here?")
@@ -24097,7 +24214,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             switched,
-            vec!["switched session s1 to role reviewer\n↓ 查看状态 → /status"]
+            vec!["Сессия s1 переключена на роль reviewer\n↓ Статус → /status"]
         );
         assert_eq!(
             fake.starts.load(Ordering::SeqCst),
@@ -24125,7 +24242,7 @@ mod tests {
             .await
             .expect_err("/rename with no active session should error");
         assert!(
-            format!("{err:#}").contains("活动会话"),
+            format!("{err:#}").contains("активная сессия"),
             "expected the no-active-session hint: {err:#}"
         );
     }
@@ -24148,7 +24265,7 @@ mod tests {
             .await
             .expect_err("/rename with a blank title should error");
         assert!(
-            format!("{err:#}").contains("用法"),
+            format!("{err:#}").contains("Использование"),
             "expected the usage hint: {err:#}"
         );
     }
@@ -24179,8 +24296,8 @@ mod tests {
         assert_eq!(
             renamed,
             vec![
-                "已重命名 s1 →「my custom title」\n· 仅 ccteam 侧(claude 无会话标题接口)\
-                 \n↓ 本项目会话 → /sessions"
+                "Переименована s1 → «my custom title»\n· Только в ccteam (claude не поддерживает заголовки сессий)\
+                 \n↓ Сессии проекта → /sessions"
             ]
         );
 
@@ -24189,7 +24306,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(listing, vec!["📁 Текущий проект: alpha\ns1 claude"]);
         // …and the rename SURFACES on the picker button.
         let chat = ChatKey::new("mock", "chat-1", "alice");
         let s1_button = |g: &Gateway| {
@@ -24212,7 +24329,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing2, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(listing2, vec!["📁 Текущий проект: alpha\ns1 claude"]);
         assert_eq!(
             s1_button(&gateway).as_deref(),
             Some("✓ s1 claude (my custom title)"),
@@ -24267,7 +24384,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reply[0].starts_with("已重命名 s1 →「the older one」"),
+            reply[0].starts_with("Переименована s1 → «the older one»"),
             "receipt must name the targeted sid: {:?}",
             reply
         );
@@ -24300,7 +24417,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reply[0].starts_with("unknown session for this chat: s1"),
+            reply[0].starts_with("Сессия s1 недоступна этому чату"),
             "{:?}",
             reply
         );
@@ -24309,7 +24426,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            unknown[0].starts_with("unknown session for this chat: s99"),
+            unknown[0].starts_with("Сессия s99 недоступна этому чату"),
             "a foreign sid and an unknown sid must read identically: {:?}",
             unknown
         );
@@ -24341,7 +24458,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reply[0].starts_with("已重命名 s1 →「archived work」"),
+            reply[0].starts_with("Переименована s1 → «archived work»"),
             "a stopped session must rename like a live one: {:?}",
             reply
         );
@@ -24374,7 +24491,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reply[0].contains("已同步到 claude 自己的会话标题"),
+            reply[0].contains("Синхронизировано с заголовком сессии claude"),
             "a real push must be reported as synced: {:?}",
             reply
         );
@@ -24391,7 +24508,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            again[0].starts_with("已重命名 s1 「ship it」→「ship it twice」"),
+            again[0].starts_with("Переименована s1: «ship it» → «ship it twice»"),
             "the receipt must show the previous title: {:?}",
             again
         );
@@ -24515,7 +24632,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replies, vec!["this choice has expired".to_string()]);
+        assert_eq!(replies, vec!["Этот выбор больше недоступен".to_string()]);
         assert!(shared.lock().await.is_empty());
     }
 
@@ -24742,7 +24859,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replies, vec!["this choice has expired".to_string()]);
+        assert_eq!(replies, vec!["Этот выбор больше недоступен".to_string()]);
         assert!(
             shared.lock().await.is_empty(),
             "lapsed pending drained, not resolved"
@@ -24987,7 +25104,7 @@ mod tests {
         assert!(
             notification
                 .user
-                .starts_with("[ccteam] [delegation completed with VENDOR ERROR]"),
+                .starts_with("[ccteam] [делегирование завершено с ОШИБКОЙ ПОСТАВЩИКА]"),
             "vendor-fatal notification must lead with an explicit marker: {}",
             notification.user
         );
@@ -25096,14 +25213,14 @@ mod tests {
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
         assert_eq!(notes.len(), 1, "exactly ONE notification per vendor turn");
         assert!(
-            notes[0]
-                .user
-                .contains("is now IDLE, waiting for the next dispatch"),
+            notes[0].user.contains("ожидает следующую задачу"),
             "notification states the child went idle: {}",
             notes[0].user
         );
         assert!(
-            notes[0].user.contains("3 interim note(s)"),
+            notes[0]
+                .user
+                .contains("3 промежуточных сообщения этого запуска остались в журнале"),
             "notification folds the interim count: {}",
             notes[0].user
         );
@@ -25293,7 +25410,7 @@ mod tests {
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
         assert_eq!(notes.len(), 1, "all-mode narration remains ledger-only");
-        assert!(notes[0].user.contains("is now IDLE"));
+        assert!(notes[0].user.contains("ожидает следующую задачу"));
 
         // `off` mode: nothing notifies, but the boundary still lands
         // delegation_completed in progress.jsonl.
@@ -25705,7 +25822,9 @@ mod tests {
             "the folded notification carries the LATEST text: {}",
             got[0].user
         );
-        assert!(got[0].user.contains("2 interim note(s)"));
+        assert!(got[0]
+            .user
+            .contains("2 промежуточных сообщения этого запуска остались в журнале"));
 
         Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -25943,7 +26062,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(created[0].contains("scheduled d1 → s1"), "{created:?}");
+        assert!(created[0].contains("Отложено d1 → s1"), "{created:?}");
 
         let listed = gateway
             .handle_text("mock", "chat-1", "alice", "/inbox")
@@ -25956,7 +26075,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/inbox cancel d1")
             .await
             .unwrap();
-        assert_eq!(cancelled, vec!["cancelled d1"]);
+        assert_eq!(cancelled, vec!["Отложенное сообщение d1 отменено"]);
         assert!(gateway.scheduled_items_for_sid("s1").unwrap().is_empty());
     }
 
@@ -26144,7 +26263,7 @@ mod tests {
             .fail_reason
             .as_deref()
             .unwrap()
-            .contains("older than 24 hours"));
+            .contains("Отложенная отправка просрочена более чем на 24 часа"));
         assert!(fake.submissions.lock().await.is_empty());
 
         gateway

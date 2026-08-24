@@ -136,7 +136,28 @@ pub const NOTIFICATION_ANSWER_MAX_CHARS: usize = 4_000;
 
 pub(crate) fn full_answer_marker(omitted: usize, child_sid: &str) -> String {
     format!(
-        "…[truncated {omitted} chars — full text stays in the session ledger; run session_collect{{sid:{child_sid}, tail:true}} for the full answer]…"
+        "…[сокращено {omitted} симв. — полный текст остаётся в журнале сессии; полный ответ: session_collect{{sid:{child_sid}, tail:true}}]…"
+    )
+}
+
+fn folded_interim_summary(count: usize, child_sid: &str) -> String {
+    let word = if (11..=14).contains(&(count % 100)) {
+        "промежуточных сообщений"
+    } else {
+        match count % 10 {
+            1 => "промежуточное сообщение",
+            2..=4 => "промежуточных сообщения",
+            _ => "промежуточных сообщений",
+        }
+    };
+    let verb = if count % 10 == 1 && !(11..=14).contains(&(count % 100)) {
+        "осталось"
+    } else {
+        "остались"
+    };
+    format!(
+        " {count} {word} этого запуска {verb} в журнале \
+         (полная история: session_collect{{sid:{child_sid}}})."
     )
 }
 
@@ -189,22 +210,19 @@ pub(crate) fn build_notification_text_with_outcome(
         |omitted| full_answer_marker(omitted, child_sid),
     );
     let folded = if interim_notes > 0 {
-        format!(
-            " {interim_notes} interim note(s) from this turn stayed in the ledger \
-             (session_collect{{sid:{child_sid}}} pages the full trail)."
-        )
+        folded_interim_summary(interim_notes, child_sid)
     } else {
         String::new()
     };
     let outcome = if vendor_error {
-        "[delegation completed with VENDOR ERROR] "
+        "[делегирование завершено с ОШИБКОЙ ПОСТАВЩИКА] "
     } else {
         ""
     };
     format!(
-        "[ccteam] {outcome}delegated session {child_sid} ({}{label}) completed turn {turn_id} and is now IDLE, waiting for the next dispatch.{folded}\n\
-         --- final answer ---\n{}\n\
-         (child is idle: if the task is not actually finished, follow up with session_dispatch{{sid:{child_sid}, task:…}}; run session_collect{{sid:{child_sid}, tail:true}} for the full answer)",
+        "[ccteam] {outcome}делегированная сессия {child_sid} ({}{label}) завершила запуск {turn_id} и ожидает следующую задачу.{folded}\n\
+         --- итоговый ответ ---\n{}\n\
+         (дочерняя сессия ждёт: если задача ещё не завершена, продолжите через session_dispatch{{sid:{child_sid}, task:…}}; полный ответ: session_collect{{sid:{child_sid}, tail:true}})",
         vendor_key(vendor),
         excerpt.text,
     )
@@ -230,8 +248,8 @@ pub fn build_interim_notification_text(
         |omitted| full_answer_marker(omitted, child_sid),
     );
     format!(
-        "[ccteam] delegated session {child_sid} ({}{label}) posted an interim note (turn {turn_id}) — still WORKING, no action needed.\n\
-         --- note ---\n{}",
+        "[ccteam] делегированная сессия {child_sid} ({}{label}) прислала промежуточное сообщение (запуск {turn_id}) — ещё работает, действий не требуется.\n\
+         --- сообщение ---\n{}",
         vendor_key(vendor),
         excerpt.text,
     )
@@ -413,27 +431,74 @@ mod tests {
             0,
         );
         assert!(t.starts_with(
-            "[ccteam] delegated session s7 (grok \"research\") completed turn s7-3 and is now IDLE"
+            "[ccteam] делегированная сессия s7 (grok \"research\") завершила запуск s7-3 и ожидает следующую задачу"
         ));
         assert!(t.contains("hello"));
         assert!(t.contains("session_collect{sid:s7, tail:true}"));
         // Single-message turn → no interim-fold sentence.
-        assert!(!t.contains("interim note(s)"));
+        assert!(!t.contains("промежуточных сообщ."));
         assert_eq!(
             t,
-            "[ccteam] delegated session s7 (grok \"research\") completed turn s7-3 and is now IDLE, waiting for the next dispatch.\n\
-             --- final answer ---\n\
+            "[ccteam] делегированная сессия s7 (grok \"research\") завершила запуск s7-3 и ожидает следующую задачу.\n\
+             --- итоговый ответ ---\n\
              hello\n\
-             (child is idle: if the task is not actually finished, follow up with session_dispatch{sid:s7, task:…}; run session_collect{sid:s7, tail:true} for the full answer)"
+             (дочерняя сессия ждёт: если задача ещё не завершена, продолжите через session_dispatch{sid:s7, task:…}; полный ответ: session_collect{sid:s7, tail:true})"
         );
     }
 
     #[test]
     fn notification_text_folds_interim_notes() {
         let t = build_notification_text("s69", AgentVendor::Codex, None, "s69-54", "wave done", 53);
-        assert!(t.contains("is now IDLE, waiting for the next dispatch"));
-        assert!(t.contains("53 interim note(s) from this turn stayed in the ledger"));
+        assert!(t.contains("ожидает следующую задачу"));
+        assert!(t.contains("53 промежуточных сообщения этого запуска остались в журнале"));
         assert!(t.contains("session_dispatch{sid:s69"));
+    }
+
+    #[test]
+    fn notification_text_pluralizes_folded_interim_notes() {
+        for (count, expected) in [
+            (
+                1,
+                "1 промежуточное сообщение этого запуска осталось в журнале",
+            ),
+            (
+                2,
+                "2 промежуточных сообщения этого запуска остались в журнале",
+            ),
+            (
+                5,
+                "5 промежуточных сообщений этого запуска остались в журнале",
+            ),
+            (
+                11,
+                "11 промежуточных сообщений этого запуска остались в журнале",
+            ),
+            (
+                21,
+                "21 промежуточное сообщение этого запуска осталось в журнале",
+            ),
+        ] {
+            let text =
+                build_notification_text("s1", AgentVendor::Claude, None, "s1-1", "raw", count);
+            assert!(text.contains(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn vendor_failure_notification_is_russian_and_keeps_raw_vendor_text() {
+        let raw = "Selected model is at capacity. Please try a different model.";
+        let text = build_notification_text_with_outcome(
+            "s7",
+            AgentVendor::Claude,
+            None,
+            "s7-3",
+            raw,
+            0,
+            true,
+        );
+        assert!(text.starts_with("[ccteam] [делегирование завершено с ОШИБКОЙ ПОСТАВЩИКА]"));
+        assert!(text.contains(raw));
+        assert!(text.contains("session_collect{sid:s7, tail:true}"));
     }
 
     #[test]
@@ -445,8 +510,8 @@ mod tests {
             "s69-3",
             "reading queue",
         );
-        assert!(t.starts_with("[ccteam] delegated session s69 (codex \"wave\") posted an interim note (turn s69-3) — still WORKING"));
-        assert!(t.contains("no action needed"));
+        assert!(t.starts_with("[ccteam] делегированная сессия s69 (codex \"wave\") прислала промежуточное сообщение (запуск s69-3) — ещё работает"));
+        assert!(t.contains("действий не требуется"));
         assert!(t.contains("reading queue"));
     }
 
@@ -465,14 +530,14 @@ mod tests {
         let t = build_notification_text("s1", AgentVendor::Claude, None, "s1-1", &long, 0);
         assert!(t.contains("HEAD"));
         assert!(t.contains("TAIL"));
-        assert!(t.contains("truncated"));
+        assert!(t.contains("сокращено"));
         assert!(t.contains("session_collect{sid:s1, tail:true}"));
         assert!(t.contains("(claude)"));
         let embedded = t
-            .split_once("--- final answer ---\n")
+            .split_once("--- итоговый ответ ---\n")
             .unwrap()
             .1
-            .split_once("\n(child is idle:")
+            .split_once("\n(дочерняя сессия ждёт:")
             .unwrap()
             .0;
         assert_eq!(embedded.chars().count(), NOTIFICATION_ANSWER_MAX_CHARS);
