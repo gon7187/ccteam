@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { I18N, makeT, navLabel, t, tr, tShowMore, tStopped } from "./i18n";
+import { I18N, WEB_LOCALE, makeT, navLabel, t, tHostsCount, tr, tShowMore, tStopped } from "./i18n";
 
 describe("i18n", () => {
   it("tr defaults to zh and picks en when chosen", () => {
@@ -30,6 +30,27 @@ describe("i18n", () => {
 
 // v0.8.24 Track A — table-driven whole-shell dictionary (prototype I18N keys).
 describe("I18N dictionary", () => {
+  it("keeps Russian, Chinese, and English dictionaries in lockstep", () => {
+    const keys = Object.keys(I18N.ru).sort();
+    expect(keys).toEqual(Object.keys(I18N.zh).sort());
+    expect(keys).toEqual(Object.keys(I18N.en).sort());
+  });
+
+  it("resolves Russian text and locale", () => {
+    expect(t("ru", "homeTitle")).toBe("За работу!");
+    expect(WEB_LOCALE.ru).toBe("ru-RU");
+    expect(tStopped("ru", "s9")).toContain("s9");
+  });
+
+  it("keeps long-form Russian copy in the core surfaces", () => {
+    expect(t("ru", "tplCommanderP")).toContain("session_spawn / session_dispatch");
+    expect(t("ru", "accessMcpDesc")).toContain("MCP");
+    expect(t("ru", "scheduleTzNote")).toContain("daemon");
+    expect(t("ru", "dshDesc")).toContain("DeepSeek Harness");
+    expect(t("ru", "teamDesc")).toContain("делегирования");
+    expect(t("ru", "charterHonesty")).toContain("MCP status");
+  });
+
   it("covers zh and en with the same key set", () => {
     const zhKeys = Object.keys(I18N.zh).sort();
     const enKeys = Object.keys(I18N.en).sort();
@@ -57,6 +78,12 @@ describe("I18N dictionary", () => {
     expect(tShowMore("en", 3)).toBe("Show more (3 more)");
     expect(tStopped("zh", "s9")).toContain("s9");
     expect(tStopped("en", "s9")).toContain("Stopped s9");
+  });
+
+  it("uses Russian plural forms for host counts", () => {
+    expect(tHostsCount("ru", 21)).toBe("21 хост");
+    expect(tHostsCount("ru", 22)).toBe("22 хоста");
+    expect(tHostsCount("ru", 25)).toBe("25 хостов");
   });
 
   it("keeps the HITL permission-mode semantics in both languages", () => {

@@ -110,6 +110,19 @@ export function AvatarPopover({
         <div className="ml-auto inline-flex overflow-hidden rounded-md border border-surface-700/60 text-xs">
           <button
             type="button"
+            data-testid="lang-ru"
+            onClick={() => onLanguage("ru")}
+            aria-pressed={lang === "ru"}
+            className={`px-2 py-1 ${
+              lang === "ru"
+                ? "bg-brand-500/20 text-brand-400"
+                : "text-text-secondary hover:text-text-primary"
+            }`}
+          >
+            Русский
+          </button>
+          <button
+            type="button"
             data-testid="lang-zh"
             onClick={() => onLanguage("zh")}
             aria-pressed={lang === "zh"}

@@ -196,6 +196,14 @@ export function GeneralPanel({
           <div className="seg" data-testid="lang-seg">
             <button
               type="button"
+              data-testid="lang-ru"
+              className={lang === "ru" ? "active" : ""}
+              onClick={() => onLang("ru")}
+            >
+              Русский
+            </button>
+            <button
+              type="button"
               data-testid="lang-zh"
               className={lang === "zh" ? "active" : ""}
               onClick={() => onLang("zh")}

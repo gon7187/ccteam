@@ -3,6 +3,8 @@
 // unit-testable (this repo has no @testing-library DOM harness; pure logic is
 // tested directly).
 
+import type { Lang } from "../lib/i18n";
+
 /** Display label for a rail / history / recent session row (v0.8.22 P1
  *  session-title system): the user-facing title when set, else the role, else
  *  the roleless placeholder. */
@@ -15,7 +17,7 @@ export function railSessionLabel(s: { title?: string | null; role: string }): st
  *  so neither surface can imply a vendor sync that didn't happen. A server
  *  that omits `vendor_sync` (older daemon) simply gets the plain line. */
 export function renameToastText(
-  lang: "zh" | "en",
+  lang: Lang,
   result: {
     sid: string;
     title: string;
@@ -84,6 +86,6 @@ export function relativeTimeEn(iso: string | null | undefined): string {
 }
 
 /** Language-aware relative time for the recents grid. */
-export function relativeTime(lang: "zh" | "en", iso: string | null | undefined): string {
+export function relativeTime(lang: Lang, iso: string | null | undefined): string {
   return lang === "en" ? relativeTimeEn(iso) : relativeTimeZh(iso);
 }
