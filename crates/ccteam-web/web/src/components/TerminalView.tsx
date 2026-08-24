@@ -290,7 +290,7 @@ export function TerminalView({ lang, slug, sid, className }: Props) {
         )}
 
         {isMobile && state.connected && (
-          <KeyboardFab keyboardOpen={keyboardOpen} onToggle={toggleKeyboard} />
+          <KeyboardFab lang={lang} keyboardOpen={keyboardOpen} onToggle={toggleKeyboard} />
         )}
 
         {isMobile && state.connected && reservedKeyboardHeight > 0 && (

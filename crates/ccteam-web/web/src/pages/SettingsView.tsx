@@ -150,7 +150,7 @@ export function OpsPanel({ lang }: { lang: Lang }) {
         <p>{t("statusDesc")}</p>
       </header>
       <section className="ops-panel" aria-label="Status">
-        <StatusView embedded />
+        <StatusView embedded lang={lang} />
       </section>
       <section className="ops-panel" aria-label="Hosts">
         <HostsView embedded lang={lang} />

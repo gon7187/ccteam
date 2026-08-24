@@ -95,15 +95,15 @@ impl Counts {
     }
 
     fn summary(&self) -> String {
-        let mut parts = vec![format!("{} pass", self.pass)];
+        let mut parts = vec![format!("{} успешно", self.pass)];
         if self.warn > 0 {
-            parts.push(format!("{} warn", self.warn));
+            parts.push(format!("{} предупреждение", self.warn));
         }
         if self.fail > 0 {
-            parts.push(format!("{} fail", self.fail));
+            parts.push(format!("{} ошибка", self.fail));
         }
         if self.skip > 0 {
-            parts.push(format!("{} skip", self.skip));
+            parts.push(format!("{} пропущено", self.skip));
         }
         parts.join(", ")
     }
@@ -218,11 +218,11 @@ fn gather_readiness(paths: &CcteamPaths) -> ReadinessReport {
             "daemon",
             daemon_version
                 .clone()
-                .map(|version| format!("running (v{version})"))
-                .unwrap_or_else(|| "running".to_string()),
+                .map(|version| format!("запущен (v{version})"))
+                .unwrap_or_else(|| "запущен".to_string()),
         )
     } else {
-        CheckLine::new(CheckStatus::Warn, "daemon", "not running")
+        CheckLine::new(CheckStatus::Warn, "daemon", "не запущен")
     };
     let version = check_version(paths, daemon_healthy.then_some(daemon_version).flatten());
     let host_skew = check_host_skew(paths);
@@ -235,7 +235,7 @@ fn gather_readiness(paths: &CcteamPaths) -> ReadinessReport {
         ccteam.push(ReportRow::advisory(CheckLine::new(
             CheckStatus::Pass,
             "hosts",
-            "fleet versions aligned",
+            "версии fleet согласованы",
         )));
     } else {
         ccteam.extend(host_skew.into_iter().map(ReportRow::visible));
@@ -254,23 +254,23 @@ fn gather_readiness(paths: &CcteamPaths) -> ReadinessReport {
 
 fn render_readiness(report: &ReadinessReport, color: bool) -> (String, bool) {
     let mut counts = Counts::default();
-    let mut out = String::from("ccteam doctor — readiness checkup\n\n");
+    let mut out = String::from("ccteam doctor — проверка готовности\n\n");
 
-    render_section(&mut out, "agents", &report.agents, color, &mut counts);
+    render_section(&mut out, "агенты", &report.agents, color, &mut counts);
     render_section(&mut out, "ccteam", &report.ccteam, color, &mut counts);
-    render_section(&mut out, "projects", &report.projects, color, &mut counts);
-    render_section(&mut out, "progress", &report.progress, color, &mut counts);
+    render_section(&mut out, "проекты", &report.projects, color, &mut counts);
+    render_section(&mut out, "прогресс", &report.progress, color, &mut counts);
 
     let any_fail = counts.fail > 0;
-    out.push_str("summary: ");
+    out.push_str("сводка: ");
     out.push_str(&counts.summary());
     if any_fail {
-        out.push_str(" — NOT READY (fix the FAIL lines above)\n");
+        out.push_str(" — НЕ ГОТОВО (исправьте строки FAIL выше)\n");
     } else {
-        out.push_str(" — READY (WARN is informational, not blocking)\n");
+        out.push_str(" — ГОТОВО (WARN носит информационный характер)\n");
     }
     if !report.daemon_healthy {
-        out.push_str("\ndaemon not running — start it:  ccteam daemon start\n");
+        out.push_str("\nдемон не запущен — запустите:  ccteam daemon start\n");
     }
     (out, any_fail)
 }
@@ -361,10 +361,10 @@ fn check_agent(
     let mut status = binary.status.worst(mcp.status);
     let mut details = vec![binary.detail];
     match auth.ok {
-        Some(true) => details.push(auth.ok_detail.unwrap_or("auth ok").to_string()),
+        Some(true) => details.push(auth.ok_detail.unwrap_or("авторизация пройдена").to_string()),
         Some(false) => {
             status = status.worst(CheckStatus::Warn);
-            details.push(format!("auth missing — {}", auth.login_hint));
+            details.push(format!("нет авторизации — {}", auth.login_hint));
         }
         None => {}
     }
@@ -385,7 +385,7 @@ fn probe_binary(env_var: &str, default_bin: &str, required: bool) -> BinaryCheck
             } else if !stderr.is_empty() {
                 stderr
             } else {
-                format!("resolved `{bin}`")
+                format!("найден `{bin}`")
             };
             BinaryCheck {
                 installed: true,
@@ -397,8 +397,8 @@ fn probe_binary(env_var: &str, default_bin: &str, required: bool) -> BinaryCheck
             let reason = out
                 .status
                 .code()
-                .map(|code| format!("exit {code}"))
-                .unwrap_or_else(|| "terminated by signal".to_string());
+                .map(|code| format!("код выхода {code}"))
+                .unwrap_or_else(|| "завершён сигналом".to_string());
             BinaryCheck {
                 installed: false,
                 status: if required {
@@ -407,15 +407,15 @@ fn probe_binary(env_var: &str, default_bin: &str, required: bool) -> BinaryCheck
                     CheckStatus::Warn
                 },
                 detail: format!(
-                    "`{bin} --version` failed ({reason}) — reinstall or point {env_var} at a working binary"
+                    "`{bin} --version` завершилась ошибкой ({reason}) — переустановите или укажите в {env_var} рабочий бинарник"
                 ),
             }
         }
         Err(_) => {
             let detail = if required {
-                format!("not installed — install the Claude Code CLI or point {env_var} at it")
+                format!("не установлен — установите Claude Code CLI или укажите его в {env_var}")
             } else {
-                format!("not installed (optional) — install it or point {env_var} at it")
+                format!("не установлен (необязательно) — установите его или укажите в {env_var}")
             };
             BinaryCheck {
                 installed: false,
@@ -438,7 +438,10 @@ fn check_vendor_auth_claude() -> AuthCheck {
     let ok = home.as_ref().is_some_and(|h| {
         h.join(".credentials.json").exists() || h.join("credentials.json").exists()
     }) || std::env::var("ANTHROPIC_API_KEY").is_ok();
-    AuthCheck::simple(Some(ok), "run `claude auth login` or set ANTHROPIC_API_KEY")
+    AuthCheck::simple(
+        Some(ok),
+        "выполните `claude auth login` или задайте ANTHROPIC_API_KEY",
+    )
 }
 
 // Daemon-start MCP auto-registration creates the vendor config files, so those
@@ -449,7 +452,10 @@ fn check_vendor_auth_codex() -> AuthCheck {
         .or_else(|| dirs::home_dir().map(|h| h.join(".codex")));
     let ok = home.as_ref().is_some_and(|h| h.join("auth.json").exists())
         || std::env::var("OPENAI_API_KEY").is_ok();
-    AuthCheck::simple(Some(ok), "run `codex login` or set OPENAI_API_KEY")
+    AuthCheck::simple(
+        Some(ok),
+        "выполните `codex login` или задайте OPENAI_API_KEY",
+    )
 }
 
 fn check_vendor_auth_grok() -> AuthCheck {
@@ -487,7 +493,10 @@ fn check_vendor_auth_kimi() -> AuthCheck {
         || kimi_home
             .as_ref()
             .is_some_and(|h| h.join("credentials").exists() || h.join("oauth").exists());
-    AuthCheck::simple(Some(ok), "run `kimi login` or set MOONSHOT_API_KEY")
+    AuthCheck::simple(
+        Some(ok),
+        "выполните `kimi login` или задайте MOONSHOT_API_KEY",
+    )
 }
 
 fn check_vendor_auth_pi() -> AuthCheck {
@@ -508,7 +517,7 @@ fn check_vendor_auth_dsh() -> AuthCheck {
         return AuthCheck {
             ok: Some(true),
             login_hint: "",
-            ok_detail: Some("auth ok (source: env)"),
+            ok_detail: Some("авторизация пройдена (источник: env)"),
         };
     }
     let mirrored =
@@ -517,12 +526,14 @@ fn check_vendor_auth_dsh() -> AuthCheck {
         return AuthCheck {
             ok: Some(true),
             login_hint: "",
-            ok_detail: Some("auth ok (source: dsh credentials, mirrored at spawn)"),
+            ok_detail: Some(
+                "авторизация пройдена (источник: учётные данные dsh, копируются при запуске)",
+            ),
         };
     }
     AuthCheck::simple(
         Some(false),
-        "export DEEPSEEK_API_KEY, or run `dsh web` once to write ~/.dsh/.credentials.yaml",
+        "задайте DEEPSEEK_API_KEY или один раз выполните `dsh web`, чтобы создать ~/.dsh/.credentials.yaml",
     )
 }
 
@@ -534,7 +545,9 @@ fn check_vendor_mcp(vendor: &str) -> McpCheck {
             status: CheckStatus::Pass,
             detail: AgentProbeSpec::by_vendor(vendor)
                 .and_then(AgentProbeSpec::tool_surface_notice)
-                .unwrap_or_else(|| "tools arrive through the managed session bridge".to_string()),
+                .unwrap_or_else(|| {
+                    "инструменты поступают через управляемый мост сессии".to_string()
+                }),
         };
     }
     let resolved = match vendor {
@@ -564,15 +577,15 @@ fn check_vendor_mcp(vendor: &str) -> McpCheck {
     match resolved {
         Ok((_, true)) => McpCheck {
             status: CheckStatus::Pass,
-            detail: "MCP registered".to_string(),
+            detail: "MCP зарегистрирован".to_string(),
         },
         Ok((_, false)) => McpCheck {
             status: CheckStatus::Warn,
-            detail: "MCP not registered — auto-registers at `ccteam daemon start` (or `ccteam config mcp`)".to_string(),
+            detail: "MCP не зарегистрирован — регистрируется автоматически через `ccteam daemon start` (или `ccteam config mcp`)".to_string(),
         },
         Err(err) => McpCheck {
             status: CheckStatus::Warn,
-            detail: format!("MCP state unknown ({err})"),
+            detail: format!("состояние MCP неизвестно ({err})"),
         },
     }
 }
@@ -585,13 +598,13 @@ fn check_legacy_service() -> CheckLine {
         None => CheckLine::new(
             CheckStatus::Pass,
             "legacy",
-            "no legacy service unit",
+            "устаревший unit службы отсутствует",
         ),
         Some((path, true)) => CheckLine::new(
             CheckStatus::Warn,
             "legacy",
             format!(
-                "legacy installer-written ccteam unit at {} — systemd/launchd management is retired; migrate with `ccteam daemon start` (auto-takeover: stops + removes the unit, restarts detached)",
+                "устаревший unit ccteam от установщика в {} — управление systemd/launchd больше не используется; перейдите на `ccteam daemon start` (автоперехват: останавливает и удаляет unit, затем запускает в фоне)",
                 path.display()
             ),
         ),
@@ -599,7 +612,7 @@ fn check_legacy_service() -> CheckLine {
             CheckStatus::Warn,
             "legacy",
             format!(
-                "service unit at {} was not written by the ccteam installer — ccteam will not manage or delete it; its instance counts as \"not managed\" for `ccteam daemon stop`. Remove it manually if you want ccteam self-management",
+                "unit службы в {} создан не установщиком ccteam — ccteam не будет им управлять или удалять его; его экземпляр считается \"неуправляемым\" для `ccteam daemon stop`. Удалите его вручную для самостоятельного управления ccteam",
                 path.display()
             ),
         ),
@@ -615,16 +628,16 @@ fn check_version(paths: &CcteamPaths, daemon_version: Option<String>) -> CheckLi
     let latest = match update_available {
         Some(latest) => {
             status = CheckStatus::Warn;
-            format!("update available → {latest}: run `ccteam update`")
+            format!("доступно обновление → {latest}: выполните `ccteam update`")
         }
-        None if cache.latest_version.is_some() => "up to date".to_string(),
-        None => "latest not checked yet".to_string(),
+        None if cache.latest_version.is_some() => "актуально".to_string(),
+        None => "последняя версия ещё не проверялась".to_string(),
     };
     let mut detail = format!("{binary_version} ({}) · {latest}", channel.as_str());
     if let Some(version) = daemon_version.filter(|version| version != binary_version) {
         status = CheckStatus::Warn;
         detail.push_str(&format!(
-            " · daemon runs {version} — restart: `ccteam daemon restart`"
+            " · демон использует {version} — перезапустите: `ccteam daemon restart`"
         ));
     }
     CheckLine::new(status, "version", detail)
@@ -654,17 +667,17 @@ fn check_pricing() -> CheckLine {
         Some(age) if age > WARN_DAYS => CheckLine::new(
             CheckStatus::Warn,
             "pricing",
-            format!("rate sheet {age}d old (>{WARN_DAYS}d) — upgrade ccteam for current pricing"),
+            format!("таблице тарифов {age} дн. (>{WARN_DAYS} дн.) — обновите ccteam для актуальных тарифов"),
         ),
         Some(age) => CheckLine::new(
             CheckStatus::Pass,
             "pricing",
-            format!("rate sheet {age}d old (fresh)"),
+            format!("таблице тарифов {age} дн. (актуальна)"),
         ),
         None => CheckLine::new(
             CheckStatus::Skip,
             "pricing",
-            "could not parse embedded schema_version",
+            "не удалось разобрать встроенный schema_version",
         ),
     }
 }
@@ -675,7 +688,7 @@ fn check_home_layout(paths: &CcteamPaths) -> CheckLine {
             CheckStatus::Skip,
             "home",
             format!(
-                "{} does not exist yet (fresh install)",
+                "{} пока не существует (свежая установка)",
                 paths.root.display()
             ),
         );
@@ -684,7 +697,7 @@ fn check_home_layout(paths: &CcteamPaths) -> CheckLine {
         return CheckLine::new(
             CheckStatus::Skip,
             "home",
-            format!("could not read {}", paths.root.display()),
+            format!("не удалось прочитать {}", paths.root.display()),
         );
     };
     let mut unexpected = Vec::new();
@@ -704,7 +717,10 @@ fn check_home_layout(paths: &CcteamPaths) -> CheckLine {
         CheckLine::new(
             CheckStatus::Pass,
             "home",
-            format!("{} matches the canonical layout", paths.root.display()),
+            format!(
+                "{} соответствует канонической структуре",
+                paths.root.display()
+            ),
         )
     } else {
         unexpected.sort();
@@ -712,7 +728,7 @@ fn check_home_layout(paths: &CcteamPaths) -> CheckLine {
             CheckStatus::Warn,
             "home",
             format!(
-                "{} unexpected dir(s) under {} (orchestrator-era leftovers, safe to `rm -rf`): {}",
+                "{} непредвиденных каталогов в {} (остатки эпохи orchestrator, можно `rm -rf`): {}",
                 unexpected.len(),
                 paths.root.display(),
                 unexpected.join(", ")
@@ -730,7 +746,7 @@ fn check_project_skill_faces(paths: &CcteamPaths) -> CheckLine {
             return CheckLine::new(
                 CheckStatus::Skip,
                 "skills",
-                format!("could not read registered projects: {err}"),
+                format!("не удалось прочитать зарегистрированные проекты: {err}"),
             );
         }
     };
@@ -745,14 +761,18 @@ fn check_project_skill_faces(paths: &CcteamPaths) -> CheckLine {
         }
     }
     if legacy.is_empty() {
-        CheckLine::new(CheckStatus::Pass, "skills", "no legacy project skill dirs")
+        CheckLine::new(
+            CheckStatus::Pass,
+            "skills",
+            "устаревших каталогов skills проекта нет",
+        )
     } else {
         legacy.sort();
         CheckLine::new(
             CheckStatus::Warn,
             "skills",
             format!(
-                "legacy .claude/skills dir in: {} — migrate: `ccteam skill migrate-project --project <slug>`",
+                "устаревший каталог .claude/skills в: {} — перенесите: `ccteam skill migrate-project --project <slug>`",
                 legacy.join(", ")
             ),
         )
@@ -773,7 +793,7 @@ fn check_progress_journals(paths: &CcteamPaths) -> Vec<ReportRow> {
         return vec![ReportRow::advisory(CheckLine::new(
             CheckStatus::Pass,
             "progress",
-            "no progress journals yet",
+            "журналов progress пока нет",
         ))];
     }
     slugs
@@ -794,19 +814,19 @@ fn check_progress_journal(paths: &CcteamPaths, slug: &str) -> CheckLine {
         Ok(scan) => scan,
         Err(error) => {
             status = CheckStatus::Warn;
-            details.push(format!("active scan error: {error}"));
+            details.push(format!("ошибка сканирования active: {error}"));
             ProgressFileScan::default()
         }
     };
     if active_scan.size > warning_size {
         status = CheckStatus::Warn;
         details.push(format!(
-            "active={}B SIZE WARNING (>{}B, 80% of {}B rotation threshold)",
+            "active={}B ПРЕДУПРЕЖДЕНИЕ О РАЗМЕРЕ (>{}B, 80% порога ротации {}B)",
             active_scan.size, warning_size, threshold
         ));
     } else {
         details.push(format!(
-            "active={}B (warn >{}B; rotate >{}B)",
+            "active={}B (предупреждение >{}B; ротация >{}B)",
             active_scan.size, warning_size, threshold
         ));
     }
@@ -814,7 +834,7 @@ fn check_progress_journal(paths: &CcteamPaths, slug: &str) -> CheckLine {
         status = CheckStatus::Warn;
     }
     details.push(format!(
-        "active corrupt={} first_offset={}",
+        "active повреждено={} first_offset={}",
         active_scan.corrupt_count,
         format_optional_offset(active_scan.first_corrupt_offset)
     ));
@@ -823,7 +843,7 @@ fn check_progress_journal(paths: &CcteamPaths, slug: &str) -> CheckLine {
         Ok(scan) => scan,
         Err(error) => {
             status = CheckStatus::Warn;
-            details.push(format!("archive scan error: {error}"));
+            details.push(format!("ошибка сканирования archive: {error}"));
             ProgressFileScan::default()
         }
     };
@@ -832,7 +852,7 @@ fn check_progress_journal(paths: &CcteamPaths, slug: &str) -> CheckLine {
     }
     if archive_scan.size > 0 || archive.exists() {
         details.push(format!(
-            "archive={}B corrupt={} first_offset={}",
+            "archive={}B повреждено={} first_offset={}",
             archive_scan.size,
             archive_scan.corrupt_count,
             format_optional_offset(archive_scan.first_corrupt_offset)
@@ -844,7 +864,7 @@ fn check_progress_journal(paths: &CcteamPaths, slug: &str) -> CheckLine {
         *histogram.entry(kind).or_insert(0) += bytes;
     }
     details.push(format!(
-        "TOP KINDS BY BYTES: {}",
+        "ТОП ТИПОВ ПО БАЙТАМ: {}",
         render_top_kinds(histogram)
     ));
 
@@ -852,7 +872,7 @@ fn check_progress_journal(paths: &CcteamPaths, slug: &str) -> CheckLine {
         Ok(coverage) => coverage,
         Err(error) => {
             status = CheckStatus::Warn;
-            details.push(format!("archive marker error: {error}"));
+            details.push(format!("ошибка маркера archive: {error}"));
             None
         }
     };
@@ -860,43 +880,44 @@ fn check_progress_journal(paths: &CcteamPaths, slug: &str) -> CheckLine {
         Ok(Some(checkpoint)) => {
             if progress_bridge::checkpoint_covers_archive(&checkpoint, archive_coverage.as_ref()) {
                 details.push(format!(
-                    "checkpoint=consistent seq={} events={}",
+                    "checkpoint=согласован seq={} events={}",
                     checkpoint.rotation_sequence, checkpoint.event_count
                 ));
                 details.push(if archive_coverage.is_some() {
-                    "archive status=covered".to_string()
+                    "статус archive=покрыт".to_string()
                 } else {
-                    "archive status=absent".to_string()
+                    "статус archive=отсутствует".to_string()
                 });
             } else {
                 status = CheckStatus::Warn;
                 details.push(format!(
-                    "checkpoint=INCONSISTENT seq={} (coverage marker does not match .1)",
+                    "checkpoint=НЕСОГЛАСОВАН seq={} (маркер покрытия не соответствует .1)",
                     checkpoint.rotation_sequence
                 ));
                 details.push(if archive_coverage.is_some() {
-                    "archive status=ORPHAN/uncovered".to_string()
+                    "статус archive=СИРОТА/не покрыт".to_string()
                 } else {
-                    "archive status=missing but checkpoint still marks coverage".to_string()
+                    "статус archive=отсутствует, но checkpoint всё ещё помечает покрытие"
+                        .to_string()
                 });
             }
         }
         Ok(None) => {
-            details.push("checkpoint=absent".to_string());
+            details.push("checkpoint=отсутствует".to_string());
             if archive_coverage.is_some() {
                 status = CheckStatus::Warn;
-                details.push("archive status=ORPHAN/uncovered".to_string());
+                details.push("статус archive=СИРОТА/не покрыт".to_string());
             } else {
-                details.push("archive status=absent".to_string());
+                details.push("статус archive=отсутствует".to_string());
             }
         }
         Err(error) => {
             status = CheckStatus::Warn;
-            details.push(format!("checkpoint=PARSE ERROR ({error})"));
+            details.push(format!("checkpoint=ОШИБКА РАЗБОРА ({error})"));
             details.push(if archive_coverage.is_some() {
-                "archive status=ORPHAN/coverage unknown".to_string()
+                "статус archive=СИРОТА/покрытие неизвестно".to_string()
             } else {
-                "archive status=absent".to_string()
+                "статус archive=отсутствует".to_string()
             });
         }
     }
@@ -912,7 +933,9 @@ fn scan_progress_file(path: &Path) -> Result<ProgressFileScan> {
     let size = match std::fs::metadata(path) {
         Ok(metadata) => metadata.len(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
+        Err(error) => {
+            return Err(error).with_context(|| format!("получить статус {}", path.display()))
+        }
     };
     let mut kind_bytes = BTreeMap::new();
     let summary = journal::scan_stream_detailed(path, |event, bytes| {
@@ -939,7 +962,7 @@ fn render_top_kinds(histogram: BTreeMap<String, u64>) -> String {
             .then_with(|| left_kind.cmp(right_kind))
     });
     if values.is_empty() {
-        return "none".to_string();
+        return "нет".to_string();
     }
     values
         .into_iter()
@@ -950,7 +973,7 @@ fn render_top_kinds(histogram: BTreeMap<String, u64>) -> String {
 }
 
 fn format_optional_offset(offset: Option<u64>) -> String {
-    offset.map_or_else(|| "none".to_string(), |offset| offset.to_string())
+    offset.map_or_else(|| "нет".to_string(), |offset| offset.to_string())
 }
 
 fn progress_slugs(paths: &CcteamPaths) -> BTreeSet<String> {
@@ -983,7 +1006,7 @@ fn progress_slugs(paths: &CcteamPaths) -> BTreeSet<String> {
 
 /// Repair every corrupt active/archive progress journal under this home.
 pub fn repair_progress(paths: &CcteamPaths) -> Result<String> {
-    let mut out = String::from("progress repair\n");
+    let mut out = String::from("исправление progress\n");
     let mut repaired = 0_u64;
     for slug in progress_slugs(paths) {
         let active = paths.progress_jsonl(&slug);
@@ -995,7 +1018,7 @@ pub fn repair_progress(paths: &CcteamPaths) -> Result<String> {
             if let Some(report) = progress_bridge::repair_progress_journal(&active, &target)? {
                 repaired = repaired.saturating_add(1);
                 out.push_str(&format!(
-                    "  {slug} {}: kept {}, dropped {}, backup {}\n",
+                    "  {slug} {}: сохранено {}, отброшено {}, резервная копия {}\n",
                     target
                         .file_name()
                         .map(|name| name.to_string_lossy())
@@ -1008,10 +1031,10 @@ pub fn repair_progress(paths: &CcteamPaths) -> Result<String> {
         }
     }
     if repaired == 0 {
-        out.push_str("  no corrupt progress lines found; no journals changed\n");
+        out.push_str("  повреждённых строк progress не найдено; журналы не менялись\n");
     } else {
         out.push_str(
-            "  note: a torn line usually costs 2 records (the truncated record and the next record glued to it)\n",
+            "  примечание: оборванная строка обычно теряет 2 записи (обрезанную и следующую, склеенную с ней)\n",
         );
     }
     out.push('\n');
@@ -1037,9 +1060,9 @@ mod tests {
                 },
                 "daemon",
                 if daemon_healthy {
-                    "running"
+                    "запущен"
                 } else {
-                    "not running"
+                    "не запущен"
                 },
             ))],
             projects: Vec::new(),
@@ -1056,7 +1079,15 @@ mod tests {
         assert!(output
             .lines()
             .rfind(|line| !line.is_empty())
-            .is_some_and(|line| line.starts_with("summary:")));
+            .is_some_and(|line| line.starts_with("сводка:")));
+    }
+
+    #[test]
+    fn renderer_uses_russian_human_headings() {
+        let (output, _) = render_readiness(&report_with_daemon(true), false);
+        assert!(output.starts_with("ccteam doctor — проверка готовности"));
+        assert!(output.contains("сводка:"));
+        assert!(output.contains("запущен"));
     }
 
     #[test]
@@ -1065,7 +1096,7 @@ mod tests {
         assert!(!any_fail);
         assert_eq!(
             output.lines().rfind(|line| !line.is_empty()),
-            Some("daemon not running — start it:  ccteam daemon start")
+            Some("демон не запущен — запустите:  ccteam daemon start")
         );
     }
 
@@ -1084,7 +1115,7 @@ mod tests {
         };
         let (output, any_fail) = render_readiness(&report, false);
         assert!(!any_fail);
-        assert!(output.contains("summary: 1 pass — READY"));
+        assert!(output.contains("сводка: 1 успешно — ГОТОВО"));
         assert!(!output.contains("clean but hidden"));
     }
 }

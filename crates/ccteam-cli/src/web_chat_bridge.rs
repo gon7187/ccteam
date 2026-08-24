@@ -772,9 +772,9 @@ mod tests {
         let mut socket = connect_chat(first.addr).await;
 
         send_text(&mut socket, "new-claude", "/new claude reviewer").await;
-        recv_reply_contains(&mut socket, "created session s1").await;
+        recv_reply_contains(&mut socket, "Создана сессия s1").await;
         send_text(&mut socket, "new-codex", "/new codex api").await;
-        recv_reply_contains(&mut socket, "created session s2").await;
+        recv_reply_contains(&mut socket, "Создана сессия s2").await;
         send_text(&mut socket, "sessions", "/sessions").await;
         let sessions = recv_sessions(&mut socket).await;
         assert!(sessions.iter().any(|item| {
@@ -871,7 +871,7 @@ mod tests {
             &format!("/newproject demo {}", proj_dir.display()),
         )
         .await;
-        recv_reply_contains(&mut socket, "已创建并切换到 demo").await;
+        recv_reply_contains(&mut socket, "✅ Создан и выбран проект demo").await;
 
         assert!(proj_dir.join(".ccteam").join("state.json").exists());
         let state = ccteam_core::ProjectState::load(&CcteamPaths::project_state_in(&proj_dir))
@@ -887,7 +887,7 @@ mod tests {
 
         // Immediately addressable by /cd in the running daemon.
         send_text(&mut socket, "cd-demo", "/cd demo").await;
-        recv_reply_contains(&mut socket, "project set to demo").await;
+        recv_reply_contains(&mut socket, "Выбран проект demo").await;
 
         drop(socket);
         stop_stack(stack).await;
@@ -918,7 +918,7 @@ mod tests {
         // chat-1 (web) creates a session.
         let mut s1 = connect_chat_as(stack.addr, "web-api", "web-api").await;
         send_text(&mut s1, "new", "/new claude reviewer").await;
-        recv_reply_contains(&mut s1, "created session s1").await;
+        recv_reply_contains(&mut s1, "Создана сессия s1").await;
 
         // A SECOND socket for the SAME identity SEES it and can /use it — the
         // flow that matters (one user, two frontends/tabs).
@@ -930,7 +930,7 @@ mod tests {
             "a second socket of the same identity should see its own session: {listed:?}"
         );
         send_text(&mut same, "use", "/use s1").await;
-        recv_reply_contains(&mut same, "using session s1").await;
+        recv_reply_contains(&mut same, "Используется сессия s1").await;
 
         // A DIFFERENT web identity sees NOTHING of it and cannot address it —
         // /use reads as unknown, so the sid's existence leaks nothing either.
@@ -942,7 +942,7 @@ mod tests {
             "another web identity must not see chat-1's session: {other:?}"
         );
         send_text(&mut s2, "use", "/use s1").await;
-        recv_reply_contains(&mut s2, "unknown session for this chat: s1").await;
+        recv_reply_contains(&mut s2, "Сессия s1 недоступна этому чату").await;
 
         drop(s1);
         drop(same);
