@@ -117,7 +117,8 @@ impl Default for ImConfig {
 /// One user-configurable quick-template button.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QuickTemplate {
-    /// Button text presented to the user.
+    /// Button text presented to the user. Leading and trailing whitespace is
+    /// ignored when the label is rendered and matched against inbound text.
     pub label: String,
     /// Prefix inserted before the next plain user message.
     pub prefix: String,

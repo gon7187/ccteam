@@ -1087,6 +1087,9 @@ fn build_rich_send_body(message: &SendMessage, markdown: &str) -> serde_json::Va
     {
         body["reply_parameters"] = serde_json::json!({ "message_id": rt });
     }
+    if let Some(reply_markup) = reply_markup_json(message) {
+        body["reply_markup"] = reply_markup;
+    }
     body
 }
 
@@ -1174,9 +1177,6 @@ impl Channel for TelegramChannel {
         // are not supported on the attachment path (unchanged).
         if !message.attachments.is_empty() {
             return self.send_with_attachments(message).await;
-        }
-        if message.reply_keyboard.is_some() && inline_keyboard_json(message).is_none() {
-            return self.send_classic(message).await;
         }
         // TG-GATE-V2 W1 — rich(markdown+buttons block) → classic HTML +
         // inline_keyboard → plain text. `rich_markdown` absent ⇒ this
@@ -1856,6 +1856,27 @@ mod tests {
         let message = SendMessage::new("hello", "42").with_rich_markdown("hello");
         let body = build_rich_send_body(&message, "hello");
         assert_eq!(body["rich_message"]["markdown"], "hello");
+    }
+
+    #[test]
+    fn rich_send_body_carries_reply_keyboard_and_prefers_inline_buttons() {
+        let reply_keyboard =
+            crate::transport::ReplyKeyboard::Buttons(vec![vec!["🎯 Commander".to_string()]]);
+        let keyboard_only = SendMessage::new("hello", "42")
+            .with_rich_markdown("**hello**")
+            .with_reply_keyboard(reply_keyboard.clone());
+        assert_eq!(
+            build_rich_send_body(&keyboard_only, "**hello**")["reply_markup"],
+            reply_keyboard_json(&reply_keyboard)
+        );
+
+        let with_inline = keyboard_only.with_options(vec![opt("choice:1", "Choose", None)]);
+        assert_eq!(
+            build_rich_send_body(&with_inline, "**hello**")["reply_markup"],
+            serde_json::json!({
+                "inline_keyboard": [[{"text": "Choose", "callback_data": "choice:1"}]]
+            })
+        );
     }
 
     #[test]

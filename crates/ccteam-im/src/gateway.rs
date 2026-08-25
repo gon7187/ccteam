@@ -1610,6 +1610,7 @@ struct RoutingState {
     default_project: String,
     current_project: Vec<SavedGatewayRoute>,
     current_session: Vec<SavedGatewayRoute>,
+    #[serde(default)]
     pending_prefix: Vec<SavedGatewayRoute>,
     /// sids live at last persist; rebuilt from meta.json on next start.
     live_sids: Vec<String>,
@@ -3614,12 +3615,8 @@ impl Gateway {
         if Self::is_gateway_command(text) {
             return Ok(Vec::new());
         }
-        if !text.trim_start().starts_with('/') {
-            if let Some(template) = self
-                .quick_templates()
-                .into_iter()
-                .find(|template| template.label == text.trim())
-            {
+        if Self::channel_supports_buttons(channel) && !text.trim_start().starts_with('/') {
+            if let Some(template) = self.quick_template_for_text(text) {
                 self.pending_prefix.insert(chat.clone(), template.prefix);
                 self.persist_routing()?;
                 return Ok(vec![RichReply::plain(format!(
@@ -3693,9 +3690,13 @@ impl Gateway {
         }
         let payload = if text.trim_start().starts_with('/') {
             text.to_string()
-        } else if let Some(prefix) = self.pending_prefix.remove(&chat) {
-            self.persist_routing()?;
-            format!("{prefix} {text}")
+        } else if Self::channel_supports_buttons(channel) && attachments.is_empty() {
+            if let Some(prefix) = self.pending_prefix.remove(&chat) {
+                self.persist_routing()?;
+                format!("{prefix} {text}")
+            } else {
+                text.to_string()
+            }
         } else {
             text.to_string()
         };
@@ -3742,6 +3743,10 @@ impl Gateway {
         has_selection: bool,
     ) -> bool {
         if has_selection {
+            return false;
+        }
+        let chat = ChatKey::new(channel, chat_id, user_id);
+        if self.is_quick_template_interaction(&chat, text) {
             return false;
         }
         if self.has_current_session(channel, chat_id, user_id) {
@@ -3795,9 +3800,9 @@ impl Gateway {
             && !Self::is_gateway_command(text)
             && crate::router::parse_first_mention(text).is_none();
         let candidate = if candidate_shape {
-            !crate::latency::gateway_lock(&gateway, "im.turn.candidate")
-                .await
-                .has_current_session(channel, chat_id, user_id)
+            let g = crate::latency::gateway_lock(&gateway, "im.turn.candidate").await;
+            !g.is_quick_template_interaction(&chat, text)
+                && !g.has_current_session(channel, chat_id, user_id)
         } else {
             false
         };
@@ -4181,6 +4186,9 @@ impl Gateway {
                 .map(|reply| Some(RichReply::plain(reply))),
             "/projects" => Ok(Some(self.render_projects(chat))),
             "/keys" => {
+                if !Self::channel_supports_buttons(&chat.channel) {
+                    return Ok(Some(RichReply::plain("Telegram only.")));
+                }
                 if parts.next() == Some("off") {
                     self.pending_prefix.remove(chat);
                     self.persist_routing()?;
@@ -4192,9 +4200,15 @@ impl Gateway {
                     Ok(Some(self.render_quick_templates()))
                 }
             }
-            "/help" => Ok(Some(
-                render_help().with_reply_keyboard(self.quick_template_keyboard()),
-            )),
+            "/help" => {
+                let telegram = Self::channel_supports_buttons(&chat.channel);
+                let reply = render_help(telegram);
+                Ok(Some(if telegram {
+                    reply.with_reply_keyboard(self.quick_template_keyboard())
+                } else {
+                    reply
+                }))
+            }
             _ => Ok(None),
         }
     }
@@ -4205,6 +4219,26 @@ impl Gateway {
             .and_then(|config| config.get().ok())
             .map(|config| config.im.quick_templates.clone())
             .unwrap_or_else(|| CcteamConfig::default().im.quick_templates)
+            .into_iter()
+            .map(|mut template| {
+                template.label = template.label.trim().to_string();
+                template
+            })
+            .collect()
+    }
+
+    fn quick_template_for_text(&self, text: &str) -> Option<QuickTemplate> {
+        let text = text.trim();
+        self.quick_templates()
+            .into_iter()
+            .find(|template| template.label == text)
+    }
+
+    fn is_quick_template_interaction(&self, chat: &ChatKey, text: &str) -> bool {
+        Self::channel_supports_buttons(&chat.channel)
+            && !text.trim_start().starts_with('/')
+            && (self.pending_prefix.contains_key(chat)
+                || self.quick_template_for_text(text).is_some())
     }
 
     fn quick_template_keyboard(&self) -> ReplyKeyboard {
@@ -14815,9 +14849,10 @@ fn render_choice_text(prompt: &ChoicePrompt) -> String {
 }
 
 /// Render the `/help` body from [`GATEWAY_COMMANDS`].
-fn render_help() -> RichReply {
+fn render_help(include_quick_templates: bool) -> RichReply {
     let commands = GATEWAY_COMMANDS
         .iter()
+        .filter(|command| include_quick_templates || command.name != "/keys")
         .map(|command| CommandView {
             name: command.name.to_string(),
             arg_hint: command.arg_hint.map(str::to_string),
@@ -15241,7 +15276,52 @@ mod tests {
             .iter()
             .any(|english| spec.description.contains(english))
         }));
-        assert!(render_help().plain.contains("Команды шлюза"));
+        assert!(render_help(true).plain.contains("Команды шлюза"));
+    }
+
+    #[test]
+    fn routing_state_without_pending_prefix_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = crate::routing_state_path_in(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "default_project": "alpha",
+                "current_project": [{
+                    "chat": { "channel": "telegram", "chat_id": "chat-1", "user_id": "alice" },
+                    "value": "alpha",
+                }],
+                "current_session": [{
+                    "chat": { "channel": "telegram", "chat_id": "chat-1", "user_id": "alice" },
+                    "value": "s7",
+                }],
+                "live_sids": ["s7"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut gateway = Gateway::new(Arc::new(FakeAdapter::default()), "beta", tmp.path());
+        gateway.enable_persistence(tmp.path()).unwrap();
+
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        assert_eq!(gateway.default_project, "alpha");
+        assert_eq!(
+            gateway.current_project.get(&chat).map(String::as_str),
+            Some("alpha")
+        );
+        assert_eq!(
+            gateway
+                .current_session
+                .read()
+                .unwrap()
+                .get(&chat)
+                .map(String::as_str),
+            Some("s7")
+        );
+        assert!(gateway.pending_prefix.is_empty());
+        assert_eq!(gateway.restore_pending, vec!["s7"]);
     }
 
     #[tokio::test]
@@ -15313,6 +15393,223 @@ mod tests {
         )
         .unwrap();
         assert!(routing["pending_prefix"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn quick_template_fresh_chat_bypasses_shared_spawn_and_prefixes_next_message() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let gateway = Arc::new(tokio::sync::Mutex::new(Gateway::new(
+            fake.clone(),
+            "alpha",
+            tmp.path(),
+        )));
+        let template = CcteamConfig::default().im.quick_templates.remove(0);
+
+        assert!(
+            !gateway.lock().await.inbound_may_spawn(
+                "telegram",
+                "chat-1",
+                "alice",
+                &template.label,
+                false,
+            ),
+            "a template tap must arm synchronously instead of entering the background spawn path"
+        );
+        let armed = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-1",
+            "alice",
+            "tg-1",
+            &template.label,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            armed,
+            vec![RichReply::plain(format!(
+                "Template {} armed — send the task",
+                template.label
+            ))]
+        );
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 0);
+
+        Gateway::handle_message_shared(
+            gateway,
+            "telegram",
+            "chat-1",
+            "alice",
+            "tg-2",
+            "repair the test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fake.submissions.lock().await[0].1,
+            format!("{} repair the test", template.prefix)
+        );
+    }
+
+    #[tokio::test]
+    async fn quick_templates_are_telegram_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let chat = ChatKey::new("lark", "chat-1", "alice");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway.current_session.write().unwrap().insert(chat, sid);
+        let template = CcteamConfig::default().im.quick_templates.remove(0);
+
+        gateway
+            .handle_message(
+                "lark",
+                "chat-1",
+                "alice",
+                "lark-1",
+                &template.label,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fake.submissions.lock().await[0].1, template.label);
+
+        let keys = gateway
+            .handle_message_rich("lark", "chat-1", "alice", "lark-2", "/keys", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(keys[0].plain, "Telegram only.");
+        assert_eq!(keys[0].reply_keyboard, None);
+
+        let help = gateway
+            .handle_message_rich("lark", "chat-1", "alice", "lark-3", "/help", &[], None)
+            .await
+            .unwrap();
+        assert!(!help[0].plain.contains("/keys"));
+        assert_eq!(help[0].reply_keyboard, None);
+    }
+
+    #[tokio::test]
+    async fn quick_template_prefix_survives_attachment_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .current_session
+            .write()
+            .unwrap()
+            .insert(chat.clone(), sid);
+        let template = CcteamConfig::default().im.quick_templates.remove(0);
+
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-1",
+                &template.label,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-2",
+                "see this",
+                &[img("/tmp/shot.png")],
+                None,
+            )
+            .await
+            .unwrap();
+        let attachment_turn = fake.submissions.lock().await[0].1.clone();
+        assert!(!attachment_turn.contains(&template.prefix));
+        assert!(attachment_turn.contains("image_path=\"/tmp/shot.png\""));
+        assert_eq!(gateway.pending_prefix.get(&chat), Some(&template.prefix));
+
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-3",
+                "repair the test",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.submissions.lock().await[1].1,
+            format!("{} repair the test", template.prefix)
+        );
+    }
+
+    #[tokio::test]
+    async fn quick_template_labels_trim_before_render_and_match() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_root = tmp.path().join("config");
+        let mut config = CcteamConfig::default();
+        config.im.quick_templates = vec![QuickTemplate {
+            label: "  Custom  ".to_string(),
+            prefix: "Custom task:".to_string(),
+        }];
+        ccteam_core::config::save(&config_root, &config).unwrap();
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let config_loader_root = config_root.clone();
+        gateway.config = Some(HotConfig::new(
+            ccteam_core::config::config_path(&config_root),
+            move || ccteam_core::config::load(&config_loader_root),
+        ));
+
+        let rendered = gateway.render_quick_templates();
+        assert_eq!(
+            rendered.reply_keyboard,
+            Some(ReplyKeyboard::Buttons(vec![vec!["Custom".to_string()]]))
+        );
+        let armed = gateway
+            .handle_message_rich(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-1",
+                "  Custom  ",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(armed[0].plain, "Template Custom armed — send the task");
     }
 
     #[tokio::test]
@@ -26323,9 +26620,9 @@ mod tests {
 
         // /help advertises /role.
         assert!(
-            render_help().plain.contains("/role"),
+            render_help(true).plain.contains("/role"),
             "render_help should list /role: {}",
-            render_help().plain
+            render_help(true).plain
         );
     }
 

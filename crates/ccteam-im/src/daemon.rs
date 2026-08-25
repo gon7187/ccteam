@@ -1958,8 +1958,8 @@ async fn queue_and_send_durable_part(
 
 /// Queue every part of a split as its OWN durable `Queued` row, id =
 /// `{id_prefix}-{part_idx}` — before anything is sent. Only the LAST
-/// part keeps `button_rows`/`options` (a tapper acting from a middle
-/// part would be acting on an incomplete reply); `rich_markdown` is
+/// part keeps `button_rows`/`options`/`reply_keyboard` (a tapper acting from a
+/// middle part would be acting on an incomplete reply); `rich_markdown` is
 /// cleared on every part (each part is a plain/HTML classic send, never
 /// itself a Rich Message).
 ///
@@ -1999,6 +1999,7 @@ fn queue_split_parts(
         if part_idx != last_idx {
             part_msg.button_rows.clear();
             part_msg.options.clear();
+            part_msg.reply_keyboard = None;
         }
         let row = DurableOutboundRow {
             ts_ms: now_unix_ms_u64(),
@@ -3606,7 +3607,10 @@ mod tests {
         let message = SendMessage::new("whole", "chat-1")
             .with_rich_markdown("whole (rich)")
             .with_options(options.clone())
-            .with_button_rows(button_rows.clone());
+            .with_button_rows(button_rows.clone())
+            .with_reply_keyboard(crate::transport::ReplyKeyboard::Buttons(vec![vec![
+                "🎯 Commander".to_string(),
+            ]]));
 
         let parts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let queued = queue_split_parts("row-x", "in-x", "telegram", parts, &message).unwrap();
@@ -3620,6 +3624,12 @@ mod tests {
             if idx == 2 {
                 assert_eq!(part_msg.button_rows, button_rows, "last part keeps buttons");
                 assert_eq!(part_msg.options, options, "last part keeps options");
+                assert_eq!(
+                    part_msg.reply_keyboard,
+                    Some(crate::transport::ReplyKeyboard::Buttons(vec![vec![
+                        "🎯 Commander".to_string(),
+                    ]]))
+                );
             } else {
                 assert!(
                     part_msg.button_rows.is_empty(),
@@ -3628,6 +3638,10 @@ mod tests {
                 assert!(
                     part_msg.options.is_empty(),
                     "part {idx} must not carry options"
+                );
+                assert_eq!(
+                    part_msg.reply_keyboard, None,
+                    "part {idx} must not carry the reply keyboard"
                 );
             }
         }
