@@ -1515,6 +1515,7 @@ async fn deliver_gateway_replies(
         Ok(replies) => {
             for (seq, reply) in replies.into_iter().enumerate() {
                 let button_rows = reply.button_rows.clone();
+                let reply_keyboard = reply.reply_keyboard.clone();
                 let mut out = SendMessage::new(reply.plain, msg.reply_target.clone())
                     .in_thread(msg.thread_ts.clone());
                 // TG-GATE-V2 W7a — `rich_markdown` only for a channel that can
@@ -1525,6 +1526,9 @@ async fn deliver_gateway_replies(
                 }
                 if !button_rows.is_empty() {
                     out = out.with_button_rows(button_rows);
+                }
+                if let Some(reply_keyboard) = reply_keyboard {
+                    out = out.with_reply_keyboard(reply_keyboard);
                 }
                 send_gateway_outbound(cid, seq, &msg.channel, channel, out).await;
             }
@@ -2782,6 +2786,7 @@ mod tests {
             markdown: "**status**".into(),
             plain: "status".into(),
             button_rows: Vec::new(),
+            reply_keyboard: None,
         };
         let rich = MockChannel::new().with_name("rich").with_rich_support();
         deliver_gateway_replies(
@@ -2805,6 +2810,7 @@ mod tests {
             markdown: "**status**".into(),
             plain: "status".into(),
             button_rows: Vec::new(),
+            reply_keyboard: None,
         };
         let plain = MockChannel::new().with_name("plain");
         deliver_gateway_replies(

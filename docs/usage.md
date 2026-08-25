@@ -258,6 +258,17 @@ After connecting IM, you can drive sessions, send files, and approve tools from 
 
 Telegram replies render a Markdown subset (bold/italic/code/fences/links/quotes/lists) as Telegram HTML and automatically fall back to plain text if Telegram rejects the markup.
 
+Telegram also has a persistent quick-template keyboard. Send `/keys` to show the configured templates, tap one to arm its prefix for the next plain message, or send `/keys off` to remove the keyboard and discard an armed prefix. The default templates are Commander, Driver+advisor, Cross review, Bake-off, Triangulate, and Pyramid. Customize them in `~/.ccteam/config.yaml`; changes are picked up without restarting the daemon:
+
+```yaml
+im:
+  quick_templates:
+    - label: "🎯 Commander"
+      prefix: "Plan the task and delegate it. Task:"
+    - label: "🛠 Focus"
+      prefix: "Implement and verify the task directly. Task:"
+```
+
 Send these commands in chat. The gateway handles them directly. Use `/help` anytime; Telegram also shows command candidates when you type `/`.
 
 ```text
@@ -294,6 +305,7 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
                            unknown rather than 0%, and survives daemon restarts.
                            A session you have just sent a message to reads as working, not
                            stuck: silence is measured within the current turn.
+/keys [off]                Show the persistent quick-template keyboard; `off` removes it.
 /help                      List gateway commands.
 
 # Delayed send (one-shot user turns)

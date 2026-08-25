@@ -23,7 +23,7 @@ use crate::telegram_html::render_markdown;
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, ButtonStyle, Channel,
     ChannelAttachment, ChannelMessage, ChoiceReply, CommandSpec, MessageOption, OutboundFile,
-    OutboundFileKind, RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
+    OutboundFileKind, RejectedSenderNotifier, RejectedSenderProbe, ReplyKeyboard, SendMessage,
 };
 
 /// `getUpdates` long-poll seconds.
@@ -583,7 +583,7 @@ impl TelegramChannel {
             body["parse_mode"] = serde_json::json!("HTML");
         }
         if include_buttons {
-            if let Some(keyboard) = inline_keyboard_json(message) {
+            if let Some(keyboard) = reply_markup_json(message) {
                 body["reply_markup"] = keyboard;
             }
         }
@@ -1137,6 +1137,25 @@ fn inline_keyboard_json(message: &SendMessage) -> Option<serde_json::Value> {
     inline_keyboard_json_from_rows(&combined_button_rows(message))
 }
 
+fn reply_keyboard_json(reply_keyboard: &ReplyKeyboard) -> serde_json::Value {
+    match reply_keyboard {
+        ReplyKeyboard::Buttons(rows) => serde_json::json!({
+            "keyboard": rows
+                .iter()
+                .map(|row| row.iter().map(|text| serde_json::json!({ "text": text })).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            "resize_keyboard": true,
+            "is_persistent": true,
+        }),
+        ReplyKeyboard::Remove => serde_json::json!({ "remove_keyboard": true }),
+    }
+}
+
+fn reply_markup_json(message: &SendMessage) -> Option<serde_json::Value> {
+    inline_keyboard_json(message)
+        .or_else(|| message.reply_keyboard.as_ref().map(reply_keyboard_json))
+}
+
 #[async_trait]
 impl Channel for TelegramChannel {
     fn name(&self) -> &str {
@@ -1155,6 +1174,9 @@ impl Channel for TelegramChannel {
         // are not supported on the attachment path (unchanged).
         if !message.attachments.is_empty() {
             return self.send_with_attachments(message).await;
+        }
+        if message.reply_keyboard.is_some() && inline_keyboard_json(message).is_none() {
+            return self.send_classic(message).await;
         }
         // TG-GATE-V2 W1 — rich(markdown+buttons block) → classic HTML +
         // inline_keyboard → plain text. `rich_markdown` absent ⇒ this
@@ -1876,6 +1898,38 @@ mod tests {
     fn inline_keyboard_json_none_when_nothing_to_render() {
         let message = SendMessage::new("hi", "42");
         assert!(inline_keyboard_json(&message).is_none());
+    }
+
+    #[test]
+    fn reply_keyboard_json_renders_persistent_buttons_and_removal() {
+        assert_eq!(
+            reply_keyboard_json(&crate::transport::ReplyKeyboard::Buttons(vec![vec![
+                "🎯 Commander".to_string(),
+                "🏗 Pyramid".to_string(),
+            ]])),
+            serde_json::json!({
+                "keyboard": [[{"text": "🎯 Commander"}, {"text": "🏗 Pyramid"}]],
+                "resize_keyboard": true,
+                "is_persistent": true,
+            })
+        );
+        assert_eq!(
+            reply_keyboard_json(&crate::transport::ReplyKeyboard::Remove),
+            serde_json::json!({"remove_keyboard": true})
+        );
+    }
+
+    #[test]
+    fn inline_keyboard_wins_over_reply_keyboard() {
+        let message = SendMessage::new("pick", "42")
+            .with_options(vec![opt("choice:1", "Choose", None)])
+            .with_reply_keyboard(crate::transport::ReplyKeyboard::Remove);
+        assert_eq!(
+            reply_markup_json(&message),
+            Some(serde_json::json!({
+                "inline_keyboard": [[{"text": "Choose", "callback_data": "choice:1"}]]
+            }))
+        );
     }
 
     #[test]

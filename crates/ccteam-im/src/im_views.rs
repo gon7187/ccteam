@@ -1,6 +1,6 @@
 //! Pure rich-message renderers for the IM gateway views.
 
-use crate::transport::{ButtonStyle, MessageOption};
+use crate::transport::{ButtonStyle, MessageOption, ReplyKeyboard};
 
 /// A rendered response with Telegram-rich and universal plain representations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,6 +11,8 @@ pub struct RichReply {
     pub plain: String,
     /// Telegram button rows, with at most eight buttons per row.
     pub button_rows: Vec<Vec<MessageOption>>,
+    /// Persistent Telegram reply keyboard request.
+    pub reply_keyboard: Option<ReplyKeyboard>,
 }
 
 impl RichReply {
@@ -21,7 +23,14 @@ impl RichReply {
             markdown: plain.clone(),
             plain,
             button_rows: Vec::new(),
+            reply_keyboard: None,
         }
+    }
+
+    /// Attach a persistent Telegram reply keyboard request.
+    pub fn with_reply_keyboard(mut self, reply_keyboard: ReplyKeyboard) -> Self {
+        self.reply_keyboard = Some(reply_keyboard);
+        self
     }
 }
 
@@ -205,6 +214,7 @@ pub fn render_status(view: &StatusView) -> RichReply {
         markdown,
         plain,
         button_rows,
+        reply_keyboard: None,
     }
 }
 
@@ -286,6 +296,7 @@ pub fn render_sessions(view: &SessionsView) -> RichReply {
         markdown,
         plain,
         button_rows,
+        reply_keyboard: None,
     }
 }
 
@@ -318,6 +329,7 @@ pub fn render_projects(view: &ProjectsView) -> RichReply {
         markdown,
         plain,
         button_rows: buttons.chunks(8).map(|row| row.to_vec()).collect(),
+        reply_keyboard: None,
     }
 }
 
@@ -332,7 +344,7 @@ pub fn render_help(commands: &[CommandView]) -> RichReply {
             "Управление",
             &["/role", "/stop", "/interrupt", "/rename", "/newproject"],
         ),
-        ("Прочее", &["/mcp", "/inbox", "/help"]),
+        ("Прочее", &["/mcp", "/inbox", "/keys", "/help"]),
     ];
     let mut markdown = String::from("**Команды шлюза**");
     let mut plain = String::from("Команды шлюза");
@@ -362,6 +374,7 @@ pub fn render_help(commands: &[CommandView]) -> RichReply {
         markdown,
         plain,
         button_rows: Vec::new(),
+        reply_keyboard: None,
     }
 }
 

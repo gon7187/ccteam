@@ -92,6 +92,65 @@ pub struct CcteamConfig {
     /// enforces on every agent-initiated (Ambient) spawn/dispatch.
     #[serde(default, skip_serializing_if = "DelegationConfig::is_default")]
     pub delegation: DelegationConfig,
+
+    /// IM-facing settings, including Telegram quick-template buttons.
+    #[serde(default)]
+    pub im: ImConfig,
+}
+
+/// Instant-message settings shared by all configured channels.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImConfig {
+    /// Persistent reply-keyboard templates exposed by Telegram.
+    #[serde(default = "default_quick_templates")]
+    pub quick_templates: Vec<QuickTemplate>,
+}
+
+impl Default for ImConfig {
+    fn default() -> Self {
+        Self {
+            quick_templates: default_quick_templates(),
+        }
+    }
+}
+
+/// One user-configurable quick-template button.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuickTemplate {
+    /// Button text presented to the user.
+    pub label: String,
+    /// Prefix inserted before the next plain user message.
+    pub prefix: String,
+}
+
+/// Built-in quick-template buttons for a fresh configuration.
+pub fn default_quick_templates() -> Vec<QuickTemplate> {
+    vec![
+        QuickTemplate {
+            label: "🎯 Commander".to_string(),
+            prefix: "Check status for the vendors available on this project first, then plan and decompose the task below and delegate via session_spawn / session_dispatch: development to codex, community/ecosystem research to grok. You own planning, acceptance, and the summary — completion notifications flow back to you. Task:".to_string(),
+        },
+        QuickTemplate {
+            label: "🚗 Driver+advisor".to_string(),
+            prefix: "You are the driver: push the task below forward directly. When you get stuck or face an uncertain decision, session_spawn a claude advisor session on this same project, brief it with the context, then execute its advice yourself. Task:".to_string(),
+        },
+        QuickTemplate {
+            label: "🔁 Cross review".to_string(),
+            prefix: "Build + cross-review: hand the requirement below to a codex session (small steps, tests stay green); when it finishes, pass the diff to a session on a different vendor for an independent review (correctness / security / regression risk). Disagreements come back to you to arbitrate; have the builder fix major findings and re-verify, then give me the change summary and the review verdict. Requirement:".to_string(),
+        },
+        QuickTemplate {
+            label: "⚔️ Bake-off".to_string(),
+            prefix: "Send the hard problem below to 2-3 fresh sessions on different vendors to solve independently (no peeking). When all finish, compare the approaches and evidence, merge the best into a final answer, and note the trade-offs. Problem:".to_string(),
+        },
+        QuickTemplate {
+            label: "🔺 Triangulate".to_string(),
+            prefix: "Triangulate the topic below: session_spawn grok to mine X / real-time chatter, claude for a deep web synthesis, and codex to verify against the source code. Cross-check the three tracks and merge them into one sourced conclusion. Topic:".to_string(),
+        },
+        QuickTemplate {
+            label: "🏗 Pyramid".to_string(),
+            prefix: "Below is a batch of mechanical tasks (bulk renames / formatting cleanup / test triage). session_spawn cheap vendors (kimi / opencode) to grind through them item by item; escalate failures and judgment calls to a stronger model, and keep a running checklist of progress. Task list:".to_string(),
+        },
+    ]
 }
 
 /// Daemon runtime sizing. Every field defaults so existing config files remain
@@ -237,6 +296,7 @@ impl Default for CcteamConfig {
             claude_jobs_retention_days: default_claude_jobs_retention_days(),
             sessions: SessionsConfig::default(),
             delegation: DelegationConfig::default(),
+            im: ImConfig::default(),
         }
     }
 }
@@ -455,6 +515,7 @@ mod tests {
             claude_jobs_retention_days: default_claude_jobs_retention_days(),
             sessions: SessionsConfig::default(),
             delegation: DelegationConfig::default(),
+            im: ImConfig::default(),
         };
         save(tmp.path(), &cfg).unwrap();
         let loaded = load(tmp.path()).unwrap();
@@ -550,6 +611,34 @@ mod tests {
         assert_eq!(cfg.delegation.max_depth, 2);
         assert_eq!(cfg.delegation.max_children, 10);
         assert_eq!(cfg.delegation.max_delegated, 50);
+    }
+
+    #[test]
+    fn default_im_quick_templates_include_six_templates() {
+        let templates = &CcteamConfig::default().im.quick_templates;
+        assert_eq!(templates.len(), 6);
+        assert_eq!(templates[0].label, "🎯 Commander");
+        assert!(templates[0].prefix.ends_with("Task:"));
+        assert_eq!(templates[5].label, "🏗 Pyramid");
+    }
+
+    #[test]
+    fn im_quick_templates_yaml_override_parses() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            config_path(tmp.path()),
+            "im:\n  quick_templates:\n    - label: Custom\n      prefix: 'Do this:'\n",
+        )
+        .unwrap();
+
+        let cfg = load(tmp.path()).unwrap();
+        assert_eq!(
+            cfg.im.quick_templates,
+            vec![QuickTemplate {
+                label: "Custom".to_string(),
+                prefix: "Do this:".to_string(),
+            }]
+        );
     }
 
     #[test]

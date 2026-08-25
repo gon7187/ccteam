@@ -489,6 +489,15 @@ pub struct MessageOption {
     pub style: Option<ButtonStyle>,
 }
 
+/// A Telegram reply keyboard request. Other channels ignore it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReplyKeyboard {
+    /// Persistent rows of plain-text buttons.
+    Buttons(Vec<Vec<String>>),
+    /// Remove the current reply keyboard.
+    Remove,
+}
+
 /// An inbound option click carried on a [`ChannelMessage`] (v0.8.5 D3).
 /// `data` echoes the [`MessageOption::data`] the user clicked; the gateway
 /// splits it on the first `:` into `(token, idx)` and resolves `idx` back
@@ -537,6 +546,9 @@ pub struct SendMessage {
     /// numbered text list the same way `options` already does today.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub button_rows: Vec<Vec<MessageOption>>,
+    /// Telegram reply keyboard request; unsupported channels ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_keyboard: Option<ReplyKeyboard>,
 }
 
 impl SendMessage {
@@ -551,6 +563,7 @@ impl SendMessage {
             options: Vec::new(),
             rich_markdown: None,
             button_rows: Vec::new(),
+            reply_keyboard: None,
         }
     }
 
@@ -581,6 +594,12 @@ impl SendMessage {
     /// Builder-style: attach button rows (TG-GATE-V2 W1).
     pub fn with_button_rows(mut self, button_rows: Vec<Vec<MessageOption>>) -> Self {
         self.button_rows = button_rows;
+        self
+    }
+
+    /// Builder-style: attach a Telegram reply keyboard request.
+    pub fn with_reply_keyboard(mut self, reply_keyboard: ReplyKeyboard) -> Self {
+        self.reply_keyboard = Some(reply_keyboard);
         self
     }
 }
