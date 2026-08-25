@@ -3624,7 +3624,7 @@ impl Gateway {
                 self.pending_prefix.insert(chat.clone(), template.prefix);
                 self.persist_routing()?;
                 return Ok(vec![RichReply::plain(format!(
-                    "Template {} armed — send the task\n{preview}",
+                    "Шаблон {} взведён — отправь задачу\n{preview}",
                     template.label,
                 ))]);
             }
@@ -4185,13 +4185,13 @@ impl Gateway {
             "/projects" => Ok(Some(self.render_projects(chat))),
             "/keys" => {
                 if !Self::channel_supports_buttons(&chat.channel) {
-                    return Ok(Some(RichReply::plain("Telegram only.")));
+                    return Ok(Some(RichReply::plain("Только для Telegram.")));
                 }
                 if parts.next() == Some("off") {
                     self.pending_prefix.remove(chat);
                     self.persist_routing()?;
                     Ok(Some(
-                        RichReply::plain("Quick template keyboard removed.")
+                        RichReply::plain("Клавиатура быстрых шаблонов убрана.")
                             .with_reply_keyboard(ReplyKeyboard::Remove),
                     ))
                 } else {
@@ -4272,11 +4272,11 @@ impl Gateway {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        RichReply::plain(format!("Quick templates:\n{list}")).with_reply_keyboard(
+        RichReply::plain(format!("Быстрые шаблоны:\n{list}")).with_reply_keyboard(
             ReplyKeyboard::Buttons(
                 templates
-                    .into_iter()
-                    .map(|template| vec![template.label])
+                    .chunks(2)
+                    .map(|row| row.iter().map(|template| template.label.clone()).collect())
                     .collect(),
             ),
         )
@@ -15409,8 +15409,9 @@ mod tests {
         assert_eq!(
             armed,
             vec![format!(
-                "Template {} armed — send the task\nCheck status for the vendors available on this project first, then plan and deco…",
-                template.label
+                "Шаблон {} взведён — отправь задачу\n{}",
+                template.label,
+                quick_template_preview(&template.prefix)
             )]
         );
         assert!(fake.submissions.lock().await.is_empty());
@@ -15481,7 +15482,7 @@ mod tests {
         assert_eq!(
             armed,
             vec![RichReply::plain(format!(
-                "Template {} armed — send the task\n{}",
+                "Шаблон {} взведён — отправь задачу\n{}",
                 template.label,
                 quick_template_preview(&template.prefix),
             ))]
@@ -15556,7 +15557,7 @@ mod tests {
             .handle_message_rich("lark", "chat-1", "alice", "lark-2", "/keys", &[], None)
             .await
             .unwrap();
-        assert_eq!(keys[0].plain, "Telegram only.");
+        assert_eq!(keys[0].plain, "Только для Telegram.");
         assert_eq!(keys[0].reply_keyboard, None);
 
         let help = gateway
@@ -15724,7 +15725,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             armed[0].plain,
-            "Template Custom armed — send the task\nCustom task:"
+            "Шаблон Custom взведён — отправь задачу\nCustom task:"
         );
     }
 
@@ -15780,7 +15781,7 @@ mod tests {
 
         let reply = gateway.render_quick_templates();
         assert!(reply.plain.contains(
-            "• 🎯 Commander\n  Check status for the vendors available on this project first, then plan and deco…"
+            "• 🎯 Командир\n  Сначала проверь доступных в этом проекте провайдеров, затем спланируй и разложи …"
         ));
     }
 

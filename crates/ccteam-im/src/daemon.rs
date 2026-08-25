@@ -3610,7 +3610,7 @@ mod tests {
             .with_options(options.clone())
             .with_button_rows(button_rows.clone())
             .with_reply_keyboard(crate::transport::ReplyKeyboard::Buttons(vec![vec![
-                "🎯 Commander".to_string(),
+                "🎯 Командир".to_string(),
             ]]));
 
         let parts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
@@ -3628,7 +3628,7 @@ mod tests {
                 assert_eq!(
                     part_msg.reply_keyboard,
                     Some(crate::transport::ReplyKeyboard::Buttons(vec![vec![
-                        "🎯 Commander".to_string(),
+                        "🎯 Командир".to_string(),
                     ]]))
                 );
             } else {

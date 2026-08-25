@@ -93,15 +93,15 @@ pub struct CcteamConfig {
     #[serde(default, skip_serializing_if = "DelegationConfig::is_default")]
     pub delegation: DelegationConfig,
 
-    /// IM-facing settings, including Telegram quick-template buttons.
+    /// Настройки обмена сообщениями, включая кнопки быстрых шаблонов Telegram.
     #[serde(default)]
     pub im: ImConfig,
 }
 
-/// Instant-message settings shared by all configured channels.
+/// Настройки обмена сообщениями, общие для всех настроенных каналов.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImConfig {
-    /// Persistent reply-keyboard templates exposed by Telegram.
+    /// Постоянные шаблоны клавиатуры ответов, доступные в Telegram.
     #[serde(default = "default_quick_templates")]
     pub quick_templates: Vec<QuickTemplate>,
 }
@@ -114,42 +114,42 @@ impl Default for ImConfig {
     }
 }
 
-/// One user-configurable quick-template button.
+/// Одна настраиваемая пользователем кнопка быстрого шаблона.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QuickTemplate {
-    /// Button text presented to the user. Leading and trailing whitespace is
-    /// ignored when the label is rendered and matched against inbound text.
+    /// Текст кнопки для пользователя. Начальные и конечные пробелы игнорируются
+    /// при отображении и сопоставлении с входящим текстом.
     pub label: String,
-    /// Prefix inserted before the next plain user message.
+    /// Префикс, добавляемый перед следующим обычным сообщением пользователя.
     pub prefix: String,
 }
 
-/// Built-in quick-template buttons for a fresh configuration.
+/// Встроенные кнопки быстрых шаблонов для новой конфигурации.
 pub fn default_quick_templates() -> Vec<QuickTemplate> {
     vec![
         QuickTemplate {
-            label: "🎯 Commander".to_string(),
-            prefix: "Check status for the vendors available on this project first, then plan and decompose the task below and delegate via session_spawn / session_dispatch: development to codex, community/ecosystem research to grok. You own planning, acceptance, and the summary — completion notifications flow back to you. Task:".to_string(),
+            label: "🎯 Командир".to_string(),
+            prefix: "Сначала проверь доступных в этом проекте провайдеров, затем спланируй и разложи задачу ниже и делегируй через session_spawn / session_dispatch: разработку — codex, исследование сообщества и экосистемы — grok. Ты отвечаешь за планирование, приёмку и итог; уведомления о завершении возвращаются тебе. Задача:".to_string(),
         },
         QuickTemplate {
-            label: "🚗 Driver+advisor".to_string(),
-            prefix: "You are the driver: push the task below forward directly. When you get stuck or face an uncertain decision, session_spawn a claude advisor session on this same project, brief it with the context, then execute its advice yourself. Task:".to_string(),
+            label: "🚗 Водитель+советник".to_string(),
+            prefix: "Ты ведёшь задачу сам: двигай её вперёд напрямую. Если застрял или столкнулся с неопределённым решением, запусти через session_spawn сессию советника claude в этом же проекте, передай ей контекст, а затем сам выполни её рекомендации. Задача:".to_string(),
         },
         QuickTemplate {
-            label: "🔁 Cross review".to_string(),
-            prefix: "Build + cross-review: hand the requirement below to a codex session (small steps, tests stay green); when it finishes, pass the diff to a session on a different vendor for an independent review (correctness / security / regression risk). Disagreements come back to you to arbitrate; have the builder fix major findings and re-verify, then give me the change summary and the review verdict. Requirement:".to_string(),
+            label: "🔁 Кросс-ревью".to_string(),
+            prefix: "Собери решение и проведи кросс-ревью: передай требование ниже сессии codex (небольшие шаги, тесты не должны падать); после завершения передай diff сессии другого провайдера на независимую проверку (корректность / безопасность / риск регрессий). Спорные места оставь себе на арбитраж; попроси автора исправить серьёзные замечания и повторно проверить результат, затем сообщи сводку изменений и вердикт ревью. Требование:".to_string(),
         },
         QuickTemplate {
-            label: "⚔️ Bake-off".to_string(),
-            prefix: "Send the hard problem below to 2-3 fresh sessions on different vendors to solve independently (no peeking). When all finish, compare the approaches and evidence, merge the best into a final answer, and note the trade-offs. Problem:".to_string(),
+            label: "⚔️ Батл".to_string(),
+            prefix: "Отправь сложную задачу ниже 2–3 свежим сессиям разных провайдеров, чтобы они независимо решили её (не подглядывая). Когда все закончат, сравни подходы и подтверждения, собери лучший итоговый ответ и укажи компромиссы. Проблема:".to_string(),
         },
         QuickTemplate {
-            label: "🔺 Triangulate".to_string(),
-            prefix: "Triangulate the topic below: session_spawn grok to mine X / real-time chatter, claude for a deep web synthesis, and codex to verify against the source code. Cross-check the three tracks and merge them into one sourced conclusion. Topic:".to_string(),
+            label: "🔺 Триангуляция".to_string(),
+            prefix: "Проведи триангуляцию темы ниже: session_spawn для grok — поиск по X и актуальным обсуждениям, claude — глубокий веб-анализ, codex — проверка по исходному коду. Сопоставь три направления и объедини их в один вывод с источниками. Тема:".to_string(),
         },
         QuickTemplate {
-            label: "🏗 Pyramid".to_string(),
-            prefix: "Below is a batch of mechanical tasks (bulk renames / formatting cleanup / test triage). session_spawn cheap vendors (kimi / opencode) to grind through them item by item; escalate failures and judgment calls to a stronger model, and keep a running checklist of progress. Task list:".to_string(),
+            label: "🏗 Пирамида".to_string(),
+            prefix: "Ниже — набор механических задач (массовые переименования / уборка форматирования / разбор тестов). Через session_spawn поручи недорогим провайдерам (kimi / opencode) пройти их по одной; ошибки и решения, требующие суждения, эскалируй более сильной модели, а прогресс отмечай в общем чек-листе. Список задач:".to_string(),
         },
     ]
 }
@@ -618,9 +618,9 @@ mod tests {
     fn default_im_quick_templates_include_six_templates() {
         let templates = &CcteamConfig::default().im.quick_templates;
         assert_eq!(templates.len(), 6);
-        assert_eq!(templates[0].label, "🎯 Commander");
-        assert!(templates[0].prefix.ends_with("Task:"));
-        assert_eq!(templates[5].label, "🏗 Pyramid");
+        assert_eq!(templates[0].label, "🎯 Командир");
+        assert!(templates[0].prefix.ends_with("Задача:"));
+        assert_eq!(templates[5].label, "🏗 Пирамида");
     }
 
     #[test]
