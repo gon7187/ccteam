@@ -19,11 +19,11 @@ use ccteam_harness::execution::session_body::{self, BodyProbe, SessionBody};
 use ccteam_harness::{
     apply_title, atomic_write_durable, chat_session_name, discover_external_claude_sessions,
     format_tokens, list_session_metas, parse_chat_session_name, truncate_title, AccountUsage,
-    AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection, DetachOutcome, Directive,
-    DirectiveOutcome, EventAttachment, ExternalClaudeSession, HarnessAdapter, HarnessError,
-    PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
-    SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource,
-    TitleSync, TurnDisposition, TurnInput, TurnRouting, UnobservedTurnCtx,
+    AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, ChoiceSelection, DetachOutcome,
+    Directive, DirectiveOutcome, EventAttachment, ExternalClaudeSession, HarnessAdapter,
+    HarnessError, PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin,
+    SessionProtocol, SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails,
+    TitleSource, TitleSync, TurnDisposition, TurnInput, TurnRouting, UnobservedTurnCtx,
 };
 #[cfg(test)]
 use ccteam_harness::{read_session_meta, write_session_meta};
@@ -147,21 +147,6 @@ fn classify_detached_termination(result: Result<bool>) -> Result<()> {
         Ok(false) => Err(anyhow!("процесс не завершился")),
         Err(error) => Err(error),
     }
-}
-
-fn bulk_stop_options(scope: &str, count: usize) -> Vec<MessageOption> {
-    vec![
-        MessageOption {
-            data: format!("nav:stop:{scope}"),
-            label: format!("Остановить {count}"),
-            id: format!("stop-{scope}"),
-        },
-        MessageOption {
-            data: "nav:stop:cancel".to_string(),
-            label: "Отмена".to_string(),
-            id: "stop-cancel".to_string(),
-        },
-    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3846,19 +3831,59 @@ impl Gateway {
                 })?;
                 let scope = target.to_ascii_lowercase();
                 if matches!(scope.as_str(), "all" | "project") {
-                    let sids = match self.bulk_stop_candidates(chat, &scope) {
-                        Ok(sids) => sids,
+                    let (sids, project) = match self.bulk_stop_candidates(chat, &scope) {
+                        Ok(snapshot) => snapshot,
                         Err(error) => return Ok(Some(error.to_string())),
                     };
                     if sids.is_empty() {
                         return Ok(Some("Нет доступных сессий для остановки".to_string()));
                     }
                     if Self::channel_supports_buttons(&chat.channel) {
-                        self.emit_list_options(
-                            chat,
-                            format_bulk_stop_preview(&sids),
-                            bulk_stop_options(&scope, sids.len()),
+                        let nanos = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_nanos())
+                            .unwrap_or(0);
+                        let token = format!("b{:x}", (nanos as u64) & 0xff_ffff_ffff);
+                        let prompt = ChoicePrompt {
+                            token: token.clone(),
+                            title: format_bulk_stop_preview(&sids),
+                            options: vec![
+                                ChoiceOption {
+                                    id: format!("stop-{scope}"),
+                                    label: format!("Остановить {}", sids.len()),
+                                },
+                                ChoiceOption {
+                                    id: "stop-cancel".to_string(),
+                                    label: "Отмена".to_string(),
+                                },
+                            ],
+                            multi: false,
+                        };
+                        self.pending.lock().await.register(
+                            token.clone(),
+                            prompt.clone(),
+                            InteractionOrigin::BulkStop {
+                                channel: chat.channel.clone(),
+                                chat_id: chat.chat_id.clone(),
+                                user_id: chat.user_id.clone(),
+                                scope,
+                                project: project.clone(),
+                                snapshot: sids.iter().cloned().collect(),
+                            },
+                            Instant::now() + gateway_pending_ttl(),
                         );
+                        self.emit_user_signal(GatewayEvent {
+                            id: format!("gateway-choice-bulk-{token}"),
+                            channel: chat.channel.clone(),
+                            chat_id: chat.chat_id.clone(),
+                            thread_ts: None,
+                            content: prompt.title.clone(),
+                            kind: GatewayEventKind::Answer,
+                            attachments: Vec::new(),
+                            options: to_message_options(&prompt),
+                            sid: None,
+                            slug: project,
+                        });
                         return Ok(None);
                     }
                     let (stopped, failures) = self.stop_sessions_bulk(&sids).await;
@@ -4216,29 +4241,11 @@ impl Gateway {
         Ok(format!("Используется сессия {sid}"))
     }
 
-    /// Resolve a `nav:` button tap (`cd:<slug>` / `use:<sid>` / `stop:<scope>`)
-    /// by delegating to the same command logic. The payload is self-describing,
-    /// so no pending-registry entry is consulted.
+    /// Resolve a self-describing project/session switch button. Stop buttons
+    /// use the token-keyed pending registry and never enter this path.
     async fn resolve_nav_selection(&mut self, chat: &ChatKey, nav: &str) -> Result<Vec<String>> {
-        if nav == "stop:cancel" {
-            return Ok(vec!["Отменено".to_string()]);
-        }
-        if let Some(scope) = nav.strip_prefix("stop:") {
-            if matches!(scope, "all" | "project") {
-                let sids = match self.bulk_stop_candidates(chat, scope) {
-                    Ok(sids) => sids,
-                    Err(error) => return Ok(vec![error.to_string()]),
-                };
-                if sids.is_empty() {
-                    return Ok(vec!["Нет доступных сессий для остановки".to_string()]);
-                }
-                // Recompute at tap time: a stale preview is never trusted; a
-                // session born since the preview is included, and a dead one
-                // simply drops out of this fresh ACL-filtered set. No nonce is
-                // needed because ACL is re-checked for this chat at tap time.
-                let (stopped, failures) = self.stop_sessions_bulk(&sids).await;
-                return Ok(vec![format_bulk_stop_result(&stopped, &failures)]);
-            }
+        if nav.starts_with("stop:") {
+            return Ok(vec!["Этот выбор больше недоступен".to_string()]);
         }
         if let Some(slug) = nav.strip_prefix("cd:") {
             let mut reply = self.change_project(chat, slug)?;
@@ -8235,7 +8242,7 @@ impl Gateway {
     /// The callback `data` (`"{token}:{idx}"`) carries the token + positional
     /// index; the real option id is reverse-resolved from the taken prompt and
     /// never leaves the gateway.
-    async fn resolve_selection(&self, chat: &ChatKey, data: &str) -> Result<Vec<String>> {
+    async fn resolve_selection(&mut self, chat: &ChatKey, data: &str) -> Result<Vec<String>> {
         let Some((token, idx)) = split_callback(data) else {
             return Ok(vec!["Некорректный выбор".to_string()]);
         };
@@ -8260,6 +8267,27 @@ impl Gateway {
             ids: vec![opt.id.clone()],
             free_text: None,
         };
+        if let InteractionOrigin::BulkStop {
+            channel,
+            chat_id,
+            user_id,
+            scope: _,
+            project,
+            snapshot,
+        } = &p.origin
+        {
+            let snapshot: BTreeSet<String> = snapshot.iter().cloned().collect();
+            if chat.channel != *channel || chat.chat_id != *chat_id || chat.user_id != *user_id {
+                return Ok(vec!["Этот выбор больше недоступен".to_string()]);
+            }
+            let bulk_chat = ChatKey::new(channel, chat_id, user_id);
+            if selection.ids.first().map(String::as_str) == Some("stop-cancel") {
+                return Ok(vec!["Отменено".to_string()]);
+            }
+            return Ok(self
+                .stop_bulk_snapshot(&bulk_chat, project.as_deref(), &snapshot)
+                .await);
+        }
         self.apply_pending(chat, p, selection).await
     }
 
@@ -8509,6 +8537,9 @@ impl Gateway {
                 let _ = reply.send(selection);
                 Ok(Vec::new())
             }
+            InteractionOrigin::BulkStop { .. } => Err(anyhow!(
+                "Подтверждение остановки нельзя разрешить из веб-интерфейса"
+            )),
         }
     }
 
@@ -12759,26 +12790,43 @@ impl Gateway {
         Ok(())
     }
 
-    fn bulk_stop_candidates(&self, chat: &ChatKey, scope: &str) -> Result<BTreeSet<String>> {
+    fn bulk_stop_candidates(
+        &self,
+        chat: &ChatKey,
+        scope: &str,
+    ) -> Result<(BTreeSet<String>, Option<String>)> {
         let project = if scope == "project" {
             Some(self.require_current_project(chat)?)
         } else {
             None
         };
-        // The predicate is identical to single-sid `/stop`; capture `project`
-        // before the loop so route mutations cannot change the filter halfway.
-        let mut memo = ProjectPrincipalMemo::new();
         let mut candidates: BTreeSet<String> = self.sessions.keys().cloned().collect();
         candidates.extend(self.detached.keys().cloned());
+        Ok((
+            self.bulk_stop_visible_snapshot(chat, project.as_deref(), &candidates),
+            project,
+        ))
+    }
+
+    /// Re-run the single-sid ACL/aliveness predicate only over a captured set.
+    /// A confirmation is a snapshot: later sessions are never admitted, while
+    /// sessions that disappeared or became invisible are dropped at tap time.
+    fn bulk_stop_visible_snapshot(
+        &self,
+        chat: &ChatKey,
+        project: Option<&str>,
+        candidates: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let mut memo = ProjectPrincipalMemo::new();
         let mut sids = BTreeSet::new();
         for sid in candidates {
-            let (accessible, session_project) = if let Some(session) = self.sessions.get(&sid) {
+            let (accessible, session_project) = if let Some(session) = self.sessions.get(sid) {
                 (
                     self.chat_can_access_with(chat, session, &mut memo),
                     session.project.clone(),
                 )
-            } else if self.is_session_detached(&sid) {
-                let Ok((slug, _cwd, meta)) = self.find_meta_for_sid(&sid) else {
+            } else if self.is_session_detached(sid) {
+                let Ok((slug, _cwd, meta)) = self.find_meta_for_sid(sid) else {
                     continue;
                 };
                 (
@@ -12788,15 +12836,37 @@ impl Gateway {
             } else {
                 continue;
             };
-            if accessible
-                && project
-                    .as_deref()
-                    .is_none_or(|project| project == session_project)
-            {
-                sids.insert(sid);
+            if accessible && project.is_none_or(|project| project == session_project) {
+                sids.insert(sid.clone());
             }
         }
-        Ok(sids)
+        sids
+    }
+
+    async fn stop_bulk_snapshot(
+        &mut self,
+        chat: &ChatKey,
+        project: Option<&str>,
+        snapshot: &BTreeSet<String>,
+    ) -> Vec<String> {
+        let visible = self.bulk_stop_visible_snapshot(chat, project, snapshot);
+        let dropped: Vec<String> = snapshot.difference(&visible).cloned().collect();
+        let (stopped, failures) = self.stop_sessions_bulk(&visible).await;
+        let mut lines = Vec::new();
+        let summary = format_bulk_stop_result(&stopped, &failures);
+        if !summary.is_empty() {
+            lines.push(summary);
+        }
+        if !dropped.is_empty() {
+            lines.push(format!(
+                "Пропущены сессии: {} (недоступны или уже остановлены)",
+                dropped.join(", ")
+            ));
+        }
+        if lines.is_empty() {
+            lines.push("Нет доступных сессий для остановки".to_string());
+        }
+        vec![lines.join("\n")]
     }
 
     async fn stop_sessions_bulk(&mut self, sids: &BTreeSet<String>) -> (Vec<String>, Vec<String>) {
@@ -15702,8 +15772,9 @@ mod tests {
         channel: &str,
         chat_id: &str,
         user_id: &str,
-        scope: &str,
+        preview: &GatewayEvent,
     ) -> Vec<String> {
+        let data = preview.options[0].data.clone();
         gateway
             .handle_message(
                 channel,
@@ -15712,9 +15783,7 @@ mod tests {
                 "",
                 "",
                 &[],
-                Some(&ChoiceReply {
-                    data: format!("nav:stop:{scope}"),
-                }),
+                Some(&ChoiceReply { data }),
             )
             .await
             .unwrap()
@@ -16973,11 +17042,11 @@ mod tests {
             preview
                 .options
                 .iter()
-                .map(|option| option.data.as_str())
+                .map(|option| option.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["nav:stop:all", "nav:stop:cancel"]
+            vec!["stop-all", "stop-cancel"]
         );
-        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", "all").await;
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
         assert_eq!(reply, vec!["Остановлено сессий: 1 (s1)".to_string()]);
         assert!(!gateway.sessions.contains_key("s1"));
         assert!(gateway.sessions.contains_key("s2"));
@@ -17095,11 +17164,11 @@ mod tests {
             preview
                 .options
                 .iter()
-                .map(|option| option.data.as_str())
+                .map(|option| option.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["nav:stop:all", "nav:stop:cancel"]
+            vec!["stop-all", "stop-cancel"]
         );
-        let reply = tap_stop(&mut restarted, "telegram", "chat-1", "alice", "all").await;
+        let reply = tap_stop(&mut restarted, "telegram", "chat-1", "alice", &preview).await;
         assert_eq!(reply, vec![format!("Остановлено сессий: 1 ({sid1})")]);
         assert!(!restarted.is_session_detached(&sid1));
         assert!(restarted.is_session_detached(&sid2));
@@ -17196,7 +17265,7 @@ mod tests {
         )
         .await;
         assert_eq!(preview.content, "Будет остановлена 1 сессия: s1");
-        let reply = tap_stop(&mut gateway, "telegram@uaaa", "chat-a", "alice", "all").await;
+        let reply = tap_stop(&mut gateway, "telegram@uaaa", "chat-a", "alice", &preview).await;
         assert_eq!(reply, vec!["Остановлено сессий: 1 (s1)".to_string()]);
         assert!(!gateway.sessions.contains_key("s1"));
         assert!(gateway.sessions.contains_key("s2"));
@@ -17228,7 +17297,7 @@ mod tests {
         )
         .await;
         assert_eq!(preview.content, "Будут остановлены 2 сессии: s1, s2");
-        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", "all").await;
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
         let summary: Vec<&str> = reply[0].lines().take(2).collect();
         assert_eq!(
             summary,
@@ -17277,7 +17346,7 @@ mod tests {
         )
         .await;
         assert_eq!(preview.content, "Будет остановлена 1 сессия: s2");
-        let reply = tap_stop(&mut gateway, "telegram", "admin-chat", "admin", "all").await;
+        let reply = tap_stop(&mut gateway, "telegram", "admin-chat", "admin", &preview).await;
         assert_eq!(reply, vec!["Остановлено сессий: 1 (s2)".to_string()]);
         assert!(
             !gateway.sessions.contains_key("s2"),
@@ -17337,11 +17406,11 @@ mod tests {
             preview
                 .options
                 .iter()
-                .map(|option| option.data.as_str())
+                .map(|option| option.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["nav:stop:project", "nav:stop:cancel"]
+            vec!["stop-project", "stop-cancel"]
         );
-        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", "project").await;
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
         assert_eq!(reply, vec!["Остановлено сессий: 1 (s2)".to_string()]);
         assert!(gateway.sessions.contains_key("s1"));
         assert!(!gateway.sessions.contains_key("s2"));
@@ -17378,7 +17447,7 @@ mod tests {
                 "",
                 &[],
                 Some(&ChoiceReply {
-                    data: "nav:stop:cancel".to_string(),
+                    data: preview.options[1].data.clone(),
                 }),
             )
             .await
@@ -17388,7 +17457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_stop_all_recomputes_candidates_at_tap_time() {
+    async fn gateway_stop_all_snapshot_excludes_session_spawned_after_preview() {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", tmp.path());
@@ -17413,9 +17482,81 @@ mod tests {
             .await
             .unwrap();
 
-        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", "all").await;
-        assert_eq!(reply, vec!["Остановлено сессий: 2 (s1, s2)".to_string()]);
-        assert!(gateway.sessions.is_empty());
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
+        assert_eq!(reply, vec!["Остановлено сессий: 1 (s1)".to_string()]);
+        assert!(!gateway.sessions.contains_key("s1"));
+        assert!(gateway.sessions.contains_key("s2"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_confirmation_is_one_shot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "all",
+        )
+        .await;
+
+        let first = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
+        assert_eq!(first, vec!["Остановлено сессий: 1 (s1)".to_string()]);
+        let second = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
+        assert_eq!(second, vec!["Этот выбор больше недоступен".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_project_snapshot_ignores_current_project_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+        gateway.register_project("beta", tmp.path());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/cd beta")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/cd alpha")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "project",
+        )
+        .await;
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/cd beta")
+            .await
+            .unwrap();
+
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
+        assert_eq!(reply, vec!["Остановлено сессий: 1 (s1)".to_string()]);
+        assert!(!gateway.sessions.contains_key("s1"));
+        assert!(gateway.sessions.contains_key("s2"));
     }
 
     #[tokio::test]

@@ -126,6 +126,14 @@ pub(crate) fn preview_args(args: &Value) -> String {
     truncate_for_preview(&raw)
 }
 
+fn literal_preview(value: &str) -> String {
+    if value.contains('`') {
+        value.to_string()
+    } else {
+        format!("`{value}`")
+    }
+}
+
 /// Map a lifecycle [`ThreadEvent`] to its [`ActivityStatus`]. Item events
 /// only — non-item events never reach this (the caller short-circuits).
 fn activity_status(evt: &ThreadEvent) -> Option<ActivityStatus> {
@@ -165,14 +173,14 @@ pub(crate) fn activity_for(evt: &ThreadEvent) -> Option<SessionActivity> {
         ThreadItemDetails::CommandExecution { cmd, .. } => Some(SessionActivity {
             kind: ActivityKind::CommandExec,
             name: "bash".to_string(),
-            summary: format!("$ {}", truncate_for_preview(cmd)),
+            summary: format!("$ {}", literal_preview(&truncate_for_preview(cmd))),
             status,
             item_id: item.id.clone(),
         }),
         ThreadItemDetails::FileChange { path, kind } => Some(SessionActivity {
             kind: ActivityKind::FileChange,
             name: kind.clone(),
-            summary: format!("{kind} {}", path.display()),
+            summary: format!("{kind} {}", literal_preview(&path.display().to_string())),
             status,
             item_id: item.id.clone(),
         }),
@@ -296,11 +304,12 @@ impl ProgressFold {
                         self.count_tool(&item.id, tool_category(name), name, preview)
                     }
                     ThreadItemDetails::CommandExecution { cmd, .. } => {
-                        let preview = format!("$ {}", truncate_for_preview(cmd));
+                        let preview = format!("$ {}", literal_preview(&truncate_for_preview(cmd)));
                         self.count_tool(&item.id, CAT_BASH, "bash", preview)
                     }
                     ThreadItemDetails::FileChange { path, kind } => {
-                        let preview = format!("{kind} {}", path.display());
+                        let preview =
+                            format!("{kind} {}", literal_preview(&path.display().to_string()));
                         self.count_tool(&item.id, CAT_EDIT, "edit", preview)
                     }
                     ThreadItemDetails::WebSearch { query } => {
@@ -541,6 +550,8 @@ mod tests {
         let r = f.render();
         assert!(r.contains("🔧 команда ×1"), "got: {r}");
         assert!(r.contains("✏️ правка ×1"), "got: {r}");
+        assert!(r.contains("$ `cargo build`"), "got: {r}");
+        assert!(r.contains("modified `/src/lib.rs`"), "got: {r}");
     }
 
     #[test]
@@ -629,7 +640,7 @@ mod tests {
         })
         .expect("command exec is activity");
         assert_eq!(cmd.kind, ActivityKind::CommandExec);
-        assert_eq!(cmd.summary, "$ cargo build");
+        assert_eq!(cmd.summary, "$ `cargo build`");
 
         let fc = activity_for(&ThreadEvent::ItemCompleted {
             item: ThreadItem {
@@ -642,7 +653,7 @@ mod tests {
         })
         .expect("file change is activity");
         assert_eq!(fc.kind, ActivityKind::FileChange);
-        assert!(fc.summary.contains("/src/lib.rs"));
+        assert_eq!(fc.summary, "modified `/src/lib.rs`");
 
         let ws = activity_for(&ThreadEvent::ItemCompleted {
             item: ThreadItem {

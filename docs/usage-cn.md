@@ -248,6 +248,8 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 
 ### 网关命令
 
+Telegram 回复会把 Markdown 子集（粗体/斜体/代码/代码围栏/链接/引用/列表）渲染为 Telegram HTML；如果 Telegram 拒绝标记，会自动回退为纯文本。
+
 聊天框里发这些命令,由网关直接处理。随时 `/help` 看清单(Telegram 里敲 `/` 也会弹候选)。
 
 ```text

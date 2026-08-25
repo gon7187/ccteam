@@ -144,14 +144,15 @@ fn render_inline(input: &str, allow_code: bool, allow_links: bool) -> Fragment {
     let mut index = 0;
     while index < input.len() {
         if input.as_bytes()[index] == b'\\' {
-            index += 1;
-            if index < input.len() {
-                let escaped = input[index..].chars().next().expect("valid char boundary");
+            let next = input[index + 1..].chars().next();
+            if next.is_some_and(|ch| ch.is_ascii_punctuation()) {
+                let escaped = next.expect("checked above");
                 append_escaped_text(&mut out, &escaped.to_string());
-                index += escaped.len_utf8();
-            } else {
-                append_escaped_text(&mut out, "\\");
+                index += 1 + escaped.len_utf8();
+                continue;
             }
+            append_escaped_text(&mut out, "\\");
+            index += 1;
             continue;
         }
 
@@ -533,7 +534,12 @@ fn is_known_dunder_name(content: &str) -> bool {
 }
 
 fn is_escaped(input: &str, index: usize) -> bool {
-    index > 0 && input.as_bytes()[index - 1] == b'\\'
+    let slash_count = input[..index]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count();
+    slash_count % 2 == 1
 }
 
 fn parse_link(input: &str, start: usize) -> Option<(usize, usize, usize)> {
@@ -547,13 +553,11 @@ fn parse_link(input: &str, start: usize) -> Option<(usize, usize, usize)> {
     while index < input.len() {
         let ch = input[index..].chars().next().expect("valid char boundary");
         if ch == '\\' {
-            index += ch.len_utf8();
-            if index < input.len() {
-                index += input[index..]
-                    .chars()
-                    .next()
-                    .expect("valid char boundary")
-                    .len_utf8();
+            let next = input[index + ch.len_utf8()..].chars().next();
+            if let Some(next) = next.filter(|ch| ch.is_ascii_punctuation()) {
+                index += ch.len_utf8() + next.len_utf8();
+            } else {
+                index += ch.len_utf8();
             }
             continue;
         }
@@ -671,7 +675,9 @@ mod tests {
     }
 
     #[test]
-    fn backslash_escapes_only_the_following_character() {
+    fn backslash_follows_commonmark_escape_rule() {
+        assert_eq!(render_markdown(r#"C:\Users\ops"#).html, r#"C:\Users\ops"#);
+        assert_eq!(render_markdown(r#"a\\b"#).html, r#"a\b"#);
         assert_eq!(render_markdown(r#"\*not italic\*"#).html, "*not italic*");
     }
 

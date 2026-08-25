@@ -256,6 +256,8 @@ After connecting IM, you can drive sessions, send files, and approve tools from 
 
 ### Gateway Commands
 
+Telegram replies render a Markdown subset (bold/italic/code/fences/links/quotes/lists) as Telegram HTML and automatically fall back to plain text if Telegram rejects the markup.
+
 Send these commands in chat. The gateway handles them directly. Use `/help` anytime; Telegram also shows command candidates when you type `/`.
 
 ```text
