@@ -146,6 +146,61 @@ pub fn split_for_channel(text: &str, max_units: usize) -> Vec<String> {
     }
 }
 
+/// [`split_for_channel`], plus a `(i/n)` numbering suffix on every part
+/// once a message actually needs more than one — the shared numbering
+/// contract both the pre-split classic path and the Telegram Rich
+/// Message fallback split follow (TG-GATE-V2).
+///
+/// The suffix is appended as `\n\n(i/n)` — a full blank line, then the
+/// marker on its own line — never glued onto the part's last content
+/// line. That matters because [`split_for_channel`] can hand back a part
+/// whose last line is a closing ` ``` ` fence (balanced by
+/// [`balance_fences`]); gluing `(i/n)` onto that line would corrupt the
+/// fence delimiter itself (`` ```(1/3) `` is not a valid fence). A blank
+/// line in between guarantees the marker always reads as its own
+/// trailing block, fence or no fence (see
+/// `telegram_html::is_fence_line`, which every part's last line is
+/// checked against in tests).
+///
+/// The suffix's own width must be reserved from `limit` BEFORE splitting
+/// — appending it after the fact could push a part back over the
+/// ceiling. But the suffix's width depends on `digits(n)`, and `n` isn't
+/// known until we've already split. Resolved by iterating: guess
+/// `digits`, reserve for it, split, check whether the actual part count
+/// still fits that many digits. Reserving more digits only shrinks the
+/// budget, which can only grow (never shrink) the part count, so
+/// `digits` is monotonically non-decreasing across iterations and the
+/// loop always converges (typically 1 iteration; 2 across a `9 → 10`
+/// part-count boundary).
+pub fn split_for_channel_numbered(text: &str, limit: usize) -> Vec<String> {
+    if utf16_len(text) <= limit {
+        return vec![text.to_string()];
+    }
+    let mut digits = 1usize;
+    let parts = loop {
+        // Width of `\n\n(i/n)` when both `i` and `n` have `digits` digits
+        // (the widest `i` can ever be, since `i <= n`): 2 newlines + 2
+        // parens + 1 slash + 2×`digits`.
+        let reserve = 2 * digits + 5;
+        let budget = limit.saturating_sub(reserve).max(1);
+        let candidate = split_for_channel(text, budget);
+        let needed = candidate.len().to_string().len();
+        if needed <= digits {
+            break candidate;
+        }
+        digits = needed;
+    };
+    if parts.len() <= 1 {
+        return parts;
+    }
+    let total = parts.len();
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(idx, part)| format!("{part}\n\n({}/{total})", idx + 1))
+        .collect()
+}
+
 /// Greedy length-budgeted split that preserves every byte (no fence
 /// awareness). Each returned chunk is `<= budget` UTF-16 units except a
 /// pathological lone char wider than `budget`, which is emitted whole to
@@ -437,5 +492,92 @@ mod tests {
         let parts = split_for_channel("😀😀😀", 1);
         assert_eq!(parts.len(), 3);
         assert_eq!(parts.concat(), "😀😀😀");
+    }
+
+    // ----- split_for_channel_numbered (TG-GATE-V2 W10) --------------
+
+    #[test]
+    fn numbered_split_fits_returns_single_unsuffixed_part() {
+        let parts = split_for_channel_numbered("short message", 4096);
+        assert_eq!(parts, vec!["short message".to_string()]);
+    }
+
+    #[test]
+    fn numbered_split_appends_suffix_on_its_own_line_after_a_blank_line() {
+        let original = "lorem ipsum dolor sit amet ".repeat(400);
+        let parts = split_for_channel_numbered(&original, 1000);
+        assert!(parts.len() >= 2);
+        let total = parts.len();
+        for (i, part) in parts.iter().enumerate() {
+            let expected_suffix = format!("({}/{total})", i + 1);
+            assert!(
+                part.ends_with(&expected_suffix),
+                "part {i} missing suffix: {part:?}"
+            );
+            // Blank line then the marker on its own line — never glued
+            // onto the previous content line.
+            let mut lines: Vec<&str> = part.lines().collect();
+            let suffix_line = lines.pop().unwrap();
+            assert_eq!(suffix_line, expected_suffix);
+            let blank_line = lines.pop().unwrap_or("nonempty");
+            assert!(
+                blank_line.is_empty(),
+                "expected a blank separator line before the suffix, got {blank_line:?} in {part:?}"
+            );
+            // The suffix line is never itself mistaken for a fence line.
+            assert!(!crate::telegram_html::is_fence_line(suffix_line));
+            // Every part stays within the requested ceiling.
+            assert!(utf16_len(part) <= 1000, "part over budget: {part:?}");
+        }
+    }
+
+    #[test]
+    fn numbered_split_suffix_never_glues_onto_a_closing_fence_line() {
+        // A fence whose body overflows the budget, so a part's last
+        // content line before the suffix is a closing ` ``` ` — the
+        // exact shape the suffix must never merge onto.
+        let body = "let x = 1;\n".repeat(60);
+        let text = format!("intro line\n```rust\n{body}```\ntrailer");
+        let parts = split_for_channel_numbered(&text, 120);
+        assert!(parts.len() >= 2);
+        for part in &parts {
+            let lines: Vec<&str> = part.lines().collect();
+            for line in &lines {
+                // No line mixes fence markers with the numbering marker —
+                // each line is either a fence delimiter or the suffix,
+                // never both.
+                if crate::telegram_html::is_fence_line(line) {
+                    assert!(
+                        !line.contains('('),
+                        "suffix glued onto a fence line: {line:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numbered_split_reserves_extra_digit_width_across_the_9_to_10_boundary() {
+        // Craft input that needs exactly 10 parts once the `(i/n)`
+        // suffix width is reserved — the digit width of `n` grows from
+        // 1 to 2 mid-reservation (the case the iterative reserve loop
+        // exists for). Every part must still carry a correctly-widened
+        // 2-digit suffix, e.g. `(1/10)` not `(1/9)`.
+        let block = "x".repeat(28);
+        let text = std::iter::repeat_n(block, 40)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let limit = 32;
+        let parts = split_for_channel_numbered(&text, limit);
+        let total = parts.len();
+        assert!(total >= 10, "expected at least 10 parts, got {total}");
+        for (i, part) in parts.iter().enumerate() {
+            let expected_suffix = format!("({}/{total})", i + 1);
+            assert!(
+                part.ends_with(&expected_suffix),
+                "part {i} missing correctly-widened suffix: {part:?}"
+            );
+            assert!(utf16_len(part) <= limit, "part over budget: {part:?}");
+        }
     }
 }
