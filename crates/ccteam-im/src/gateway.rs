@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::im_callbacks;
 use crate::pending::InteractionOrigin;
-use crate::transport::{ChannelAttachment, ChoiceReply, MessageOption};
+use crate::transport::{ButtonStyle, ChannelAttachment, ChoiceReply, MessageOption};
 use crate::BotRegistration;
 
 /// v0.8.7 review-fix (R-M6) — a typed "the named role has no
@@ -745,6 +745,7 @@ impl DelegationProgressEmitter {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: None,
             slug: Some(record.slug),
         };
@@ -921,6 +922,12 @@ pub struct GatewayEvent {
     /// for ordinary answers; non-empty when an adapter `NeedsChoice` (or a
     /// D6 hook prompt, W2) is delivered asynchronously.
     pub options: Vec<crate::transport::MessageOption>,
+    /// Button rows (TG-GATE-V2 W5) — [`crate::transport::SendMessage::button_rows`]'s
+    /// shape, rendered alongside `options`. Empty for ordinary answers;
+    /// non-empty for the live progress edit's `[⛔ Прервать]` while the
+    /// fold is not done.
+    #[allow(clippy::type_complexity)]
+    pub button_rows: Vec<Vec<crate::transport::MessageOption>>,
     /// Originating gateway session id (`s{n}`), when the event came from a
     /// tracked session's event pump / turn watchdog (V0.8.6 W5b). This is
     /// the **SSE filter key**: a per-session web SSE handler keeps only the
@@ -2697,6 +2704,7 @@ impl Gateway {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: Some(slug.to_string()),
         });
@@ -3151,6 +3159,7 @@ impl Gateway {
                 kind: GatewayEventKind::Answer,
                 attachments: Vec::new(),
                 options: Vec::new(),
+                button_rows: Vec::new(),
                 sid: Some(sid.to_string()),
                 slug: Some(slug.to_string()),
             });
@@ -3888,6 +3897,7 @@ impl Gateway {
                             kind: GatewayEventKind::Answer,
                             attachments: Vec::new(),
                             options: to_message_options(&prompt),
+                            button_rows: Vec::new(),
                             sid: None,
                             slug: project,
                         });
@@ -4455,6 +4465,37 @@ impl Gateway {
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options,
+            button_rows: Vec::new(),
+            sid: None,
+            slug: None,
+        });
+    }
+
+    /// Sibling of [`Self::emit_list_options`] for multi-per-row
+    /// [`SendMessage::button_rows`] (TG-GATE-V2 W5) — e.g. a `cmd:?<cmd>`
+    /// confirmation's `[✅ Да][❌ Отмена]` row, where the two buttons must
+    /// render side by side rather than one per row like `options`. Same
+    /// one-message delivery contract as `emit_list_options`.
+    fn emit_button_rows(
+        &self,
+        chat: &ChatKey,
+        content: String,
+        button_rows: Vec<Vec<MessageOption>>,
+    ) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        self.emit_user_signal(GatewayEvent {
+            id: format!("gateway-picker-{}-{nanos}", chat.chat_id),
+            channel: chat.channel.clone(),
+            chat_id: chat.chat_id.clone(),
+            thread_ts: None,
+            content,
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows,
             sid: None,
             slug: None,
         });
@@ -5851,6 +5892,7 @@ impl Gateway {
                                 },
                                 attachments: Vec::new(),
                                 options: Vec::new(),
+                                button_rows: Vec::new(),
                                 sid: Some(session_id.clone()),
                                 slug: Some(session.project.clone()),
                             }) {
@@ -6441,6 +6483,7 @@ impl Gateway {
                                 kind: GatewayEventKind::Answer,
                                 attachments: Vec::new(),
                                 options: Vec::new(),
+                                button_rows: Vec::new(),
                                 sid: Some(session_id.clone()),
                                 slug: Some(session.project.clone()),
                             };
@@ -7071,6 +7114,7 @@ impl Gateway {
             kind: GatewayEventKind::ScheduledChanged,
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(item.sid.clone()),
             slug: Some(item.project.clone()),
         });
@@ -7205,6 +7249,7 @@ impl Gateway {
                 kind: GatewayEventKind::Answer,
                 attachments: Vec::new(),
                 options: Vec::new(),
+                button_rows: Vec::new(),
                 sid: Some(entry.item.sid.clone()),
                 slug: Some(entry.item.project.clone()),
             });
@@ -7912,6 +7957,7 @@ impl Gateway {
                 },
                 attachments: Vec::new(),
                 options: Vec::new(),
+                button_rows: Vec::new(),
                 sid: Some(session_id.to_string()),
                 slug: Some(session.project.clone()),
             });
@@ -8232,6 +8278,7 @@ impl Gateway {
                 kind: GatewayEventKind::Answer,
                 attachments: Vec::new(),
                 options: to_message_options(&prompt),
+                button_rows: Vec::new(),
                 sid: Some(session_id.to_string()),
                 slug: self.sessions.get(session_id).map(|s| s.project.clone()),
             });
@@ -8307,40 +8354,30 @@ impl Gateway {
     /// (`handle_message`) filters that arm to the existing token-keyed
     /// [`Self::resolve_selection`] path instead.
     ///
-    /// **Identity check.** `cmd:` payloads are self-describing and carry no
-    /// pending-registry token (unlike `resolve_selection`'s `{token}:{idx}`,
-    /// there is nothing stored at render time to look a tapper up against);
-    /// a rendered command can bake in concrete args (e.g. `cmd:/stop s42`),
-    /// so any principal able to tap the button can act on the args as
-    /// written. The one fact available here is `chat` itself, which
-    /// `handle_message` builds straight from the inbound tap's own
-    /// `(channel, chat_id, user_id)`. For Telegram, `chat_id == user_id`
-    /// holds exactly when the tap landed in the bot's own private chat with
-    /// that user (Telegram gives a private chat's `chat.id` the member's own
-    /// `user.id`); a group chat's shared `chat_id` never equals any single
-    /// member's `user_id`. Requiring equality here is what the brief calls
-    /// "tapper's user == message's chat user": it keeps privileged `cmd:`
-    /// taps to the person the bot is DMing and out of any chat the button
-    /// might otherwise be visible in. A mismatch answers nothing (the
-    /// transport already ack'd the callback) and returns no reply.
+    /// **No separate identity check here** (TG-GATE-V2 W5 — dropped a prior
+    /// `chat.chat_id == chat.user_id` gate that disabled every `cmd:` button
+    /// in a group chat). `Command` reaches [`Self::handle_command`], which
+    /// already applies the SAME ACL a typed `/command` gets for this
+    /// `chat` — there is no privilege a button tap gains that typing the
+    /// same text in the same chat wouldn't also have. Gating on
+    /// `chat_id == user_id` would have meant a group's `cmd:` buttons never
+    /// work at all (a group chat's shared `chat_id` never equals any
+    /// member's `user_id`), which is strictly worse than "as permissive as
+    /// typing".
     async fn resolve_cmd_callback(
         &mut self,
         chat: &ChatKey,
         action: im_callbacks::CallbackAction,
     ) -> Result<Vec<String>> {
-        if chat.chat_id != chat.user_id {
-            return Ok(Vec::new());
-        }
         match action {
             im_callbacks::CallbackAction::Choice { .. } => Ok(Vec::new()),
             im_callbacks::CallbackAction::Noop => Ok(vec!["Отменено".to_string()]),
             im_callbacks::CallbackAction::Confirm(cmd) => {
-                // TG-GATE-V2: switch to `SendMessage::button_rows` once W1's
-                // transport contract lands — for now the two confirmation
-                // buttons ride the existing `options` (one per row) via
-                // `emit_list_options`, same as the project/session pickers.
-                let options = confirm_cmd_options(&cmd);
-                self.emit_list_options(chat, confirm_prompt_text(&cmd), options);
+                // TG-GATE-V2 W5 — the two confirmation buttons ride ONE
+                // `SendMessage::button_rows` row (side by side), not the
+                // one-per-row `options` the project/session pickers use.
+                let rows = confirm_cmd_button_rows(&cmd);
+                self.emit_button_rows(chat, confirm_prompt_text(&cmd), rows);
                 Ok(Vec::new())
             }
             im_callbacks::CallbackAction::Command(cmd) => {
@@ -8482,6 +8519,7 @@ impl Gateway {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: (!slug.is_empty()).then_some(slug),
         });
@@ -10827,6 +10865,7 @@ impl Gateway {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: Some(slug.to_string()),
         });
@@ -12439,6 +12478,7 @@ impl Gateway {
                         kind: GatewayEventKind::Answer,
                         attachments: Vec::new(),
                         options: to_message_options(&prompt),
+                        button_rows: Vec::new(),
                         sid: Some(sid.to_string()),
                         slug: Some(session.project),
                     });
@@ -12730,6 +12770,7 @@ impl Gateway {
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: self.sessions.get(sid).map(|s| s.project.clone()),
         });
@@ -13095,6 +13136,7 @@ impl Gateway {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: Some(slug.to_string()),
         });
@@ -13683,6 +13725,7 @@ fn emit_turn_stall_warning(
         kind: GatewayEventKind::Answer,
         attachments: Vec::new(),
         options: Vec::new(),
+        button_rows: Vec::new(),
         sid: Some(session_id.to_string()),
         slug: Some(session.project.clone()),
     });
@@ -13880,9 +13923,23 @@ fn mirror_internal_web_answer(
         kind: GatewayEventKind::Answer,
         attachments: Vec::new(),
         options: Vec::new(),
+        button_rows: Vec::new(),
         sid: Some(session_id.to_string()),
         slug: Some(session.project.clone()),
     });
+}
+
+/// `[⛔ Прервать]` — the single [`SendMessage::button_rows`] row attached to
+/// a live progress edit while the turn is still running (TG-GATE-V2 W5).
+/// Taps `cmd:?/interrupt`: `resolve_cmd_callback`'s `Confirm` arm renders the
+/// usual yes/no picker before actually running `/interrupt`.
+fn progress_interrupt_button_rows() -> Vec<Vec<MessageOption>> {
+    vec![vec![MessageOption {
+        data: "cmd:?/interrupt".to_string(),
+        label: "⛔ Прервать".to_string(),
+        id: "interrupt".to_string(),
+        style: Some(ButtonStyle::Danger),
+    }]]
 }
 
 /// Send one `Progress` gateway event with the given rendered `content`.
@@ -13898,7 +13955,13 @@ fn emit_progress(
 ) -> bool {
     let (channel, chat_id) = pump_target(session);
     let status_key = format!("{session_id}-{epoch}");
-    // TG-GATE-V2: add [⛔ Прервать → cmd:?/interrupt] via button_rows after W1 merge
+    // TG-GATE-V2 W5 — `[⛔ Прервать]` rides the edit while the fold is not
+    // done; a `done` (finalized ✅/❌) edit carries no buttons.
+    let button_rows = if done {
+        Vec::new()
+    } else {
+        progress_interrupt_button_rows()
+    };
     // `send` returns false only when the mpsc consumer is gone; surface that as
     // emit_progress's "sink closed → pump should stop" signal.
     tx.send(GatewayEvent {
@@ -13912,6 +13975,7 @@ fn emit_progress(
         kind: GatewayEventKind::Progress { status_key, done },
         attachments: Vec::new(),
         options: Vec::new(),
+        button_rows,
     })
 }
 
@@ -13943,6 +14007,7 @@ fn emit_activity(
         },
         attachments: Vec::new(),
         options: Vec::new(),
+        button_rows: Vec::new(),
         slug: Some(session.project.clone()),
     })
 }
@@ -14408,26 +14473,35 @@ fn confirm_prompt_text(cmd: &str) -> String {
     format!("Точно выполнить `{cmd}`?")
 }
 
-/// `[✅ Да][❌ Отмена]` buttons for a `cmd:?<cmd>` confirmation (TG-GATE-V2
-/// W3): "Да" re-taps as the bare `cmd:<cmd>` (runs it), "Отмена" taps
-/// `cmd:noop`. Dropped (like the nav pickers) if a pathologically long `cmd`
-/// would blow Telegram's `callback_data` cap.
-fn confirm_cmd_options(cmd: &str) -> Vec<MessageOption> {
-    vec![
+/// `[✅ Да][❌ Отмена]` — a single [`SendMessage::button_rows`] row for a
+/// `cmd:?<cmd>` confirmation (TG-GATE-V2 W3/W5): "Да" re-taps as the bare
+/// `cmd:<cmd>` (runs it, styled [`ButtonStyle::Success`]), "Отмена" taps
+/// `cmd:noop` (styled [`ButtonStyle::Danger`]). Either button is dropped
+/// (like the nav pickers) if a pathologically long `cmd` would blow
+/// Telegram's `callback_data` cap.
+fn confirm_cmd_button_rows(cmd: &str) -> Vec<Vec<MessageOption>> {
+    let row: Vec<MessageOption> = vec![
         MessageOption {
             data: format!("cmd:{cmd}"),
             label: "✅ Да".to_string(),
             id: "yes".to_string(),
+            style: Some(ButtonStyle::Success),
         },
         MessageOption {
             data: "cmd:noop".to_string(),
             label: "❌ Отмена".to_string(),
             id: "no".to_string(),
+            style: Some(ButtonStyle::Danger),
         },
     ]
     .into_iter()
     .filter(|o: &MessageOption| o.data.len() <= TELEGRAM_CALLBACK_MAX)
-    .collect()
+    .collect();
+    if row.is_empty() {
+        Vec::new()
+    } else {
+        vec![row]
+    }
 }
 
 /// Max display columns a session title may occupy inside a `/sessions` switch
@@ -15933,6 +16007,7 @@ mod tests {
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: sid.map(str::to_string),
             slug: None,
         }
@@ -21818,20 +21893,26 @@ mod tests {
 
         let event = events.try_recv().expect("confirmation picker event");
         assert_eq!(event.content, "Точно выполнить `/stop s1`?");
+        assert!(
+            event.options.is_empty(),
+            "confirmation rides button_rows, not options"
+        );
         assert_eq!(
-            event.options,
-            vec![
+            event.button_rows,
+            vec![vec![
                 MessageOption {
                     data: "cmd:/stop s1".to_string(),
                     label: "✅ Да".to_string(),
                     id: "yes".to_string(),
+                    style: Some(ButtonStyle::Success),
                 },
                 MessageOption {
                     data: "cmd:noop".to_string(),
                     label: "❌ Отмена".to_string(),
                     id: "no".to_string(),
+                    style: Some(ButtonStyle::Danger),
                 },
-            ]
+            ]]
         );
     }
 
@@ -21885,22 +21966,31 @@ mod tests {
         assert_eq!(replies, vec!["Неизвестная команда"]);
     }
 
-    /// A `cmd:` tap from a DIFFERENT user than the chat it landed in
-    /// (`chat_id != user_id` — a group chat, per
-    /// [`Gateway::resolve_cmd_callback`]'s identity-check doc) is ignored
-    /// silently: no reply, no command run, no confirmation rendered.
+    /// A `cmd:` tap in a GROUP chat (`chat_id != user_id`, unlike a
+    /// Telegram private chat where they're equal) routes exactly like a
+    /// private-chat tap — `Command` reaches `handle_command` (same ACL as
+    /// typed text, no separate identity gate; see
+    /// [`Gateway::resolve_cmd_callback`]'s doc), and `Confirm` still renders
+    /// the yes/no picker. TG-GATE-V2 W5 replaces the prior
+    /// `cmd_callback_wrong_user_is_ignored`, which asserted the opposite
+    /// (group taps silently dropped) — that disabled every `cmd:` button in
+    /// any group chat.
     #[tokio::test]
-    async fn cmd_callback_wrong_user_is_ignored() {
+    async fn cmd_callback_routes_normally_in_group_chat() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let mut events = gateway.subscribe_events();
 
-        let replies = gateway
+        let typed = gateway
+            .handle_text("telegram", "group-9", "someone", "/status")
+            .await
+            .unwrap();
+        let via_button = gateway
             .handle_message(
                 "telegram",
                 "group-9",
-                "intruder",
+                "someone",
                 "",
                 "",
                 &[],
@@ -21910,13 +22000,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(replies.is_empty());
+        assert_eq!(
+            via_button, typed,
+            "group tap must run the command, not be dropped"
+        );
 
         let confirm_replies = gateway
             .handle_message(
                 "telegram",
                 "group-9",
-                "intruder",
+                "someone",
                 "",
                 "",
                 &[],
@@ -21926,11 +22019,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(confirm_replies.is_empty());
         assert!(
-            events.try_recv().is_err(),
-            "wrong-user cmd:? must not render a confirmation picker"
+            confirm_replies.is_empty(),
+            "confirmation rides the picker event, not a direct reply"
         );
+        let event = events
+            .try_recv()
+            .expect("group tap must render a confirmation picker");
+        assert_eq!(event.content, "Точно выполнить `/stop s1`?");
     }
 
     /// `strip_vendor_prefix` drops a leading `{vendor}` + separator from a

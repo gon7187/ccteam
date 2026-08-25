@@ -642,13 +642,22 @@ pub trait Channel: Send + Sync {
     /// message via [`Channel::send`], so a channel without edit support
     /// still shows progress (just as extra messages rather than one live
     /// status). Telegram overrides with `editMessageText`.
+    ///
+    /// `button_rows` (TG-GATE-V2 W5) carries the same shape as
+    /// [`SendMessage::button_rows`] — e.g. the live progress edit's
+    /// `[⛔ Прервать]` button. The default degrades by folding it into
+    /// [`SendMessage::button_rows`] on the fallback `send`; a channel with
+    /// no native buttons ignores it or folds it into a numbered text list
+    /// (mirrors `options`' existing fallback).
     async fn edit_message(
         &self,
         recipient: &str,
         _message_id: &str,
         content: &str,
+        button_rows: &[Vec<MessageOption>],
     ) -> anyhow::Result<Option<String>> {
-        self.send(&SendMessage::new(content, recipient)).await
+        self.send(&SendMessage::new(content, recipient).with_button_rows(button_rows.to_vec()))
+            .await
     }
 
     /// Register the gateway's own commands in the channel's command menu

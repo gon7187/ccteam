@@ -451,9 +451,10 @@ impl TelegramChannel {
         recipient: &str,
         message_id: &str,
         markdown: &str,
+        button_rows: &[Vec<MessageOption>],
     ) -> Result<Option<String>, String> {
         let url = self.api_url("editMessageText");
-        let body = build_rich_edit_body(recipient, message_id, markdown);
+        let body = build_rich_edit_body(recipient, message_id, markdown, button_rows);
         let resp = self
             .http
             .post(&url)
@@ -582,6 +583,7 @@ impl TelegramChannel {
         recipient: &str,
         message_id: &str,
         content: &str,
+        button_rows: &[Vec<MessageOption>],
     ) -> anyhow::Result<Option<String>> {
         let url = self.api_url("editMessageText");
         let payload = text_payload(content);
@@ -592,6 +594,9 @@ impl TelegramChannel {
         });
         if payload.formatted {
             body["parse_mode"] = serde_json::json!("HTML");
+        }
+        if let Some(keyboard) = inline_keyboard_json_from_rows(button_rows) {
+            body["reply_markup"] = keyboard;
         }
         let resp = self.http.post(&url).json(&body).send().await?;
         let mut status = resp.status();
@@ -967,22 +972,31 @@ fn build_rich_send_body(message: &SendMessage, markdown: &str) -> serde_json::Va
 }
 
 /// Build the `editMessageText` request body using `rich_message` (Bot API
-/// 10.3) instead of `text`. No buttons: [`Channel::edit_message`] carries
-/// no button/option data (only `content`), so an edit's rich attempt is
-/// markdown-only.
-fn build_rich_edit_body(recipient: &str, message_id: &str, markdown: &str) -> serde_json::Value {
+/// 10.3) instead of `text`. TG-GATE-V2 W5 — `button_rows` (e.g. the live
+/// progress edit's `[⛔ Прервать]`) rides the same trailing
+/// `<tg-button-row>` blocks [`build_rich_send_body`] appends for a send.
+fn build_rich_edit_body(
+    recipient: &str,
+    message_id: &str,
+    markdown: &str,
+    button_rows: &[Vec<MessageOption>],
+) -> serde_json::Value {
+    let buttons_html = button_rows_to_tg_html(button_rows);
+    let full_markdown = if buttons_html.is_empty() {
+        markdown.to_string()
+    } else {
+        format!("{markdown}\n\n{buttons_html}")
+    };
     serde_json::json!({
         "chat_id": recipient,
         "message_id": message_id.parse::<i64>().ok(),
-        "rich_message": { "markdown": markdown },
+        "rich_message": { "markdown": full_markdown },
     })
 }
 
-/// Build the classic `inline_keyboard` from [`combined_button_rows`], or
-/// `None` when there is nothing to render (today's zero-behavior-change
-/// case: no `button_rows`, no `options`).
-fn inline_keyboard_json(message: &SendMessage) -> Option<serde_json::Value> {
-    let rows = combined_button_rows(message);
+/// Build the classic `inline_keyboard` from `rows`, or `None` when there is
+/// nothing to render (today's zero-behavior-change case: no rows).
+fn inline_keyboard_json_from_rows(rows: &[Vec<MessageOption>]) -> Option<serde_json::Value> {
     if rows.is_empty() {
         return None;
     }
@@ -995,6 +1009,13 @@ fn inline_keyboard_json(message: &SendMessage) -> Option<serde_json::Value> {
         })
         .collect();
     Some(serde_json::json!({ "inline_keyboard": keyboard }))
+}
+
+/// Build the classic `inline_keyboard` from [`combined_button_rows`], or
+/// `None` when there is nothing to render (today's zero-behavior-change
+/// case: no `button_rows`, no `options`).
+fn inline_keyboard_json(message: &SendMessage) -> Option<serde_json::Value> {
+    inline_keyboard_json_from_rows(&combined_button_rows(message))
 }
 
 #[async_trait]
@@ -1178,16 +1199,21 @@ impl Channel for TelegramChannel {
         recipient: &str,
         message_id: &str,
         content: &str,
+        button_rows: &[Vec<MessageOption>],
     ) -> anyhow::Result<Option<String>> {
-        // TG-GATE-V2 W1 — same rich→classic ladder as `send` (see there for
-        // the fallback contract + once-per-reason-kind logging). Edit has
-        // no button/option payload (the trait carries only `content`), so
-        // the rich attempt is markdown-only.
-        match self.try_edit_rich(recipient, message_id, content).await {
+        // TG-GATE-V2 W1/W5 — same rich→classic ladder as `send` (see there
+        // for the fallback contract + once-per-reason-kind logging), now
+        // carrying `button_rows` (e.g. the progress edit's `[⛔ Прервать]`)
+        // through both legs.
+        match self
+            .try_edit_rich(recipient, message_id, content, button_rows)
+            .await
+        {
             Ok(id) => return Ok(id),
             Err(reason) => self.log_rich_fallback_once(&reason).await,
         }
-        self.edit_classic(recipient, message_id, content).await
+        self.edit_classic(recipient, message_id, content, button_rows)
+            .await
     }
 
     /// Add the 👀 ack reaction via `setMessageReaction` (stateless — Telegram
@@ -1690,14 +1716,39 @@ mod tests {
 
     #[test]
     fn rich_edit_body_has_no_buttons_and_parses_message_id() {
-        let body = build_rich_edit_body("42", "tg-99", "**edited**");
+        let body = build_rich_edit_body("42", "tg-99", "**edited**", &[]);
         assert_eq!(body["chat_id"], "42");
         assert_eq!(body["message_id"].as_i64(), None, "tg-99 isn't numeric");
         assert_eq!(body["rich_message"]["markdown"], "**edited**");
         assert!(body.get("text").is_none());
 
-        let body = build_rich_edit_body("42", "99", "**edited**");
+        let body = build_rich_edit_body("42", "99", "**edited**", &[]);
         assert_eq!(body["message_id"], 99);
+    }
+
+    /// TG-GATE-V2 W5 — an edit's `button_rows` (e.g. the progress edit's
+    /// `[⛔ Прервать]`) append the same trailing `<tg-button-row>` block a
+    /// send gets.
+    #[test]
+    fn rich_edit_body_appends_button_rows() {
+        let rows = vec![vec![opt("cmd:?/interrupt", "⛔ Прервать", None)]];
+        let body = build_rich_edit_body("42", "99", "working...", &rows);
+        let markdown = body["rich_message"]["markdown"].as_str().unwrap();
+        assert!(markdown.starts_with("working...\n\n<tg-button-row>"));
+        assert!(markdown.contains(">⛔ Прервать</tg-button>"));
+    }
+
+    /// The classic edit fallback attaches the same `inline_keyboard` shape
+    /// `send`'s classic path does (TG-GATE-V2 W5).
+    #[test]
+    fn inline_keyboard_json_from_rows_mirrors_send() {
+        let rows = vec![vec![opt("cmd:?/interrupt", "⛔ Прервать", None)]];
+        let keyboard = inline_keyboard_json_from_rows(&rows).expect("some keyboard");
+        assert_eq!(
+            keyboard["inline_keyboard"][0][0]["callback_data"],
+            "cmd:?/interrupt"
+        );
+        assert!(inline_keyboard_json_from_rows(&[]).is_none());
     }
 
     #[test]

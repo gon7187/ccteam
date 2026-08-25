@@ -1352,12 +1352,18 @@ impl Channel for LarkChannel {
         _recipient: &str,
         message_id: &str,
         content: &str,
+        button_rows: &[Vec<MessageOption>],
     ) -> anyhow::Result<Option<String>> {
         // Lark addresses the edit by `message_id` in the URL path, not by
         // recipient, so `recipient` is unused here.
         let url = format!("{}/im/v1/messages/{message_id}", self.api_base());
+        // TG-GATE-V2 W5 — same numbered-text fallback `send` already gives
+        // `button_rows` (Lark has no button-row concept on a plain text
+        // edit); e.g. the progress edit's `[⛔ Прервать]` shows up as a
+        // trailing numbered line.
+        let body_text = with_button_rows_numbered(content, button_rows);
         // Same Feishu quirk as `send`: the inner value is stringified JSON.
-        let inner = serde_json::json!({ "text": content }).to_string();
+        let inner = serde_json::json!({ "text": body_text }).to_string();
         let body = serde_json::json!({
             "msg_type": "text",
             "content": inner,

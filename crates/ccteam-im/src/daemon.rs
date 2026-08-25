@@ -1599,7 +1599,8 @@ fn spawn_gateway_event_consumer(
                     let out = SendMessage::new(evt.content, evt.chat_id)
                         .in_thread(evt.thread_ts)
                         .with_attachments(evt.attachments)
-                        .with_options(evt.options);
+                        .with_options(evt.options)
+                        .with_button_rows(evt.button_rows);
                     send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out).await;
                 }
                 GatewayEventKind::Progress { status_key, done } => {
@@ -1612,6 +1613,7 @@ fn spawn_gateway_event_consumer(
                         evt.chat_id,
                         evt.thread_ts,
                         evt.content,
+                        evt.button_rows,
                     )
                     .await;
                 }
@@ -1682,10 +1684,16 @@ async fn deliver_progress(
     chat_id: String,
     thread_ts: Option<String>,
     content: String,
+    button_rows: Vec<Vec<crate::transport::MessageOption>>,
 ) {
     if let Some(handle) = status_messages.get(&status_key).cloned() {
         if let Err(err) = channel
-            .edit_message(&handle.recipient, &handle.message_id, &content)
+            .edit_message(
+                &handle.recipient,
+                &handle.message_id,
+                &content,
+                &button_rows,
+            )
             .await
         {
             tracing::warn!(
@@ -1701,7 +1709,9 @@ async fn deliver_progress(
         return;
     }
     // First progress for this turn — send a new status message (the seed).
-    let seed = SendMessage::new(content, chat_id.clone()).in_thread(thread_ts.clone());
+    let seed = SendMessage::new(content, chat_id.clone())
+        .in_thread(thread_ts.clone())
+        .with_button_rows(button_rows);
     match channel.send(&seed).await {
         Ok(Some(message_id)) if !done => {
             status_messages.insert(
@@ -2110,6 +2120,7 @@ mod tests {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some("s1".to_string()),
             slug: None,
         };
@@ -2173,6 +2184,7 @@ mod tests {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: None,
             slug: None,
         };

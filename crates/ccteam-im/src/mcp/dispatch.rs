@@ -867,6 +867,7 @@ fn build_send_file_event(
             kind,
         }],
         options: Vec::new(),
+        button_rows: Vec::new(),
         // Web staging replaces this with the server-resolved caller sid so
         // the current per-session SSE can render the reference live. IM-only
         // delivery keeps the historical `None`.
@@ -1053,6 +1054,7 @@ async fn execute_interaction_ask(
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: message_options,
+            button_rows: Vec::new(),
             // The D6 `interaction/ask` hook prompt has no gateway session.
             sid: None,
             slug: if slug.is_empty() {
@@ -1283,6 +1285,7 @@ async fn execute_permission_ask(
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: message_options,
+            button_rows: Vec::new(),
             // sid set so a per-session web UI stream can show the approval
             // (None would route to IM fine but be filtered out of SSE).
             sid: sid_label.clone(),

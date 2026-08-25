@@ -330,14 +330,14 @@ async fn progress_edits_one_status_message_not_spam() {
     // The status was edited (≥1 edit), and finalized to a ✅ summary.
     assert!(!edits.is_empty(), "status message was never edited");
     assert!(
-        edits.iter().any(|(_, c)| c.starts_with("✅ готово · ")),
+        edits.iter().any(|(_, c, _)| c.starts_with("✅ готово · ")),
         "status was not finalized, edits: {edits:?}"
     );
     // A tool count surfaced in some status text.
     assert!(
         outbox
             .iter()
-            .chain(edits.iter().map(|(_, c)| c))
+            .chain(edits.iter().map(|(_, c, _)| c))
             .any(|c| c.contains("команда ×1")),
         "no folded tool count appeared"
     );

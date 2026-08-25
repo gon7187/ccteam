@@ -9,13 +9,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use crate::transport::{Channel, ChannelMessage, CommandSpec, SendMessage};
+use crate::transport::{Channel, ChannelMessage, CommandSpec, MessageOption, SendMessage};
 
 /// One recorded reaction call (v0.8.19): `(op, chat_id, message_id, handle)`
 /// where `op` is `"add"`/`"remove"` and `handle` is what was passed to remove
 /// (always `None` on add). Factored out so the [`MockChannel`] field stays a
 /// simple type.
 type RecordedReaction = (String, String, String, Option<String>);
+
+/// One recorded [`Channel::edit_message`] call: `(message_id, content,
+/// button_rows)` (TG-GATE-V2 W5 added `button_rows`).
+type RecordedEdit = (String, String, Vec<Vec<MessageOption>>);
 
 /// Test-only Channel. Cheap to clone (`Arc` inside) so a test can
 /// hand one copy to the daemon and keep another for assertions.
@@ -24,9 +28,11 @@ pub struct MockChannel {
     inbox: Arc<Mutex<Vec<ChannelMessage>>>,
     outbox: Arc<Mutex<Vec<SendMessage>>>,
     /// Edits applied via [`Channel::edit_message`], as `(message_id,
-    /// content)` — lets a test prove a status message is *edited* in
-    /// place rather than re-sent (V0.8.4 P1).
-    edits: Arc<Mutex<Vec<(String, String)>>>,
+    /// content, button_rows)` — lets a test prove a status message is
+    /// *edited* in place rather than re-sent (V0.8.4 P1), and (TG-GATE-V2
+    /// W5) inspect the buttons an edit carried (e.g. progress's
+    /// `[⛔ Прервать]`).
+    edits: Arc<Mutex<Vec<RecordedEdit>>>,
     name: String,
     /// Optional per-message UTF-16 ceiling (default `None` = unlimited),
     /// so a test can exercise the daemon's split path without a real
@@ -123,8 +129,8 @@ impl MockChannel {
     }
 
     /// Snapshot of every `edit_message` call so far, as `(message_id,
-    /// content)`.
-    pub async fn edits(&self) -> Vec<(String, String)> {
+    /// content, button_rows)`.
+    pub async fn edits(&self) -> Vec<RecordedEdit> {
         self.edits.lock().await.clone()
     }
 
@@ -175,11 +181,13 @@ impl Channel for MockChannel {
         _recipient: &str,
         message_id: &str,
         content: &str,
+        button_rows: &[Vec<MessageOption>],
     ) -> anyhow::Result<Option<String>> {
-        self.edits
-            .lock()
-            .await
-            .push((message_id.to_string(), content.to_string()));
+        self.edits.lock().await.push((
+            message_id.to_string(),
+            content.to_string(),
+            button_rows.to_vec(),
+        ));
         Ok(Some(message_id.to_string()))
     }
 

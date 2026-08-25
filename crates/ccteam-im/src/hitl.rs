@@ -399,6 +399,7 @@ async fn ask_external_choice(
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: message_options,
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: None,
         })
