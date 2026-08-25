@@ -15,37 +15,17 @@
 
 ## 当前卡
 
-### TG-STOP-1 IM `/stop all` + `/stop project`:一键释放会话资源(owner 直驱 2026-08-25)
-- **状态**:完成(9e2dd86) · **冲突域**:`crates/ccteam-im/src/gateway.rs(GATEWAY_COMMANDS + handle_command "/stop" 臂 + stop_session 复用)+ docs/usage.md` · **建议入口**:codex gpt-5.6-luna(worktree `tg-stop-1`,基 origin/dev),review = opus max + codex gpt-5.6-sol max
-- **验证**:2026-08-25 codex gpt-5.6-luna 四轮(opus max + gpt-5.6-sol max 交替 review):bulk 候选集 = 单 sid 同一 ACL 谓词 + memo;detached 体并发 terminate、bookkeeping 仅在确认死亡后;`close_thread` 失败如实报告并保留记录;Telegram 走既有 pending 选项注册表的**一次性 snapshot 确认按钮**(tap 只在快照上重跑 ACL,新会话不入、`/cd` 不改目标、二次 tap 拒),非按钮频道立即执行;stop 测 26/26。终审遗留 → STOP-HONEST-1。
-- **背景**:`/stop <sid>` 只能逐个杀;资源紧张时需一条命令停掉全部(或当前项目内全部)会话。红线:「永不主动 kill」不受影响——这是用户**显式**命令,与 `project stop` 同性质。
-- **规格**:①`/stop all` = 停掉该 chat **可见**(`chat_can_access` / `chat_can_access_sid`,含 detached 体)的全部会话;②`/stop project` = 同上但限 `current_project_for(chat)`,无当前项目 → 可读拒绝;③复用 `stop_session` 逐个串行,回执列出已停 sid 数量与清单 + 失败项;④`GATEWAY_COMMANDS` `/stop` 的 `arg_hint`/`help` 同步(`<id>|all|project`),setMyCommands 自动跟随;⑤ACL 零新逻辑:只走既有可见性判定,绝不停他人会话;⑥sid 字面 `all`/`project` 不可能与 `s<N>` 撞名,无歧义。
-- **DoD**:gateway 单测:`/stop all` 只停可见集(混入他 chat 会话不动)、`/stop project` 只停当前项目、无项目可读拒、空集回执;`make test-baseline` 只增;clippy 0;fmt;usage.md 命令表同步;writeback 绿。
+### TG-KEYS-1 Telegram 常驻快捷键盘:web「快速开始」六模板落 IM(owner 直驱 2026-08-25)
+- **状态**:进行中(规划会话 + codex/claude subagent · 2026-08-25) · **冲突域**:`crates/ccteam-im/src(gateway + transport/providers/telegram)+ crates/ccteam-core/src/config.rs + docs/usage.md` · **建议入口**:规划亲自派工(coder terra/sonnet · review sol max · 二审 opus)
+- **背景**:owner Telegram 反馈:web 的六个 quick-start 模板(`web/src/lib/playbooks.ts` + `i18n.ts tpl*P`)在 IM 只能手打;要常驻 reply keyboard(非 inline、非 bot 菜单),且可配置。
+- **规格**:① `CcteamConfig.im.quick_templates: Vec<{label, prefix}>`(`serde(default)`,默认 = 六模板英文 prefix,label 短),hot reload 生效;② Telegram `send` 新增 `reply_keyboard` 携带(`SendMessage` 加可选字段,provider 渲染 `reply_markup.keyboard` persistent + resize),`/help` 与 `/keys` 附带键盘,`/keys off` 收起(`remove_keyboard`);③ 点按 = 收到与 label 相等的文本 → per-chat pending prefix(`RoutingState` 新字段,持久化)+ 回执「模板 X 已选,发任务」;下一条普通文本 = `<prefix> <text>` 后走原 `wrap_inbound`/`submit_to_current`,一次性清除;再点另一键 = 覆盖;④ 非 Telegram 通道零影响;⑤ 不注入 system prompt(模板是用户自己选的用户 turn,与 web 同构)。
+- **DoD**:gateway 单测(点按→pending→下一条前缀→清除 / 覆盖 / off)+ telegram 渲染单测(keyboard JSON 形状);`make check` + `make test` 只增;fmt 干净;`docs/usage.md` Gateway Commands 段补 `/keys` + config 示例。
 
-### TG-FMT-1 Telegram 出站富文本:Markdown→HTML parse_mode + 实体安全分片(owner 直驱 2026-08-25)
-- **状态**:完成(9e2dd86) · **冲突域**:`crates/ccteam-im/src/transport/providers/telegram.rs + crates/ccteam-im/src/sanitize.rs(或新 telegram_html.rs)+ crates/ccteam-im/src/daemon.rs(send_gateway_outbound 分片处)` · **建议入口**:codex gpt-5.6-luna(worktree `tg-fmt-1`,基 origin/dev),review = opus max + codex gpt-5.6-sol max;调研 = codex gpt-5.6-terra
-- **验证**:2026-08-25 codex gpt-5.6-luna 四轮(opus/sol 交替,含 128k 输入 fuzz):新 `telegram_html.rs`(pub(crate))CommonMark flanking(`snake_case`/`src/**/*.rs`/`5 * 3` 零标签)、fence 长度规则、链接括号深度、backslash 仅转义 ASCII 标点;空白渲染 → plain 直发;400 `can't parse entities`/`message is empty` → 一次 plain 重发;send/edit 超限 → plain 截断;progress 拼接路径包 code span;telegram 测 48/48;~45 条真实网关回复 byte-identical。
-- **背景**:`telegram.rs::send()` 无 `parse_mode`,agent 的 Markdown(标题/列表/代码块/粗体)原样落到 Telegram,可读性差。
-- **规格**:①出站文本经 Markdown→Telegram **HTML** 转换(`parse_mode:"HTML"`;HTML 只需转义 `<>&`,比 MarkdownV2 的 18 字符转义稳得多):粗体/斜体/行内代码/代码块(`<pre><code class="language-x">`)/链接/标题→粗体行/列表→`•`;不支持的结构降级为纯文本,**永不丢内容**;②分片先于转换(沿用 `split_for_channel` 的 fence 平衡),每片独立转换,保证实体不跨片;③Telegram 返回 400 `can't parse entities` → **同一条消息以纯文本重发一次**(fail-safe,不能因格式丢消息);④caption(附件)同规则,1024 上限按 UTF-16 算的是**渲染前**文本,转义后超限则回落纯文本;⑤纯函数可测:转换器与转义有 fixture 单测;⑥其他 channel(web 等)零影响——转换只在 Telegram provider 内。
-- **DoD**:单测:转义 `<>&`、fence→pre/code、嵌套 fence 不炸、超长分片每片独立合法 HTML、400 回落路径(fake http 或纯函数拆分);真机 1 次 roundtrip(`telegram_real_test` 或手测截图);`make test-baseline` 只增;clippy 0;fmt;writeback 绿。
-
-### RU-I18N-2 web SPA 俄语化收尾:补全遗漏的 ru 串(owner 直驱 2026-08-25)
-- **状态**:完成(f3c4579) · **冲突域**:`crates/ccteam-web/web/src` · **建议入口**:haiku 侦察清单 → codex gpt-5.6-luna 执行(worktree `ru-i18n-2`,基 origin/dev)
-- **验证**:2026-08-25 haiku 侦察(误报「104 缺 ru 键」,实际 `zh\ru=∅`)→ codex gpt-5.6-luna 落 `5c476b9d`(4 键 + 30 条 ru 分支,WorkflowView 三元全补,Hosts/Access/Settings 硬编码收 `tr`)+ `f3c4579b`(补漏 `tr` import —— `make web-check` 不跑 tsc,luna 自报的「tsc 绿」为假;`npx tsc -b` 现为门禁)+ 终审修 HostsView `langRef`(语言切换不再重探主机)、`workflowBuiltIn` 阴性、i18n 测死断言删;vitest 706/706,tsc/eslint 0。
-- **背景**:origin/dev 已合入俄语化(`I18N` 表 + `tr(lang, zh, en, ru)`),但 web 界面仍有未覆盖处:硬编码中/英文串、`ru` 分支落英文、aria/title/placeholder/toast 漏译。
-- **规格**:①侦察产出「文件:行 → 串 → 现状」清单;②补译走既有机制(`I18N` 加键 / `tr` 加 ru 参数),不引新 i18n 库;③术语一致(会话/项目/工作区/主机/租户等沿用已有 ru 词);④zh/en 零变更;⑤`i18n.test.ts` 若有「三语键齐全」不变量测试则扩展覆盖。
-- **DoD**:侦察清单全部关闭;`make web-check`(vitest/tsc/eslint)绿;writeback 绿。
-
-### FINAL-CYCLE-1 收口循环(owner 直驱 2026-08-25):全 diff 二次 review(opus max + codex gpt-5.6-sol max)→ 修补 → 合 dev → push → dev→main PR → 部署重启 TG 网关
-- **状态**:进行中(规划会话·2026-08-25)
-- **验证**:2026-08-25 opus max + gpt-5.6-sol max 终审全 diff(`origin/dev..integ-fix`,15 文件)→ 两轮修补(luna s54,`c201a146`/`9e2dd86a`,opus 复核 MERGE)→ merge dev `012f0ab3` → push 至 fork `gon7187/ccteam` dev(注意:本机 origin = fork,upstream `firstintent` 的 PR #188 是另一周期,不动)→ fork 内 dev→main PR。余项:部署重启本机 daemon(校 `/proc/<pid>/exe` build sha)+ TG 真机验证。 · **冲突域**:全仓(串行,仅规划会话) · **建议入口**:规划会话调度;机械步骤(commit/push/PR)可派便宜 agent
-- **DoD**:两位 reviewer 零阻塞项;`make test-baseline` 只增;clippy 0;fmt;PR 开出并 CI 绿;本机 daemon 换装重启后 TG 真机验证 `/stop all` + 富文本回复(核 `/proc/<pid>/exe` build sha = 磁盘 binary,见 state.md 教训)。
-
-### STOP-HONEST-1 单 sid `/stop <sid>` 与 bulk 路径同一诚实等级(TG-STOP-1 终审遗留)
-- **状态**:待排 · **冲突域**:`crates/ccteam-im/src/gateway.rs(stop_session / stop_live_session)+ crates/ccteam-web/src/routes(sessions_api stop 路由文案)+ docs/usage.md` · **建议入口**:dev 会话(codex luna)
-- **背景**:TG-STOP-1 让 bulk `/stop all|project` 在 `close_thread` 出错时如实报告并保留记录,而单 sid `/stop <sid>`(及 web/MCP 走的 `stop_session`)仍 `let _ =` 吞错、恒报「已停止」——同一动词两种诚实等级;另 `stop_detached_body` 现对 `terminate == Ok(false)` 返回 Err 并保留 detached 记录 → `POST /sessions/{sid}/stop` 从 200 变可 500(诚实、可重试),docs 未提。
-- **规格**:①单 sid 路径改为与 bulk 同形(close 出错 → 报错 + 保留记录,可重试);web/MCP `stop_session` 契约同步(错误体可读);②usage.md/tech-design 指针补一句「stop 可失败且可重试」;③`principals.forget` 先后顺序两路统一并注释(§三 defence-in-depth)。
-- **DoD**:gateway 单 sid 失败测试;web `sessions_api_test` stop 失败臂;baseline 只增;clippy 0;writeback 绿。
+### TG-FMT-1 Telegram 渲染两处:formatting 丢失 + 工具行原始名(owner 直驱 2026-08-25)
+- **状态**:进行中(规划会话 + subagent · 2026-08-25) · **冲突域**:`crates/ccteam-im/src(telegram send / 进度渲染)` · **建议入口**:规划派工(sonnet · review sol)
+- **背景**:owner 见 `/sessions` 等消息无粗体;进度消息工具行为 `🔧 Bash(ls …)` 原始名,而页脚已本地化「команда ×4」。
+- **规格**:病根层修一次:出站单一路径统一 `parse_mode`(HTML 或 MarkdownV2 二选一,配转义 helper,渲染器统一用同一标记);工具行 label 复用页脚同一本地化映射,输入截断。
+- **DoD**:转义单测(含用户文本里 `<`/`_`/`*`)+ 渲染单测;`make check`/`make test` 只增;fmt 干净。
 
 ### RESTART-1 一 sid 一 body:daemon 重启后孤儿体识别 / 跟踪 / 回收,杜绝同 sid 双进程(owner 直驱 2026-08-19)
 - **状态**:完成(905e4a9) · **冲突域**:`crates/ccteam-harness/src/execution(session_body 新 + claude_stream_json + acp/transport + pi_rpc + adapter.rs + progress_bridge)+ crates/ccteam-im/src(gateway + daemon + mcp/dispatch)+ crates/ccteam-web(sessions_api + web lifecycle)+ crates/ccteam-cli/src(main 停机 + daemon_cli 文案)+ crates/ccteam-core/src(progress re-export + daemon 指纹委托)+ docs` · **建议入口**:规划(控制)会话亲自(owner「从 ccteam 代码本身解决,需要一个完善的方案,之后执行」)
