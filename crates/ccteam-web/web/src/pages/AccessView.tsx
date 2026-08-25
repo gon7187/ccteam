@@ -24,7 +24,7 @@ import {
   type EnrollCredentialView,
   type MintedEnrollment,
 } from "../lib/enrollApi";
-import { makeT, type Lang } from "../lib/i18n";
+import { makeT, tr, type Lang } from "../lib/i18n";
 import { getToken } from "../lib/token";
 import { getUserLink, listUsers, type TenantView } from "../lib/usersApi";
 import { useMe } from "../hooks/useMe";
