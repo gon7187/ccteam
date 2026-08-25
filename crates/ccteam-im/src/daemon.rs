@@ -2264,12 +2264,24 @@ async fn replay_durable_outbox(channels: &ChannelMap) {
         return;
     };
     let mut latest: HashMap<String, DurableOutboundRow> = HashMap::new();
+    // TG-GATE-V2 W14 — `HashMap` iteration order is arbitrary (and
+    // randomized per-process), so replaying `latest.into_values()`
+    // directly would send a split's parts in whatever order the hasher
+    // happens to yield rather than the order they were queued in.
+    // `order` records each id's first appearance in the file — since
+    // `queue_split_parts` appends part rows one at a time in ascending
+    // `part_index`, replaying in first-appearance order also replays
+    // parts in `part_index` order.
+    let mut order: Vec<String> = Vec::new();
     for (line_idx, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         match serde_json::from_str::<DurableOutboundRow>(line) {
             Ok(row) => {
+                if !latest.contains_key(&row.id) {
+                    order.push(row.id.clone());
+                }
                 latest.insert(row.id.clone(), row);
             }
             Err(err) => {
@@ -2339,12 +2351,32 @@ async fn replay_durable_outbox(channels: &ChannelMap) {
         .map(|(parent_id, _)| parent_id.clone())
         .collect();
 
-    // Orphan parts of an INCOMPLETE set: mark each still-non-terminal
-    // one `Sent` with a "discarded" error so the main loop below never
-    // sends it — the parent itself replays whole instead.
+    // TG-GATE-V2 W14 — the whole "incomplete split → discard orphan
+    // parts" rule above only makes sense when there IS a parent row to
+    // replay whole instead. The ordinary (non-rich) pre-split path —
+    // `send_gateway_outbound`'s multi-part branch, via
+    // `send_split_parts`/`queue_split_parts` directly — never appends a
+    // parent row at all (see `send_split_parts`'s docs: "has no parent
+    // row to protect"); its parts are the ONLY durable record of that
+    // message. Treating an incomplete set as orphans there would
+    // silently drop whatever parts never got queued before the crash,
+    // with nothing left to resend them. So: only discard when
+    // `parent_id` actually names a row present in `latest` (the rich
+    // fallback's parent, appended by `finish_durable_outbound_send`'s
+    // `TelegramRichFallbackNeedsSplit` catch); parentless part sets fall
+    // through untouched and each non-`Sent` part replays individually in
+    // the main loop below, exactly as before splits existed.
+    //
+    // Orphan parts of an INCOMPLETE set (with a real parent row): mark
+    // each still-non-terminal one `Sent` with a "discarded" error so the
+    // main loop below never sends it — the parent itself replays whole
+    // instead.
     let mut discarded_ids: HashSet<String> = HashSet::new();
     for (parent_id, parts) in &parts_by_parent {
         if superseded_parents.contains(parent_id) {
+            continue;
+        }
+        if !latest.contains_key(parent_id) {
             continue;
         }
         for (_, part_id) in parts {
@@ -2371,8 +2403,52 @@ async fn replay_durable_outbox(channels: &ChannelMap) {
         }
     }
 
-    for row in latest
-        .into_values()
+    // TG-GATE-V2 W14 — `queue_split_parts` always appends parts
+    // ascending, so append order already implies `part_index` order in
+    // the common case; but nothing about the durable log format
+    // enforces that (and a group's parts are interleaved in `order` with
+    // whatever else got appended around the same time). Re-derive a
+    // final replay order explicitly: walk `order` once, and the first
+    // time any row belonging to a given `parent_id` is reached, emit
+    // that WHOLE group sorted by `part_index` right there (using the
+    // already-sorted-by-index `parts_by_parent`); a row with no parent
+    // (or one whose parent group was already emitted) is emitted as
+    // itself, in place.
+    let mut sorted_parts_by_parent: HashMap<String, Vec<String>> = parts_by_parent
+        .iter()
+        .map(|(parent_id, parts)| {
+            let mut parts = parts.clone();
+            parts.sort_by_key(|(idx, _)| *idx);
+            (
+                parent_id.clone(),
+                parts.into_iter().map(|(_, id)| id).collect(),
+            )
+        })
+        .collect();
+    let mut emitted: HashSet<String> = HashSet::new();
+    let mut ordered_ids: Vec<String> = Vec::with_capacity(order.len());
+    for id in order {
+        if emitted.contains(&id) {
+            continue;
+        }
+        let parent_of_id = latest.get(&id).and_then(|row| row.parent_id.clone());
+        if let Some(group) =
+            parent_of_id.and_then(|parent_id| sorted_parts_by_parent.remove(&parent_id))
+        {
+            for part_id in group {
+                if emitted.insert(part_id.clone()) {
+                    ordered_ids.push(part_id);
+                }
+            }
+            continue;
+        }
+        emitted.insert(id.clone());
+        ordered_ids.push(id);
+    }
+
+    for row in ordered_ids
+        .into_iter()
+        .filter_map(|id| latest.remove(&id))
         .filter(|row| row.state != DurableOutboundState::Sent && !discarded_ids.contains(&row.id))
     {
         if superseded_parents.contains(&row.id) {
@@ -3333,6 +3409,156 @@ mod tests {
             after_second_replay.len(),
             3,
             "a second replay must not duplicate anything: {after_second_replay:?}"
+        );
+
+        restore_env("CCTEAM_HOME", old_ccteam_home);
+        restore_env("HOME", old_home);
+    }
+
+    /// TG-GATE-V2 W14 — the "incomplete split → discard orphan parts"
+    /// rule (W12) must only fire when a parent row actually exists to
+    /// replay whole instead. The ordinary (non-rich) pre-split path —
+    /// `send_gateway_outbound`'s multi-part branch via
+    /// `send_split_parts`/`queue_split_parts` — never appends a row for
+    /// its `id_prefix` at all; its parts ARE the message. Simulate a
+    /// crash right after part 0 of a 3-part set is durably queued (mid
+    /// `queue_split_parts`, same crash point as W12) but with NO parent
+    /// row ever written, and confirm replay sends exactly the queued
+    /// part — never discarding it as an "orphan".
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crash_mid_parentless_split_never_discards_the_queued_part() {
+        use crate::transport::providers::mock::MockChannel;
+
+        let _guard = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("CCTEAM_HOME", tmp.path().join(".ccteam"));
+
+        // Only part 0 of a 3-part split gets durably queued before the
+        // crash — parts 1 and 2 never make it. Crucially: unlike the W12
+        // test, NO row with id "row-6" (the `id_prefix`/`parent_id`) is
+        // ever appended — this is what the ordinary pre-split path
+        // (`send_split_parts`) actually looks like, it has no parent row
+        // to protect.
+        append_durable_outbound(DurableOutboundRow {
+            ts_ms: now_unix_ms_u64(),
+            id: "row-6-0".to_string(),
+            inbound_id: "in-6".to_string(),
+            channel: "telegram".to_string(),
+            state: DurableOutboundState::Queued,
+            message: SendMessage::new("part one", "chat-1"),
+            platform_message_id: None,
+            error: None,
+            parent_id: Some("row-6".to_string()),
+            part_index: Some(0),
+            part_total: Some(3),
+        });
+
+        // CRASH — parts 1 and 2 never get appended; there is no parent
+        // row (there never was one for this path).
+
+        let mock = MockChannel::new().with_name("telegram");
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), Arc::new(mock.clone()));
+
+        replay_durable_outbox(&channels).await;
+
+        let delivered = mock.outbox().await;
+        assert_eq!(
+            delivered.len(),
+            1,
+            "replay must send exactly the one queued part, nothing discarded, \
+             nothing fabricated: {delivered:?}"
+        );
+        assert_eq!(
+            delivered[0].content, "part one",
+            "the queued part must be replayed as itself, not discarded as an orphan: {delivered:?}"
+        );
+
+        let raw = std::fs::read_to_string(durable_outbox_path()).unwrap();
+        let terminal_row = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<DurableOutboundRow>(line).ok())
+            .rfind(|row| row.id == "row-6-0")
+            .expect("part row must exist");
+        assert_eq!(terminal_row.state, DurableOutboundState::Sent);
+        assert_ne!(
+            terminal_row.error.as_deref(),
+            Some("discarded: incomplete split"),
+            "a parentless part must never be marked discarded"
+        );
+
+        // A second replay must not resend anything.
+        replay_durable_outbox(&channels).await;
+        let after_second_replay = mock.outbox().await;
+        assert_eq!(
+            after_second_replay.len(),
+            1,
+            "a second replay must not duplicate anything: {after_second_replay:?}"
+        );
+
+        restore_env("CCTEAM_HOME", old_ccteam_home);
+        restore_env("HOME", old_home);
+    }
+
+    /// TG-GATE-V2 W14 — replay must resend a split's parts in
+    /// `part_index` order, not whatever order `HashMap` iteration
+    /// happens to yield. Append the three part rows to the outbox file
+    /// in reverse (part 2, then 1, then 0) — `queue_split_parts` always
+    /// appends ascending, but a durable log doesn't enforce that by
+    /// construction, and `HashMap::into_values()` alone would scramble
+    /// order regardless — and confirm the mock channel observes them
+    /// delivered 0, 1, 2.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_sends_split_parts_in_part_index_order() {
+        use crate::transport::providers::mock::MockChannel;
+
+        let _guard = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("CCTEAM_HOME", tmp.path().join(".ccteam"));
+
+        // Appended out of order: part 2 first, then 1, then 0.
+        for part_idx in [2usize, 1, 0] {
+            append_durable_outbound(DurableOutboundRow {
+                ts_ms: now_unix_ms_u64(),
+                id: format!("row-7-{part_idx}"),
+                inbound_id: "in-7".to_string(),
+                channel: "telegram".to_string(),
+                state: DurableOutboundState::Queued,
+                message: SendMessage::new(format!("part {part_idx}"), "chat-1"),
+                platform_message_id: None,
+                error: None,
+                parent_id: Some("row-7".to_string()),
+                part_index: Some(part_idx),
+                part_total: Some(3),
+            });
+        }
+
+        let mock = MockChannel::new().with_name("telegram");
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), Arc::new(mock.clone()));
+
+        replay_durable_outbox(&channels).await;
+
+        let delivered = mock.outbox().await;
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "part 0".to_string(),
+                "part 1".to_string(),
+                "part 2".to_string(),
+            ],
+            "parts must replay in ascending part_index order, not file/hash order: {delivered:?}"
         );
 
         restore_env("CCTEAM_HOME", old_ccteam_home);
