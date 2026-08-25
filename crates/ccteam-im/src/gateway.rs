@@ -106,6 +106,34 @@ fn format_bulk_stop_result(stopped: &[String], failures: &[String]) -> String {
     lines.join("\n")
 }
 
+fn format_bulk_stop_preview(sids: &BTreeSet<String>) -> String {
+    const PREVIEW_CAP: usize = 20;
+    let mut preview: Vec<&str> = sids.iter().take(PREVIEW_CAP).map(String::as_str).collect();
+    if sids.len() > PREVIEW_CAP {
+        preview.push("…");
+    }
+    format!(
+        "Будут остановлены {} сессий: {}",
+        sids.len(),
+        preview.join(", ")
+    )
+}
+
+fn bulk_stop_options(scope: &str, count: usize) -> Vec<MessageOption> {
+    vec![
+        MessageOption {
+            data: format!("nav:stop:{scope}"),
+            label: format!("Остановить {count}"),
+            id: format!("stop-{scope}"),
+        },
+        MessageOption {
+            data: "nav:stop:cancel".to_string(),
+            label: "Отмена".to_string(),
+            id: "stop-cancel".to_string(),
+        },
+    ]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnOrigin {
     User,
@@ -3794,8 +3822,16 @@ impl Gateway {
                     if sids.is_empty() {
                         return Ok(Some("Нет доступных сессий для остановки".to_string()));
                     }
-                    let (stopped, failures) = self.stop_sessions_bulk(&sids).await;
-                    return Ok(Some(format_bulk_stop_result(&stopped, &failures)));
+                    let preview = format_bulk_stop_preview(&sids);
+                    if Self::channel_supports_buttons(&chat.channel) {
+                        self.emit_list_options(
+                            chat,
+                            preview,
+                            bulk_stop_options(&scope, sids.len()),
+                        );
+                        return Ok(None);
+                    }
+                    return Ok(Some(preview));
                 }
                 let sid = target.to_string();
                 // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own session.
@@ -4149,12 +4185,29 @@ impl Gateway {
         Ok(format!("Используется сессия {sid}"))
     }
 
-    /// Resolve a `nav:` switch-button tap (`cd:<slug>` / `use:<sid>`) by
-    /// delegating to the SAME switch logic `/cd` / `/use` use (ACL + cold
-    /// resume included). The payload is self-describing, so no pending-registry
-    /// entry is consulted; a stale button just re-runs the (idempotent) switch
-    /// or reads as an unknown target.
+    /// Resolve a `nav:` button tap (`cd:<slug>` / `use:<sid>` / `stop:<scope>`)
+    /// by delegating to the same command logic. The payload is self-describing,
+    /// so no pending-registry entry is consulted.
     async fn resolve_nav_selection(&mut self, chat: &ChatKey, nav: &str) -> Result<Vec<String>> {
+        if nav == "stop:cancel" {
+            return Ok(vec!["Отменено".to_string()]);
+        }
+        if let Some(scope) = nav.strip_prefix("stop:") {
+            if matches!(scope, "all" | "project") {
+                let sids = match self.bulk_stop_candidates(chat, scope) {
+                    Ok(sids) => sids,
+                    Err(error) => return Ok(vec![error.to_string()]),
+                };
+                if sids.is_empty() {
+                    return Ok(vec!["Нет доступных сессий для остановки".to_string()]);
+                }
+                // Recompute at tap time: a stale preview is never trusted; a
+                // session born since the preview is included, and a dead one
+                // simply drops out of this fresh ACL-filtered set.
+                let (stopped, failures) = self.stop_sessions_bulk(&sids).await;
+                return Ok(vec![format_bulk_stop_result(&stopped, &failures)]);
+            }
+        }
         if let Some(slug) = nav.strip_prefix("cd:") {
             let mut reply = self.change_project(chat, slug)?;
             if chat.channel != "web" {
@@ -15584,6 +15637,45 @@ mod tests {
         }
     }
 
+    async fn stop_preview(
+        gateway: &mut Gateway,
+        events: &mut tokio::sync::broadcast::Receiver<GatewayEvent>,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        scope: &str,
+    ) -> GatewayEvent {
+        let replies = gateway
+            .handle_text(channel, chat_id, user_id, &format!("/stop {scope}"))
+            .await
+            .unwrap();
+        assert!(replies.is_empty(), "bulk Telegram stop uses the event sink");
+        recv_answer(events).await
+    }
+
+    async fn tap_stop(
+        gateway: &mut Gateway,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        scope: &str,
+    ) -> Vec<String> {
+        gateway
+            .handle_message(
+                channel,
+                chat_id,
+                user_id,
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:stop:{scope}"),
+                }),
+            )
+            .await
+            .unwrap()
+    }
+
     /// Regression: a real `codex app-server` turn emits the agent message
     /// as a streaming `ItemUpdated` delta AND a final `ItemCompleted`
     /// carrying the full text (verified live: delta "391" + completed
@@ -16811,23 +16903,38 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", tmp.path());
-        gateway.bind_operator_allowlist("mock", ["chat-1".to_string(), "chat-2".to_string()]);
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string(), "chat-2".to_string()]);
+        let mut events = gateway.subscribe_events();
 
         gateway
-            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
             .unwrap();
         gateway
-            .handle_text("mock", "chat-2", "bob", "/new claude")
+            .handle_text("telegram", "chat-2", "bob", "/new claude")
             .await
             .unwrap();
 
-        let reply = gateway
-            .handle_text("mock", "chat-1", "alice", "/stop ALL")
-            .await
-            .unwrap();
-
-        assert_eq!(reply[0].lines().next(), Some("Остановлено сессий: 1 (s1)"));
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "ALL",
+        )
+        .await;
+        assert_eq!(preview.content, "Будут остановлены 1 сессий: s1");
+        assert_eq!(
+            preview
+                .options
+                .iter()
+                .map(|option| option.data.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nav:stop:all", "nav:stop:cancel"]
+        );
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", "all").await;
+        assert_eq!(reply, vec!["Остановлено сессий: 1 (s1)".to_string()]);
         assert!(!gateway.sessions.contains_key("s1"));
         assert!(gateway.sessions.contains_key("s2"));
     }
@@ -16840,9 +16947,10 @@ mod tests {
             let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
             let mut gateway = Gateway::new(fake, "alpha", tmp.path());
             gateway.enable_persistence(tmp.path()).unwrap();
-            gateway.bind_operator_allowlist("mock", ["chat-1".to_string(), "chat-2".to_string()]);
             gateway
-                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .bind_operator_allowlist("telegram", ["chat-1".to_string(), "chat-2".to_string()]);
+            gateway
+                .handle_text("telegram", "chat-1", "alice", "/new claude")
                 .await
                 .unwrap();
             sid1 = gateway
@@ -16852,7 +16960,7 @@ mod tests {
                 .cloned()
                 .expect("first session");
             gateway
-                .handle_text("mock", "chat-2", "bob", "/new claude")
+                .handle_text("telegram", "chat-2", "bob", "/new claude")
                 .await
                 .unwrap();
             sid2 = gateway
@@ -16867,19 +16975,35 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut restarted = Gateway::new(fake, "alpha", tmp.path());
         restarted.enable_persistence(tmp.path()).unwrap();
-        restarted.bind_operator_allowlist("mock", ["chat-1".to_string(), "chat-2".to_string()]);
+        restarted.bind_operator_allowlist("telegram", ["chat-1".to_string(), "chat-2".to_string()]);
         restarted.resume_restored_sessions().await;
         assert!(restarted.is_session_detached(&sid1));
         assert!(restarted.is_session_detached(&sid2));
 
-        let reply = restarted
-            .handle_text("mock", "chat-1", "alice", "/stop all")
-            .await
-            .unwrap();
+        let mut events = restarted.subscribe_events();
+        let preview = stop_preview(
+            &mut restarted,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "all",
+        )
+        .await;
         assert_eq!(
-            reply[0].lines().next(),
-            Some(format!("Остановлено сессий: 1 ({sid1})").as_str())
+            preview.content,
+            format!("Будут остановлены 1 сессий: {sid1}")
         );
+        assert_eq!(
+            preview
+                .options
+                .iter()
+                .map(|option| option.data.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nav:stop:all", "nav:stop:cancel"]
+        );
+        let reply = tap_stop(&mut restarted, "telegram", "chat-1", "alice", "all").await;
+        assert_eq!(reply, vec![format!("Остановлено сессий: 1 ({sid1})")]);
         assert!(!restarted.is_session_detached(&sid1));
         assert!(restarted.is_session_detached(&sid2));
         own_body.wait().expect("own detached body stopped");
@@ -16964,11 +17088,19 @@ mod tests {
             .await
             .unwrap();
 
-        let reply = gateway
-            .handle_text("telegram@uaaa", "chat-a", "alice", "/stop all")
-            .await
-            .unwrap();
-        assert_eq!(reply[0].lines().next(), Some("Остановлено сессий: 1 (s1)"));
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram@uaaa",
+            "chat-a",
+            "alice",
+            "all",
+        )
+        .await;
+        assert_eq!(preview.content, "Будут остановлены 1 сессий: s1");
+        let reply = tap_stop(&mut gateway, "telegram@uaaa", "chat-a", "alice", "all").await;
+        assert_eq!(reply, vec!["Остановлено сессий: 1 (s1)".to_string()]);
         assert!(!gateway.sessions.contains_key("s1"));
         assert!(gateway.sessions.contains_key("s2"));
     }
@@ -16979,19 +17111,27 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_close_failures(1));
         let adapter: Arc<dyn HarnessAdapter> = fake.clone();
         let mut gateway = Gateway::new(adapter, "alpha", tmp.path());
-        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
         gateway
-            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
             .unwrap();
         gateway
-            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
             .unwrap();
-        let reply = gateway
-            .handle_text("mock", "chat-1", "alice", "/stop all")
-            .await
-            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "all",
+        )
+        .await;
+        assert_eq!(preview.content, "Будут остановлены 2 сессий: s1, s2");
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", "all").await;
         let summary: Vec<&str> = reply[0].lines().take(2).collect();
         assert_eq!(
             summary,
@@ -17007,11 +17147,11 @@ mod tests {
     #[tokio::test]
     async fn gateway_stop_all_keeps_tenant_session_from_operator() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (paths, operator_dir) = mirror_test_paths(&tmp);
+        let (paths, _alpha_dir) = mirror_test_paths(&tmp);
         seed_owned_project(&paths, "alpha", Some("user:uaaa"));
         seed_owned_project(&paths, "operator", None);
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake, "operator", &operator_dir);
+        let mut gateway = Gateway::new(fake, "operator", paths.projects_root.join("operator"));
         gateway.enable_project_creation(paths);
         gateway.bind_operator_allowlist("telegram", ["admin-chat".to_string()]);
         gateway
@@ -17027,11 +17167,19 @@ mod tests {
             .await
             .unwrap();
 
-        let reply = gateway
-            .handle_text("telegram", "admin-chat", "admin", "/stop all")
-            .await
-            .unwrap();
-        assert_eq!(reply[0].lines().next(), Some("Остановлено сессий: 1 (s2)"));
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "admin-chat",
+            "admin",
+            "all",
+        )
+        .await;
+        assert_eq!(preview.content, "Будут остановлены 1 сессий: s2");
+        let reply = tap_stop(&mut gateway, "telegram", "admin-chat", "admin", "all").await;
+        assert_eq!(reply, vec!["Остановлено сессий: 1 (s2)".to_string()]);
         assert!(
             !gateway.sessions.contains_key("s2"),
             "operator session stopped"
@@ -17047,43 +17195,128 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", tmp.path());
-        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
         gateway.register_project("beta", tmp.path());
 
         gateway
-            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
             .unwrap();
         gateway
-            .handle_text("mock", "chat-1", "alice", "/cd beta")
+            .handle_text("telegram", "chat-1", "alice", "/cd beta")
             .await
             .unwrap();
         gateway
-            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
             .unwrap();
         gateway
-            .handle_text("mock", "chat-1", "alice", "/cd alpha")
+            .handle_text("telegram", "chat-1", "alice", "/cd alpha")
             .await
             .unwrap();
         gateway
-            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
             .unwrap();
         gateway
-            .handle_text("mock", "chat-1", "alice", "/cd beta")
+            .handle_text("telegram", "chat-1", "alice", "/cd beta")
             .await
             .unwrap();
 
-        let reply = gateway
-            .handle_text("mock", "chat-1", "alice", "/stop project")
-            .await
-            .unwrap();
-
-        assert_eq!(reply[0].lines().next(), Some("Остановлено сессий: 1 (s2)"));
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "project",
+        )
+        .await;
+        assert_eq!(preview.content, "Будут остановлены 1 сессий: s2");
+        assert_eq!(
+            preview
+                .options
+                .iter()
+                .map(|option| option.data.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nav:stop:project", "nav:stop:cancel"]
+        );
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", "project").await;
+        assert_eq!(reply, vec!["Остановлено сессий: 1 (s2)".to_string()]);
         assert!(gateway.sessions.contains_key("s1"));
         assert!(!gateway.sessions.contains_key("s2"));
         assert!(gateway.sessions.contains_key("s3"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_cancel_leaves_sessions_alive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "all",
+        )
+        .await;
+        assert_eq!(preview.content, "Будут остановлены 1 сессий: s1");
+        let reply = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "nav:stop:cancel".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["Отменено".to_string()]);
+        assert!(gateway.sessions.contains_key("s1"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_recomputes_candidates_at_tap_time() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "all",
+        )
+        .await;
+        assert_eq!(preview.content, "Будут остановлены 1 сессий: s1");
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", "all").await;
+        assert_eq!(reply, vec!["Остановлено сессий: 2 (s1, s2)".to_string()]);
+        assert!(gateway.sessions.is_empty());
     }
 
     #[tokio::test]
