@@ -584,7 +584,7 @@ fn text_payload(source: &str) -> TextPayload {
             text: truncate_plain_message(source),
             formatted: false,
         }
-    } else if rendered.text_utf16_len == 0 && !source.trim().is_empty() {
+    } else if !rendered.has_non_whitespace {
         TextPayload {
             text: source.to_owned(),
             formatted: false,
@@ -616,9 +616,8 @@ fn plain_text_for_request(source: &str) -> String {
 fn caption_payload(caption: &str) -> CaptionPayload {
     let plain = truncate_caption(caption);
     let rendered = render_markdown(&plain);
-    let html = (rendered.text_utf16_len <= MAX_CAPTION_UTF16
-        && !(rendered.text_utf16_len == 0 && !plain.trim().is_empty()))
-    .then_some(rendered.html);
+    let html = (rendered.text_utf16_len <= MAX_CAPTION_UTF16 && rendered.has_non_whitespace)
+        .then_some(rendered.html);
     CaptionPayload { html, plain }
 }
 
@@ -634,7 +633,9 @@ fn should_retry_plain(status: reqwest::StatusCode, response_text: &str) -> bool 
         .unwrap_or_else(|| response_text.to_owned());
     let description = description.to_ascii_lowercase();
     status == reqwest::StatusCode::BAD_REQUEST
-        && (description.contains("parse") || description.contains("entit"))
+        && (description.contains("can't parse entities")
+            || description.contains("message text is empty")
+            || description.contains("message is empty"))
 }
 
 #[async_trait]
@@ -1250,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_entity_error_retries_only_parse_related_bad_requests() {
+    fn parse_entity_error_retries_only_known_bad_requests() {
         assert!(should_retry_plain(
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities: Can't find end tag corresponding to start tag b"}"#,
@@ -1258,6 +1259,18 @@ mod tests {
         assert!(!should_retry_plain(
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"description":"Bad Request: message is too long"}"#,
+        ));
+        assert!(!should_retry_plain(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"description":"Bad Request: wrong parse_mode specified"}"#,
+        ));
+        assert!(should_retry_plain(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"description":"Bad Request: message text is empty"}"#,
+        ));
+        assert!(should_retry_plain(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"description":"Bad Request: message is empty"}"#,
         ));
         assert!(!should_retry_plain(
             reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -1277,7 +1290,7 @@ mod tests {
 
     #[test]
     fn empty_rendered_text_uses_plain_payload() {
-        for source in ["```", "```\n```", "# ", "> "] {
+        for source in ["```", "```\n```\n", "# \n", "> \n", "   ", "\n"] {
             let payload = text_payload(source);
             assert_eq!(payload.text, source);
             assert!(!payload.formatted);

@@ -11,12 +11,15 @@ pub struct RenderedMarkdown {
     pub html: String,
     /// Length of the rendered text, excluding HTML markup.
     pub text_utf16_len: usize,
+    /// Whether the rendered text contains at least one non-whitespace character.
+    pub has_non_whitespace: bool,
 }
 
 #[derive(Default)]
 struct Fragment {
     html: String,
     text_utf16_len: usize,
+    has_non_whitespace: bool,
     contains_code: bool,
 }
 
@@ -113,6 +116,7 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
     RenderedMarkdown {
         html: out.html,
         text_utf16_len: out.text_utf16_len,
+        has_non_whitespace: out.has_non_whitespace,
     }
 }
 
@@ -130,6 +134,7 @@ fn render_code_block(body: &str, language: Option<&str>) -> Fragment {
     Fragment {
         html,
         text_utf16_len: utf16_len(body),
+        has_non_whitespace: body.chars().any(|ch| !ch.is_whitespace()),
         contains_code: true,
     }
 }
@@ -157,6 +162,7 @@ fn render_inline(input: &str, allow_code: bool, allow_links: bool) -> Fragment {
                     let mut fragment = Fragment {
                         html: String::from("<code>"),
                         text_utf16_len: utf16_len(code),
+                        has_non_whitespace: code.chars().any(|ch| !ch.is_whitespace()),
                         contains_code: true,
                     };
                     fragment.html.push_str(&escape_html(code));
@@ -175,6 +181,7 @@ fn render_inline(input: &str, allow_code: bool, allow_links: bool) -> Fragment {
                 let mut fragment = Fragment {
                     html: format!("<a href=\"{href}\">"),
                     text_utf16_len: label.text_utf16_len,
+                    has_non_whitespace: label.has_non_whitespace,
                     contains_code: false,
                 };
                 fragment.html.push_str(&label.html);
@@ -244,6 +251,7 @@ fn wrap(tag: &str, inner: Fragment) -> Fragment {
     Fragment {
         html,
         text_utf16_len: inner.text_utf16_len,
+        has_non_whitespace: inner.has_non_whitespace,
         contains_code: inner.contains_code,
     }
 }
@@ -251,12 +259,14 @@ fn wrap(tag: &str, inner: Fragment) -> Fragment {
 fn append_fragment(out: &mut Fragment, fragment: Fragment) {
     out.html.push_str(&fragment.html);
     out.text_utf16_len += fragment.text_utf16_len;
+    out.has_non_whitespace |= fragment.has_non_whitespace;
     out.contains_code |= fragment.contains_code;
 }
 
 fn append_escaped_text(out: &mut Fragment, text: &str) {
     out.html.push_str(&escape_html(text));
     out.text_utf16_len += utf16_len(text);
+    out.has_non_whitespace |= text.chars().any(|ch| !ch.is_whitespace());
 }
 
 fn escape_html(text: &str) -> String {
@@ -473,7 +483,53 @@ fn is_identifier_like_underscore_pair(
     }
     let content = &input[start + delimiter.len()..end];
     let identifier = content.chars().all(|ch| ch.is_alphanumeric() || ch == '_');
-    identifier && ((delimiter == "_" && content.contains('_')) || delimiter == "__")
+    identifier
+        && ((delimiter == "_" && content.contains('_'))
+            || (delimiter == "__" && is_known_dunder_name(content)))
+}
+
+// Keep common source identifiers such as `__init__` literal, while retaining
+// the documented `__bold__` strong-emphasis form for ordinary prose.
+fn is_known_dunder_name(content: &str) -> bool {
+    matches!(
+        content,
+        "init"
+            | "new"
+            | "del"
+            | "repr"
+            | "str"
+            | "bytes"
+            | "format"
+            | "lt"
+            | "le"
+            | "eq"
+            | "ne"
+            | "gt"
+            | "ge"
+            | "hash"
+            | "bool"
+            | "call"
+            | "len"
+            | "getitem"
+            | "setitem"
+            | "delitem"
+            | "iter"
+            | "next"
+            | "contains"
+            | "enter"
+            | "exit"
+            | "aenter"
+            | "aexit"
+            | "name"
+            | "module"
+            | "qualname"
+            | "doc"
+            | "all"
+            | "version"
+            | "slots"
+            | "dict"
+            | "weakref"
+    )
 }
 
 fn is_escaped(input: &str, index: usize) -> bool {
@@ -572,10 +628,10 @@ mod tests {
 
     #[test]
     fn renders_all_inline_styles() {
-        let rendered = render_markdown("**bold** *italic* _italic_ ~~strike~~ `code`");
+        let rendered = render_markdown("**bold** __bold__ *italic* _italic_ ~~strike~~ `code`");
         assert_eq!(
             rendered.html,
-            "<b>bold</b> <i>italic</i> <i>italic</i> <s>strike</s> <code>code</code>"
+            "<b>bold</b> <b>bold</b> <i>italic</i> <i>italic</i> <s>strike</s> <code>code</code>"
         );
     }
 
@@ -592,6 +648,7 @@ mod tests {
         ] {
             assert_eq!(render_markdown(input).html, input);
         }
+        assert_eq!(render_markdown("x__y__z").html, "x__y__z");
     }
 
     #[test]
@@ -601,6 +658,7 @@ mod tests {
             ("*it*", "<i>it</i>"),
             ("_it_", "<i>it</i>"),
             ("a **b** c", "a <b>b</b> c"),
+            ("__bold__", "<b>bold</b>"),
         ] {
             assert_eq!(render_markdown(input).html, expected);
         }
