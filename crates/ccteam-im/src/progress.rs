@@ -20,6 +20,7 @@
 //! start/complete pair by `item.id` so it counts once.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use ccteam_harness::{ThreadEvent, ThreadItemDetails};
 use serde_json::Value;
@@ -28,10 +29,11 @@ use crate::gateway::{ActivityKind, ActivityStatus, SessionActivity};
 
 /// Phone-sized cap (chars) for a tool's argument preview.
 pub const PREVIEW_MAX: usize = 200;
-/// How many recent steps to expand below the folded summary.
-const MAX_DETAIL_LINES: usize = 2;
-/// Hard cap on rendered status lines (summary + details).
-const MAX_LINES: usize = 8;
+/// Recent tool/command lines shown in the terminal block.
+const MAX_DETAIL_LINES: usize = 12;
+/// Per-line terminal cap. At most twelve Unicode scalar lines can occupy no
+/// more than 2891 UTF-16 units including newlines, below Telegram's 3000 cap.
+const MAX_OUTPUT_LINE_CHARS: usize = 120;
 
 /// A folded category: a stable emoji + short label that several raw tool
 /// names collapse into (e.g. `Read`/`Grep`/`Glob` → `read`).
@@ -213,7 +215,6 @@ struct Bucket {
 /// Rolling fold of a single status epoch (one turn's progress). Feed it
 /// [`ThreadEvent`]s with [`apply`](Self::apply); render the current
 /// status text with [`render`](Self::render).
-#[derive(Default)]
 pub struct ProgressFold {
     buckets: Vec<Bucket>,
     seen_ids: HashSet<String>,
@@ -222,11 +223,28 @@ pub struct ProgressFold {
     recent: Vec<String>,
     thinking: bool,
     /// Codex streamed an `ItemUpdated{AgentMessage}` delta (drafting the
-    /// reply) — shown as a head state, never sent as its own answer.
+    /// reply), which keeps this fold eligible for a progress update.
     drafting: bool,
     done: bool,
     tool_total: usize,
     file_total: usize,
+    started_at: Instant,
+}
+
+impl Default for ProgressFold {
+    fn default() -> Self {
+        Self {
+            buckets: Vec::new(),
+            seen_ids: HashSet::new(),
+            recent: Vec::new(),
+            thinking: false,
+            drafting: false,
+            done: false,
+            tool_total: 0,
+            file_total: 0,
+            started_at: Instant::now(),
+        }
+    }
 }
 
 impl ProgressFold {
@@ -373,19 +391,9 @@ impl ProgressFold {
         )
     }
 
-    fn head(&self) -> &'static str {
-        if self.drafting {
-            "✍️ формирование ответа…"
-        } else if self.buckets.is_empty() && self.thinking {
-            "💭 обдумывание…"
-        } else {
-            "⏳ работа…"
-        }
-    }
-
     fn done_summary(&self) -> String {
         format!(
-            "✅ Готово · {} {} · {} {}",
+            "{} {} · {} {}",
             self.tool_total,
             russian_count_word(self.tool_total, "инструмент", "инструмента", "инструментов"),
             self.file_total,
@@ -393,24 +401,83 @@ impl ProgressFold {
         )
     }
 
-    /// Render the current status text (≤ [`MAX_LINES`] lines).
-    pub fn render(&self) -> String {
+    /// Render the current terminal-style status text for `sid`.
+    pub fn render(&self, sid: &str) -> String {
+        let elapsed = render_elapsed(self.started_at.elapsed());
         if self.done {
-            return self.done_summary();
+            return format!("✅ готово · {elapsed} · {}", self.done_summary());
         }
-        let mut header = self.head().to_string();
+        let mut lines = vec![format!("▶️ {sid} работает · {elapsed}")];
         let summary = self.counts_summary();
+        if !self.recent.is_empty() {
+            lines.push("```text".to_string());
+            lines.extend(self.recent.iter().map(|line| terminal_line(line)));
+            lines.push("```".to_string());
+        }
         if !summary.is_empty() {
-            header.push_str(" · ");
-            header.push_str(&summary);
+            lines.push(summary);
         }
-        let mut lines = vec![header];
-        for d in &self.recent {
-            lines.push(format!("  {d}"));
-        }
-        lines.truncate(MAX_LINES);
         lines.join("\n")
     }
+}
+
+fn render_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds >= 3600 {
+        format!(
+            "{}ч{}м{}с",
+            seconds / 3600,
+            (seconds / 60) % 60,
+            seconds % 60
+        )
+    } else if seconds >= 60 {
+        format!("{}м{}с", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}с")
+    }
+}
+
+fn terminal_line(line: &str) -> String {
+    let stripped = strip_ansi(line);
+    let flat = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX_OUTPUT_LINE_CHARS {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(MAX_OUTPUT_LINE_CHARS - 1).collect();
+    out.push('…');
+    out
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for code in chars.by_ref() {
+                    if ('@'..='~').contains(&code) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(code) = chars.next() {
+                    if code == '\u{7}' {
+                        break;
+                    }
+                    if code == '\u{1b}' && chars.next() == Some('\\') {
+                        break;
+                    }
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    out
 }
 
 pub(crate) fn russian_count_word<'a>(
@@ -466,10 +533,10 @@ mod tests {
         assert!(f.apply(&started_tool("t1", "Read", json!({"file_path": "/a"}))));
         assert!(f.apply(&started_tool("t2", "Read", json!({"file_path": "/b"}))));
         assert!(f.apply(&started_tool("t3", "Bash", json!({"command": "ls"}))));
-        let r = f.render();
+        let r = f.render("s42");
         assert!(r.contains("📖 чтение ×2"), "got: {r}");
         assert!(r.contains("🔧 команда ×1"), "got: {r}");
-        assert!(r.starts_with("⏳ работа…"), "got: {r}");
+        assert!(r.starts_with("▶️ s42 работает · "), "got: {r}");
     }
 
     #[test]
@@ -490,7 +557,7 @@ mod tests {
         assert!(f.apply(&started_tool("t1", "Bash", json!({"command": "ls"}))));
         // The matching completion carries the same id → must NOT recount.
         assert!(!f.apply(&completed_tool("t1", "Bash")));
-        assert!(f.render().contains("🔧 команда ×1"));
+        assert!(f.render("s42").contains("🔧 команда ×1"));
     }
 
     #[test]
@@ -498,11 +565,15 @@ mod tests {
         let mut f = ProgressFold::new();
         let long = "x".repeat(500);
         f.apply(&started_tool("t1", "Bash", json!({ "command": long })));
-        let r = f.render();
+        let r = f.render("s42");
         // The arg preview is capped to PREVIEW_MAX chars; the whole line
         // adds only the `🔧 Bash(…)` wrapper + indent, so it stays far
         // below the untruncated 500.
-        let detail = r.lines().last().unwrap();
+        let detail = r
+            .split("```text\n")
+            .nth(1)
+            .and_then(|body| body.lines().next())
+            .expect("output detail");
         assert!(
             detail.chars().count() < PREVIEW_MAX + 32,
             "detail not truncated: {} chars",
@@ -522,7 +593,7 @@ mod tests {
         };
         assert!(f.apply(&ev));
         assert!(!f.apply(&ev)); // second reasoning is a no-op
-        assert!(f.render().starts_with("💭 обдумывание…"));
+        assert!(f.render("s42").starts_with("▶️ s42 работает · "));
         assert!(f.has_activity());
     }
 
@@ -547,7 +618,7 @@ mod tests {
                 },
             },
         });
-        let r = f.render();
+        let r = f.render("s42");
         assert!(r.contains("🔧 команда ×1"), "got: {r}");
         assert!(r.contains("✏️ правка ×1"), "got: {r}");
         assert!(r.contains("$ `cargo build`"), "got: {r}");
@@ -560,7 +631,9 @@ mod tests {
         f.apply(&started_tool("t1", "Bash", json!({"command": "ls"})));
         f.apply(&started_tool("t2", "Edit", json!({"file_path": "/a"})));
         f.mark_done();
-        assert_eq!(f.render(), "✅ Готово · 2 инструмента · 1 файл");
+        let rendered = f.render("s42");
+        assert!(rendered.starts_with("✅ готово · "));
+        assert!(rendered.contains("2 инструмента · 1 файл"));
     }
 
     #[test]
@@ -585,6 +658,13 @@ mod tests {
             russian_count_word(21, "инструмент", "инструмента", "инструментов"),
             "инструмент"
         );
+    }
+
+    #[test]
+    fn elapsed_uses_compact_russian_terminal_units() {
+        assert_eq!(render_elapsed(Duration::from_secs(5)), "5с");
+        assert_eq!(render_elapsed(Duration::from_secs(83)), "1м23с");
+        assert_eq!(render_elapsed(Duration::from_secs(3_723)), "1ч2м3с");
     }
 
     // ----- v0.8.19 shared activity summarizer -----
@@ -702,7 +782,7 @@ mod tests {
         let act = activity_for(&ev).expect("activity");
         let mut f = ProgressFold::new();
         f.apply(&ev);
-        let detail = f.render();
+        let detail = f.render("s42");
         // The fold's detail line is `📖 Read(/etc/hosts)`; the activity summary
         // is the same `Read(/etc/hosts)` payload (no emoji).
         assert_eq!(act.summary, "Read(/etc/hosts)");
@@ -732,6 +812,50 @@ mod tests {
                 json!({"command": "ls"}),
             ));
         }
-        assert!(f.render().lines().count() <= MAX_LINES);
+        let rendered = f.render("s42");
+        let block = rendered
+            .split("```text\n")
+            .nth(1)
+            .and_then(|body| body.split("\n```").next())
+            .expect("fenced output block");
+        assert_eq!(block.lines().count(), MAX_DETAIL_LINES);
+    }
+
+    #[test]
+    fn terminal_render_keeps_recent_output_inside_a_fenced_text_block() {
+        let mut f = ProgressFold::new();
+        for i in 0..14 {
+            f.apply(&started_tool(
+                &format!("t{i}"),
+                "Bash",
+                json!({"command": format!("\u{1b}[31mline-{i} {}", "x".repeat(200))}),
+            ));
+        }
+
+        let rendered = f.render("s42");
+        assert!(
+            rendered.starts_with("▶️ s42 работает · "),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("```text\n"), "got: {rendered}");
+        assert!(!rendered.contains('\u{1b}'), "ANSI leaked: {rendered:?}");
+
+        let block = rendered
+            .split("```text\n")
+            .nth(1)
+            .and_then(|body| body.split("\n```").next())
+            .expect("fenced output block");
+        assert_eq!(block.lines().count(), 12);
+        assert!(block.lines().all(|line| line.chars().count() <= 120));
+        assert!(block.encode_utf16().count() <= 3000);
+        assert!(block.contains("line-13"));
+        assert!(!block.contains("line-0"));
+        assert!(rendered.contains("🔧 команда ×14"));
+
+        let html = crate::telegram_html::render_markdown(&rendered).html;
+        assert!(
+            html.contains("<pre><code class=\"language-text\">"),
+            "got: {html}"
+        );
     }
 }

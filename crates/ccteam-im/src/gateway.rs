@@ -13833,6 +13833,7 @@ fn emit_progress(
 ) -> bool {
     let (channel, chat_id) = pump_target(session);
     let status_key = format!("{session_id}-{epoch}");
+    // TG-GATE-V2: add [⛔ Прервать → cmd:?/interrupt] via button_rows after W1 merge
     // `send` returns false only when the mpsc consumer is gone; surface that as
     // emit_progress's "sink closed → pump should stop" signal.
     tx.send(GatewayEvent {
@@ -13899,7 +13900,7 @@ fn flush_progress(
 ) -> bool {
     *last_emit = Some(std::time::Instant::now());
     *dirty = false;
-    let content = fold.render();
+    let content = fold.render(session_id);
     if !fold.done() && last_sent.as_deref() == Some(content.as_str()) {
         return true; // no visible change → don't spend an edit
     }
@@ -13919,17 +13920,14 @@ fn progress_enabled() -> bool {
     )
 }
 
-/// Minimum interval between status-message edits (default 800ms — lowered
-/// from 1500ms for snappier activity updates; the live daemon showed ZERO
-/// Telegram 429 backoff at the old rate, and each edit still pays a ~0.5s
-/// platform round-trip so this stays comfortably under the edit rate-limit).
+/// Minimum interval between status-message edits (default 20s).
 /// Override with `CCTEAM_IM_PROGRESS_THROTTLE_MS`; `=0` makes every step emit,
 /// for deterministic tests that don't rely on sleeps.
 fn progress_throttle() -> std::time::Duration {
     let ms = std::env::var("CCTEAM_IM_PROGRESS_THROTTLE_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(800);
+        .unwrap_or(20_000);
     std::time::Duration::from_millis(ms)
 }
 
