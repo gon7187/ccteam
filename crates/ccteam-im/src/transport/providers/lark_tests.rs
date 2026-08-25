@@ -959,11 +959,13 @@ fn build_option_card_renders_text_and_one_button_per_option() {
             data: "nav:cd:alpha".into(),
             label: "✓ alpha".into(),
             id: "alpha".into(),
+            style: None,
         },
         MessageOption {
             data: "nav:cd:beta".into(),
             label: "▸ beta".into(),
             id: "beta".into(),
+            style: None,
         },
     ];
     let card = build_option_card("Pick a project", &opts);
@@ -990,6 +992,7 @@ fn build_option_card_omits_empty_text_div() {
         data: "t:0".into(),
         label: "Yes".into(),
         id: "yes".into(),
+        style: None,
     }];
     let card = build_option_card("", &opts);
     let elements = card["elements"].as_array().expect("elements array");

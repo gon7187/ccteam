@@ -1765,8 +1765,15 @@ async fn send_gateway_outbound(
     // `4096`/`"telegram"` branch lives here.
     // Attachment-bearing messages never split — the files + caption are
     // one logical send (splitting would duplicate the files across parts).
+    // TG-GATE-V2 W1 — a `rich_markdown` message is allowed through unsplit
+    // up to Telegram's much higher Rich Message ceiling (32768 chars vs.
+    // the classic path's ~4096); the provider's own send ladder handles
+    // splitting internally IF it ends up falling back to the classic path
+    // for a long message. Pre-splitting here at the classic ceiling would
+    // defeat that — every part would carry the same (also unsplit)
+    // `rich_markdown`, duplicating it across messages.
     let parts = match channel.max_message_len() {
-        Some(limit) if message.attachments.is_empty() => {
+        Some(limit) if message.attachments.is_empty() && message.rich_markdown.is_none() => {
             crate::sanitize::split_for_channel(&message.content, limit)
         }
         _ => vec![message.content.clone()],

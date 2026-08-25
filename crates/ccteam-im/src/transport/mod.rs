@@ -441,6 +441,22 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+/// Visual style of a rendered button (TG-GATE-V2 W1). Maps to Telegram Rich
+/// Message `RichMessageButton.style` (`"danger"` / `"success"` / `"primary"`)
+/// when a message is sent via `sendRichMessage`; ignored by the classic
+/// `InlineKeyboardButton` path (no per-button style there) and by every
+/// non-Telegram channel.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ButtonStyle {
+    /// Primary/emphasized action.
+    Primary,
+    /// Positive/confirming action.
+    Success,
+    /// Destructive/dangerous action.
+    Danger,
+}
+
 /// A single selectable option rendered on an outbound [`SendMessage`]
 /// (v0.8.5 D3). Channel-local + deliberately opaque: `data` is whatever
 /// the gateway minted (always `"{token}:{idx}"`) and rides the platform's
@@ -465,6 +481,12 @@ pub struct MessageOption {
     /// the SAME token-keyed pending the IM callback does, never a turn.
     #[serde(default)]
     pub id: String,
+    /// TG-GATE-V2 W1 — optional visual style (danger/success/primary).
+    /// `None` = default styling. Only Telegram's Rich Message buttons block
+    /// honors it; the classic inline-keyboard fallback and other channels
+    /// ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<ButtonStyle>,
 }
 
 /// An inbound option click carried on a [`ChannelMessage`] (v0.8.5 D3).
@@ -498,6 +520,23 @@ pub struct SendMessage {
     /// buttons fall back to a numbered text list.
     #[serde(default)]
     pub options: Vec<MessageOption>,
+    /// TG-GATE-V2 W1 — Rich Messages markdown (Bot API 10.3
+    /// `InputRichMessage.markdown`). When `Some`, Telegram tries
+    /// `sendRichMessage` first; on any error it falls back to `content` via
+    /// HTML (`telegram_html`) then plain text. `None` ⇒ zero behavior
+    /// change (classic `sendMessage`/HTML path only). Ignored by every
+    /// other channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rich_markdown: Option<String>,
+    /// TG-GATE-V2 W1 — button rows (1..=8 buttons per row), rendered ABOVE
+    /// [`Self::options`] on both the Rich Message buttons block and the
+    /// classic `inline_keyboard` fallback. `options` (one-per-row, choice
+    /// replies) is untouched and stays a separate concept — `button_rows`
+    /// is for multi-per-row command/navigation buttons. Empty ⇒ no extra
+    /// rows (zero behavior change). Non-Telegram channels fold rows into a
+    /// numbered text list the same way `options` already does today.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub button_rows: Vec<Vec<MessageOption>>,
 }
 
 impl SendMessage {
@@ -510,6 +549,8 @@ impl SendMessage {
             thread_ts: None,
             attachments: Vec::new(),
             options: Vec::new(),
+            rich_markdown: None,
+            button_rows: Vec::new(),
         }
     }
 
@@ -528,6 +569,18 @@ impl SendMessage {
     /// Builder-style: attach selectable options (v0.8.5 D3).
     pub fn with_options(mut self, options: Vec<MessageOption>) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Builder-style: attach Rich Messages markdown (TG-GATE-V2 W1).
+    pub fn with_rich_markdown(mut self, rich_markdown: impl Into<String>) -> Self {
+        self.rich_markdown = Some(rich_markdown.into());
+        self
+    }
+
+    /// Builder-style: attach button rows (TG-GATE-V2 W1).
+    pub fn with_button_rows(mut self, button_rows: Vec<Vec<MessageOption>>) -> Self {
+        self.button_rows = button_rows;
         self
     }
 }

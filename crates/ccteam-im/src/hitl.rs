@@ -375,6 +375,7 @@ async fn ask_external_choice(
             data: format!("{token}:{index}"),
             label: option.label.clone(),
             id: option.id.clone(),
+            style: None,
         })
         .collect();
     let (reply, answer) = oneshot::channel::<ChoiceSelection>();

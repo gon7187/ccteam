@@ -4364,6 +4364,7 @@ impl Gateway {
                     data: format!("nav:cd:{slug}"),
                     label,
                     id: slug,
+                    style: None,
                 }
             })
             .filter(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX)
@@ -4419,6 +4420,7 @@ impl Gateway {
                     data: format!("nav:use:{}", s.id),
                     label,
                     id: s.id.clone(),
+                    style: None,
                 }
             })
             .filter(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX)
@@ -14415,6 +14417,7 @@ fn to_message_options(prompt: &ChoicePrompt) -> Vec<MessageOption> {
             data: format!("{}:{}", prompt.token, i),
             label: opt.label.clone(),
             id: opt.id.clone(),
+            style: None,
         })
         .collect()
 }
@@ -21565,11 +21568,13 @@ mod tests {
                 data: "a".into(),
                 label: "▸ s39 · grok · 「当前是什么模型」".into(),
                 id: "s39".into(),
+                style: None,
             },
             MessageOption {
                 data: "b".into(),
                 label: "▸ s43 · claude · 「Completed the full reques…".into(),
                 id: "s43".into(),
+                style: None,
             },
         ];
         left_align_option_labels(&mut opts);

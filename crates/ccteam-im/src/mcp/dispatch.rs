@@ -1023,6 +1023,7 @@ async fn execute_interaction_ask(
             // "allow"/"deny") so the web SSE consumer can resolve by
             // {token, selection=id} through the same pending machinery.
             id: opt.id.clone(),
+            style: None,
         })
         .collect();
 
@@ -1244,6 +1245,7 @@ async fn execute_permission_ask(
             // "allow"/"deny") so the web SSE consumer can resolve by
             // {token, selection=id} through the same pending machinery.
             id: opt.id.clone(),
+            style: None,
         })
         .collect();
 

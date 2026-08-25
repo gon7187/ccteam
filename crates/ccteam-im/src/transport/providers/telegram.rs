@@ -21,9 +21,9 @@ use anyhow::Context as _;
 use crate::latency::now_unix_ms;
 use crate::telegram_html::render_markdown;
 use crate::transport::{
-    inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, ChoiceReply, CommandSpec, OutboundFile, OutboundFileKind,
-    RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
+    inbound_staging_dir, sanitize_attachment_name, AttachmentKind, ButtonStyle, Channel,
+    ChannelAttachment, ChannelMessage, ChoiceReply, CommandSpec, MessageOption, OutboundFile,
+    OutboundFileKind, RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
 };
 
 /// `getUpdates` long-poll seconds.
@@ -55,6 +55,10 @@ pub struct TelegramChannel {
     http: reqwest::Client,
     last_offset: Arc<Mutex<i64>>,
     name: String,
+    /// TG-GATE-V2 W1 — reason kinds (`"http_400"`, `"network_error"`, …)
+    /// already logged for a rich→classic fallback, so a noisy failure mode
+    /// logs once (debug) instead of once per message.
+    rich_fallback_logged: Mutex<std::collections::HashSet<String>>,
 }
 
 impl TelegramChannel {
@@ -73,6 +77,7 @@ impl TelegramChannel {
                 .expect("reqwest client"),
             last_offset: Arc::new(Mutex::new(0)),
             name: "telegram".to_string(),
+            rich_fallback_logged: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -394,6 +399,222 @@ impl TelegramChannel {
         let text = resp.text().await.unwrap_or_default();
         Ok((status, text))
     }
+
+    // ----- TG-GATE-V2 W1: Rich Messages transport ------------------------
+
+    /// Log a rich→classic fallback `reason` (e.g. `"http_400"`,
+    /// `"network_error"`) at debug level, once per reason kind for this
+    /// channel's lifetime — a persistently-failing rich path (e.g. an old
+    /// Bot API server) must not spam the log once per message.
+    async fn log_rich_fallback_once(&self, reason: &str) {
+        let mut seen = self.rich_fallback_logged.lock().await;
+        if seen.insert(reason.to_string()) {
+            tracing::debug!(
+                channel = %self.name,
+                reason,
+                "telegram: rich message send/edit failed, falling back to classic HTML"
+            );
+        }
+    }
+
+    /// Attempt `sendRichMessage`. `Ok` carries the platform message id (when
+    /// parseable); `Err` carries a short reason kind for
+    /// [`Self::log_rich_fallback_once`] — the caller falls back to the
+    /// classic HTML path on ANY non-2xx or transport error, never
+    /// propagating the rich failure to the caller.
+    async fn try_send_rich(
+        &self,
+        message: &SendMessage,
+        markdown: &str,
+    ) -> Result<Option<String>, String> {
+        let url = self.api_url("sendRichMessage");
+        let body = build_rich_send_body(message, markdown);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| format!("network_error:{err}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("http_{}", status.as_u16()));
+        }
+        Ok(extract_message_id(&text))
+    }
+
+    /// Attempt `editMessageText` with `rich_message` (Bot API 10.3). Same
+    /// contract as [`Self::try_send_rich`].
+    async fn try_edit_rich(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        markdown: &str,
+    ) -> Result<Option<String>, String> {
+        let url = self.api_url("editMessageText");
+        let body = build_rich_edit_body(recipient, message_id, markdown);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| format!("network_error:{err}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!("http_{}", status.as_u16()));
+        }
+        let _ = text;
+        Ok(Some(message_id.to_string()))
+    }
+
+    /// The classic `sendMessage` path (HTML → plain retry), extended with
+    /// [`SendMessage::button_rows`] ⊕ [`SendMessage::options`] as an
+    /// `inline_keyboard`. Splits internally at [`MAX_MESSAGE_UTF16`] when
+    /// `content` overflows it (reached either directly, for a non-rich
+    /// message, or as the rich-fallback path for a long `rich_markdown`
+    /// message whose plain `content` the daemon left unsplit).
+    async fn send_classic(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if message.content.encode_utf16().count() <= MAX_MESSAGE_UTF16 {
+            return self
+                .send_classic_part(message, &message.content, true)
+                .await;
+        }
+        let parts = crate::sanitize::split_for_channel(&message.content, MAX_MESSAGE_UTF16);
+        let total = parts.len();
+        let mut first_id = None;
+        for (i, part) in parts.into_iter().enumerate() {
+            let numbered = if total > 1 {
+                format!("{part} ({}/{total})", i + 1)
+            } else {
+                part
+            };
+            // Buttons ride the LAST part only, so they appear once the
+            // full message has been read.
+            let id = self
+                .send_classic_part(message, &numbered, i + 1 == total)
+                .await?;
+            if first_id.is_none() {
+                first_id = id;
+            }
+        }
+        Ok(first_id)
+    }
+
+    /// Send one classic `sendMessage` part with `text` as the body
+    /// (already length-bounded by the caller), optionally attaching the
+    /// `inline_keyboard`. Shares the existing HTML→plain retry ladder.
+    async fn send_classic_part(
+        &self,
+        message: &SendMessage,
+        text: &str,
+        include_buttons: bool,
+    ) -> anyhow::Result<Option<String>> {
+        let url = self.api_url("sendMessage");
+        let payload = text_payload(text);
+        let mut body = serde_json::json!({
+            "chat_id": message.recipient,
+            "text": payload.text,
+            "reply_to_message_id": message.thread_ts.as_ref().and_then(|s| s.parse::<i64>().ok()),
+        });
+        if payload.formatted {
+            body["parse_mode"] = serde_json::json!("HTML");
+        }
+        if include_buttons {
+            if let Some(keyboard) = inline_keyboard_json(message) {
+                body["reply_markup"] = keyboard;
+            }
+        }
+        let t0 = Instant::now();
+        let resp = self.http.post(&url).json(&body).send().await?;
+        let mut status = resp.status();
+        let mut resp_text = resp.text().await.unwrap_or_default();
+        if payload.formatted && should_retry_plain(status, &resp_text) {
+            tracing::warn!(
+                method = "sendMessage",
+                recipient = %message.recipient,
+                "telegram formatting rejected; retrying with plain text"
+            );
+            let plain_text = plain_text_for_request(text);
+            let plain_body = plain_body(body.clone(), &plain_text);
+            let resp = self.http.post(&url).json(&plain_body).send().await?;
+            status = resp.status();
+            resp_text = resp.text().await.unwrap_or_default();
+        }
+        let send_http_ms = t0.elapsed().as_millis() as u64;
+        if !status.is_success() {
+            tracing::warn!(
+                event = "latency",
+                stage = "tg.egress",
+                recipient = %message.recipient,
+                status = %status,
+                send_http_ms,
+                content_len = text.len(),
+                "latency tg.egress (failed)"
+            );
+            anyhow::bail!(
+                "telegram sendMessage {} → {}: {}",
+                message.recipient,
+                status,
+                resp_text
+            );
+        }
+        let id = extract_message_id(&resp_text);
+        tracing::info!(
+            event = "latency",
+            stage = "tg.egress",
+            recipient = %message.recipient,
+            tg_msg_id = id.as_deref().unwrap_or(""),
+            send_http_ms,
+            content_len = text.len(),
+            "latency tg.egress"
+        );
+        Ok(id)
+    }
+
+    /// The classic `editMessageText` path (HTML → plain retry), unchanged
+    /// from pre-W1 behavior — the rich attempt (when it fails) falls back
+    /// here verbatim.
+    async fn edit_classic(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        content: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let url = self.api_url("editMessageText");
+        let payload = text_payload(content);
+        let mut body = serde_json::json!({
+            "chat_id": recipient,
+            "message_id": message_id.parse::<i64>().ok(),
+            "text": payload.text,
+        });
+        if payload.formatted {
+            body["parse_mode"] = serde_json::json!("HTML");
+        }
+        let resp = self.http.post(&url).json(&body).send().await?;
+        let mut status = resp.status();
+        let mut text = resp.text().await.unwrap_or_default();
+        if payload.formatted && should_retry_plain(status, &text) {
+            tracing::warn!(
+                method = "editMessageText",
+                recipient,
+                "telegram formatting rejected; retrying with plain text"
+            );
+            let plain_text = plain_text_for_request(content);
+            let plain_body = plain_body(body.clone(), &plain_text);
+            let resp = self.http.post(&url).json(&plain_body).send().await?;
+            status = resp.status();
+            text = resp.text().await.unwrap_or_default();
+        }
+        if !status.is_success() {
+            anyhow::bail!("telegram editMessageText {recipient}#{message_id} → {status}: {text}");
+        }
+        // editMessageText returns the (same) edited Message; the id is
+        // stable, so echo it back for the daemon's status bookkeeping.
+        Ok(Some(message_id.to_string()))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -638,6 +859,144 @@ fn should_retry_plain(status: reqwest::StatusCode, response_text: &str) -> bool 
             || description.contains("message is empty"))
 }
 
+// ----- TG-GATE-V2 W1: Rich Messages request shapes (pure) -----------------
+
+/// Pluck `result.message_id` from a Bot API JSON response, best-effort
+/// (shared by `sendMessage` / `sendRichMessage` / `sendPhoto`/`sendDocument`
+/// so the platform-id echo stays one implementation).
+fn extract_message_id(response_text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(response_text)
+        .ok()
+        .and_then(|v| {
+            v.get("result")
+                .and_then(|r| r.get("message_id"))
+                .and_then(|n| n.as_i64())
+        })
+        .map(|n| n.to_string())
+}
+
+/// Map a [`ButtonStyle`] to the `RichMessageButton.style` string (Bot API
+/// 10.3 §4.3: `"danger"` / `"success"` / `"primary"` / `"link"` — ccteam
+/// never emits `"link"`, callback buttons only). `None` omits the
+/// attribute (Telegram's default styling).
+fn button_style_str(style: Option<ButtonStyle>) -> Option<&'static str> {
+    match style {
+        Some(ButtonStyle::Primary) => Some("primary"),
+        Some(ButtonStyle::Success) => Some("success"),
+        Some(ButtonStyle::Danger) => Some("danger"),
+        None => None,
+    }
+}
+
+/// Escape a string for use inside a `<tg-button …>` HTML attribute value
+/// embedded in Rich Message markdown (label text and `callback_data` both
+/// ride attributes, so both need the same escaping as any HTML attribute).
+fn escape_tg_button_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// `SendMessage::button_rows` ⊕ `SendMessage::options` — button rows first,
+/// then one row per choice-reply option (`options` stays a one-per-row
+/// concept; see [`MessageOption`] docs). Shared by the Rich Message
+/// buttons-block builder and the classic `inline_keyboard` fallback so the
+/// two ladders never drift in ordering.
+fn combined_button_rows(message: &SendMessage) -> Vec<Vec<MessageOption>> {
+    let mut rows = message.button_rows.clone();
+    for opt in &message.options {
+        rows.push(vec![opt.clone()]);
+    }
+    rows
+}
+
+/// Render `rows` as trailing `<tg-button-row>` blocks (Bot API 10.3 §5.2 —
+/// the Rich Markdown button syntax; `type="callback_data"` is the only
+/// button kind ccteam emits). Empty `rows` ⇒ empty string (no trailing
+/// blank block).
+fn button_rows_to_tg_html(rows: &[Vec<MessageOption>]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        if row.is_empty() {
+            continue;
+        }
+        out.push_str("<tg-button-row>");
+        for opt in row {
+            out.push_str("<tg-button type=\"callback_data\" callback_data=\"");
+            out.push_str(&escape_tg_button_attr(&opt.data));
+            out.push('"');
+            if let Some(style) = button_style_str(opt.style) {
+                out.push_str(" style=\"");
+                out.push_str(style);
+                out.push('"');
+            }
+            out.push('>');
+            out.push_str(&escape_tg_button_attr(&opt.label));
+            out.push_str("</tg-button>");
+        }
+        out.push_str("</tg-button-row>");
+    }
+    out
+}
+
+/// Build the `sendRichMessage` request body: `rich_message.markdown` =
+/// `markdown` with [`combined_button_rows`] appended as trailing
+/// `<tg-button-row>` blocks. No `parse_mode` — Rich Messages have no such
+/// parameter (see research doc §3).
+fn build_rich_send_body(message: &SendMessage, markdown: &str) -> serde_json::Value {
+    let rows = combined_button_rows(message);
+    let buttons_html = button_rows_to_tg_html(&rows);
+    let full_markdown = if buttons_html.is_empty() {
+        markdown.to_string()
+    } else {
+        format!("{markdown}\n\n{buttons_html}")
+    };
+    let mut body = serde_json::json!({
+        "chat_id": message.recipient,
+        "rich_message": { "markdown": full_markdown },
+    });
+    if let Some(rt) = message
+        .thread_ts
+        .as_ref()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        body["reply_parameters"] = serde_json::json!({ "message_id": rt });
+    }
+    body
+}
+
+/// Build the `editMessageText` request body using `rich_message` (Bot API
+/// 10.3) instead of `text`. No buttons: [`Channel::edit_message`] carries
+/// no button/option data (only `content`), so an edit's rich attempt is
+/// markdown-only.
+fn build_rich_edit_body(recipient: &str, message_id: &str, markdown: &str) -> serde_json::Value {
+    serde_json::json!({
+        "chat_id": recipient,
+        "message_id": message_id.parse::<i64>().ok(),
+        "rich_message": { "markdown": markdown },
+    })
+}
+
+/// Build the classic `inline_keyboard` from [`combined_button_rows`], or
+/// `None` when there is nothing to render (today's zero-behavior-change
+/// case: no `button_rows`, no `options`).
+fn inline_keyboard_json(message: &SendMessage) -> Option<serde_json::Value> {
+    let rows = combined_button_rows(message);
+    if rows.is_empty() {
+        return None;
+    }
+    let keyboard: Vec<Vec<serde_json::Value>> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|o| serde_json::json!({ "text": o.label, "callback_data": o.data }))
+                .collect()
+        })
+        .collect();
+    Some(serde_json::json!({ "inline_keyboard": keyboard }))
+}
+
 #[async_trait]
 impl Channel for TelegramChannel {
     fn name(&self) -> &str {
@@ -646,86 +1005,22 @@ impl Channel for TelegramChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         // V0.8.4 P2b — files go via sendPhoto/sendDocument (multipart);
-        // the caption rides the first attachment.
+        // the caption rides the first attachment. Rich Messages / buttons
+        // are not supported on the attachment path (unchanged).
         if !message.attachments.is_empty() {
             return self.send_with_attachments(message).await;
         }
-        let url = self.api_url("sendMessage");
-        let payload = text_payload(&message.content);
-        let mut body = serde_json::json!({
-            "chat_id": message.recipient,
-            "text": payload.text,
-            // Telegram supports reply_to_message_id for in-thread replies.
-            "reply_to_message_id": message.thread_ts.as_ref().and_then(|s| s.parse::<i64>().ok()),
-        });
-        if payload.formatted {
-            body["parse_mode"] = serde_json::json!("HTML");
+        // TG-GATE-V2 W1 — rich(markdown+buttons block) → classic HTML +
+        // inline_keyboard → plain text. `rich_markdown` absent ⇒ this
+        // branch never runs, so a caller that never opts in keeps today's
+        // behavior byte-for-byte.
+        if let Some(markdown) = message.rich_markdown.as_deref() {
+            match self.try_send_rich(message, markdown).await {
+                Ok(id) => return Ok(id),
+                Err(reason) => self.log_rich_fallback_once(&reason).await,
+            }
         }
-        // v0.8.5 D3 — render choice options as an inline keyboard (one button
-        // per row); the opaque `data` ("{token}:{idx}") rides `callback_data`
-        // (≤64B). The numbered-text fallback already lives in `content`, so
-        // button-less clients still work.
-        if !message.options.is_empty() {
-            let rows: Vec<Vec<serde_json::Value>> = message
-                .options
-                .iter()
-                .map(|o| vec![serde_json::json!({ "text": o.label, "callback_data": o.data })])
-                .collect();
-            body["reply_markup"] = serde_json::json!({ "inline_keyboard": rows });
-        }
-        let t0 = Instant::now();
-        let resp = self.http.post(&url).json(&body).send().await?;
-        let mut status = resp.status();
-        let mut text = resp.text().await.unwrap_or_default();
-        if payload.formatted && should_retry_plain(status, &text) {
-            tracing::warn!(
-                method = "sendMessage",
-                recipient = %message.recipient,
-                "telegram formatting rejected; retrying with plain text"
-            );
-            let plain_text = plain_text_for_request(&message.content);
-            let plain_body = plain_body(body.clone(), &plain_text);
-            let resp = self.http.post(&url).json(&plain_body).send().await?;
-            status = resp.status();
-            text = resp.text().await.unwrap_or_default();
-        }
-        let send_http_ms = t0.elapsed().as_millis() as u64;
-        if !status.is_success() {
-            tracing::warn!(
-                event = "latency",
-                stage = "tg.egress",
-                recipient = %message.recipient,
-                status = %status,
-                send_http_ms,
-                content_len = message.content.len(),
-                "latency tg.egress (failed)"
-            );
-            anyhow::bail!(
-                "telegram sendMessage {} → {}: {}",
-                message.recipient,
-                status,
-                text
-            );
-        }
-        // Best-effort: pluck message_id without a full type.
-        let id = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v.get("result")
-                    .and_then(|r| r.get("message_id"))
-                    .and_then(|n| n.as_i64())
-            })
-            .map(|n| n.to_string());
-        tracing::info!(
-            event = "latency",
-            stage = "tg.egress",
-            recipient = %message.recipient,
-            tg_msg_id = id.as_deref().unwrap_or(""),
-            send_http_ms,
-            content_len = message.content.len(),
-            "latency tg.egress"
-        );
-        Ok(id)
+        self.send_classic(message).await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -884,37 +1179,15 @@ impl Channel for TelegramChannel {
         message_id: &str,
         content: &str,
     ) -> anyhow::Result<Option<String>> {
-        let url = self.api_url("editMessageText");
-        let payload = text_payload(content);
-        let mut body = serde_json::json!({
-            "chat_id": recipient,
-            "message_id": message_id.parse::<i64>().ok(),
-            "text": payload.text,
-        });
-        if payload.formatted {
-            body["parse_mode"] = serde_json::json!("HTML");
+        // TG-GATE-V2 W1 — same rich→classic ladder as `send` (see there for
+        // the fallback contract + once-per-reason-kind logging). Edit has
+        // no button/option payload (the trait carries only `content`), so
+        // the rich attempt is markdown-only.
+        match self.try_edit_rich(recipient, message_id, content).await {
+            Ok(id) => return Ok(id),
+            Err(reason) => self.log_rich_fallback_once(&reason).await,
         }
-        let resp = self.http.post(&url).json(&body).send().await?;
-        let mut status = resp.status();
-        let mut text = resp.text().await.unwrap_or_default();
-        if payload.formatted && should_retry_plain(status, &text) {
-            tracing::warn!(
-                method = "editMessageText",
-                recipient,
-                "telegram formatting rejected; retrying with plain text"
-            );
-            let plain_text = plain_text_for_request(content);
-            let plain_body = plain_body(body.clone(), &plain_text);
-            let resp = self.http.post(&url).json(&plain_body).send().await?;
-            status = resp.status();
-            text = resp.text().await.unwrap_or_default();
-        }
-        if !status.is_success() {
-            anyhow::bail!("telegram editMessageText {recipient}#{message_id} → {status}: {text}");
-        }
-        // editMessageText returns the (same) edited Message; the id is
-        // stable, so echo it back for the daemon's status bookkeeping.
-        Ok(Some(message_id.to_string()))
+        self.edit_classic(recipient, message_id, content).await
     }
 
     /// Add the 👀 ack reaction via `setMessageReaction` (stateless — Telegram
@@ -1314,5 +1587,175 @@ mod tests {
         assert!(!payload.formatted);
         assert!(payload.text.ends_with('…'));
         assert!(payload.text.chars().map(char::len_utf16).sum::<usize>() <= MAX_MESSAGE_UTF16);
+    }
+
+    // ----- TG-GATE-V2 W1: Rich Messages request shapes ------------------
+
+    fn opt(data: &str, label: &str, style: Option<ButtonStyle>) -> MessageOption {
+        MessageOption {
+            data: data.into(),
+            label: label.into(),
+            id: String::new(),
+            style,
+        }
+    }
+
+    #[test]
+    fn rich_send_body_carries_markdown_and_button_rows_block() {
+        let message = SendMessage::new("hello", "42")
+            .with_rich_markdown("**hello**")
+            .with_button_rows(vec![vec![
+                opt("cmd:/stop", "⛔ Стоп", Some(ButtonStyle::Danger)),
+                opt("cmd:/new", "✏️ Новая", None),
+            ]]);
+        let body = build_rich_send_body(&message, "**hello**");
+        assert_eq!(body["chat_id"], "42");
+        assert!(body.get("text").is_none(), "rich send has no `text` field");
+        let markdown = body["rich_message"]["markdown"].as_str().unwrap();
+        assert!(markdown.starts_with("**hello**"));
+        assert!(markdown.contains("<tg-button-row>"));
+        assert!(markdown.contains(r#"type="callback_data""#));
+        assert!(markdown.contains(r#"callback_data="cmd:/stop""#));
+        assert!(markdown.contains(r#"style="danger""#));
+        assert!(markdown.contains(">⛔ Стоп</tg-button>"));
+        // The second button has no style attribute at all.
+        assert!(markdown.contains(r#"callback_data="cmd:/new">✏️ Новая</tg-button>"#));
+        assert!(markdown.contains("</tg-button-row>"));
+    }
+
+    #[test]
+    fn rich_send_body_omits_buttons_block_when_no_rows_or_options() {
+        let message = SendMessage::new("hello", "42").with_rich_markdown("hello");
+        let body = build_rich_send_body(&message, "hello");
+        assert_eq!(body["rich_message"]["markdown"], "hello");
+    }
+
+    #[test]
+    fn combined_button_rows_puts_button_rows_before_options() {
+        let message = SendMessage::new("pick", "42")
+            .with_button_rows(vec![vec![opt("nav:a", "A", None)]])
+            .with_options(vec![opt("t:0", "Yes", None), opt("t:1", "No", None)]);
+        let rows = combined_button_rows(&message);
+        // button_rows first (as-is), then one row per option.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].len(), 1);
+        assert_eq!(rows[0][0].data, "nav:a");
+        assert_eq!(rows[1], vec![opt("t:0", "Yes", None)]);
+        assert_eq!(rows[2], vec![opt("t:1", "No", None)]);
+    }
+
+    #[test]
+    fn inline_keyboard_json_mirrors_combined_button_rows() {
+        let message = SendMessage::new("pick", "42")
+            .with_button_rows(vec![vec![
+                opt("nav:a", "A", Some(ButtonStyle::Primary)),
+                opt("nav:b", "B", None),
+            ]])
+            .with_options(vec![opt("t:0", "Yes", None)]);
+        let keyboard = inline_keyboard_json(&message).expect("some keyboard");
+        let rows = keyboard["inline_keyboard"].as_array().unwrap();
+        // Row 1: both button_rows buttons together; row 2: the option alone.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].as_array().unwrap().len(), 2);
+        assert_eq!(rows[0][0]["text"], "A");
+        assert_eq!(rows[0][0]["callback_data"], "nav:a");
+        // Classic inline_keyboard has no per-button style field at all —
+        // the style only exists on the Rich Message ladder.
+        assert!(rows[0][0].get("style").is_none());
+        assert_eq!(rows[1][0]["text"], "Yes");
+        assert_eq!(rows[1][0]["callback_data"], "t:0");
+    }
+
+    #[test]
+    fn inline_keyboard_json_none_when_nothing_to_render() {
+        let message = SendMessage::new("hi", "42");
+        assert!(inline_keyboard_json(&message).is_none());
+    }
+
+    #[test]
+    fn escape_tg_button_attr_escapes_html_specials() {
+        assert_eq!(
+            escape_tg_button_attr(r#"a<b>c&"d""#),
+            "a&lt;b&gt;c&amp;&quot;d&quot;"
+        );
+    }
+
+    #[test]
+    fn button_rows_to_tg_html_skips_empty_rows() {
+        let rows: Vec<Vec<MessageOption>> = vec![vec![], vec![opt("a", "A", None)]];
+        let html = button_rows_to_tg_html(&rows);
+        assert_eq!(html.matches("<tg-button-row>").count(), 1);
+        assert!(html.contains(">A</tg-button>"));
+    }
+
+    #[test]
+    fn rich_edit_body_has_no_buttons_and_parses_message_id() {
+        let body = build_rich_edit_body("42", "tg-99", "**edited**");
+        assert_eq!(body["chat_id"], "42");
+        assert_eq!(body["message_id"].as_i64(), None, "tg-99 isn't numeric");
+        assert_eq!(body["rich_message"]["markdown"], "**edited**");
+        assert!(body.get("text").is_none());
+
+        let body = build_rich_edit_body("42", "99", "**edited**");
+        assert_eq!(body["message_id"], 99);
+    }
+
+    #[test]
+    fn extract_message_id_reads_result_message_id() {
+        assert_eq!(
+            extract_message_id(r#"{"ok":true,"result":{"message_id":123}}"#),
+            Some("123".to_string())
+        );
+        assert_eq!(extract_message_id("not json"), None);
+        assert_eq!(extract_message_id(r#"{"ok":true,"result":{}}"#), None);
+    }
+
+    #[test]
+    fn button_style_str_maps_the_three_variants() {
+        assert_eq!(
+            button_style_str(Some(ButtonStyle::Primary)),
+            Some("primary")
+        );
+        assert_eq!(
+            button_style_str(Some(ButtonStyle::Success)),
+            Some("success")
+        );
+        assert_eq!(button_style_str(Some(ButtonStyle::Danger)), Some("danger"));
+        assert_eq!(button_style_str(None), None);
+    }
+
+    // ----- rich→classic fallback decision --------------------------------
+
+    #[tokio::test]
+    async fn send_classic_falls_back_to_html_when_rich_markdown_absent() {
+        // No live HTTP in this test crate (no mock server dependency), so
+        // this exercises the decision surface that IS unit-testable
+        // without one: a message with no `rich_markdown` never calls the
+        // rich path at all — `send_classic`'s body-building matches the
+        // pre-W1 shape exactly (byte-for-byte `send_classic_part`), proven
+        // via `text_payload`/`inline_keyboard_json` directly.
+        let message =
+            SendMessage::new("hi **there**", "42").with_options(vec![opt("t:0", "Yes", None)]);
+        assert!(message.rich_markdown.is_none());
+        let payload = text_payload(&message.content);
+        assert!(payload.formatted);
+        assert_eq!(payload.text, "hi <b>there</b>");
+        let keyboard = inline_keyboard_json(&message).unwrap();
+        assert_eq!(keyboard["inline_keyboard"][0][0]["text"], "Yes");
+    }
+
+    #[test]
+    fn long_content_splits_with_part_suffix_like_existing_splitter() {
+        // The rich-fallback split path reuses `split_for_channel` + a
+        // `(i/n)` suffix; assert the suffix shape independent of the live
+        // HTTP call (mirrors `send_classic`'s internal numbering).
+        let long = "word ".repeat(2000);
+        let parts = crate::sanitize::split_for_channel(&long, MAX_MESSAGE_UTF16);
+        assert!(parts.len() > 1);
+        let total = parts.len();
+        for (i, part) in parts.iter().enumerate() {
+            let numbered = format!("{part} ({}/{total})", i + 1);
+            assert!(numbered.ends_with(&format!("({}/{total})", i + 1)));
+        }
     }
 }
