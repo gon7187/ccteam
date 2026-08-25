@@ -1800,6 +1800,21 @@ struct DurableOutboundRow {
     /// already-queued parts.
     #[serde(default)]
     parent_id: Option<String>,
+    /// TG-GATE-V2 W12 — this row's 0-based position among its split
+    /// siblings, set alongside `parent_id` by [`queue_split_parts`].
+    /// `#[serde(default)]` keeps pre-W12 outbox lines deserializable as
+    /// `None`. Together with `part_total`, lets `replay_durable_outbox`
+    /// tell a COMPLETE set of queued parts (safe to supersede the
+    /// parent) from an INCOMPLETE one left by a crash mid-`queue_split_parts`
+    /// (parent must replay whole instead; the orphan parts must never be
+    /// sent alone).
+    #[serde(default)]
+    part_index: Option<usize>,
+    /// TG-GATE-V2 W12 — total number of parts in this row's split, set
+    /// alongside `parent_id`/`part_index` by [`queue_split_parts`]. See
+    /// `part_index`'s docs.
+    #[serde(default)]
+    part_total: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1886,6 +1901,8 @@ async fn queue_and_send_durable_part(
         platform_message_id: None,
         error: None,
         parent_id: None,
+        part_index: None,
+        part_total: None,
     });
     finish_durable_outbound_send(id, inbound_id, channel_name, channel, message).await
 }
@@ -1944,6 +1961,8 @@ fn queue_split_parts(
             platform_message_id: None,
             error: None,
             parent_id: Some(id_prefix.to_string()),
+            part_index: Some(part_idx),
+            part_total: Some(total),
         };
         append_durable_outbound_inner(&row)?;
         queued.push((id, part_msg));
@@ -2052,6 +2071,8 @@ async fn finish_durable_outbound_send(
                 platform_message_id,
                 error: None,
                 parent_id: None,
+                part_index: None,
+                part_total: None,
             });
             true
         }
@@ -2129,6 +2150,8 @@ async fn finish_durable_outbound_send(
                         part_ids.join(", ")
                     )),
                     parent_id: None,
+                    part_index: None,
+                    part_total: None,
                 });
                 // Boxed: this cycles back through `send_queued_parts` →
                 // `finish_durable_outbound_send`, and a recursive async fn
@@ -2153,6 +2176,8 @@ async fn finish_durable_outbound_send(
                 platform_message_id: None,
                 error: Some(err.to_string()),
                 parent_id: None,
+                part_index: None,
+                part_total: None,
             });
             tracing::warn!(
                 inbound_id,
@@ -2197,30 +2222,98 @@ async fn replay_durable_outbox(channels: &ChannelMap) {
     // message (re-deciding to split it, re-queuing the same part ids —
     // idempotent by id, but ALSO immediately re-sending them) on top of
     // this loop's own delivery of the already-`Queued` parts: each part
-    // sent twice. Detect it up front from `parent_id` — any row named as
-    // a parent by at least one other row is superseded regardless of its
-    // own state — and settle it as terminal without sending, exactly the
-    // shape `finish_durable_outbound_send`'s rich-fallback catch writes.
-    let superseded_parents: HashSet<String> = latest
-        .values()
-        .filter_map(|row| row.parent_id.clone())
-        .collect();
-    let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+    // sent twice.
+    //
+    // TG-GATE-V2 W12 — naively superseding the parent for ANY row that
+    // is named as a parent by at least one other row is itself unsafe:
+    // `queue_split_parts` appends part rows one at a time, so a crash
+    // mid-loop (e.g. after part 0 is durably queued, before part 1 is)
+    // leaves the parent non-terminal AND named as a parent by an
+    // INCOMPLETE part set. Superseding it then would settle the parent
+    // as "sent" while most of the message was never queued at all — a
+    // silent loss. So a parent is only superseded when its part set is
+    // COMPLETE: every row naming it as `parent_id` carries a
+    // `part_index`/`part_total`, and the distinct indices seen cover
+    // `0..part_total`. An incomplete set instead: (a) leaves the parent
+    // OFF `superseded_parents`, so the main loop below replays it as
+    // itself — the whole original message, re-split fresh; (b) has its
+    // orphan part rows marked terminal-but-undelivered up front (never
+    // sent alone, since they'd otherwise reach the main loop as
+    // ordinary non-`Sent` rows and get delivered piecemeal, duplicating
+    // content once the parent resends whole).
+    let mut parts_by_parent: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut total_by_parent: HashMap<String, usize> = HashMap::new();
     for row in latest.values() {
         if let Some(parent_id) = &row.parent_id {
-            children_by_parent
-                .entry(parent_id.clone())
-                .or_default()
-                .push(row.id.clone());
+            if let Some(part_index) = row.part_index {
+                parts_by_parent
+                    .entry(parent_id.clone())
+                    .or_default()
+                    .push((part_index, row.id.clone()));
+            }
+            if let Some(part_total) = row.part_total {
+                total_by_parent.insert(parent_id.clone(), part_total);
+            }
+        }
+    }
+    let superseded_parents: HashSet<String> = parts_by_parent
+        .iter()
+        .filter(|(parent_id, parts)| {
+            let Some(&total) = total_by_parent.get(*parent_id) else {
+                return false;
+            };
+            if total == 0 {
+                return false;
+            }
+            let distinct: HashSet<usize> = parts.iter().map(|(idx, _)| *idx).collect();
+            distinct.len() == total && distinct.iter().all(|idx| *idx < total)
+        })
+        .map(|(parent_id, _)| parent_id.clone())
+        .collect();
+
+    // Orphan parts of an INCOMPLETE set: mark each still-non-terminal
+    // one `Sent` with a "discarded" error so the main loop below never
+    // sends it — the parent itself replays whole instead.
+    let mut discarded_ids: HashSet<String> = HashSet::new();
+    for (parent_id, parts) in &parts_by_parent {
+        if superseded_parents.contains(parent_id) {
+            continue;
+        }
+        for (_, part_id) in parts {
+            let Some(part_row) = latest.get(part_id) else {
+                continue;
+            };
+            if part_row.state == DurableOutboundState::Sent {
+                continue;
+            }
+            discarded_ids.insert(part_id.clone());
+            append_durable_outbound(DurableOutboundRow {
+                ts_ms: now_unix_ms_u64(),
+                id: part_row.id.clone(),
+                inbound_id: part_row.inbound_id.clone(),
+                channel: part_row.channel.clone(),
+                state: DurableOutboundState::Sent,
+                message: part_row.message.clone(),
+                platform_message_id: None,
+                error: Some("discarded: incomplete split".to_string()),
+                parent_id: part_row.parent_id.clone(),
+                part_index: part_row.part_index,
+                part_total: part_row.part_total,
+            });
         }
     }
 
     for row in latest
         .into_values()
-        .filter(|row| row.state != DurableOutboundState::Sent)
+        .filter(|row| row.state != DurableOutboundState::Sent && !discarded_ids.contains(&row.id))
     {
         if superseded_parents.contains(&row.id) {
-            let mut part_ids = children_by_parent.remove(&row.id).unwrap_or_default();
+            let mut part_ids: Vec<String> = parts_by_parent
+                .remove(&row.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect();
             part_ids.sort();
             append_durable_outbound(DurableOutboundRow {
                 ts_ms: now_unix_ms_u64(),
@@ -2232,6 +2325,8 @@ async fn replay_durable_outbox(channels: &ChannelMap) {
                 platform_message_id: None,
                 error: Some(format!("superseded by parts: {}", part_ids.join(", "))),
                 parent_id: None,
+                part_index: None,
+                part_total: None,
             });
             continue;
         }
@@ -2246,6 +2341,8 @@ async fn replay_durable_outbox(channels: &ChannelMap) {
                 platform_message_id: None,
                 error: Some("replay failed: channel is not configured".to_string()),
                 parent_id: None,
+                part_index: None,
+                part_total: None,
             });
             continue;
         };
@@ -2813,6 +2910,8 @@ mod tests {
             platform_message_id: None,
             error: Some("superseded by parts: row-1-0, row-1-1, row-1-2".to_string()),
             parent_id: None,
+            part_index: None,
+            part_total: None,
         });
 
         // CRASH — step (d) never runs; nothing has been sent yet.
@@ -2892,6 +2991,8 @@ mod tests {
             platform_message_id: None,
             error: None,
             parent_id: None,
+            part_index: None,
+            part_total: None,
         });
 
         // Queue every part — durable, `parent_id` pointing back at
@@ -2933,6 +3034,114 @@ mod tests {
             after_second_replay.len(),
             3,
             "a second replay must not duplicate anything: {after_second_replay:?}"
+        );
+
+        restore_env("CCTEAM_HOME", old_ccteam_home);
+        restore_env("HOME", old_home);
+    }
+
+    /// TG-GATE-V2 W12 — the crash window W11's fix left open: a crash
+    /// INSIDE `queue_split_parts`' append loop, after part 0 is durably
+    /// queued but before part 1 ever gets appended. The parent is still
+    /// non-terminal (as in the W11 case) but is now named as a parent by
+    /// an INCOMPLETE part set (1 of 3). Naively superseding the parent
+    /// here (W11's actual behaviour, fixed by this wave) would settle it
+    /// as "sent" while two-thirds of the message was never queued —
+    /// silent loss. The fix: the parent must replay WHOLE (nothing lost)
+    /// and the orphan part-0 row must never be sent alone (it would
+    /// duplicate content once the parent's fresh split re-sends
+    /// everything).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crash_mid_queue_split_parts_replays_parent_whole_not_orphan_part() {
+        use crate::transport::providers::mock::MockChannel;
+
+        let _guard = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("CCTEAM_HOME", tmp.path().join(".ccteam"));
+
+        let message = SendMessage::new("whole message", "chat-1");
+
+        // The original (pre-split) row — still `Queued`, never marked
+        // terminal (same as the W11 scenario).
+        append_durable_outbound(DurableOutboundRow {
+            ts_ms: now_unix_ms_u64(),
+            id: "row-3".to_string(),
+            inbound_id: "in-3".to_string(),
+            channel: "telegram".to_string(),
+            state: DurableOutboundState::Queued,
+            message: message.clone(),
+            platform_message_id: None,
+            error: None,
+            parent_id: None,
+            part_index: None,
+            part_total: None,
+        });
+
+        // Only part 0 of a 3-part split gets durably queued before the
+        // crash — parts 1 and 2 never make it (this is what
+        // `queue_split_parts` looks like mid-loop, appending one row at
+        // a time).
+        append_durable_outbound(DurableOutboundRow {
+            ts_ms: now_unix_ms_u64(),
+            id: "row-3-0".to_string(),
+            inbound_id: "in-3".to_string(),
+            channel: "telegram".to_string(),
+            state: DurableOutboundState::Queued,
+            message: SendMessage::new("part one", "chat-1"),
+            platform_message_id: None,
+            error: None,
+            parent_id: Some("row-3".to_string()),
+            part_index: Some(0),
+            part_total: Some(3),
+        });
+
+        // CRASH — parts 1 and 2 never get appended; the parent never
+        // gets its superseded-terminal row.
+
+        let mock = MockChannel::new().with_name("telegram");
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), Arc::new(mock.clone()));
+
+        replay_durable_outbox(&channels).await;
+
+        let delivered = mock.outbox().await;
+        assert!(
+            delivered.iter().any(|m| m.content == message.content),
+            "the parent must replay whole (nothing lost) when its part set is incomplete: {delivered:?}"
+        );
+        assert!(
+            !delivered.iter().any(|m| m.content == "part one"),
+            "the orphan part-0 row must never be sent alone (it would duplicate content \
+             once the parent's fresh split re-sends everything): {delivered:?}"
+        );
+
+        // The orphan part row must be settled terminal (never left
+        // `Queued` to be picked up by some later replay) but recorded as
+        // discarded, not delivered.
+        let raw = std::fs::read_to_string(durable_outbox_path()).unwrap();
+        let mut orphan_rows: Vec<DurableOutboundRow> = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<DurableOutboundRow>(line).ok())
+            .filter(|row| row.id == "row-3-0")
+            .collect();
+        let orphan = orphan_rows.pop().expect("orphan part row must exist");
+        assert_eq!(orphan.state, DurableOutboundState::Sent);
+        assert_eq!(orphan.error.as_deref(), Some("discarded: incomplete split"));
+
+        // A second replay must not resend or duplicate anything — the
+        // parent (now `Sent` from its fresh whole/re-split send) and the
+        // discarded orphan part are both terminal.
+        let before_second_replay = delivered.len();
+        replay_durable_outbox(&channels).await;
+        let after_second_replay = mock.outbox().await;
+        assert_eq!(
+            after_second_replay.len(),
+            before_second_replay,
+            "a second replay must send nothing further: {after_second_replay:?}"
         );
 
         restore_env("CCTEAM_HOME", old_ccteam_home);
