@@ -1790,6 +1790,16 @@ struct DurableOutboundRow {
     message: SendMessage,
     platform_message_id: Option<String>,
     error: Option<String>,
+    /// TG-GATE-V2 W11 — set on split-part rows to the id of the parent
+    /// (pre-split) row they supersede. `#[serde(default)]` keeps old
+    /// outbox lines (written before this field existed) deserializable
+    /// as `None`. `replay_durable_outbox` uses this to detect a parent
+    /// row that is still non-terminal (crash landed between "parts
+    /// queued" and "parent marked Sent") and treat it as superseded
+    /// rather than re-sending the whole original message alongside its
+    /// already-queued parts.
+    #[serde(default)]
+    parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1875,6 +1885,7 @@ async fn queue_and_send_durable_part(
         message: message.clone(),
         platform_message_id: None,
         error: None,
+        parent_id: None,
     });
     finish_durable_outbound_send(id, inbound_id, channel_name, channel, message).await
 }
@@ -1894,13 +1905,23 @@ async fn queue_and_send_durable_part(
 /// terminal parent row with no part rows behind it for
 /// [`replay_durable_outbox`] to pick up. Queuing before marking the
 /// parent terminal closes that window.
+///
+/// Every part row's `parent_id` is set to `id_prefix` — see
+/// [`DurableOutboundRow::parent_id`] and [`replay_durable_outbox`].
+///
+/// Appends propagate (`?`) instead of being swallowed: a caller relying
+/// on this durably queuing the parts before doing anything else (the
+/// crash-safety contract this function exists for) must know when that
+/// didn't happen, so it can leave the parent row's last-written state
+/// alone (still `Queued`) rather than mark it terminal over parts that
+/// were never actually queued.
 fn queue_split_parts(
     id_prefix: &str,
     inbound_id: &str,
     channel_name: &str,
     parts: Vec<String>,
     message: &SendMessage,
-) -> Vec<(String, SendMessage)> {
+) -> Result<Vec<(String, SendMessage)>> {
     let total = parts.len();
     let last_idx = total.saturating_sub(1);
     let mut queued = Vec::with_capacity(total);
@@ -1913,7 +1934,7 @@ fn queue_split_parts(
             part_msg.button_rows.clear();
             part_msg.options.clear();
         }
-        append_durable_outbound(DurableOutboundRow {
+        let row = DurableOutboundRow {
             ts_ms: now_unix_ms_u64(),
             id: id.clone(),
             inbound_id: inbound_id.to_string(),
@@ -1922,10 +1943,12 @@ fn queue_split_parts(
             message: part_msg.clone(),
             platform_message_id: None,
             error: None,
-        });
+            parent_id: Some(id_prefix.to_string()),
+        };
+        append_durable_outbound_inner(&row)?;
         queued.push((id, part_msg));
     }
-    queued
+    Ok(queued)
 }
 
 /// Send already-`Queued` parts (from [`queue_split_parts`]) in order
@@ -1993,7 +2016,18 @@ async fn send_split_parts(
     parts: Vec<String>,
     message: &SendMessage,
 ) {
-    let queued = queue_split_parts(id_prefix, inbound_id, channel_name, parts, message);
+    let queued = match queue_split_parts(id_prefix, inbound_id, channel_name, parts, message) {
+        Ok(queued) => queued,
+        Err(err) => {
+            tracing::warn!(
+                inbound_id,
+                channel = %channel_name,
+                error = %err,
+                "ccteam-im: failed to durably queue split parts; dropping this send"
+            );
+            return;
+        }
+    };
     send_queued_parts(inbound_id, channel_name, channel, queued, message).await;
 }
 
@@ -2017,6 +2051,7 @@ async fn finish_durable_outbound_send(
                 message,
                 platform_message_id,
                 error: None,
+                parent_id: None,
             });
             true
         }
@@ -2055,8 +2090,31 @@ async fn finish_durable_outbound_send(
                     .unwrap_or(split_message.content.encode_utf16().count().max(1));
                 let parts =
                     crate::sanitize::split_for_channel_numbered(&split_message.content, limit);
-                let queued =
-                    queue_split_parts(&id, inbound_id, channel_name, parts, &split_message);
+                // Append propagates (`?` inside `queue_split_parts`): if
+                // durably queuing the parts fails, we must NOT mark this
+                // parent row terminal — that would claim the parts exist
+                // when they don't. Leave the parent's last-written state
+                // alone (still `Queued`/pending from before this call) so
+                // the whole original message gets retried from scratch on
+                // the next replay.
+                let queued = match queue_split_parts(
+                    &id,
+                    inbound_id,
+                    channel_name,
+                    parts,
+                    &split_message,
+                ) {
+                    Ok(queued) => queued,
+                    Err(append_err) => {
+                        tracing::warn!(
+                            inbound_id,
+                            channel = %channel_name,
+                            error = %append_err,
+                            "ccteam-im: failed to durably queue split parts; parent stays queued for whole-message retry"
+                        );
+                        return false;
+                    }
+                };
                 let part_ids: Vec<String> = queued.iter().map(|(pid, _)| pid.clone()).collect();
                 append_durable_outbound(DurableOutboundRow {
                     ts_ms: now_unix_ms_u64(),
@@ -2070,6 +2128,7 @@ async fn finish_durable_outbound_send(
                         "rich message too long for classic fallback; superseded by parts: {}",
                         part_ids.join(", ")
                     )),
+                    parent_id: None,
                 });
                 // Boxed: this cycles back through `send_queued_parts` →
                 // `finish_durable_outbound_send`, and a recursive async fn
@@ -2093,6 +2152,7 @@ async fn finish_durable_outbound_send(
                 message,
                 platform_message_id: None,
                 error: Some(err.to_string()),
+                parent_id: None,
             });
             tracing::warn!(
                 inbound_id,
@@ -2129,10 +2189,52 @@ async fn replay_durable_outbox(channels: &ChannelMap) {
             }
         }
     }
+    // TG-GATE-V2 W11 — a crash between "parts durably Queued" and
+    // "parent marked terminal" (see `queue_split_parts`'/
+    // `finish_durable_outbound_send`'s docs) leaves the parent row
+    // non-terminal AND every part already `Queued`. Naively replaying
+    // every non-`Sent` row would then resend the parent's whole original
+    // message (re-deciding to split it, re-queuing the same part ids —
+    // idempotent by id, but ALSO immediately re-sending them) on top of
+    // this loop's own delivery of the already-`Queued` parts: each part
+    // sent twice. Detect it up front from `parent_id` — any row named as
+    // a parent by at least one other row is superseded regardless of its
+    // own state — and settle it as terminal without sending, exactly the
+    // shape `finish_durable_outbound_send`'s rich-fallback catch writes.
+    let superseded_parents: HashSet<String> = latest
+        .values()
+        .filter_map(|row| row.parent_id.clone())
+        .collect();
+    let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+    for row in latest.values() {
+        if let Some(parent_id) = &row.parent_id {
+            children_by_parent
+                .entry(parent_id.clone())
+                .or_default()
+                .push(row.id.clone());
+        }
+    }
+
     for row in latest
         .into_values()
         .filter(|row| row.state != DurableOutboundState::Sent)
     {
+        if superseded_parents.contains(&row.id) {
+            let mut part_ids = children_by_parent.remove(&row.id).unwrap_or_default();
+            part_ids.sort();
+            append_durable_outbound(DurableOutboundRow {
+                ts_ms: now_unix_ms_u64(),
+                id: row.id,
+                inbound_id: row.inbound_id,
+                channel: row.channel,
+                state: DurableOutboundState::Sent,
+                message: row.message,
+                platform_message_id: None,
+                error: Some(format!("superseded by parts: {}", part_ids.join(", "))),
+                parent_id: None,
+            });
+            continue;
+        }
         let Some(channel) = channels.get(&row.channel) else {
             append_durable_outbound(DurableOutboundRow {
                 ts_ms: now_unix_ms_u64(),
@@ -2143,6 +2245,7 @@ async fn replay_durable_outbox(channels: &ChannelMap) {
                 message: row.message,
                 platform_message_id: None,
                 error: Some("replay failed: channel is not configured".to_string()),
+                parent_id: None,
             });
             continue;
         };
@@ -2694,7 +2797,8 @@ mod tests {
         ];
 
         // Step (b): queue every part as its own `Queued` row.
-        let queued = queue_split_parts("row-1", "in-1", "telegram", parts.clone(), &message);
+        let queued = queue_split_parts("row-1", "in-1", "telegram", parts.clone(), &message)
+            .expect("queuing parts must succeed against a fresh temp outbox");
         assert_eq!(queued.len(), 3);
         // Step (c): the parent row goes terminal, naming the parts it was
         // superseded by — same shape `finish_durable_outbound_send`
@@ -2708,6 +2812,7 @@ mod tests {
             message: message.clone(),
             platform_message_id: None,
             error: Some("superseded by parts: row-1-0, row-1-1, row-1-2".to_string()),
+            parent_id: None,
         });
 
         // CRASH — step (d) never runs; nothing has been sent yet.
@@ -2746,11 +2851,113 @@ mod tests {
         restore_env("HOME", old_home);
     }
 
+    /// TG-GATE-V2 W11 — the actually-dangerous crash window: parts are
+    /// durably `Queued` but the parent row was NEVER marked terminal
+    /// (crash landed between "parts queued" and "parent marked Sent",
+    /// see `queue_split_parts`'/`finish_durable_outbound_send`'s docs).
+    /// Naive replay would treat the still-`Queued` parent as a normal
+    /// pending row and resend the whole original message on top of the
+    /// already-`Queued` parts this loop also delivers — duplicating
+    /// every part. `parent_id` must let `replay_durable_outbox` detect
+    /// this and settle the parent as superseded instead of sending it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crash_before_parent_marked_terminal_does_not_duplicate_parts() {
+        use crate::transport::providers::mock::MockChannel;
+
+        let _guard = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("CCTEAM_HOME", tmp.path().join(".ccteam"));
+
+        let message = SendMessage::new("whole message", "chat-1");
+        let parts = vec![
+            "part one".to_string(),
+            "part two".to_string(),
+            "part three".to_string(),
+        ];
+
+        // The original (pre-split) row, as it would have been appended
+        // before the send attempt that decided to split it — still
+        // `Queued`, never marked terminal.
+        append_durable_outbound(DurableOutboundRow {
+            ts_ms: now_unix_ms_u64(),
+            id: "row-2".to_string(),
+            inbound_id: "in-2".to_string(),
+            channel: "telegram".to_string(),
+            state: DurableOutboundState::Queued,
+            message: message.clone(),
+            platform_message_id: None,
+            error: None,
+            parent_id: None,
+        });
+
+        // Queue every part — durable, `parent_id` pointing back at
+        // `row-2`. CRASH right here: the parent never gets its
+        // superseded-terminal row.
+        let queued = queue_split_parts("row-2", "in-2", "telegram", parts.clone(), &message)
+            .expect("queuing parts must succeed against a fresh temp outbox");
+        assert_eq!(queued.len(), 3);
+
+        let mock = MockChannel::new().with_name("telegram");
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), Arc::new(mock.clone()));
+
+        replay_durable_outbox(&channels).await;
+
+        let delivered = mock.outbox().await;
+        assert_eq!(
+            delivered.len(),
+            3,
+            "replay must deliver each part exactly once, never the whole parent too: {delivered:?}"
+        );
+        for part in &parts {
+            assert_eq!(
+                delivered.iter().filter(|m| &m.content == part).count(),
+                1,
+                "part {part:?} must be delivered exactly once, got {delivered:?}"
+            );
+        }
+        assert!(
+            !delivered.iter().any(|m| m.content == message.content),
+            "the whole (pre-split) parent message must never be sent once its parts are queued: {delivered:?}"
+        );
+
+        // A second replay must not resend anything — every row (parts
+        // and the now-settled parent) is `Sent`.
+        replay_durable_outbox(&channels).await;
+        let after_second_replay = mock.outbox().await;
+        assert_eq!(
+            after_second_replay.len(),
+            3,
+            "a second replay must not duplicate anything: {after_second_replay:?}"
+        );
+
+        restore_env("CCTEAM_HOME", old_ccteam_home);
+        restore_env("HOME", old_home);
+    }
+
     /// TG-GATE-V2 W10 — `button_rows`/`options` must land on the LAST
     /// part only: a tapper acting on a middle part would be acting on an
     /// incomplete reply. `rich_markdown` is cleared on every part.
     #[test]
     fn queue_split_parts_keeps_buttons_only_on_the_last_part() {
+        // TG-GATE-V2 W11 — `queue_split_parts` durably appends every part
+        // row to `durable_outbox_path()` (HOME/CCTEAM_HOME-derived), so
+        // this test must isolate the same way the crash-replay tests do:
+        // without `env_lock()` + a temp `CCTEAM_HOME`, it races any other
+        // test in this binary that also points `HOME`/`CCTEAM_HOME` at a
+        // tempdir, writing its rows into that other test's outbox file
+        // (and vice versa) whenever the two happen to run concurrently.
+        let _guard = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("CCTEAM_HOME", tmp.path().join(".ccteam"));
+
         use crate::transport::MessageOption;
         let options = vec![MessageOption {
             label: "opt".to_string(),
@@ -2770,7 +2977,7 @@ mod tests {
             .with_button_rows(button_rows.clone());
 
         let parts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let queued = queue_split_parts("row-x", "in-x", "telegram", parts, &message);
+        let queued = queue_split_parts("row-x", "in-x", "telegram", parts, &message).unwrap();
         assert_eq!(queued.len(), 3);
 
         for (idx, (_, part_msg)) in queued.iter().enumerate() {
@@ -2792,6 +2999,9 @@ mod tests {
                 );
             }
         }
+
+        restore_env("CCTEAM_HOME", old_ccteam_home);
+        restore_env("HOME", old_home);
     }
 
     /// v0.8.19 — the stateless (Telegram) shape: `add_reaction` returns `None`,
