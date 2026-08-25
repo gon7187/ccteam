@@ -70,6 +70,7 @@ pub mod router;
 pub mod sanitize;
 pub mod scheduled;
 mod session_catalog;
+pub mod telegram_html;
 pub mod three_layer_sec;
 pub mod transport;
 

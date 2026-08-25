@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use anyhow::Context as _;
 
 use crate::latency::now_unix_ms;
+use crate::telegram_html::render_markdown;
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
     ChannelMessage, ChoiceReply, CommandSpec, OutboundFile, OutboundFileKind,
@@ -309,25 +310,41 @@ impl TelegramChannel {
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
-        let mut form = reqwest::multipart::Form::new()
-            .text("chat_id", recipient.to_string())
-            .part(
+        let caption = caption.map(caption_payload);
+        let formatted_caption = caption.as_ref().and_then(|c| c.html.as_deref());
+        let caption_text = formatted_caption.or_else(|| caption.as_ref().map(|c| c.plain.as_str()));
+        let (mut status, mut text) = self
+            .send_attachment_request(AttachmentRequest {
+                method,
                 field,
-                reqwest::multipart::Part::bytes(bytes).file_name(file_name),
+                recipient,
+                bytes: &bytes,
+                file_name: &file_name,
+                caption: caption_text,
+                formatted: formatted_caption.is_some(),
+                reply_to,
+            })
+            .await?;
+        if caption.as_ref().is_some_and(|c| c.html.is_some()) && should_retry_plain(status, &text) {
+            tracing::warn!(
+                method,
+                recipient,
+                "telegram formatting rejected; retrying attachment with plain text"
             );
-        if let Some(cap) = caption {
-            // V0.8.4 P2b (F7): caption ceiling (1024) ≠ message ceiling
-            // (4096), and attachment messages skip the splitter — truncate
-            // here so an over-long caption can't trip a 400.
-            form = form.text("caption", truncate_caption(cap));
+            let plain = caption.as_ref().expect("checked above");
+            (status, text) = self
+                .send_attachment_request(AttachmentRequest {
+                    method,
+                    field,
+                    recipient,
+                    bytes: &bytes,
+                    file_name: &file_name,
+                    caption: Some(&plain.plain),
+                    formatted: false,
+                    reply_to,
+                })
+                .await?;
         }
-        if let Some(rt) = reply_to.and_then(|s| s.parse::<i64>().ok()) {
-            form = form.text("reply_to_message_id", rt.to_string());
-        }
-        let url = self.api_url(method);
-        let resp = self.http.post(&url).multipart(form).send().await?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             anyhow::bail!("telegram {method} {recipient} → {status}: {text}");
         }
@@ -340,6 +357,42 @@ impl TelegramChannel {
             })
             .map(|n| n.to_string());
         Ok(id)
+    }
+
+    async fn send_attachment_request(
+        &self,
+        request: AttachmentRequest<'_>,
+    ) -> anyhow::Result<(reqwest::StatusCode, String)> {
+        let AttachmentRequest {
+            method,
+            field,
+            recipient,
+            bytes,
+            file_name,
+            caption,
+            formatted,
+            reply_to,
+        } = request;
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", recipient.to_string())
+            .part(
+                field.to_string(),
+                reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(file_name.to_string()),
+            );
+        if let Some(caption) = caption {
+            form = form.text("caption", caption.to_string());
+            if formatted {
+                form = form.text("parse_mode", "HTML");
+            }
+        }
+        if let Some(rt) = reply_to.and_then(|s| s.parse::<i64>().ok()) {
+            form = form.text("reply_to_message_id", rt.to_string());
+        }
+        let url = self.api_url(method);
+        let resp = self.http.post(&url).multipart(form).send().await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        Ok((status, text))
     }
 }
 
@@ -472,6 +525,17 @@ fn pick_attachment(m: &TgMessage) -> Option<PendingDownload> {
 /// splitter, so an over-long caption is truncated here (V0.8.4 P2b / F7).
 const MAX_CAPTION_UTF16: usize = 1024;
 
+struct AttachmentRequest<'a> {
+    method: &'a str,
+    field: &'a str,
+    recipient: &'a str,
+    bytes: &'a [u8],
+    file_name: &'a str,
+    caption: Option<&'a str>,
+    formatted: bool,
+    reply_to: Option<&'a str>,
+}
+
 /// Truncate `s` to at most [`MAX_CAPTION_UTF16`] UTF-16 code units (never
 /// splitting a char), so an over-long attachment caption can't trip a 400.
 fn truncate_caption(s: &str) -> String {
@@ -488,6 +552,37 @@ fn truncate_caption(s: &str) -> String {
     out
 }
 
+struct CaptionPayload {
+    html: Option<String>,
+    plain: String,
+}
+
+fn caption_payload(caption: &str) -> CaptionPayload {
+    let plain = truncate_caption(caption);
+    let rendered = render_markdown(&plain);
+    let html = (rendered.text_utf16_len <= MAX_CAPTION_UTF16).then_some(rendered.html);
+    CaptionPayload { html, plain }
+}
+
+fn should_retry_plain(status: reqwest::StatusCode, response_text: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let description = serde_json::from_str::<serde_json::Value>(response_text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| response_text.to_owned());
+    description
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("bad request: can't parse entities:")
+}
+
 #[async_trait]
 impl Channel for TelegramChannel {
     fn name(&self) -> &str {
@@ -501,9 +596,11 @@ impl Channel for TelegramChannel {
             return self.send_with_attachments(message).await;
         }
         let url = self.api_url("sendMessage");
+        let rendered = render_markdown(&message.content);
         let mut body = serde_json::json!({
             "chat_id": message.recipient,
-            "text": message.content,
+            "text": rendered.html,
+            "parse_mode": "HTML",
             // Telegram supports reply_to_message_id for in-thread replies.
             "reply_to_message_id": message.thread_ts.as_ref().and_then(|s| s.parse::<i64>().ok()),
         });
@@ -519,10 +616,26 @@ impl Channel for TelegramChannel {
                 .collect();
             body["reply_markup"] = serde_json::json!({ "inline_keyboard": rows });
         }
+        let mut plain_body = body.clone();
+        plain_body["text"] = serde_json::json!(message.content);
+        plain_body
+            .as_object_mut()
+            .expect("sendMessage body is an object")
+            .remove("parse_mode");
         let t0 = Instant::now();
         let resp = self.http.post(&url).json(&body).send().await?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let mut status = resp.status();
+        let mut text = resp.text().await.unwrap_or_default();
+        if should_retry_plain(status, &text) {
+            tracing::warn!(
+                method = "sendMessage",
+                recipient = %message.recipient,
+                "telegram formatting rejected; retrying with plain text"
+            );
+            let resp = self.http.post(&url).json(&plain_body).send().await?;
+            status = resp.status();
+            text = resp.text().await.unwrap_or_default();
+        }
         let send_http_ms = t0.elapsed().as_millis() as u64;
         if !status.is_success() {
             tracing::warn!(
@@ -719,14 +832,32 @@ impl Channel for TelegramChannel {
         content: &str,
     ) -> anyhow::Result<Option<String>> {
         let url = self.api_url("editMessageText");
+        let rendered = render_markdown(content);
         let body = serde_json::json!({
             "chat_id": recipient,
             "message_id": message_id.parse::<i64>().ok(),
-            "text": content,
+            "text": rendered.html,
+            "parse_mode": "HTML",
         });
+        let mut plain_body = body.clone();
+        plain_body["text"] = serde_json::json!(content);
+        plain_body
+            .as_object_mut()
+            .expect("editMessageText body is an object")
+            .remove("parse_mode");
         let resp = self.http.post(&url).json(&body).send().await?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let mut status = resp.status();
+        let mut text = resp.text().await.unwrap_or_default();
+        if should_retry_plain(status, &text) {
+            tracing::warn!(
+                method = "editMessageText",
+                recipient,
+                "telegram formatting rejected; retrying with plain text"
+            );
+            let resp = self.http.post(&url).json(&plain_body).send().await?;
+            status = resp.status();
+            text = resp.text().await.unwrap_or_default();
+        }
         if !status.is_success() {
             anyhow::bail!("telegram editMessageText {recipient}#{message_id} → {status}: {text}");
         }
@@ -1066,5 +1197,31 @@ mod tests {
         let out = truncate_caption(&emoji);
         assert!(out.chars().map(char::len_utf16).sum::<usize>() <= 1024);
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn parse_entity_error_only_retries_exact_bad_request_prefix() {
+        assert!(should_retry_plain(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"description":"Bad Request: Can't Parse Entities: Character '<' is reserved"}"#,
+        ));
+        assert!(!should_retry_plain(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"description":"Bad Request: message is too long: can't parse entities"}"#,
+        ));
+        assert!(!should_retry_plain(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"description":"Bad Request: can't parse entities: broken"}"#,
+        ));
+    }
+
+    #[test]
+    fn caption_payload_formats_with_a_plain_fallback() {
+        let payload = caption_payload("**caption** <&>");
+        assert_eq!(
+            payload.html.as_deref(),
+            Some("<b>caption</b> &lt;&amp;&gt;")
+        );
+        assert_eq!(payload.plain, "**caption** <&>");
     }
 }
