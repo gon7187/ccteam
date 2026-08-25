@@ -673,8 +673,6 @@ impl Channel for TelegramChannel {
                 .collect();
             body["reply_markup"] = serde_json::json!({ "inline_keyboard": rows });
         }
-        let plain_text = plain_text_for_request(&message.content);
-        let plain_body = plain_body(body.clone(), &plain_text);
         let t0 = Instant::now();
         let resp = self.http.post(&url).json(&body).send().await?;
         let mut status = resp.status();
@@ -685,6 +683,8 @@ impl Channel for TelegramChannel {
                 recipient = %message.recipient,
                 "telegram formatting rejected; retrying with plain text"
             );
+            let plain_text = plain_text_for_request(&message.content);
+            let plain_body = plain_body(body.clone(), &plain_text);
             let resp = self.http.post(&url).json(&plain_body).send().await?;
             status = resp.status();
             text = resp.text().await.unwrap_or_default();
@@ -894,8 +894,6 @@ impl Channel for TelegramChannel {
         if payload.formatted {
             body["parse_mode"] = serde_json::json!("HTML");
         }
-        let plain_text = plain_text_for_request(content);
-        let plain_body = plain_body(body.clone(), &plain_text);
         let resp = self.http.post(&url).json(&body).send().await?;
         let mut status = resp.status();
         let mut text = resp.text().await.unwrap_or_default();
@@ -905,6 +903,8 @@ impl Channel for TelegramChannel {
                 recipient,
                 "telegram formatting rejected; retrying with plain text"
             );
+            let plain_text = plain_text_for_request(content);
+            let plain_body = plain_body(body.clone(), &plain_text);
             let resp = self.http.post(&url).json(&plain_body).send().await?;
             status = resp.status();
             text = resp.text().await.unwrap_or_default();

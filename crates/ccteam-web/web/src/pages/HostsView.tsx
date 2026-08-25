@@ -30,7 +30,7 @@
 // host whose detail probe fails renders offline (honest state — we then say
 // we cannot see what it needs, not that there is nothing to do).
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   getHostDetail,
@@ -171,6 +171,10 @@ export default function HostsView({
   embedded = false,
 }: { lang?: Lang; /** hide page title when nested under Ops panel */ embedded?: boolean } = {}) {
   const t = makeT(lang);
+  const langRef = useRef(lang);
+  useEffect(() => {
+    langRef.current = lang;
+  }, [lang]);
   const { isAdmin } = useMe();
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   /** vendor token currently registering (scoped per host:vendor), or REFRESH. */
@@ -203,13 +207,13 @@ export default function HostsView({
       .catch((e) => {
         if (cancelled) return;
         if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
-        const message = e instanceof Error ? e.message : tr(lang, "加载失败", "Load failed", "Не удалось загрузить");
+        const message = e instanceof Error ? e.message : tr(langRef.current, "加载失败", "Load failed", "Не удалось загрузить");
         setState((prev) => (prev.kind === "ready" ? prev : { kind: "error", message }));
       });
     return () => {
       cancelled = true;
     };
-  }, [lang]);
+  }, []);
 
   // Latest published versions for the Update CTA — fired once over the whole
   // vendor axis (mirrors the Team roster); `fetchVendorLatests` drops the

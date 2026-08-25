@@ -35,15 +35,13 @@ describe("I18N dictionary", () => {
     const keys = Object.keys(I18N.ru).sort();
     expect(keys).toEqual(Object.keys(I18N.zh).sort());
     expect(keys).toEqual(Object.keys(I18N.en).sort());
-    expect(Object.keys(I18N.ru)).toEqual(expect.arrayContaining(Object.keys(I18N.zh)));
-    expect(Object.keys(I18N.ru)).toEqual(expect.arrayContaining(Object.keys(I18N.en)));
   });
 
   it("localizes workflow labels", () => {
     expect(t("zh", "workflowSkillsTitle")).toBe("Skills");
     expect(t("en", "workflowRolesTitle")).toBe("Roles");
     expect(t("ru", "workflowMcpTitle")).toBe("MCP-серверы");
-    expect(t("ru", "workflowBuiltIn")).toBe("встроенный");
+    expect(t("ru", "workflowBuiltIn")).toBe("встроенная");
   });
 
   it("resolves Russian text and locale", () => {

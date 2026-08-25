@@ -108,12 +108,33 @@ fn format_bulk_stop_result(stopped: &[String], failures: &[String]) -> String {
 
 fn format_bulk_stop_preview(sids: &BTreeSet<String>) -> String {
     const PREVIEW_CAP: usize = 20;
-    let mut preview: Vec<&str> = sids.iter().take(PREVIEW_CAP).map(String::as_str).collect();
+    let mut preview: Vec<&str> = sids.iter().map(String::as_str).collect();
+    preview.sort_by(|left, right| {
+        let left_number = left
+            .strip_prefix('s')
+            .and_then(|suffix| suffix.parse::<u64>().ok());
+        let right_number = right
+            .strip_prefix('s')
+            .and_then(|suffix| suffix.parse::<u64>().ok());
+        match (left_number, right_number) {
+            (Some(left_number), Some(right_number)) => {
+                left_number.cmp(&right_number).then_with(|| left.cmp(right))
+            }
+            _ => left.cmp(right),
+        }
+    });
+    preview.truncate(PREVIEW_CAP);
     if sids.len() > PREVIEW_CAP {
         preview.push("…");
     }
     format!(
-        "Будут остановлены {} {}: {}",
+        "{} {} {}: {}",
+        crate::progress::russian_count_word(
+            sids.len(),
+            "Будет остановлена",
+            "Будут остановлены",
+            "Будут остановлены",
+        ),
         sids.len(),
         crate::progress::russian_count_word(sids.len(), "сессия", "сессии", "сессий"),
         preview.join(", ")
@@ -12702,12 +12723,19 @@ impl Gateway {
         let thread = session.thread.clone();
         let adapter = Arc::clone(&session.adapter);
         if report_close_error {
-            // Bulk reporting must keep every gateway fact intact when close
-            // fails: the idempotent close can then be retried safely.
+            // In the reporting (bulk) path the principal is forgotten AFTER
+            // close_thread (retry-safe), whereas the single path forgets it
+            // BEFORE close_thread (the secret dies before close). Both are
+            // acceptable because the per-session secret is defence-in-depth
+            // per AGENTS.md §三.
             adapter
                 .close_thread(&thread)
                 .await
                 .map_err(anyhow::Error::from)?;
+            self.principals.forget(sid);
+            if let Some(pump) = self.event_pumps.remove(sid) {
+                pump.abort();
+            }
         } else {
             // Preserve the public single-sid teardown order for web/MCP.
             self.principals.forget(sid);
@@ -12715,12 +12743,6 @@ impl Gateway {
                 pump.abort();
             }
             let _ = adapter.close_thread(&thread).await;
-        }
-        if report_close_error {
-            self.principals.forget(sid);
-            if let Some(pump) = self.event_pumps.remove(sid) {
-                pump.abort();
-            }
         }
         self.finish_stopped_live_session(sid)
     }
@@ -16946,7 +16968,7 @@ mod tests {
             "ALL",
         )
         .await;
-        assert_eq!(preview.content, "Будут остановлены 1 сессия: s1");
+        assert_eq!(preview.content, "Будет остановлена 1 сессия: s1");
         assert_eq!(
             preview
                 .options
@@ -16985,6 +17007,16 @@ mod tests {
             Some("Остановлено сессий: 2 (s1, s2)")
         );
         assert!(gateway.sessions.is_empty());
+    }
+
+    #[test]
+    fn bulk_stop_preview_sorts_session_ids_numerically() {
+        let sids = (1..=11).rev().map(|n| format!("s{n}")).collect();
+
+        assert_eq!(
+            format_bulk_stop_preview(&sids),
+            "Будут остановлены 11 сессий: s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11"
+        );
     }
 
     #[test]
@@ -17057,7 +17089,7 @@ mod tests {
         .await;
         assert_eq!(
             preview.content,
-            format!("Будут остановлены 1 сессия: {sid1}")
+            format!("Будет остановлена 1 сессия: {sid1}")
         );
         assert_eq!(
             preview
@@ -17163,7 +17195,7 @@ mod tests {
             "all",
         )
         .await;
-        assert_eq!(preview.content, "Будут остановлены 1 сессия: s1");
+        assert_eq!(preview.content, "Будет остановлена 1 сессия: s1");
         let reply = tap_stop(&mut gateway, "telegram@uaaa", "chat-a", "alice", "all").await;
         assert_eq!(reply, vec!["Остановлено сессий: 1 (s1)".to_string()]);
         assert!(!gateway.sessions.contains_key("s1"));
@@ -17244,7 +17276,7 @@ mod tests {
             "all",
         )
         .await;
-        assert_eq!(preview.content, "Будут остановлены 1 сессия: s2");
+        assert_eq!(preview.content, "Будет остановлена 1 сессия: s2");
         let reply = tap_stop(&mut gateway, "telegram", "admin-chat", "admin", "all").await;
         assert_eq!(reply, vec!["Остановлено сессий: 1 (s2)".to_string()]);
         assert!(
@@ -17300,7 +17332,7 @@ mod tests {
             "project",
         )
         .await;
-        assert_eq!(preview.content, "Будут остановлены 1 сессия: s2");
+        assert_eq!(preview.content, "Будет остановлена 1 сессия: s2");
         assert_eq!(
             preview
                 .options
@@ -17336,7 +17368,7 @@ mod tests {
             "all",
         )
         .await;
-        assert_eq!(preview.content, "Будут остановлены 1 сессия: s1");
+        assert_eq!(preview.content, "Будет остановлена 1 сессия: s1");
         let reply = gateway
             .handle_message(
                 "telegram",
@@ -17375,7 +17407,7 @@ mod tests {
             "all",
         )
         .await;
-        assert_eq!(preview.content, "Будут остановлены 1 сессия: s1");
+        assert_eq!(preview.content, "Будет остановлена 1 сессия: s1");
         gateway
             .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
