@@ -248,6 +248,8 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 
 ### 网关命令
 
+Telegram 回复会把 Markdown 子集（粗体/斜体/代码/代码围栏/链接/引用/列表）渲染为 Telegram HTML；如果 Telegram 拒绝标记，会自动回退为纯文本。
+
 聊天框里发这些命令,由网关直接处理。随时 `/help` 看清单(Telegram 里敲 `/` 也会弹候选)。
 
 ```text
@@ -270,7 +272,7 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 /use <id>                  切到会话 s<N>(已停止的会话会自动从磁盘冷恢复)
 /role <role>               把当前会话换成另一个角色(原地重启,句柄 s<N> 不变)
 /interrupt [id]            打断正在跑的回合,保留会话(省略 id = 当前)
-/stop <id>                 销毁一个会话
+/stop <id>|all|project     按 id 停止会话；Telegram 中 all/project 显示确认按钮，其他渠道立即停止此聊天可见的所有会话 / 当前项目的可见会话
 
 # 查看 / 接入
 /sessions [all]            列当前项目的会话(带 vendor · role · model · 上下文用量);`all` = 跨所有项目

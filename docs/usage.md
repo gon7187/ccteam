@@ -256,6 +256,8 @@ After connecting IM, you can drive sessions, send files, and approve tools from 
 
 ### Gateway Commands
 
+Telegram replies render a Markdown subset (bold/italic/code/fences/links/quotes/lists) as Telegram HTML and automatically fall back to plain text if Telegram rejects the markup.
+
 Send these commands in chat. The gateway handles them directly. Use `/help` anytime; Telegram also shows command candidates when you type `/`.
 
 ```text
@@ -279,7 +281,7 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 /use <id>                  Switch to session s<N>; stopped sessions cold-resume from disk.
 /role <role>               Change the current session role in place; handle stays the same.
 /interrupt [id]            Interrupt an in-flight turn; keep the session. Omit id for current.
-/stop <id>                 Destroy a session.
+/stop <id>|all|project     Stop one session by id. Telegram shows a confirmation button; other channels stop immediately. Only sessions visible to this chat are affected.
 
 # Inspect / onboard
 /sessions [all]            List sessions for current project; all = across projects.
