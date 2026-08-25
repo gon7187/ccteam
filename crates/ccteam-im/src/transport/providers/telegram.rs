@@ -557,17 +557,72 @@ struct CaptionPayload {
     plain: String,
 }
 
+struct TextPayload {
+    text: String,
+    formatted: bool,
+}
+
+fn truncate_plain_message(source: &str) -> String {
+    let mut out = String::new();
+    let mut units = 0;
+    for ch in source.chars() {
+        let width = ch.len_utf16();
+        if units + width + 1 > MAX_MESSAGE_UTF16 {
+            break;
+        }
+        out.push(ch);
+        units += width;
+    }
+    out.push('…');
+    out
+}
+
+fn text_payload(source: &str) -> TextPayload {
+    let rendered = render_markdown(source);
+    if rendered.text_utf16_len > MAX_MESSAGE_UTF16 {
+        TextPayload {
+            text: truncate_plain_message(source),
+            formatted: false,
+        }
+    } else if rendered.text_utf16_len == 0 && !source.trim().is_empty() {
+        TextPayload {
+            text: source.to_owned(),
+            formatted: false,
+        }
+    } else {
+        TextPayload {
+            text: rendered.html,
+            formatted: true,
+        }
+    }
+}
+
+fn plain_body(mut body: serde_json::Value, text: &str) -> serde_json::Value {
+    body["text"] = serde_json::json!(text);
+    body.as_object_mut()
+        .expect("Telegram request body is an object")
+        .remove("parse_mode");
+    body
+}
+
+fn plain_text_for_request(source: &str) -> String {
+    if source.encode_utf16().count() > MAX_MESSAGE_UTF16 {
+        truncate_plain_message(source)
+    } else {
+        source.to_owned()
+    }
+}
+
 fn caption_payload(caption: &str) -> CaptionPayload {
     let plain = truncate_caption(caption);
     let rendered = render_markdown(&plain);
-    let html = (rendered.text_utf16_len <= MAX_CAPTION_UTF16).then_some(rendered.html);
+    let html = (rendered.text_utf16_len <= MAX_CAPTION_UTF16
+        && !(rendered.text_utf16_len == 0 && !plain.trim().is_empty()))
+    .then_some(rendered.html);
     CaptionPayload { html, plain }
 }
 
 fn should_retry_plain(status: reqwest::StatusCode, response_text: &str) -> bool {
-    if status != reqwest::StatusCode::BAD_REQUEST {
-        return false;
-    }
     let description = serde_json::from_str::<serde_json::Value>(response_text)
         .ok()
         .and_then(|value| {
@@ -577,10 +632,9 @@ fn should_retry_plain(status: reqwest::StatusCode, response_text: &str) -> bool 
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| response_text.to_owned());
-    description
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("bad request: can't parse entities:")
+    let description = description.to_ascii_lowercase();
+    status == reqwest::StatusCode::BAD_REQUEST
+        && (description.contains("parse") || description.contains("entit"))
 }
 
 #[async_trait]
@@ -596,14 +650,16 @@ impl Channel for TelegramChannel {
             return self.send_with_attachments(message).await;
         }
         let url = self.api_url("sendMessage");
-        let rendered = render_markdown(&message.content);
+        let payload = text_payload(&message.content);
         let mut body = serde_json::json!({
             "chat_id": message.recipient,
-            "text": rendered.html,
-            "parse_mode": "HTML",
+            "text": payload.text,
             // Telegram supports reply_to_message_id for in-thread replies.
             "reply_to_message_id": message.thread_ts.as_ref().and_then(|s| s.parse::<i64>().ok()),
         });
+        if payload.formatted {
+            body["parse_mode"] = serde_json::json!("HTML");
+        }
         // v0.8.5 D3 — render choice options as an inline keyboard (one button
         // per row); the opaque `data` ("{token}:{idx}") rides `callback_data`
         // (≤64B). The numbered-text fallback already lives in `content`, so
@@ -616,17 +672,13 @@ impl Channel for TelegramChannel {
                 .collect();
             body["reply_markup"] = serde_json::json!({ "inline_keyboard": rows });
         }
-        let mut plain_body = body.clone();
-        plain_body["text"] = serde_json::json!(message.content);
-        plain_body
-            .as_object_mut()
-            .expect("sendMessage body is an object")
-            .remove("parse_mode");
+        let plain_text = plain_text_for_request(&message.content);
+        let plain_body = plain_body(body.clone(), &plain_text);
         let t0 = Instant::now();
         let resp = self.http.post(&url).json(&body).send().await?;
         let mut status = resp.status();
         let mut text = resp.text().await.unwrap_or_default();
-        if should_retry_plain(status, &text) {
+        if payload.formatted && should_retry_plain(status, &text) {
             tracing::warn!(
                 method = "sendMessage",
                 recipient = %message.recipient,
@@ -832,23 +884,21 @@ impl Channel for TelegramChannel {
         content: &str,
     ) -> anyhow::Result<Option<String>> {
         let url = self.api_url("editMessageText");
-        let rendered = render_markdown(content);
-        let body = serde_json::json!({
+        let payload = text_payload(content);
+        let mut body = serde_json::json!({
             "chat_id": recipient,
             "message_id": message_id.parse::<i64>().ok(),
-            "text": rendered.html,
-            "parse_mode": "HTML",
+            "text": payload.text,
         });
-        let mut plain_body = body.clone();
-        plain_body["text"] = serde_json::json!(content);
-        plain_body
-            .as_object_mut()
-            .expect("editMessageText body is an object")
-            .remove("parse_mode");
+        if payload.formatted {
+            body["parse_mode"] = serde_json::json!("HTML");
+        }
+        let plain_text = plain_text_for_request(content);
+        let plain_body = plain_body(body.clone(), &plain_text);
         let resp = self.http.post(&url).json(&body).send().await?;
         let mut status = resp.status();
         let mut text = resp.text().await.unwrap_or_default();
-        if should_retry_plain(status, &text) {
+        if payload.formatted && should_retry_plain(status, &text) {
             tracing::warn!(
                 method = "editMessageText",
                 recipient,
@@ -1200,14 +1250,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_entity_error_only_retries_exact_bad_request_prefix() {
+    fn parse_entity_error_retries_only_parse_related_bad_requests() {
         assert!(should_retry_plain(
             reqwest::StatusCode::BAD_REQUEST,
-            r#"{"description":"Bad Request: Can't Parse Entities: Character '<' is reserved"}"#,
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities: Can't find end tag corresponding to start tag b"}"#,
         ));
         assert!(!should_retry_plain(
             reqwest::StatusCode::BAD_REQUEST,
-            r#"{"description":"Bad Request: message is too long: can't parse entities"}"#,
+            r#"{"description":"Bad Request: message is too long"}"#,
         ));
         assert!(!should_retry_plain(
             reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -1223,5 +1273,33 @@ mod tests {
             Some("<b>caption</b> &lt;&amp;&gt;")
         );
         assert_eq!(payload.plain, "**caption** <&>");
+    }
+
+    #[test]
+    fn empty_rendered_text_uses_plain_payload() {
+        for source in ["```", "```\n```", "# ", "> "] {
+            let payload = text_payload(source);
+            assert_eq!(payload.text, source);
+            assert!(!payload.formatted);
+            assert!(caption_payload(source).html.is_none());
+        }
+    }
+
+    #[test]
+    fn plain_retry_body_strips_parse_mode() {
+        let body = plain_body(
+            serde_json::json!({"text":"<b>x</b>","parse_mode":"HTML"}),
+            "**x**",
+        );
+        assert_eq!(body["text"], "**x**");
+        assert!(body.get("parse_mode").is_none());
+    }
+
+    #[test]
+    fn edit_payload_truncates_overlong_rendered_text() {
+        let payload = text_payload(&"😀".repeat(2049));
+        assert!(!payload.formatted);
+        assert!(payload.text.ends_with('…'));
+        assert!(payload.text.chars().map(char::len_utf16).sum::<usize>() <= MAX_MESSAGE_UTF16);
     }
 }
