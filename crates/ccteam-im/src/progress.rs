@@ -439,7 +439,11 @@ fn render_elapsed(elapsed: Duration) -> String {
 
 fn terminal_line(line: &str) -> String {
     let stripped = strip_ansi(line);
-    let flat = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = stripped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("```", "ˋˋˋ");
     if flat.chars().count() <= MAX_OUTPUT_LINE_CHARS {
         return flat;
     }

@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry};
@@ -18,21 +18,22 @@ use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::execution::session_body::{self, BodyProbe, SessionBody};
 use ccteam_harness::{
     apply_title, atomic_write_durable, chat_session_name, discover_external_claude_sessions,
-    list_session_metas, parse_chat_session_name, truncate_title, AgentSpecBrief, AgentVendor,
-    ChoiceOption, ChoicePrompt, ChoiceSelection, DetachOutcome, Directive, DirectiveOutcome,
-    EventAttachment, ExternalClaudeSession, HarnessAdapter, HarnessError, PermissionMode,
-    ProcessBackend, SessionMeta, SessionOrigin, SessionProtocol, SessionTitleTarget, SpawnCtx,
-    ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource, TitleSync, TurnDisposition,
-    TurnInput, TurnRouting, UnobservedTurnCtx,
+    list_session_metas, parse_chat_session_name, truncate_title, AccountUsage, AgentSpecBrief,
+    AgentVendor, ChoiceOption, ChoicePrompt, ChoiceSelection, DetachOutcome, Directive,
+    DirectiveOutcome, EventAttachment, ExternalClaudeSession, HarnessAdapter, HarnessError,
+    PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
+    SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource,
+    TitleSync, TurnDisposition, TurnInput, TurnRouting, UnobservedTurnCtx,
 };
 #[cfg(test)]
-use ccteam_harness::{read_session_meta, write_session_meta, AccountUsage, RunningTask};
+use ccteam_harness::{read_session_meta, write_session_meta};
 use futures::{future::join_all, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::im_callbacks;
 use crate::im_views::{
-    self, CommandView, ProjectRow, ProjectsView, RichReply, SessionRow, SessionsView, StatusView,
+    self, CommandView, DetachedSessionRow, ProjectRow, ProjectsView, RichReply, SessionRow,
+    SessionsView, StatusView,
 };
 use crate::pending::InteractionOrigin;
 use crate::transport::{ButtonStyle, ChannelAttachment, ChoiceReply, MessageOption};
@@ -81,6 +82,26 @@ impl ChatKey {
         let (channel, chat_id) = s.split_once(':')?;
         Some(Self::new(channel, chat_id, chat_id))
     }
+}
+
+#[derive(Debug, Clone)]
+struct PendingCommandConfirmation {
+    chat: ChatKey,
+    command: String,
+    created_at: Instant,
+    ttl: Duration,
+}
+
+impl PendingCommandConfirmation {
+    fn expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.created_at) >= self.ttl
+    }
+}
+
+enum ConfirmationResolution {
+    Stale,
+    Foreign,
+    Command(String),
 }
 
 /// `slug -> tenant project principal` resolved once per ACL pass (`None` =
@@ -562,6 +583,10 @@ pub struct Gateway {
     /// handed to the mcp.sock handler) via [`Gateway::set_pending`]; tests
     /// get the default fresh registry.
     pending: Arc<tokio::sync::Mutex<crate::pending::PendingInteractions>>,
+    /// Five-minute, tapper-bound command confirmations. The command stays in
+    /// gateway memory so Telegram callback data never carries an executable
+    /// `/stop …` payload.
+    pending_command_confirmations: BTreeMap<String, PendingCommandConfirmation>,
     /// Path context for `/newproject` (scaffold + config-registry write).
     /// `None` in unit tests that don't exercise project creation; the
     /// daemon sets it via [`Gateway::enable_project_creation`].
@@ -2040,6 +2065,7 @@ impl Gateway {
             pending: Arc::new(tokio::sync::Mutex::new(
                 crate::pending::PendingInteractions::new(),
             )),
+            pending_command_confirmations: BTreeMap::new(),
             project_paths: None,
             config: None,
             progress_projection: None,
@@ -8266,7 +8292,7 @@ impl Gateway {
 
     /// Route a `cmd:` inline-button tap (TG-GATE-V2 W3): `Command` runs the
     /// named command exactly as if typed, `Confirm` renders a Russian
-    /// yes/no prompt, `Noop` cancels one. Never called with
+    /// yes/no prompt, and an opaque token confirms or cancels it. Never called with
     /// [`im_callbacks::CallbackAction::Choice`] — the caller
     /// (`handle_message`) filters that arm to the existing token-keyed
     /// [`Self::resolve_selection`] path instead.
@@ -8288,14 +8314,43 @@ impl Gateway {
     ) -> Result<Vec<RichReply>> {
         match action {
             im_callbacks::CallbackAction::Choice { .. } => Ok(Vec::new()),
-            im_callbacks::CallbackAction::Noop => Ok(vec![RichReply::plain("Отменено")]),
             im_callbacks::CallbackAction::Confirm(cmd) => {
+                let first = cmd.split_whitespace().next().unwrap_or_default();
+                if !Self::is_gateway_command(first) {
+                    return Ok(vec![RichReply::plain("Неизвестная команда")]);
+                }
                 // TG-GATE-V2 W5 — the two confirmation buttons ride ONE
                 // `SendMessage::button_rows` row (side by side), not the
                 // one-per-row `options` the project/session pickers use.
-                let rows = confirm_cmd_button_rows(&cmd);
+                let token = self.register_command_confirmation(chat.clone(), cmd.clone());
+                let rows = confirm_cmd_button_rows(&token);
                 self.emit_button_rows(chat, confirm_prompt_text(&cmd), rows);
                 Ok(Vec::new())
+            }
+            im_callbacks::CallbackAction::Confirmed(token) => {
+                let cmd = match self.take_command_confirmation(chat, &token) {
+                    ConfirmationResolution::Command(cmd) => cmd,
+                    ConfirmationResolution::Foreign => return Ok(Vec::new()),
+                    ConfirmationResolution::Stale => {
+                        return Ok(vec![RichReply::plain("Подтверждение устарело")]);
+                    }
+                };
+                // TG-GATE-V2 W7b: needs egress-targeted edit by platform message id.
+                let mut replies = vec![RichReply::plain(format!("✅ {cmd}"))];
+                match self.handle_command(chat, &cmd).await? {
+                    Some(reply) => replies.push(reply),
+                    None => replies.push(RichReply::plain("Неизвестная команда")),
+                }
+                Ok(replies)
+            }
+            im_callbacks::CallbackAction::Cancelled(token) => {
+                match self.take_command_confirmation(chat, &token) {
+                    ConfirmationResolution::Foreign => Ok(Vec::new()),
+                    ConfirmationResolution::Stale => {
+                        Ok(vec![RichReply::plain("Подтверждение устарело")])
+                    }
+                    ConfirmationResolution::Command(_) => Ok(vec![RichReply::plain("Отменено")]),
+                }
             }
             im_callbacks::CallbackAction::Command(cmd) => {
                 let first = cmd.split_whitespace().next().unwrap_or_default();
@@ -8308,6 +8363,44 @@ impl Gateway {
                 }
             }
         }
+    }
+
+    fn register_command_confirmation(&mut self, chat: ChatKey, command: String) -> String {
+        let now = Instant::now();
+        self.pending_command_confirmations
+            .retain(|_, pending| !pending.expired(now));
+        loop {
+            let token = ccteam_core::session_secret::mint()[..8].to_string();
+            if self.pending_command_confirmations.contains_key(&token) {
+                continue;
+            }
+            self.pending_command_confirmations.insert(
+                token.clone(),
+                PendingCommandConfirmation {
+                    chat,
+                    command,
+                    created_at: now,
+                    ttl: Duration::from_secs(5 * 60),
+                },
+            );
+            return token;
+        }
+    }
+
+    fn take_command_confirmation(&mut self, chat: &ChatKey, token: &str) -> ConfirmationResolution {
+        let now = Instant::now();
+        let Some(pending) = self.pending_command_confirmations.get(token).cloned() else {
+            return ConfirmationResolution::Stale;
+        };
+        if pending.expired(now) {
+            self.pending_command_confirmations.remove(token);
+            return ConfirmationResolution::Stale;
+        }
+        if pending.chat != *chat {
+            return ConfirmationResolution::Foreign;
+        }
+        self.pending_command_confirmations.remove(token);
+        ConfirmationResolution::Command(pending.command)
     }
 
     /// Ask about a session's ccteam tool face the FIRST time it is activated
@@ -9062,11 +9155,16 @@ impl Gateway {
         if !waiting_sids.is_empty() {
             visible.sort_by_key(|s| !waiting_sids.contains(&s.id));
         }
-        let detached_here = self
+        let detached = self
             .detached
             .values()
             .filter(|d| (all || d.slug == cur) && self.chat_can_access_sid(chat, &d.sid))
-            .count();
+            .map(|d| DetachedSessionRow {
+                sid: d.sid.clone(),
+                pid: d.body.pid,
+            })
+            .collect::<Vec<_>>();
+        let detached_here = detached.len();
         if visible.is_empty() && is_web {
             return RichReply::plain("no sessions");
         }
@@ -9080,11 +9178,80 @@ impl Gateway {
                 "📁 Текущий проект: {cur}\nНет сессий — создайте через /new"
             ));
         }
+        // Preserve the priority ordering while rendering the IM list as a
+        // delegation tree. A malformed cycle becomes a flat tail instead of
+        // hiding a session forever.
+        let ordered_sessions: Vec<(&GatewaySession, usize)> = if is_web {
+            visible.iter().map(|session| (*session, 0)).collect()
+        } else {
+            let visible_sids: HashSet<&str> =
+                visible.iter().map(|session| session.id.as_str()).collect();
+            let by_sid: std::collections::HashMap<&str, &GatewaySession> = visible
+                .iter()
+                .map(|session| (session.id.as_str(), *session))
+                .collect();
+            let mut children_of: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for session in &visible {
+                if let Some(parent) = session.parent_sid.as_deref() {
+                    if visible_sids.contains(parent) {
+                        children_of
+                            .entry(parent)
+                            .or_default()
+                            .push(session.id.as_str());
+                    }
+                }
+            }
+            let roots: Vec<&str> = visible
+                .iter()
+                .filter(|session| {
+                    session
+                        .parent_sid
+                        .as_deref()
+                        .map(|parent| !visible_sids.contains(parent))
+                        .unwrap_or(true)
+                })
+                .map(|session| session.id.as_str())
+                .collect();
+            let mut ordered = Vec::with_capacity(visible.len());
+            let mut visited = HashSet::new();
+            let mut stack: Vec<(&str, usize)> = roots.iter().rev().map(|sid| (*sid, 0)).collect();
+            while let Some((sid, depth)) = stack.pop() {
+                if !visited.insert(sid) {
+                    continue;
+                }
+                if let Some(session) = by_sid.get(sid) {
+                    ordered.push((*session, depth));
+                }
+                if let Some(children) = children_of.get(sid) {
+                    for child in children.iter().rev() {
+                        stack.push((child, depth + 1));
+                    }
+                }
+            }
+            let mut leftovers: Vec<&str> = visible
+                .iter()
+                .map(|session| session.id.as_str())
+                .filter(|sid| !visited.contains(sid))
+                .collect();
+            leftovers.sort_by_key(|sid| session_index(sid));
+            ordered.extend(
+                leftovers
+                    .into_iter()
+                    .filter_map(|sid| by_sid.get(sid).map(|session| (*session, 0))),
+            );
+            ordered
+        };
+        let current_sid = self
+            .current_session
+            .read()
+            .ok()
+            .and_then(|sessions| sessions.get(chat).cloned());
         // Read each visible session's status once. Web keeps its existing
         // machine-parsed feed; every IM channel receives the shared compact view.
         let mut web_rows: Vec<String> = Vec::with_capacity(visible.len());
         let mut view_rows: Vec<SessionRow> = Vec::with_capacity(visible.len());
-        for s in &visible {
+        for (s, tree_depth) in ordered_sessions {
             // P3 — model + ctx from the owning adapter's `thread_status`.
             // Statusless adapters (bg / default) report `ThreadStatus::default()`
             // (no model / no context). Per-session failures degrade to the bare
@@ -9127,28 +9294,20 @@ impl Gateway {
                 vendor_model: format!("{}.{}", vendor_str(s.vendor), model),
                 status: status_label,
                 context,
+                title: self.session_title(s),
+                current: current_sid.as_deref() == Some(s.id.as_str()),
+                tree_depth,
+                host: (!s.host.is_empty() && s.host != "local").then(|| s.host.clone()),
             });
         }
         if is_web {
             return RichReply::plain(web_rows.join("\n"));
         }
-        view_rows.extend(
-            self.detached
-                .values()
-                .filter(|detached| {
-                    (all || detached.slug == cur) && self.chat_can_access_sid(chat, &detached.sid)
-                })
-                .map(|detached| SessionRow {
-                    sid: detached.sid.clone(),
-                    vendor_model: "—".to_string(),
-                    status: "⏳ отсоединена".to_string(),
-                    context: "—".to_string(),
-                }),
-        );
         im_views::render_sessions(&SessionsView {
             project: cur,
             sessions: view_rows,
             elsewhere,
+            detached,
         })
     }
 
@@ -9320,6 +9479,22 @@ impl Gateway {
         // Pull the focused session's live facts from its harness.
         let status = s.adapter.thread_status(&s.thread).await.ok();
         let running = s.adapter.running_tasks(&s.thread).await;
+        // Account usage belongs to a vendor account, not a session. Keep the
+        // vendor boundary intact while borrowing a same-vendor live session
+        // when the focused one has not received its rate-limit snapshot yet.
+        let mut account = s.adapter.account_usage(&s.thread).await;
+        if account.is_none() {
+            let vendor = s.adapter.vendor();
+            for other in &visible {
+                if other.adapter.vendor() != vendor {
+                    continue;
+                }
+                if let Some(usage) = other.adapter.account_usage(&other.thread).await {
+                    account = Some(usage);
+                    break;
+                }
+            }
+        }
 
         // State: a turn in flight ⇒ 🔵 working; silent past the idle window ⇒
         // 🔴 stuck — EXCEPT a BLOCKING subagent is an AUTHORITATIVE "still
@@ -9389,25 +9564,97 @@ impl Gateway {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "—".to_string());
         let child_activity = self.session_activity_snapshot(&direct_children);
+        let child_statuses = join_all(
+            direct_children
+                .iter()
+                .map(|child| child.adapter.thread_status(&child.thread)),
+        )
+        .await;
         let child_summary = direct_children
             .iter()
-            .map(|child| {
+            .zip(child_statuses)
+            .map(|(child, status)| {
                 let activity = child_activity
                     .get(&child.id)
                     .map(String::as_str)
                     .unwrap_or("idle");
+                let child_model = status
+                    .ok()
+                    .and_then(|status| status.model)
+                    .filter(|model| !model.is_empty())
+                    .map(|model| strip_vendor_prefix(vendor_str(child.vendor), &model).to_string())
+                    .unwrap_or_else(|| "—".to_string());
                 let title = self
                     .session_title(child)
                     .and_then(|title| truncate_title(&title))
                     .unwrap_or_else(|| "—".to_string());
                 format!(
-                    "{} · {} · {} · {title}",
+                    "{} · {} · {child_model} · {} · {title}",
                     child.id,
                     vendor_str(child.vendor),
                     activity_marker(activity)
                 )
             })
             .collect::<Vec<_>>();
+        let role = if s.role.is_empty() { "—" } else { &s.role };
+        let resume = thread_vendor_uuid(&s.thread)
+            .map(|uuid| format!("resume {uuid}"))
+            .unwrap_or_else(|| "resume —".to_string());
+        let mut detail_lines = vec![
+            format!("Запущено: {detail}"),
+            format!("Роль: {role}"),
+            resume,
+        ];
+        detail_lines.extend(
+            format_running_tasks(&running)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string),
+        );
+        if let Some(goal) = status.as_ref().and_then(|status| status.goal.as_ref()) {
+            let condition = goal.condition.trim();
+            if !condition.is_empty() {
+                let marker = if goal.met { "✅" } else { "🎯" };
+                let shown: String = if condition.chars().count() > 60 {
+                    format!("{}…", condition.chars().take(59).collect::<String>())
+                } else {
+                    condition.to_string()
+                };
+                detail_lines.push(format!("{marker} {shown}"));
+            }
+        }
+        if let Some(usage) = account.as_ref() {
+            let usage = format_account_usage(usage);
+            if !usage.is_empty() {
+                detail_lines.push(usage);
+            }
+        }
+        if !child_summary.is_empty() {
+            detail_lines.push(format!(
+                "👥 Прямые дочерние сессии: {}",
+                child_summary.join(", ")
+            ));
+        }
+        let same_project_sessions = visible
+            .iter()
+            .filter(|other| other.project == s.project && other.id != s.id)
+            .count();
+        if same_project_sessions > 0 {
+            detail_lines.push(format!(
+                "↓ Другие сессии проекта: {same_project_sessions} → /sessions"
+            ));
+        }
+        detail_lines.push(format!(
+            "↓ Все проекты: {} → /projects",
+            self.visible_project_slugs(chat).len()
+        ));
+        let cost_24h = self
+            .progress_projection
+            .as_ref()
+            .map(|projection| projection.project_snapshot(&s.project).cost.cost_24h_usd)
+            .map(|cost| format!("Расход проекта 24ч: ${cost:.2}"))
+            .unwrap_or_else(|| "Расход проекта 24ч: нет данных".to_string());
         im_views::render_status(&StatusView {
             sid: s.id.clone(),
             project: s.project.clone(),
@@ -9422,12 +9669,12 @@ impl Gateway {
             } else {
                 s.host.clone()
             },
-            started: if child_summary.is_empty() {
-                detail
-            } else {
-                format!("{detail}; дочерние: {}", child_summary.join(", "))
-            },
-            cost_24h: None,
+            detail_lines,
+            cost_24h,
+            child_stop_sids: direct_children
+                .iter()
+                .map(|child| child.id.clone())
+                .collect(),
         })
     }
 
@@ -9438,6 +9685,7 @@ impl Gateway {
         // so IM `/projects` never diverges from the other surfaces: a
         // half-registered project (in config, no state.json) shows in NEITHER, a
         // removed project disappears from BOTH, and each owner sees only its own.
+        let current = self.current_project_label(chat);
         let projects = self
             .visible_project_slugs(chat)
             .into_iter()
@@ -9454,6 +9702,7 @@ impl Gateway {
                         session.project == slug && self.chat_can_access(chat, session)
                     })
                     .count(),
+                current: slug == current,
                 slug,
             })
             .collect();
@@ -14021,7 +14270,6 @@ fn gateway_turn_timeout_duration() -> std::time::Duration {
 /// `45s`, `1m12s`, `6m`, `2h3m`. Compact (no leading-zero noise); seconds are
 /// dropped once the span is ≥ 1h to keep the line tidy. Sub-second rounds to
 /// `0s`.
-#[cfg(test)]
 /// Render the `/status` running-task block — claude's own task lifecycle
 /// mirrored verbatim (NOT a fold), oldest first (longest-running on top).
 /// Empty string when nothing runs. Three buckets by `task_type`: subagents
@@ -14078,7 +14326,6 @@ fn format_running_tasks(running: &[RunningTask]) -> String {
     out
 }
 
-#[cfg(test)]
 /// Render [`AccountUsage`] as the `/status` dashboard usage line:
 /// `⚡ Использование: 5h 17% (→19:00) · неделя 78%⚠ (→06/29) · лимит 46% · max`. Each field is
 /// omitted when the vendor didn't report it; an empty result = nothing to show.
@@ -14147,6 +14394,17 @@ fn humanize_dur(d: std::time::Duration) -> String {
     }
 }
 
+/// The vendor resume id persisted by stream-json spawn/resume, when the
+/// harness has one. Other protocols honestly render `resume —`.
+fn thread_vendor_uuid(thread: &ThreadHandle) -> Option<String> {
+    thread
+        .raw_extras
+        .get("vendor_uuid")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// Outcome of [`Gateway::submit_resolved`] — the one core both user-entry
 /// legs (IM `submit_to_current`, web `submit_to_sid`) funnel through. A
 /// `/command` runs synchronously (carry its receipt lines); plain text becomes
@@ -14213,21 +14471,19 @@ fn confirm_prompt_text(cmd: &str) -> String {
 }
 
 /// `[✅ Да][❌ Отмена]` — a single [`SendMessage::button_rows`] row for a
-/// `cmd:?<cmd>` confirmation (TG-GATE-V2 W3/W5): "Да" re-taps as the bare
-/// `cmd:<cmd>` (runs it, styled [`ButtonStyle::Success`]), "Отмена" taps
-/// `cmd:noop` (styled [`ButtonStyle::Danger`]). Either button is dropped
-/// (like the nav pickers) if a pathologically long `cmd` would blow
-/// Telegram's `callback_data` cap.
-fn confirm_cmd_button_rows(cmd: &str) -> Vec<Vec<MessageOption>> {
+/// `cmd:?<cmd>` confirmation. Both callback payloads carry only its opaque
+/// eight-character token, keeping executable commands out of Telegram and
+/// always below its `callback_data` cap.
+fn confirm_cmd_button_rows(token: &str) -> Vec<Vec<MessageOption>> {
     let row: Vec<MessageOption> = vec![
         MessageOption {
-            data: format!("cmd:{cmd}"),
+            data: format!("cmd:!{token}"),
             label: "✅ Да".to_string(),
             id: "yes".to_string(),
             style: Some(ButtonStyle::Success),
         },
         MessageOption {
-            data: "cmd:noop".to_string(),
+            data: format!("cmd:x{token}"),
             label: "❌ Отмена".to_string(),
             id: "no".to_string(),
             style: Some(ButtonStyle::Danger),
@@ -19060,7 +19316,7 @@ mod tests {
             ev.content
         );
         assert!(
-            ev.content.ends_with("\n\n→ alpha/s1 (reviewer)"),
+            ev.content.contains("\n\n→ alpha/s1 (reviewer)"),
             "context echo suffix present: {:?}",
             ev.content
         );
@@ -21252,7 +21508,8 @@ mod tests {
         assert!(mock[0].contains("s2 | claude.—"), "{}", mock[0]);
     }
 
-    /// Session buttons carry the `cmd:/use <sid>` callback from the compact table.
+    /// Session buttons carry the `cmd:/use <sid>` callback and the focused
+    /// session marker from the compact table.
     #[tokio::test]
     async fn session_buttons_carry_use_commands() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -21276,10 +21533,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["cmd:/use s2", "cmd:/use s1"]
         );
-        assert!(options.iter().all(|option| option.label.ends_with('▶')));
+        assert_eq!(options[0].label, "▶ s2 claude");
+        assert_eq!(options[1].label, "s1 claude");
     }
 
-    /// A verbose title stays out of the compact session switch button.
+    /// A verbose title is capped in the compact session switch button.
     #[tokio::test]
     async fn session_buttons_stay_compact_with_a_long_title() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -21294,7 +21552,7 @@ mod tests {
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let reply = gateway.render_sessions(&chat, false).await;
         let option = &reply.button_rows[0][0];
-        assert_eq!(option.label, "s1 ▶");
+        assert_eq!(option.label, "▶ s1 claude · A really re…");
         assert_eq!(option.data, "cmd:/use s1");
         assert!(option.data.len() <= 64);
     }
@@ -21329,9 +21587,14 @@ mod tests {
                     vendor_model: "claude.—".into(),
                     status: "🟢 ожидание".into(),
                     context: "—".into(),
+                    title: None,
+                    current: false,
+                    tree_depth: 0,
+                    host: None,
                 })
                 .collect(),
             elsewhere: 0,
+            detached: Vec::new(),
         });
         assert_eq!(
             reply.button_rows.iter().map(Vec::len).collect::<Vec<_>>(),
@@ -21454,8 +21717,8 @@ mod tests {
 
     /// `cmd:?<command>` renders a Russian confirmation with `[✅ Да][❌
     /// Отмена]` buttons — no direct text reply (the prompt is delivered as
-    /// a picker event, matching the project/session pickers), "Да" re-taps
-    /// as the bare `cmd:<command>`, "Отмена" taps `cmd:noop`.
+    /// a picker event, matching the project/session pickers), and both
+    /// buttons carry the same opaque confirmation token.
     #[tokio::test]
     async fn cmd_confirm_callback_renders_yes_no_buttons() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -21488,31 +21751,109 @@ mod tests {
             event.options.is_empty(),
             "confirmation rides button_rows, not options"
         );
-        assert_eq!(
-            event.button_rows,
-            vec![vec![
-                MessageOption {
-                    data: "cmd:/stop s1".to_string(),
-                    label: "✅ Да".to_string(),
-                    id: "yes".to_string(),
-                    style: Some(ButtonStyle::Success),
-                },
-                MessageOption {
-                    data: "cmd:noop".to_string(),
-                    label: "❌ Отмена".to_string(),
-                    id: "no".to_string(),
-                    style: Some(ButtonStyle::Danger),
-                },
-            ]]
-        );
+        assert_eq!(event.button_rows.len(), 1);
+        assert_eq!(event.button_rows[0].len(), 2);
+        let yes = &event.button_rows[0][0];
+        let no = &event.button_rows[0][1];
+        assert_eq!(yes.label, "✅ Да");
+        assert_eq!(yes.id, "yes");
+        assert_eq!(yes.style, Some(ButtonStyle::Success));
+        assert!(yes.data.starts_with("cmd:!"));
+        assert_eq!(yes.data.len(), "cmd:!".len() + 8);
+        assert!(!yes.data.contains("/stop"));
+        assert_eq!(no.label, "❌ Отмена");
+        assert_eq!(no.id, "no");
+        assert_eq!(no.style, Some(ButtonStyle::Danger));
+        assert_eq!(no.data, format!("cmd:x{}", &yes.data[5..]));
     }
 
-    /// `cmd:noop` (the confirmation's "Отмена" button) just says so.
+    /// Confirmation tokens bind the rendered prompt to the tapper, including
+    /// in a group chat where the shared chat id cannot identify that person.
     #[tokio::test]
-    async fn cmd_noop_callback_cancels() {
+    async fn cmd_confirmation_ignores_a_different_tapper() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "group-9",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+        let event = events.try_recv().expect("confirmation picker event");
+        let yes = event.button_rows[0][0].data.clone();
+
+        let stranger = gateway
+            .handle_message(
+                "telegram",
+                "group-9",
+                "bob",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply { data: yes.clone() }),
+            )
+            .await
+            .unwrap();
+        assert!(stranger.is_empty(), "another group member must be ignored");
+
+        let owner = gateway
+            .handle_message(
+                "telegram",
+                "group-9",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply { data: yes }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            owner,
+            vec!["✅ /status", "Нет сессий — создайте через /new"]
+        );
+    }
+
+    /// A cancellation token spends only its matching confirmation.
+    #[tokio::test]
+    async fn cmd_confirmation_cancel_cancels() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        let cancel = events
+            .try_recv()
+            .expect("confirmation picker event")
+            .button_rows[0][1]
+            .data
+            .clone();
 
         let replies = gateway
             .handle_message(
@@ -21522,13 +21863,76 @@ mod tests {
                 "",
                 "",
                 &[],
-                Some(&ChoiceReply {
-                    data: "cmd:noop".to_string(),
-                }),
+                Some(&ChoiceReply { data: cancel }),
             )
             .await
             .unwrap();
         assert_eq!(replies, vec!["Отменено"]);
+    }
+
+    #[tokio::test]
+    async fn cmd_confirmation_unknown_or_expired_reports_stale() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let unknown = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:!deadbeef".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown, vec!["Подтверждение устарело"]);
+
+        gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        let cancel = events
+            .try_recv()
+            .expect("confirmation picker event")
+            .button_rows[0][1]
+            .data
+            .clone();
+        let token = cancel.strip_prefix("cmd:x").unwrap();
+        gateway
+            .pending_command_confirmations
+            .get_mut(token)
+            .expect("registered confirmation")
+            .created_at = Instant::now() - Duration::from_secs(301);
+
+        let expired = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply { data: cancel }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired, vec!["Подтверждение устарело"]);
     }
 
     /// A `cmd:` command that isn't one of `GATEWAY_COMMANDS` (typo, or a
@@ -21955,7 +22359,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (paths, project_dir) = mirror_test_paths(&tmp);
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
         // The owner's own chat(s): named in the bot allowlist ⇒ operator.
         gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
         gateway.enable_project_creation(paths.clone());
@@ -21989,13 +22393,20 @@ mod tests {
             "investigate",
         );
         ccteam_core::progress::append_event(&paths.progress_jsonl("alpha"), &progress).unwrap();
+        fake.set_status(ThreadStatus {
+            model: Some("gpt-5.6-terra".into()),
+            ..Default::default()
+        })
+        .await;
 
         let out = gateway
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
             .unwrap();
         assert!(
-            out[0].contains("дочерние: s2 · claude · 🟡 работает · delegated investigation"),
+            out[0].contains(
+                "Прямые дочерние сессии: s2 · claude · gpt-5.6-terra · 🟡 работает · delegated investigation"
+            ),
             "working child is visible from its root status: {out:?}"
         );
     }
@@ -22070,7 +22481,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            torn[0].contains(&format!("{child} · claude · 🟡 работает ·")),
+            torn[0].contains(&format!("{child} · claude · — · 🟡 работает ·")),
             "a torn line elsewhere in the stream must not blind the child row: {torn:?}"
         );
 
@@ -22089,7 +22500,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            silent[0].contains(&format!("{child} · claude · 🟡 работает ·")),
+            silent[0].contains(&format!("{child} · claude · — · 🟡 работает ·")),
             "an in-flight turn outranks a stream that says nothing: {silent:?}"
         );
 
@@ -22104,7 +22515,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            idle[0].contains(&format!("{child} · claude · 🟢 ожидание ·")),
+            idle[0].contains(&format!("{child} · claude · — · 🟢 ожидание ·")),
             "no open turn ⇒ the file verdict stands: {idle:?}"
         );
     }
@@ -22123,12 +22534,51 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
             .unwrap();
-        assert_eq!(
-            out,
-            vec![format!(
-                "🧭 s1 · alpha · claude\n🟢 ожидание · — · — · ctx —\n📁 {}\n🖥 host: local\nЗапущено: ожидание / Расход 24ч: —",
+        assert!(
+            out[0].contains(&format!(
+                "🧭 s1 · alpha · claude\n🟢 ожидание · — · — · ctx —\n📁 {}\n🖥 host: local",
                 proj.path().display()
-            )]
+            )),
+            "status card header changed: {out:?}"
+        );
+        assert!(out[0].contains("Роль: reviewer"), "role missing: {out:?}");
+        assert!(out[0].contains("resume —"), "resume fact missing: {out:?}");
+        assert!(
+            out[0].contains("Расход проекта 24ч: нет данных"),
+            "honest missing ledger state missing: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_status_reads_project_24h_cost_from_progress_ledger() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        ccteam_core::progress::append_event(
+            &paths.progress_jsonl("alpha"),
+            &serde_json::json!({
+                "event": ccteam_harness::execution::progress_bridge::AGENT_DONE,
+                "session_id": "s1",
+                "vendor": "claude",
+                "cost_usd": 1.25,
+                "ts": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .unwrap();
+
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            out[0].contains("Расход проекта 24ч: $1.25"),
+            "project ledger cost missing: {out:?}"
         );
     }
 
@@ -22337,8 +22787,7 @@ mod tests {
         );
     }
 
-    /// The compact rich status card deliberately keeps the vendor's internal
-    /// resume UUID out of the phone-facing summary.
+    /// The expandable `/status` detail retains the vendor's real resume UUID.
     #[tokio::test]
     async fn gateway_status_shows_real_vendor_resume_uuid() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -22362,7 +22811,7 @@ mod tests {
             out[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
             "got: {out:?}"
         );
-        assert!(!out[0].contains(uuid), "internal UUID leaked into: {out:?}");
+        assert!(out[0].contains(uuid), "resume UUID missing from: {out:?}");
     }
 
     /// v0.8.19 `/status` — registered in the command set + dispatches via
@@ -25228,7 +25677,8 @@ mod tests {
             ]
         );
 
-        // The compact table does not repeat a verbose title.
+        // The compact table stays terse while the switch button carries a
+        // capped title to disambiguate otherwise identical sessions.
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
@@ -25237,7 +25687,7 @@ mod tests {
         let chat = ChatKey::new("mock", "chat-1", "alice");
         assert_eq!(
             gateway.render_sessions(&chat, false).await.button_rows[0][0].label,
-            "s1 ▶"
+            "▶ s1 claude · my custom t…"
         );
 
         // A later plain message must NOT clobber the rename via auto-title.
@@ -26757,8 +27207,8 @@ mod tests {
         );
     }
 
-    /// `/sessions` keeps delegated sessions in the same compact, recency-sorted
-    /// table as every other live session.
+    /// `/sessions` renders the visible delegation tree without dropping the
+    /// priority ordering among siblings.
     #[tokio::test]
     async fn delegation_sessions_tree_indents_children() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -26805,17 +27255,17 @@ mod tests {
             .render_sessions(&ChatKey::new("mock", "chat-1", "alice"), true)
             .await
             .plain;
-        // The compact table preserves the gateway's recency order; the child
-        // was created after its parent, so it leads the two rows.
+        // A visible parent roots the child regardless of its newer recency;
+        // the child keeps its compact row but gains a delegation indent.
         let pline = format!("{parent} | claude.— | 🟢 ожидание | —");
-        let cline = format!("{child} | claude.— | 🟢 ожидание | —");
+        let cline = format!("└─ {child} | claude.— | 🟢 ожидание | —");
         let pi = out
             .find(&pline)
             .unwrap_or_else(|| panic!("parent row: {out}"));
         let ci = out
             .find(&cline)
             .unwrap_or_else(|| panic!("child row: {out}"));
-        assert!(ci < pi, "newer child leads the compact table:\n{out}");
+        assert!(pi < ci, "parent must precede its indented child:\n{out}");
     }
 
     /// `ancestor_chain` (the stop-descendant + cycle basis): a child's chain

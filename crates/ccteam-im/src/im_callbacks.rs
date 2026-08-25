@@ -11,7 +11,8 @@
 //! - `cmd:<command>` — run `<command>` (with its args) exactly as if the
 //!   user had typed it.
 //! - `cmd:?<command>` — ask for confirmation before running `<command>`.
-//! - `cmd:noop` — the confirmation prompt's "cancel" button.
+//! - `cmd:!<token>` / `cmd:x<token>` — approve / cancel a gateway-held
+//!   confirmation. The token is opaque and never contains the command.
 
 /// One inline-button callback payload, parsed into the action it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,8 +27,10 @@ pub enum CallbackAction {
     Command(String),
     /// Ask for confirmation before running this command.
     Confirm(String),
-    /// Cancel a pending confirmation.
-    Noop,
+    /// Approve a pending confirmation by its opaque token.
+    Confirmed(String),
+    /// Cancel a pending confirmation by its opaque token.
+    Cancelled(String),
 }
 
 /// Parse one inline-button `callback_data` payload into a [`CallbackAction`].
@@ -41,12 +44,11 @@ pub fn parse(data: &str) -> CallbackAction {
             data: data.to_string(),
         };
     };
-    if rest == "noop" {
-        return CallbackAction::Noop;
-    }
-    match rest.strip_prefix('?') {
-        Some(cmd) => CallbackAction::Confirm(cmd.to_string()),
-        None => CallbackAction::Command(rest.to_string()),
+    match rest.chars().next() {
+        Some('?') => CallbackAction::Confirm(rest[1..].to_string()),
+        Some('!') => CallbackAction::Confirmed(rest[1..].to_string()),
+        Some('x') => CallbackAction::Cancelled(rest[1..].to_string()),
+        _ => CallbackAction::Command(rest.to_string()),
     }
 }
 
@@ -79,8 +81,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_noop() {
-        assert_eq!(parse("cmd:noop"), CallbackAction::Noop);
+    fn confirmation_tokens_are_not_direct_commands() {
+        assert_eq!(
+            parse("cmd:!deadbeef"),
+            CallbackAction::Confirmed("deadbeef".to_string()),
+        );
+        assert_eq!(
+            parse("cmd:xdeadbeef"),
+            CallbackAction::Cancelled("deadbeef".to_string()),
+        );
     }
 
     #[test]
