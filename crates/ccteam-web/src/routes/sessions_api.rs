@@ -1476,8 +1476,10 @@ fn synthetic_approval_event(sid: &str, prompt: &ChoicePrompt) -> GatewayEvent {
                 data: format!("{}:{i}", prompt.token),
                 label: opt.label.clone(),
                 id: opt.id.clone(),
+                style: None,
             })
             .collect(),
+        button_rows: Vec::new(),
         sid: Some(sid.to_string()),
         // Not resolvable from a bare `(sid, prompt)` pair; the reseed just
         // won't ACL-filter into the team view's global SSE for a tenant
@@ -2403,6 +2405,7 @@ mod tests {
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: sid.map(str::to_string),
             slug: None,
         }
@@ -2587,11 +2590,13 @@ mod tests {
                 data: "pcafef00d:0".into(),
                 label: "✅ Approve".into(),
                 id: "allow".into(),
+                style: None,
             },
             MessageOption {
                 data: "pcafef00d:1".into(),
                 label: "⛔ Deny".into(),
                 id: "deny".into(),
+                style: None,
             },
         ];
         let payload = session_event_payload(&ev);
@@ -2613,6 +2618,7 @@ mod tests {
             data: "ptok:0".into(),
             label: "x".into(),
             id: "allow".into(),
+            style: None,
         }];
         assert_eq!(approval_token(&ev).as_deref(), Some("ptok"));
         // No options ⇒ None (the payload then omits the resolve affordance).
@@ -3294,6 +3300,7 @@ mod tests {
             kind: ccteam_im::gateway::GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: None,
         };

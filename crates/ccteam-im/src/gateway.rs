@@ -18,19 +18,22 @@ use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::execution::session_body::{self, BodyProbe, SessionBody};
 use ccteam_harness::{
     apply_title, atomic_write_durable, chat_session_name, discover_external_claude_sessions,
-    format_tokens, list_session_metas, parse_chat_session_name, truncate_title, AccountUsage,
-    AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, ChoiceSelection, DetachOutcome,
-    Directive, DirectiveOutcome, EventAttachment, ExternalClaudeSession, HarnessAdapter,
-    HarnessError, PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin,
-    SessionProtocol, SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails,
-    TitleSource, TitleSync, TurnDisposition, TurnInput, TurnRouting, UnobservedTurnCtx,
+    list_session_metas, parse_chat_session_name, truncate_title, AgentSpecBrief, AgentVendor,
+    ChoiceOption, ChoicePrompt, ChoiceSelection, DetachOutcome, Directive, DirectiveOutcome,
+    EventAttachment, ExternalClaudeSession, HarnessAdapter, HarnessError, PermissionMode,
+    ProcessBackend, SessionMeta, SessionOrigin, SessionProtocol, SessionTitleTarget, SpawnCtx,
+    ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource, TitleSync, TurnDisposition,
+    TurnInput, TurnRouting, UnobservedTurnCtx,
 };
 #[cfg(test)]
-use ccteam_harness::{read_session_meta, write_session_meta};
+use ccteam_harness::{read_session_meta, write_session_meta, AccountUsage, RunningTask};
 use futures::{future::join_all, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::im_callbacks;
+use crate::im_views::{
+    self, CommandView, ProjectRow, ProjectsView, RichReply, SessionRow, SessionsView, StatusView,
+};
 use crate::pending::InteractionOrigin;
 use crate::transport::{ButtonStyle, ChannelAttachment, ChoiceReply, MessageOption};
 use crate::BotRegistration;
@@ -3464,6 +3467,31 @@ impl Gateway {
         attachments: &[ChannelAttachment],
         selection: Option<&ChoiceReply>,
     ) -> Result<Vec<String>> {
+        self.handle_message_rich(
+            channel,
+            chat_id,
+            user_id,
+            message_id,
+            text,
+            attachments,
+            selection,
+        )
+        .await
+        .map(|replies| replies.into_iter().map(|reply| reply.plain).collect())
+    }
+
+    /// Route one inbound message and preserve rich command replies for Telegram.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn handle_message_rich(
+        &mut self,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        message_id: &str,
+        text: &str,
+        attachments: &[ChannelAttachment],
+        selection: Option<&ChoiceReply>,
+    ) -> Result<Vec<RichReply>> {
         let chat = ChatKey::new(channel, chat_id, user_id);
         // (v0.8.5 D3) An inbound option click (Telegram callback / web chip)
         // resolves the session's pending choice — never treated as text.
@@ -3473,7 +3501,10 @@ impl Gateway {
             // `nav:use:<sid>` — with no pending-registry token), so it is
             // resolved here, before the token-keyed choice path.
             if let Some(nav) = reply.data.strip_prefix("nav:") {
-                return self.resolve_nav_selection(&chat, nav).await;
+                return self
+                    .resolve_nav_selection(&chat, nav)
+                    .await
+                    .map(plain_replies);
             }
             // TG-GATE-V2 W3 — `cmd:`/`cmd:?`/`cmd:noop` inline buttons route
             // through `handle_command`, not the token-keyed pending registry.
@@ -3481,20 +3512,23 @@ impl Gateway {
                 im_callbacks::CallbackAction::Choice { .. } => {}
                 action => return self.resolve_cmd_callback(&chat, action).await,
             }
-            return self.resolve_selection(&chat, &reply.data).await;
+            return self
+                .resolve_selection(&chat, &reply.data)
+                .await
+                .map(plain_replies);
         }
         // Pi extension input/editor dialogs are represented by an External
         // pending with no buttons. While one is tagged to this ccteam sid,
         // the next text reply resolves it instead of becoming an agent turn.
         if let Some(replies) = self.resolve_free_text(&chat, text).await? {
-            return Ok(replies);
+            return Ok(plain_replies(replies));
         }
         // (v0.8.5 D3) A bare number is a short-reply to a pending choice, but
         // only when one is outstanding for the current session; otherwise
         // it's ordinary text for the agent.
         if let Some(n) = numeric_choice(text) {
             if self.has_pending_for_current(&chat).await {
-                return self.resolve_numeric(&chat, n).await;
+                return self.resolve_numeric(&chat, n).await.map(plain_replies);
             }
         }
         // Commands parse on the raw text; attachments don't apply to them.
@@ -3511,7 +3545,8 @@ impl Gateway {
             if chat.channel != "web" {
                 if let Some(hint) = command_next_hint(text.split_whitespace().next().unwrap_or(""))
                 {
-                    append_next_hint(&mut reply, hint);
+                    append_next_hint(&mut reply.markdown, hint);
+                    append_next_hint(&mut reply.plain, hint);
                 }
             }
             return Ok(vec![reply]);
@@ -3531,11 +3566,14 @@ impl Gateway {
                     .unwrap()
                     .insert(chat.clone(), session_id);
                 if payload.is_empty() && attachments.is_empty() {
-                    return Ok(vec![format!("Выбран @{handle}")]);
+                    return Ok(vec![RichReply::plain(format!("Выбран @{handle}"))]);
                 }
                 let turn =
                     wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
-                return self.submit_to_current(&chat, message_id, turn).await;
+                return self
+                    .submit_to_current(&chat, message_id, turn)
+                    .await
+                    .map(plain_replies);
             }
             if let Some(template) = self.template_by_handle(&chat, &handle) {
                 let session_id = self.start_template_session(chat.clone(), template).await?;
@@ -3544,11 +3582,14 @@ impl Gateway {
                     .unwrap()
                     .insert(chat.clone(), session_id);
                 if payload.is_empty() && attachments.is_empty() {
-                    return Ok(vec![format!("Выбран @{handle}")]);
+                    return Ok(vec![RichReply::plain(format!("Выбран @{handle}"))]);
                 }
                 let turn =
                     wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
-                return self.submit_to_current(&chat, message_id, turn).await;
+                return self
+                    .submit_to_current(&chat, message_id, turn)
+                    .await
+                    .map(plain_replies);
             }
         }
         let templates = self.templates_for_chat(&chat);
@@ -3556,7 +3597,7 @@ impl Gateway {
             let mut handles: Vec<String> = templates.iter().map(|t| t.handle.clone()).collect();
             handles.sort();
             handles.dedup();
-            return Ok(vec![format_ambiguous_dm_reply(&handles)]);
+            return Ok(vec![RichReply::plain(format_ambiguous_dm_reply(&handles))]);
         }
         self.ensure_current_session(&chat).await?;
         // v0.8.10 — codex `/clear` = recycle + recreate at the gateway, so its
@@ -3574,7 +3615,10 @@ impl Gateway {
                     .map(|s| s.vendor == AgentVendor::Codex)
                     .unwrap_or(false);
                 if is_codex {
-                    return self.recycle_codex_session(chat.clone(), &sid).await;
+                    return self
+                        .recycle_codex_session(chat.clone(), &sid)
+                        .await
+                        .map(plain_replies);
                 }
             }
         }
@@ -3585,7 +3629,7 @@ impl Gateway {
                 append_next_hint(last, NEXT_HINT_STATUS);
             }
         }
-        Ok(replies)
+        Ok(plain_replies(replies))
     }
 
     /// v0.8.x (concurrency review §4.1 P1) — cheap, synchronous, read-only hot
@@ -3662,7 +3706,7 @@ impl Gateway {
         text: &str,
         attachments: &[ChannelAttachment],
         selection: Option<&ChoiceReply>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<RichReply>> {
         let chat = ChatKey::new(channel, chat_id, user_id);
         // Re-derive the "implicit spawn candidate" decision authoritatively
         // (the daemon's `inbound_may_spawn` call is only a hint to decide
@@ -3721,7 +3765,7 @@ impl Gateway {
         }
         crate::latency::gateway_lock(&gateway, "im.turn.handle")
             .await
-            .handle_message(
+            .handle_message_rich(
                 channel,
                 chat_id,
                 user_id,
@@ -3733,7 +3777,7 @@ impl Gateway {
             .await
     }
 
-    async fn handle_command(&mut self, chat: &ChatKey, text: &str) -> Result<Option<String>> {
+    async fn handle_command(&mut self, chat: &ChatKey, text: &str) -> Result<Option<RichReply>> {
         let trimmed = text.trim();
         if !trimmed.starts_with('/') {
             return Ok(None);
@@ -3741,7 +3785,9 @@ impl Gateway {
         let mut parts = trimmed.split_whitespace();
         let cmd = parts.next().unwrap_or_default();
         match cmd {
-            "/inbox" => Ok(Some(self.handle_inbox_command(chat, trimmed)?)),
+            "/inbox" => Ok(Some(RichReply::plain(
+                self.handle_inbox_command(chat, trimmed)?,
+            ))),
             "/new" => {
                 let args: Vec<&str> = parts.collect();
                 let NewSessionArgs {
@@ -3765,7 +3811,7 @@ impl Gateway {
                         tuning,
                     )
                     .await?;
-                Ok(Some(Self::new_session_receipt(&outcome)))
+                Ok(Some(RichReply::plain(Self::new_session_receipt(&outcome))))
             }
             "/role" => {
                 let role = parts
@@ -3774,7 +3820,9 @@ impl Gateway {
                     .ok_or_else(|| anyhow!("Использование: /role <role>"))?
                     .to_string();
                 let sid = self.switch_current_role(chat, role.clone()).await?;
-                Ok(Some(format!("Сессия {sid} переключена на роль {role}")))
+                Ok(Some(RichReply::plain(format!(
+                    "Сессия {sid} переключена на роль {role}"
+                ))))
             }
             "/rename" => {
                 // Raw remainder (like `/newproject`'s path arg) — a title may
@@ -3813,10 +3861,12 @@ impl Gateway {
                 // too) — same visibility rule every other sid-addressed
                 // command applies.
                 if !self.chat_can_access_sid(chat, &sid) {
-                    return Ok(Some(format!("Сессия {sid} недоступна этому чату")));
+                    return Ok(Some(RichReply::plain(format!(
+                        "Сессия {sid} недоступна этому чату"
+                    ))));
                 }
                 let renamed = self.rename_session(&sid, raw_title).await?;
-                Ok(Some(render_rename_receipt(&renamed)))
+                Ok(Some(RichReply::plain(render_rename_receipt(&renamed))))
             }
             "/use" => {
                 let arg = parts
@@ -3837,7 +3887,9 @@ impl Gateway {
                 };
                 // The switch itself lives in `use_session` (shared with the
                 // clickable session picker's `nav:use:<sid>` button tap).
-                self.use_session(chat, id).await.map(Some)
+                self.use_session(chat, id)
+                    .await
+                    .map(|reply| Some(RichReply::plain(reply)))
             }
             "/stop" => {
                 // v0.10.3 — stop one session by id, or every session visible
@@ -3849,10 +3901,10 @@ impl Gateway {
                 if matches!(scope.as_str(), "all" | "project") {
                     let (sids, project) = match self.bulk_stop_candidates(chat, &scope) {
                         Ok(snapshot) => snapshot,
-                        Err(error) => return Ok(Some(error.to_string())),
+                        Err(error) => return Ok(Some(RichReply::plain(error.to_string()))),
                     };
                     if sids.is_empty() {
-                        return Ok(Some("Нет доступных сессий для остановки".to_string()));
+                        return Ok(Some(RichReply::plain("Нет доступных сессий для остановки")));
                     }
                     if Self::channel_supports_buttons(&chat.channel) {
                         let nanos = std::time::SystemTime::now()
@@ -3904,7 +3956,9 @@ impl Gateway {
                         return Ok(None);
                     }
                     let (stopped, failures) = self.stop_sessions_bulk(&sids).await;
-                    return Ok(Some(format_bulk_stop_result(&stopped, &failures)));
+                    return Ok(Some(RichReply::plain(format_bulk_stop_result(
+                        &stopped, &failures,
+                    ))));
                 }
                 let sid = target.to_string();
                 // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own session.
@@ -3918,16 +3972,18 @@ impl Gateway {
                         self.is_session_detached(&sid) && self.chat_can_access_sid(chat, &sid)
                     });
                 if !accessible {
-                    return Ok(Some(format!("Сессия {sid} недоступна этому чату")));
+                    return Ok(Some(RichReply::plain(format!(
+                        "Сессия {sid} недоступна этому чату"
+                    ))));
                 }
                 let was_detached = self.is_session_detached(&sid);
                 self.stop_session(&sid).await?;
                 if was_detached {
-                    return Ok(Some(format!(
+                    return Ok(Some(RichReply::plain(format!(
                         "Сессия {sid} остановлена (её процесс до перезапуска завершён)"
-                    )));
+                    ))));
                 }
-                Ok(Some(format!("Сессия {sid} остановлена")))
+                Ok(Some(RichReply::plain(format!("Сессия {sid} остановлена"))))
             }
             "/interrupt" => {
                 // Interrupt the session's CURRENTLY-RUNNING turn WITHOUT
@@ -3961,12 +4017,14 @@ impl Gateway {
                     .map(|s| self.chat_can_access(chat, s))
                     .unwrap_or(false);
                 if !accessible {
-                    return Ok(Some(format!("Сессия {sid} недоступна этому чату")));
+                    return Ok(Some(RichReply::plain(format!(
+                        "Сессия {sid} недоступна этому чату"
+                    ))));
                 }
                 self.interrupt_session(&sid).await?;
-                Ok(Some(format!(
+                Ok(Some(RichReply::plain(format!(
                     "Текущий turn сессии {sid} прерван (сессия сохранена; можно продолжить /model и др.)"
-                )))
+                ))))
             }
             "/cd" => {
                 let project = parts
@@ -3974,7 +4032,8 @@ impl Gateway {
                     .ok_or_else(|| anyhow!("Для /cd нужен проект"))?;
                 // The switch itself lives in `change_project` (shared with the
                 // clickable project picker's `nav:cd:<slug>` button tap).
-                self.change_project(chat, project).map(Some)
+                self.change_project(chat, project)
+                    .map(|reply| Some(RichReply::plain(reply)))
             }
             "/newproject" => {
                 // `/newproject <slug> <path>` — the path is the remainder
@@ -4000,7 +4059,7 @@ impl Gateway {
                 // `/cd`), so the next message spawns a session there instead of
                 // landing back in the previous project.
                 self.create_project(chat, slug, path, Some(&owner_id))
-                    .map(Some)
+                    .map(|reply| Some(RichReply::plain(reply)))
             }
             "/sessions" => {
                 // Default = the current project only (so switching between
@@ -4009,46 +4068,15 @@ impl Gateway {
                 let all = parts
                     .next()
                     .is_some_and(|a| a.eq_ignore_ascii_case("all") || a == "*");
-                let text = self.render_sessions(chat, all).await;
-                // On a button-capable channel (Telegram) the SAME list is
-                // delivered via the event sink as text + one inline "switch"
-                // button per live session (`nav:use:<sid>` tap → `/use`); the
-                // command then returns no inline reply. Every other channel
-                // (web's structured session frame, Lark's text-only send, the
-                // test mock) keeps the plain-text reply unchanged.
-                if Self::channel_supports_buttons(&chat.channel) {
-                    let options = self.session_switch_options(chat, all);
-                    self.emit_list_options(chat, text, options);
-                    Ok(None)
-                } else {
-                    Ok(Some(text))
-                }
+                Ok(Some(self.render_sessions(chat, all).await))
             }
             "/status" => Ok(Some(self.render_status(chat).await)),
-            "/mcp" => self.rebuild_tool_surface(chat).await.map(Some),
-            "/projects" => {
-                // Button-capable channel (Telegram) → a text header + one inline
-                // "switch" button per project (`nav:cd:<slug>` tap → `/cd`),
-                // delivered via the event sink. Others keep the bare
-                // newline-separated slug list as an inline reply.
-                if Self::channel_supports_buttons(&chat.channel) {
-                    let options = self.project_switch_options(chat);
-                    let cur = self.current_project_label(chat);
-                    self.emit_list_options(
-                        chat,
-                        format!("📁 Проекты (нажмите для переключения, ✓ = текущий {cur}):"),
-                        options,
-                    );
-                    Ok(None)
-                } else {
-                    Ok(Some(self.render_projects(chat)))
-                }
-            }
-            "/help" => Ok(Some(format!(
-                "📁 Текущий проект: {}\n\n{}",
-                self.current_project_label(chat),
-                render_help()
-            ))),
+            "/mcp" => self
+                .rebuild_tool_surface(chat)
+                .await
+                .map(|reply| Some(RichReply::plain(reply))),
+            "/projects" => Ok(Some(self.render_projects(chat))),
+            "/help" => Ok(Some(render_help())),
             _ => Ok(None),
         }
     }
@@ -4360,122 +4388,11 @@ impl Gateway {
             .map(|owner| reply_target_for_owner(&owner))
     }
 
-    /// One "switch project" button per project (`nav:cd:<slug>`), the current
-    /// one marked `✓`. Payloads over Telegram's 64-byte `callback_data` cap are
-    /// dropped (a pathologically long slug still shows in the text list).
-    fn project_switch_options(&self, chat: &ChatKey) -> Vec<MessageOption> {
-        let cur = self.current_project_for(chat).unwrap_or_default();
-        let mut options: Vec<MessageOption> = self
-            .visible_project_slugs(chat)
-            .into_iter()
-            .map(|slug| {
-                // A consistent leading glyph (✓ current / ▸ others) lines the
-                // labels up on the left, so the picker reads as a tidy list
-                // rather than centre-floating text (owner req).
-                let label = if slug == cur {
-                    format!("✓ {slug}")
-                } else {
-                    format!("▸ {slug}")
-                };
-                MessageOption {
-                    data: format!("nav:cd:{slug}"),
-                    label,
-                    id: slug,
-                    style: None,
-                }
-            })
-            .filter(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX)
-            .collect();
-        left_align_option_labels(&mut options);
-        options
-    }
-
-    /// One "switch session" button per live, chat-visible session
-    /// (`nav:use:<sid>`), the current one marked `✓`. Scoped + ordered like
-    /// [`Self::render_sessions`] (current project unless `all`; recency then
-    /// numeric-sid descending) so the buttons track the text list. Ended
-    /// (history) sessions switch only via their text `→ /use <sid>` hint.
-    fn session_switch_options(&self, chat: &ChatKey, all: bool) -> Vec<MessageOption> {
-        let cur = self.current_project_for(chat).unwrap_or_default();
-        let mut memo = ProjectPrincipalMemo::new();
-        let mut visible: Vec<&GatewaySession> = self
-            .sessions
-            .values()
-            .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
-            .filter(|s| all || s.project == cur)
-            .collect();
-        visible.sort_by(|a, b| {
-            let la = self.session_last_active(a);
-            let lb = self.session_last_active(b);
-            lb.cmp(&la)
-                .then_with(|| session_index(&b.id).cmp(&session_index(&a.id)))
-        });
-        let current_sid = self.current_session.read().unwrap().get(chat).cloned();
-        let mut options: Vec<MessageOption> = visible
-            .into_iter()
-            .map(|s| {
-                // Label = `sid vendor (title)` (✓ prefixes the current
-                // session), arranged sid → vendor → title — same `sid vendor`
-                // opening as the text rows. The button carries the human name;
-                // a long title is clipped to `SESSION_BUTTON_TITLE_MAX_COLS`
-                // display cols so one verbose title can't widen every button
-                // (the left-align padding below pads all labels to the widest).
-                // Callback `data` is unchanged.
-                let marker = if Some(&s.id) == current_sid.as_ref() {
-                    "✓ "
-                } else {
-                    ""
-                };
-                let mut label = format!("{marker}{} {}", s.id, vendor_str(s.vendor));
-                if let Some(title) = self.session_title(s) {
-                    label.push_str(&format!(
-                        " ({})",
-                        truncate_cols(&title, SESSION_BUTTON_TITLE_MAX_COLS)
-                    ));
-                }
-                MessageOption {
-                    data: format!("nav:use:{}", s.id),
-                    label,
-                    id: s.id.clone(),
-                    style: None,
-                }
-            })
-            .filter(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX)
-            .collect();
-        left_align_option_labels(&mut options);
-        options
-    }
-
-    /// Emit a picker message (a project/session list) carrying inline `options`
-    /// to a button-capable channel, via the user-signal sink.
-    /// Delivers text + buttons as ONE message
-    /// (`spawn_gateway_event_consumer` calls `.with_options`), so the caller
-    /// returns no separate inline reply.
-    fn emit_list_options(&self, chat: &ChatKey, content: String, options: Vec<MessageOption>) {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        self.emit_user_signal(GatewayEvent {
-            id: format!("gateway-picker-{}-{nanos}", chat.chat_id),
-            channel: chat.channel.clone(),
-            chat_id: chat.chat_id.clone(),
-            thread_ts: None,
-            content,
-            kind: GatewayEventKind::Answer,
-            attachments: Vec::new(),
-            options,
-            button_rows: Vec::new(),
-            sid: None,
-            slug: None,
-        });
-    }
-
-    /// Sibling of [`Self::emit_list_options`] for multi-per-row
-    /// [`SendMessage::button_rows`] (TG-GATE-V2 W5) — e.g. a `cmd:?<cmd>`
-    /// confirmation's `[✅ Да][❌ Отмена]` row, where the two buttons must
-    /// render side by side rather than one per row like `options`. Same
-    /// one-message delivery contract as `emit_list_options`.
+    /// Emit a multi-per-row [`SendMessage::button_rows`] message (TG-GATE-V2
+    /// W5) — e.g. a `cmd:?<cmd>` confirmation's `[✅ Да][❌ Отмена]` row,
+    /// where the two buttons must render side by side rather than one per
+    /// row. Delivers text + buttons as ONE message via the user-signal sink
+    /// (`spawn_gateway_event_consumer` calls `.with_button_rows`).
     fn emit_button_rows(
         &self,
         chat: &ChatKey,
@@ -8368,10 +8285,10 @@ impl Gateway {
         &mut self,
         chat: &ChatKey,
         action: im_callbacks::CallbackAction,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<RichReply>> {
         match action {
             im_callbacks::CallbackAction::Choice { .. } => Ok(Vec::new()),
-            im_callbacks::CallbackAction::Noop => Ok(vec!["Отменено".to_string()]),
+            im_callbacks::CallbackAction::Noop => Ok(vec![RichReply::plain("Отменено")]),
             im_callbacks::CallbackAction::Confirm(cmd) => {
                 // TG-GATE-V2 W5 — the two confirmation buttons ride ONE
                 // `SendMessage::button_rows` row (side by side), not the
@@ -8383,11 +8300,11 @@ impl Gateway {
             im_callbacks::CallbackAction::Command(cmd) => {
                 let first = cmd.split_whitespace().next().unwrap_or_default();
                 if !Self::is_gateway_command(first) {
-                    return Ok(vec!["Неизвестная команда".to_string()]);
+                    return Ok(vec![RichReply::plain("Неизвестная команда")]);
                 }
                 match self.handle_command(chat, &cmd).await? {
                     Some(reply) => Ok(vec![reply]),
-                    None => Ok(vec!["Неизвестная команда".to_string()]),
+                    None => Ok(vec![RichReply::plain("Неизвестная команда")]),
                 }
             }
         }
@@ -9080,8 +8997,8 @@ impl Gateway {
             .collect()
     }
 
-    async fn render_sessions(&self, chat: &ChatKey, all: bool) -> String {
-        // v0.8.18 柱2 档0 — own-only: a chat lists only the sessions it owns
+    async fn render_sessions(&self, chat: &ChatKey, all: bool) -> RichReply {
+        // v0.8.18 ACL regression — a chat lists only sessions it owns.
         // (the web-global + same-project leaks are gone). Soft per-chat isolation.
         let mut memo = ProjectPrincipalMemo::new();
         let accessible: Vec<&GatewaySession> = self
@@ -9151,21 +9068,22 @@ impl Gateway {
             .filter(|d| (all || d.slug == cur) && self.chat_can_access_sid(chat, &d.sid))
             .count();
         if visible.is_empty() && is_web {
-            return "no sessions".to_string();
+            return RichReply::plain("no sessions");
         }
         if visible.is_empty() && detached_here == 0 {
             if elsewhere > 0 {
-                return format!(
+                return RichReply::plain(format!(
                     "📁 Текущий проект: {cur}\nВ этом проекте нет сессий — ↓ в других проектах: {elsewhere} → /sessions all"
-                );
+                ));
             }
-            return format!("📁 Текущий проект: {cur}\nНет сессий — создайте через /new");
+            return RichReply::plain(format!(
+                "📁 Текущий проект: {cur}\nНет сессий — создайте через /new"
+            ));
         }
-        // Render each visible session's row (async `thread_status`) once,
-        // keyed by sid for the IM tree; web keeps the flat bare-row feed.
+        // Read each visible session's status once. Web keeps its existing
+        // machine-parsed feed; every IM channel receives the shared compact view.
         let mut web_rows: Vec<String> = Vec::with_capacity(visible.len());
-        let mut rendered: std::collections::HashMap<String, String> =
-            std::collections::HashMap::with_capacity(visible.len());
+        let mut view_rows: Vec<SessionRow> = Vec::with_capacity(visible.len());
         for s in &visible {
             // P3 — model + ctx from the owning adapter's `thread_status`.
             // Statusless adapters (bg / default) report `ThreadStatus::default()`
@@ -9183,141 +9101,55 @@ impl Gateway {
                 });
                 continue;
             }
-            // IM row: COMPACT, single-line, `.`-joined with no padding. Leads
-            // with `sid vendor` (the SAME opening as the switch button —
-            // `session_switch_options`: `sid vendor (title)`), then — when the
-            // adapter reports them — `.model`, `.effort`, and `.window(pct%)`
-            // context: the TOTAL window (absolute, via the same
-            // `format_tokens` humanizer `ContextUsage::render` uses) + the
-            // used percentage, but NOT the absolute used count. NO project
-            // slug (the `📁 当前项目:` header already names it; `/sessions all`
-            // spans projects without a per-row slug), NO role, NO `ctx` label
-            // (all on /status); the title lives on the button; the vendor tag
-            // + activity dot are gone.
-            let mut row = format!("{} {}", s.id, vendor_str(s.vendor));
-            if let Some(st) = &status {
-                if let Some(m) = st.model.as_deref().filter(|m| !m.is_empty()) {
-                    row.push_str(&format!(
-                        ".{}",
-                        strip_vendor_prefix(vendor_str(s.vendor), m)
-                    ));
+            let model = status
+                .as_ref()
+                .and_then(|st| st.model.as_deref())
+                .filter(|model| !model.is_empty())
+                .map(|model| strip_vendor_prefix(vendor_str(s.vendor), model))
+                .unwrap_or("—");
+            let context = status
+                .as_ref()
+                .and_then(|st| st.context.as_ref())
+                .and_then(|context| context.pct())
+                .map(|percent| format!("{percent:.0}%"))
+                .unwrap_or_else(|| "—".to_string());
+            let status_label = if waiting_sids.contains(&s.id) {
+                "⏳ ожидание".to_string()
+            } else {
+                match self.live_turn(s, Instant::now()) {
+                    Some(live) if live.is_stuck() => "🔴 зависание".to_string(),
+                    Some(_) => "🔵 работает".to_string(),
+                    None => "🟢 ожидание".to_string(),
                 }
-                if let Some(e) = st.effort.as_deref().filter(|e| !e.is_empty()) {
-                    row.push_str(&format!(".{e}"));
-                }
-                if let Some(ctx) = st.context.as_ref().filter(|c| c.window_tokens > 0) {
-                    // Window known but occupancy not (a just-resumed ACP
-                    // session, a vendor with no usage channel) renders `—`,
-                    // never `0%` — the row must not claim an empty context.
-                    let pct = match ctx.pct() {
-                        Some(p) => format!("{p:.0}%"),
-                        None => "—".to_string(),
-                    };
-                    row.push_str(&format!(".{}({pct})", format_tokens(ctx.window_tokens)));
-                }
-            }
-            // v0.9.0 W2 (F2) — annotate the IM row with a non-local host.
-            if !s.host.is_empty() && s.host != "local" {
-                row.push_str(&format!(" @{}", s.host));
-            }
-            // v0.8.23 review item 9 — ⏳ marks a session pinned to the top for
-            // an outstanding HITL approval. Prefixed last so it stays the
-            // leftmost glance cue.
-            if waiting_sids.contains(&s.id) {
-                row = format!("⏳ {row}");
-            }
-            rendered.insert(s.id.clone(), row);
+            };
+            view_rows.push(SessionRow {
+                sid: s.id.clone(),
+                vendor_model: format!("{}.{}", vendor_str(s.vendor), model),
+                status: status_label,
+                context,
+            });
         }
         if is_web {
-            return web_rows.join("\n");
+            return RichReply::plain(web_rows.join("\n"));
         }
-        // v0.9.0 W2 (F2) — IM tree: roots (a session with no VISIBLE parent —
-        // a true root, or a parent in another project) sorted by sid, each
-        // followed by its children indented `└─ ` (recursively). A parent-chain
-        // cycle can never orphan a session: any unvisited row is appended flat.
-        let visible_sids: std::collections::HashSet<&str> =
-            visible.iter().map(|s| s.id.as_str()).collect();
-        let mut children_of: std::collections::HashMap<&str, Vec<&str>> =
-            std::collections::HashMap::new();
-        for s in &visible {
-            if let Some(p) = s.parent_sid.as_deref() {
-                if visible_sids.contains(p) {
-                    children_of.entry(p).or_default().push(s.id.as_str());
-                }
-            }
-        }
-        // Roots + children keep the ALREADY-computed `visible` order (recency +
-        // waiting-approval pin); the tree only adds indentation, never reorders
-        // (so the ⏳ pin + recency sort above are preserved).
-        let roots: Vec<&str> = visible
-            .iter()
-            .filter(|s| {
-                s.parent_sid
-                    .as_deref()
-                    .map(|p| !visible_sids.contains(p))
-                    .unwrap_or(true)
-            })
-            .map(|s| s.id.as_str())
-            .collect();
-        let mut tree_rows: Vec<String> = Vec::with_capacity(visible.len());
-        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut stack: Vec<(&str, usize)> = roots.iter().rev().map(|r| (*r, 0usize)).collect();
-        while let Some((sid, depth)) = stack.pop() {
-            if !visited.insert(sid) {
-                continue;
-            }
-            if let Some(row) = rendered.get(sid) {
-                let prefix = if depth == 0 {
-                    String::new()
-                } else {
-                    format!("{}└─ ", "   ".repeat(depth - 1))
-                };
-                tree_rows.push(format!("{prefix}{row}"));
-            }
-            if let Some(kids) = children_of.get(sid) {
-                for k in kids.iter().rev() {
-                    stack.push((k, depth + 1));
-                }
-            }
-        }
-        // Cycle-orphaned leftovers → flat, sorted by sid (never drop a row).
-        let mut leftovers: Vec<&str> = visible
-            .iter()
-            .map(|s| s.id.as_str())
-            .filter(|sid| !visited.contains(sid))
-            .collect();
-        leftovers.sort_by_key(|sid| session_index(sid));
-        for sid in leftovers {
-            if let Some(row) = rendered.get(sid) {
-                tree_rows.push(row.clone());
-            }
-        }
-        let mut out = format!("📁 Текущий проект: {cur}\n{}", tree_rows.join("\n"));
-        // One sid, one body: sessions whose body from before a restart is still
-        // finishing its turn are real and this chat's — list them, say what
-        // they are, and name the two things that can be done about them.
-        let detached_rows: Vec<String> = self
-            .detached
-            .values()
-            .filter(|d| (all || d.slug == cur) && self.chat_can_access_sid(chat, &d.sid))
-            .map(|d| {
-                format!(
-                    "⏳ {} detached — finishing a turn from before the ccteam restart (pid {}); \
-                     messages queue behind it, /stop {} ends it now",
-                    d.sid, d.body.pid, d.sid
-                )
-            })
-            .collect();
-        if !detached_rows.is_empty() {
-            out.push('\n');
-            out.push_str(&detached_rows.join("\n"));
-        }
-        if elsewhere > 0 {
-            out.push_str(&format!(
-                "\n↓ В других проектах ещё {elsewhere} сессий → /sessions all"
-            ));
-        }
-        out
+        view_rows.extend(
+            self.detached
+                .values()
+                .filter(|detached| {
+                    (all || detached.slug == cur) && self.chat_can_access_sid(chat, &detached.sid)
+                })
+                .map(|detached| SessionRow {
+                    sid: detached.sid.clone(),
+                    vendor_model: "—".to_string(),
+                    status: "⏳ отсоединена".to_string(),
+                    context: "—".to_string(),
+                }),
+        );
+        im_views::render_sessions(&SessionsView {
+            project: cur,
+            sessions: view_rows,
+            elsewhere,
+        })
     }
 
     /// Best-effort `last_active` (RFC3339) for a LIVE session from the catalog.
@@ -9437,14 +9269,8 @@ impl Gateway {
             .collect()
     }
 
-    /// v0.8.19 — PULL-only fleet-health view for `/status`. One line per
-    /// accessible session: state (🟢 idle / 🔵 working / 🔴 stuck) · sid ·
-    /// session-name (`ccteam-chat-<slug>-<sid>`) · the real vendor `--resume`
-    /// id (`resume <uuid>`, or `resume —` when none) · project · role ·
-    /// state-detail · model · effort · ctx, plus the live activity counts
-    /// (`read×N·bash×M`) while working. Same ACL + iteration as
-    /// [`render_sessions`]; pure rendering (no side effects, no push, no
-    /// mutation) — it only renders when the user types `/status`.
+    /// Render the focused session's compact status card. It reads the same
+    /// live harness facts as before, then hands plain data to `im_views`.
     ///
     /// State derivation = [`Gateway::live_turn`] — the same in-flight verdict
     /// the child rows, MCP `session_list` and the web session list are given
@@ -9455,7 +9281,7 @@ impl Gateway {
     /// authoritative "still working" straight from the vendor, so it upgrades
     /// 🔴 back to 🔵 (`running_tasks` costs an adapter round-trip per session,
     /// which a fleet listing does not pay).
-    async fn render_status(&self, chat: &ChatKey) -> String {
+    async fn render_status(&self, chat: &ChatKey) -> RichReply {
         let mut memo = ProjectPrincipalMemo::new();
         let visible: Vec<&GatewaySession> = self
             .sessions
@@ -9463,7 +9289,7 @@ impl Gateway {
             .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .collect();
         if visible.is_empty() {
-            return "Нет сессий — создайте через /new".to_string();
+            return RichReply::plain("Нет сессий — создайте через /new");
         }
         // /status = the chat's CURRENT (focused) session in DEPTH; /sessions is
         // the full fleet list. Resolve the focused sid; if none is set (or it has
@@ -9483,37 +9309,17 @@ impl Gateway {
             let cur = self.current_project_label(chat);
             let in_proj = visible.iter().filter(|s| s.project == cur).count();
             return if in_proj > 0 {
-                format!(
+                RichReply::plain(format!(
                     "📁 Текущий проект: {cur}\nНет текущей сессии — выберите через /use <id> (в проекте: {in_proj}; все — /sessions)"
-                )
+                ))
             } else {
-                format!("📁 Текущий проект: {cur}\nВ этом проекте нет сессий — отправьте сообщение или /new")
+                RichReply::plain(format!("📁 Текущий проект: {cur}\nВ этом проекте нет сессий — отправьте сообщение или /new"))
             };
         };
 
-        // Pull live facts FROM the harness — never folded by ccteam: the
-        // model/effort/ctx/goal status, the running subagent/workflow list
-        // (claude's own `system:task_*` lifecycle), and account usage.
+        // Pull the focused session's live facts from its harness.
         let status = s.adapter.thread_status(&s.thread).await.ok();
         let running = s.adapter.running_tasks(&s.thread).await;
-        // Account usage is account-scoped but PER VENDOR: a Codex session must
-        // never display a Claude account's windows (and vice-versa). Prefer the
-        // current session; else borrow from another visible session OF THE SAME
-        // VENDOR whose adapter answers (so usage still shows when the current
-        // session is idle/released). No same-vendor answer ⇒ omit the row.
-        let mut account = s.adapter.account_usage(&s.thread).await;
-        if account.is_none() {
-            let vendor = s.adapter.vendor();
-            for o in &visible {
-                if o.adapter.vendor() != vendor {
-                    continue;
-                }
-                if let Some(u) = o.adapter.account_usage(&o.thread).await {
-                    account = Some(u);
-                    break;
-                }
-            }
-        }
 
         // State: a turn in flight ⇒ 🔵 working; silent past the idle window ⇒
         // 🔴 stuck — EXCEPT a BLOCKING subagent is an AUTHORITATIVE "still
@@ -9548,31 +9354,6 @@ impl Gateway {
             ),
         };
 
-        let role = if s.role.is_empty() { "—" } else { &s.role };
-        // v0.8.23 review §3.2-5 (item 2c) — "你在哪": a standalone header line
-        // giving the project slug + current session (sid/role/title) ahead of
-        // the existing deep-view body, so the two-pointer (project × session)
-        // mental model has one line that answers both at a glance. Same
-        // format as the turn-answer context echo (`context_echo_line`), so
-        // the two surfaces read identically.
-        let title = self.session_title(s);
-        let mut out = format!(
-            "🧭 {}\n📍 Текущая сессия {} · {} · {} · {role} · {state} {detail}",
-            context_echo_line(&s.project, &s.id, &s.role, title.as_deref()),
-            s.id,
-            s.project,
-            vendor_str(s.vendor)
-        );
-
-        // Project working-tree PATH — disambiguates an auto-appended slug
-        // (demo2 vs demo): the real dir is unambiguous. Resolved from the loaded
-        // project map (slug → dir); omitted if the project isn't mapped.
-        if let Some(dir) = self.projects.get(&s.project) {
-            out.push_str(&format!("\n   📁 {}", dir.display()));
-        }
-
-        // Line 2: model · effort · ctx · resume (same fields /sessions shows, on
-        // their own line for the deep view). Statusless/failed → `—` placeholder.
         let model = status
             .as_ref()
             .and_then(|st| st.model.as_deref())
@@ -9591,47 +9372,8 @@ impl Gateway {
             Some(pct) => format!("контекст {pct:.0}%"),
             None => "контекст —".to_string(),
         };
-        // The REAL `--resume` id (Anthropic session uuid), shown in full so it
-        // can be matched against `tmux ls` / `claude --resume`; `—` for a
-        // tmux/codex session that carries no stream-json uuid (never fabricated).
-        let resume = thread_vendor_uuid(&s.thread)
-            .map(|u| format!("resume {u}"))
-            .unwrap_or_else(|| "resume —".to_string());
-        out.push_str(&format!("\n   {model} · {effort} · {ctx} · {resume}"));
-
-        // Running subagents / background workflows — straight from claude's task
-        // lifecycle (NOT a fold). Subagents only exist while a turn is working;
-        // background workflows outlive the turn, so an idle session can still
-        // show its running workflows here.
-        out.push_str(&format_running_tasks(&running));
-
-        // Goal (🎯 open / ✅ met) — from the same thread_status the statusline uses.
-        if let Some(g) = status.as_ref().and_then(|st| st.goal.as_ref()) {
-            let cond = g.condition.trim();
-            if !cond.is_empty() {
-                let marker = if g.met { "✅" } else { "🎯" };
-                let shown: String = if cond.chars().count() > 60 {
-                    format!("{}…", cond.chars().take(59).collect::<String>())
-                } else {
-                    cond.to_string()
-                };
-                out.push_str(&format!("\n   {marker} {shown}"));
-            }
-        }
-
-        // Account usage (5h / weekly / credits) — the vendor rate-limit windows.
-        if let Some(u) = &account {
-            let usage = format_account_usage(u);
-            if !usage.is_empty() {
-                out.push_str("\n   ");
-                out.push_str(&usage);
-            }
-        }
-
-        // Direct delegated children belong on the root's deep status card:
-        // their work explains why an otherwise-idle parent is still waiting.
-        // Only live, chat-visible children participate. Deeper descendants
-        // are intentionally collapsed to a count to keep the phone card small.
+        // Keep direct child activity in the expandable detail, where it explains
+        // why an otherwise-idle parent is waiting without bloating the card.
         let mut direct_children: Vec<&GatewaySession> = visible
             .iter()
             .copied()
@@ -9639,9 +9381,17 @@ impl Gateway {
             .collect();
         if !direct_children.is_empty() {
             direct_children.sort_by_key(|child| session_index(&child.id));
-            let child_activity = self.session_activity_snapshot(&direct_children);
-            out.push_str("\n   👥 Прямые дочерние сессии:");
-            for child in &direct_children {
+        }
+        let context = ctx.strip_prefix("контекст ").unwrap_or(&ctx).to_string();
+        let path = self
+            .projects
+            .get(&s.project)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "—".to_string());
+        let child_activity = self.session_activity_snapshot(&direct_children);
+        let child_summary = direct_children
+            .iter()
+            .map(|child| {
                 let activity = child_activity
                     .get(&child.id)
                     .map(String::as_str)
@@ -9650,62 +9400,64 @@ impl Gateway {
                     .session_title(child)
                     .and_then(|title| truncate_title(&title))
                     .unwrap_or_else(|| "—".to_string());
-                out.push_str(&format!(
-                    "\n      · {} · {} · {} · {title}",
+                format!(
+                    "{} · {} · {} · {title}",
                     child.id,
                     vendor_str(child.vendor),
                     activity_marker(activity)
-                ));
-            }
-
-            let mut descendants: HashSet<String> = direct_children
-                .iter()
-                .map(|child| child.id.clone())
-                .collect();
-            let mut frontier: Vec<String> = descendants.iter().cloned().collect();
-            while let Some(parent) = frontier.pop() {
-                for descendant in &visible {
-                    if descendant.id != s.id
-                        && descendant.parent_sid.as_deref() == Some(parent.as_str())
-                        && descendants.insert(descendant.id.clone())
-                    {
-                        frontier.push(descendant.id.clone());
-                    }
-                }
-            }
-            let deeper = descendants.len().saturating_sub(direct_children.len());
-            if deeper > 0 {
-                out.push_str(&format!("\n      … ещё {deeper} более глубоких потомков"));
-            }
-        }
-
-        // Footer: the rest of the fleet lives in /sessions. Split by project so
-        // the counts line up with the project-scoped `/sessions` (same project)
-        // vs the full-fleet `/sessions all` (other projects).
-        let same = visible
-            .iter()
-            .filter(|o| o.project == s.project && o.id != s.id)
-            .count();
-        if same > 0 {
-            out.push_str(&format!("\n   ↓ Другие сессии проекта: {same} → /sessions"));
-        }
-        // Owner req — the last line points at the full project list (with a live
-        // count), replacing the old cross-project `/sessions all` fleet pointer.
-        // Count only the projects THIS chat may see (same ACL as `/projects`), so
-        // the pointer never advertises another owner's projects.
-        let nproj = self.visible_project_slugs(chat).len();
-        out.push_str(&format!("\n   ↓ Все проекты: {nproj} → /projects"));
-        out
+                )
+            })
+            .collect::<Vec<_>>();
+        im_views::render_status(&StatusView {
+            sid: s.id.clone(),
+            project: s.project.clone(),
+            vendor: vendor_str(s.vendor).to_string(),
+            state: format!("{state} {detail}"),
+            model: model.to_string(),
+            effort: effort.to_string(),
+            context,
+            path,
+            host: if s.host.is_empty() {
+                "local".to_string()
+            } else {
+                s.host.clone()
+            },
+            started: if child_summary.is_empty() {
+                detail
+            } else {
+                format!("{detail}; дочерние: {}", child_summary.join(", "))
+            },
+            cost_24h: None,
+        })
     }
 
-    fn render_projects(&self, chat: &ChatKey) -> String {
+    fn render_projects(&self, chat: &ChatKey) -> RichReply {
         // `visible_project_slugs` reads the SAME source web / `ccteam status` use
         // — `collect_projects` (config.yaml filtered to projects that have an
         // on-disk `state.json`) — filtered by the SAME per-owner ACL web applies,
         // so IM `/projects` never diverges from the other surfaces: a
         // half-registered project (in config, no state.json) shows in NEITHER, a
         // removed project disappears from BOTH, and each owner sees only its own.
-        self.visible_project_slugs(chat).join("\n")
+        let projects = self
+            .visible_project_slugs(chat)
+            .into_iter()
+            .map(|slug| ProjectRow {
+                path: self
+                    .projects
+                    .get(&slug)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                sessions: self
+                    .sessions
+                    .values()
+                    .filter(|session| {
+                        session.project == slug && self.chat_can_access(chat, session)
+                    })
+                    .count(),
+                slug,
+            })
+            .collect();
+        im_views::render_projects(&ProjectsView { projects })
     }
 
     /// Reconcile live `ccteam-chat-*` process names against tracked sessions.
@@ -12743,7 +12495,7 @@ impl Gateway {
                 }
             }
             if let Some(reply) = self.handle_command(&chat, &text).await? {
-                self.emit_sid_answer(sid, 0, reply);
+                self.emit_sid_answer(sid, 0, reply.plain);
                 return Ok(format!("command:{sid}"));
             }
         }
@@ -14269,6 +14021,7 @@ fn gateway_turn_timeout_duration() -> std::time::Duration {
 /// `45s`, `1m12s`, `6m`, `2h3m`. Compact (no leading-zero noise); seconds are
 /// dropped once the span is ≥ 1h to keep the line tidy. Sub-second rounds to
 /// `0s`.
+#[cfg(test)]
 /// Render the `/status` running-task block — claude's own task lifecycle
 /// mirrored verbatim (NOT a fold), oldest first (longest-running on top).
 /// Empty string when nothing runs. Three buckets by `task_type`: subagents
@@ -14325,6 +14078,7 @@ fn format_running_tasks(running: &[RunningTask]) -> String {
     out
 }
 
+#[cfg(test)]
 /// Render [`AccountUsage`] as the `/status` dashboard usage line:
 /// `⚡ Использование: 5h 17% (→19:00) · неделя 78%⚠ (→06/29) · лимит 46% · max`. Each field is
 /// omitted when the vendor didn't report it; an empty result = nothing to show.
@@ -14393,21 +14147,6 @@ fn humanize_dur(d: std::time::Duration) -> String {
     }
 }
 
-/// The vendor `--resume` id (Anthropic session UUID) carried by a stream-json
-/// [`ThreadHandle`], or `None` for a tmux / Codex handle (which has no
-/// stream-json uuid). Read from `raw_extras["vendor_uuid"]` — the field both
-/// the spawn and resume paths populate, persisted across daemon restarts — so
-/// `/status` shows the actual id that `--resume` would use. Filters out an
-/// empty string so a blank uuid degrades to `None` (→ `resume —`).
-fn thread_vendor_uuid(thread: &ThreadHandle) -> Option<String> {
-    thread
-        .raw_extras
-        .get("vendor_uuid")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
 /// Outcome of [`Gateway::submit_resolved`] — the one core both user-entry
 /// legs (IM `submit_to_current`, web `submit_to_sid`) funnel through. A
 /// `/command` runs synchronously (carry its receipt lines); plain text becomes
@@ -14461,10 +14200,10 @@ fn pending_key(chat: &ChatKey, session_id: &str) -> String {
     )
 }
 
-/// Telegram's hard cap on inline-button `callback_data` (bytes). The nav
-/// picker (`project_switch_options` / `session_switch_options`) drops any
-/// button whose payload would exceed it; slugs/sids are short, so this only
-/// guards a pathological slug and never the common case.
+/// Telegram's hard cap on inline-button `callback_data` (bytes). The
+/// `cmd:?<cmd>` confirmation row drops any button whose payload would
+/// exceed it; slugs/sids are short, so this only guards a pathological
+/// slug and never the common case.
 const TELEGRAM_CALLBACK_MAX: usize = 64;
 
 /// Russian confirmation text for a `cmd:?<cmd>` inline-button tap (TG-GATE-V2
@@ -14504,67 +14243,6 @@ fn confirm_cmd_button_rows(cmd: &str) -> Vec<Vec<MessageOption>> {
     }
 }
 
-/// Max display columns a session title may occupy inside a `/sessions` switch
-/// button label. A longer title is clipped with `…` so one verbose title can't
-/// widen every button — the left-align padding aligns all labels to the widest.
-const SESSION_BUTTON_TITLE_MAX_COLS: usize = 32;
-
-/// Clip `s` to at most `max_cols` DISPLAY columns, appending `…` on overflow.
-/// Column-based (not char count) so a CJK double-width title clips at a stable
-/// visual width; the ellipsis reserves one column.
-fn truncate_cols(s: &str, max_cols: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    if s.width() <= max_cols {
-        return s.to_string();
-    }
-    let budget = max_cols.saturating_sub(1);
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in s.chars() {
-        let w = ch.width().unwrap_or(0);
-        if used + w > budget {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out.push('…');
-    out
-}
-
-/// Floor for [`left_align_option_labels`]'s pad target: Telegram renders every
-/// option as its OWN full-width single-button row (one button per
-/// `inline_keyboard` row — see `TelegramChannel::send`), so its text is
-/// centered within the FULL row width, not a column sized to the option set.
-/// Padding rows to only the OBSERVED max-in-set (e.g. all bare sids like
-/// "s1"/"s2"/"s28") still centers a short block deep in a wide row — visually
-/// indistinguishable from plain centering. Padding every label out to at
-/// least this many columns pushes that block toward the row's left edge on a
-/// typical phone-width chat. Approximate by nature: the bot API exposes no
-/// client viewport, so this can undershoot (desktop) or overshoot slightly.
-const PICKER_LABEL_MIN_PAD_COLS: usize = 30;
-
-/// Right-pad every picker label to at least the widest row in the SET, or
-/// [`PICKER_LABEL_MIN_PAD_COLS`], whichever is larger — so Telegram's
-/// centre-aligned button text reads as a LEFT-aligned list (owner req,
-/// tg-6955) even when every option in the set is short. Telegram strips
-/// ordinary trailing whitespace from button labels, so the pad is U+2800
-/// BRAILLE PATTERN BLANK — renders blank, survives the trim, ~1 cell wide.
-fn left_align_option_labels(options: &mut [MessageOption]) {
-    use unicode_width::UnicodeWidthStr;
-    let observed_max = options
-        .iter()
-        .map(|o| o.label.as_str().width())
-        .max()
-        .unwrap_or(0);
-    let target = observed_max.max(PICKER_LABEL_MIN_PAD_COLS);
-    for o in options.iter_mut() {
-        for _ in 0..target.saturating_sub(o.label.as_str().width()) {
-            o.label.push('\u{2800}');
-        }
-    }
-}
-
 /// Map a harness [`ChoicePrompt`] to channel-local [`MessageOption`]s. The
 /// IM callback payload is `"{token}:{idx}"` — short, opaque, within Telegram's
 /// 64-byte `callback_data` cap; the IM click resolves by idx (reverse-resolved
@@ -14596,16 +14274,20 @@ fn render_choice_text(prompt: &ChoicePrompt) -> String {
 }
 
 /// Render the `/help` body from [`GATEWAY_COMMANDS`].
-fn render_help() -> String {
-    let mut s = String::from("Команды шлюза:");
-    for c in GATEWAY_COMMANDS {
-        match c.arg_hint {
-            Some(hint) => s.push_str(&format!("\n{} {} — {}", c.name, hint, c.help)),
-            None => s.push_str(&format!("\n{} — {}", c.name, c.help)),
-        }
-    }
-    s.push_str("\n\nЛюбая другая /command передаётся агенту текущей сессии.");
-    s
+fn render_help() -> RichReply {
+    let commands = GATEWAY_COMMANDS
+        .iter()
+        .map(|command| CommandView {
+            name: command.name.to_string(),
+            arg_hint: command.arg_hint.map(str::to_string),
+            help: command.help.to_string(),
+        })
+        .collect::<Vec<_>>();
+    im_views::render_help(&commands)
+}
+
+fn plain_replies(replies: Vec<String>) -> Vec<RichReply> {
+    replies.into_iter().map(RichReply::plain).collect()
 }
 
 fn parse_inbox_create_args(rest: &str) -> Result<(String, String)> {
@@ -15018,7 +14700,7 @@ mod tests {
             .iter()
             .any(|english| spec.description.contains(english))
         }));
-        assert!(render_help().contains("Команды шлюза:"));
+        assert!(render_help().plain.contains("Команды шлюза"));
     }
 
     #[test]
@@ -15892,29 +15574,19 @@ mod tests {
         .unwrap();
     }
 
-    /// Fetch a `/sessions` or `/projects` list as the user SEES it, regardless
-    /// of whether it arrives as a plain-text inline reply (mock / web / Lark)
-    /// or — on a button-capable channel (Telegram) — as an event carrying the
-    /// list text + inline switch buttons. Returns the list text as a
-    /// single-element Vec so ACL assertions read identically across channels.
+    /// Fetch a `/sessions` or `/projects` plain fallback as the user sees it.
     async fn list_text(
         gateway: &mut Gateway,
-        events: &mut tokio::sync::broadcast::Receiver<GatewayEvent>,
+        _events: &mut tokio::sync::broadcast::Receiver<GatewayEvent>,
         channel: &str,
         chat_id: &str,
         user_id: &str,
         cmd: &str,
     ) -> Vec<String> {
-        let replies = gateway
+        gateway
             .handle_text(channel, chat_id, user_id, cmd)
             .await
-            .unwrap();
-        if replies.is_empty() {
-            // Button-capable channel → the list rode the event sink.
-            vec![recv_answer(events).await.content]
-        } else {
-            replies
-        }
+            .unwrap()
     }
 
     async fn stop_preview(
@@ -19776,12 +19448,10 @@ mod tests {
             gateway.chat_can_access(&tenant, gateway.sessions.get(&child).unwrap()),
             "a LIVE session in a tenant-owned project belongs to that tenant"
         );
-        let status = gateway.render_status(&tenant).await;
+        let sessions = gateway.render_sessions(&tenant, true).await.plain;
         assert!(
-            status.contains(&format!(
-                "👥 Прямые дочерние сессии:\n      · {child} · claude"
-            )),
-            "the tenant's /status must list its project's delegated children: {status}"
+            sessions.contains(&format!("{child} | claude.— | 🟢 ожидание | —")),
+            "the tenant's session list must include its delegated child: {sessions}"
         );
     }
 
@@ -21513,53 +21183,37 @@ mod tests {
         assert_eq!(answer.assistant, "LGTM, two nits inline.");
     }
 
-    /// Clickable project picker: on Telegram, `/projects` is delivered as a
-    /// header + one inline "switch" button per project (`nav:cd:<slug>`), so
-    /// the command returns NO inline reply (the buttons ride the event sink).
-    /// Non-button channels (the test mock, web, Lark) keep the plain slug list.
+    /// `/projects` has command buttons in its rich reply and a table fallback.
     #[tokio::test]
     async fn telegram_projects_delivers_switch_buttons() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
         gateway.register_project("beta", proj.path());
-        let mut events = gateway.subscribe_events();
-
-        // Telegram → the reply is empty; the list + buttons arrive as an Answer.
         let replies = gateway
-            .handle_text("telegram", "chat-1", "alice", "/projects")
+            .handle_message_rich("telegram", "chat-1", "alice", "", "/projects", &[], None)
             .await
             .unwrap();
-        assert!(
-            replies.is_empty(),
-            "a button-capable /projects returns no inline reply: {replies:?}"
-        );
-        let ev = recv_answer(&mut events).await;
-        assert!(ev.content.contains("Проекты"), "header: {}", ev.content);
-        let datas: Vec<&str> = ev.options.iter().map(|o| o.data.as_str()).collect();
-        assert!(datas.contains(&"nav:cd:alpha"), "options: {datas:?}");
-        assert!(datas.contains(&"nav:cd:beta"), "options: {datas:?}");
-        // The current project is marked with ✓ (default project = alpha).
-        assert!(
-            ev.options
-                .iter()
-                .any(|o| o.data == "nav:cd:alpha" && o.label.starts_with('✓')),
-            "current project marked: {:?}",
-            ev.options
-        );
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].markdown.contains("| `alpha` |"));
+        let datas = replies[0]
+            .button_rows
+            .iter()
+            .flatten()
+            .map(|option| option.data.as_str())
+            .collect::<Vec<_>>();
+        assert!(datas.contains(&"cmd:/cd alpha"), "buttons: {datas:?}");
+        assert!(datas.contains(&"cmd:/cd beta"), "buttons: {datas:?}");
 
-        // The mock channel has no buttons → the bare newline slug list, verbatim.
         let mock = gateway
             .handle_text("mock", "chat-2", "bob", "/projects")
             .await
             .unwrap();
-        assert_eq!(mock, vec!["alpha\nbeta"]);
+        assert!(mock[0].contains("slug | путь | сессий"));
+        assert!(mock[0].contains("alpha |"));
     }
 
-    /// Clickable session picker: on Telegram, `/sessions` is delivered as the
-    /// usual text list PLUS one inline "switch" button per live session
-    /// (`nav:use:<sid>`), so the command returns no inline reply. The mock
-    /// channel still gets the plain-text list (regression guard).
+    /// `/sessions` has `cmd:/use` buttons in its rich reply and a table fallback.
     #[tokio::test]
     async fn telegram_sessions_delivers_switch_buttons() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -21570,26 +21224,22 @@ mod tests {
             .await
             .unwrap();
 
-        let mut events = gateway.subscribe_events();
         let replies = gateway
-            .handle_text("telegram", "chat-1", "alice", "/sessions")
+            .handle_message_rich("telegram", "chat-1", "alice", "", "/sessions", &[], None)
             .await
             .unwrap();
-        assert!(
-            replies.is_empty(),
-            "a button-capable /sessions returns no inline reply: {replies:?}"
-        );
-        let ev = recv_answer(&mut events).await;
-        assert!(ev.content.contains("s1"), "list text: {}", ev.content);
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].markdown.contains("| `s1` |"));
         assert_eq!(
-            ev.options
+            replies[0]
+                .button_rows
                 .iter()
-                .map(|o| o.data.as_str())
+                .flatten()
+                .map(|option| option.data.as_str())
                 .collect::<Vec<_>>(),
-            vec!["nav:use:s1"],
+            vec!["cmd:/use s1"],
         );
 
-        // Mock channel = plain text list, unchanged.
         gateway
             .handle_text("mock", "chat-2", "bob", "/new claude reviewer")
             .await
@@ -21599,21 +21249,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mock.len(), 1);
-        assert!(mock[0].contains("s2 claude"), "{}", mock[0]);
+        assert!(mock[0].contains("s2 | claude.—"), "{}", mock[0]);
     }
 
-    /// Picker buttons are `sid vendor (title)` (sid → vendor → title), a `✓`
-    /// marking the current session. The ROLE is NOT on the button (it stays on
-    /// the information-rich text rows). Tail-padding stays visual-only so
-    /// Telegram left-aligns the variable-width labels.
+    /// Session buttons carry the `cmd:/use <sid>` callback from the compact table.
     #[tokio::test]
-    async fn session_picker_labels_carry_sid_vendor_and_title() {
-        use unicode_width::UnicodeWidthStr;
+    async fn session_buttons_carry_use_commands() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
-        // One roleless untitled session + one titled session: the untitled
-        // button is `sid vendor`, the titled one appends its (title).
         gateway
             .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
@@ -21622,45 +21266,22 @@ mod tests {
             .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        gateway
-            .rename_session("s2", "A long review title")
-            .await
-            .unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
-        let opts = gateway.session_switch_options(&chat, false);
-        assert_eq!(opts.len(), 2, "{opts:?}");
-        let s1 = opts.iter().find(|o| o.id == "s1").unwrap();
-        let s2 = opts.iter().find(|o| o.id == "s2").unwrap();
-        let s1_text = s1.label.trim_end_matches('\u{2800}');
-        let s2_text = s2.label.trim_end_matches('\u{2800}');
-        // Untitled → `sid vendor`; titled + current → `✓ sid vendor (title)`.
-        // Vendor is lowercase (`vendor_str`).
-        assert_eq!(s1_text, "s1 claude");
-        assert_eq!(s2_text, "✓ s2 claude (A long review title)");
-        for label in [s1_text, s2_text] {
-            assert!(
-                !label.contains("reviewer"),
-                "no role on the button: {label:?}"
-            );
-        }
-        // Both labels padded to the same display width, with braille blanks.
+        let reply = gateway.render_sessions(&chat, false).await;
+        let options = reply.button_rows.into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(
-            s1.label.as_str().width(),
-            s2.label.as_str().width(),
-            "equal width: {opts:?}"
+            options
+                .iter()
+                .map(|option| option.data.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cmd:/use s2", "cmd:/use s1"]
         );
-        assert!(
-            s1.label.ends_with('\u{2800}'),
-            "shorter row is tail-padded: {:?}",
-            s1.label
-        );
+        assert!(options.iter().all(|option| option.label.ends_with('▶')));
     }
 
-    /// A verbose title is clipped to `SESSION_BUTTON_TITLE_MAX_COLS` display
-    /// columns (ellipsis included) so one long title can't widen every button.
+    /// A verbose title stays out of the compact session switch button.
     #[tokio::test]
-    async fn session_picker_title_is_width_capped() {
-        use unicode_width::UnicodeWidthStr;
+    async fn session_buttons_stay_compact_with_a_long_title() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
@@ -21671,32 +21292,16 @@ mod tests {
         let long = "A really really long session title that keeps going";
         gateway.rename_session("s1", long).await.unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
-        let opts = gateway.session_switch_options(&chat, false);
-        let label = opts[0].label.trim_end_matches('\u{2800}');
-        let title = label
-            .split_once('(')
-            .and_then(|(_, rest)| rest.strip_suffix(')'))
-            .expect("titled button label");
-        assert!(
-            title.ends_with('…'),
-            "clipped title ends with an ellipsis: {title:?}"
-        );
-        assert!(
-            title.width() <= SESSION_BUTTON_TITLE_MAX_COLS,
-            "within cap: {title:?}"
-        );
-        assert!(
-            long.starts_with(title.trim_end_matches('…')),
-            "prefix of the real title"
-        );
+        let reply = gateway.render_sessions(&chat, false).await;
+        let option = &reply.button_rows[0][0];
+        assert_eq!(option.label, "s1 ▶");
+        assert_eq!(option.data, "cmd:/use s1");
+        assert!(option.data.len() <= 64);
     }
 
-    /// `/sessions` text rows START with the sid and carry NO activity dot
-    /// (🟢/🟡/🟠/🔴/⚪) or leading `[vendor]` tag — those lived on the text row
-    /// pre-cleanup; activity now lives only on `/status`, and the vendor is
-    /// still readable from the `:{vendor}:` colon field.
+    /// `/sessions` renders the required compact Russian table.
     #[tokio::test]
-    async fn gateway_sessions_text_rows_start_with_sid_and_have_no_activity_dot() {
+    async fn gateway_sessions_render_a_compact_table() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
@@ -21709,42 +21314,28 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        let row = listing[0].split('\n').nth(1).expect("a session row");
-        assert!(
-            row.starts_with("s1 claude"),
-            "row starts with the sid: {row:?}"
-        );
-        for marker in ["🟢", "🟡", "🟠", "🔴", "⚪", "[claude]"] {
-            assert!(
-                !listing[0].contains(marker),
-                "no activity dot / vendor tag on the text row: {listing:?}"
-            );
-        }
+        assert!(listing[0].contains("sid | vendor.model | статус | ctx"));
+        assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | —"));
     }
 
-    /// Picker-label padding equalizes display width across an option set.
+    /// Session buttons retain Telegram's eight-button row bound.
     #[test]
-    fn picker_label_padding_equalizes_display_width() {
-        use unicode_width::UnicodeWidthStr;
-        // Padding: mixed CJK/Latin rows end up the same display width.
-        let mut opts = vec![
-            MessageOption {
-                data: "a".into(),
-                label: "▸ s39 · grok · 「当前是什么模型」".into(),
-                id: "s39".into(),
-                style: None,
-            },
-            MessageOption {
-                data: "b".into(),
-                label: "▸ s43 · claude · 「Completed the full reques…".into(),
-                id: "s43".into(),
-                style: None,
-            },
-        ];
-        left_align_option_labels(&mut opts);
+    fn session_buttons_have_at_most_eight_entries_per_row() {
+        let reply = im_views::render_sessions(&SessionsView {
+            project: "alpha".into(),
+            sessions: (1..=9)
+                .map(|index| SessionRow {
+                    sid: format!("s{index}"),
+                    vendor_model: "claude.—".into(),
+                    status: "🟢 ожидание".into(),
+                    context: "—".into(),
+                })
+                .collect(),
+            elsewhere: 0,
+        });
         assert_eq!(
-            opts[0].label.as_str().width(),
-            opts[1].label.as_str().width()
+            reply.button_rows.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![8, 1]
         );
     }
 
@@ -22080,7 +21671,8 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(bare, vec!["📁 Текущий проект: alpha\ns1 claude"]);
+        assert_eq!(bare.len(), 1);
+        assert!(bare[0].contains("s1 | claude.— | 🟢 ожидание | —"));
 
         // Now report a model + effort + usage → suffix appears with the
         // TOTAL window (absolute, via `format_tokens`) + percent — no project
@@ -22100,10 +21692,8 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            with_status,
-            vec!["📁 Текущий проект: alpha\ns1 claude.opus-4-8[1m].max.1M(19%)"]
-        );
+        assert_eq!(with_status.len(), 1);
+        assert!(with_status[0].contains("s1 | claude.opus-4-8[1m] | 🟢 ожидание | 19%"));
 
         // A non-[1m] model, no effort, renders against the 200k baseline.
         fake.set_status(ThreadStatus {
@@ -22121,10 +21711,8 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            baseline,
-            vec!["📁 Текущий проект: alpha\ns1 claude.sonnet-4-5.200k(94%)"]
-        );
+        assert_eq!(baseline.len(), 1);
+        assert!(baseline[0].contains("s1 | claude.sonnet-4-5 | 🟢 ожидание | 94%"));
     }
 
     /// Every vendor's IM row carries its lowercase vendor right after the sid
@@ -22184,10 +21772,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            before,
-            vec!["📁 Текущий проект: alpha\ns2 claude\ns1 claude"]
-        );
+        assert_eq!(before.len(), 1);
+        let s2 = before[0].find("s2 | claude.—").unwrap();
+        let s1 = before[0].find("s1 | claude.—").unwrap();
+        assert!(s2 < s1, "newer s2 remains first: {}", before[0]);
 
         // Tag s1 (the OLDER session) with an outstanding approval.
         let token = "pwaitpin001";
@@ -22204,11 +21792,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            after,
-            vec!["📁 Текущий проект: alpha\n⏳ s1 claude\ns2 claude"],
-            "s1 pinned to the top + ⏳-marked despite being less recent"
-        );
+        assert_eq!(after.len(), 1);
+        let s1 = after[0].find("s1 | claude.— | ⏳ ожидание | —").unwrap();
+        let s2 = after[0].find("s2 | claude.—").unwrap();
+        assert!(s1 < s2, "s1 pinned to the top: {}", after[0]);
     }
 
     /// v0.8.23 review §1.3-D item 9 — the web bare-row feed (`parse_sessions_reply`'s
@@ -22288,22 +21875,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(idle.len(), 1, "one message: {idle:?}");
-        // /status = the CURRENT session deep view (📍 Текущая сессия), NOT the fleet
-        // list. The fake adapter's handle carries no `vendor_uuid` → `resume —`.
+        // /status remains the CURRENT session's card, not the fleet table.
         assert!(
-            idle[0].contains("📍 Текущая сессия s1 · alpha · claude · reviewer · 🟢 ожидание"),
+            idle[0]
+                .contains("🧭 s1 · alpha · claude\n🟢 ожидание · claude-opus-4-8 · max · ctx 41%"),
             "current-session header: {idle:?}"
-        );
-        assert!(
-            idle[0].contains("claude-opus-4-8 · max · контекст 41% · resume —"),
-            "model·effort·ctx·resume line: {idle:?}"
-        );
-        // Owner req — /status ends by pointing at the full project list with a
-        // live count (this gateway has one project, `alpha`), replacing the old
-        // `/sessions all` cross-project pointer.
-        assert!(
-            idle[0].contains("↓ Все проекты: 1 → /projects"),
-            "/status footer points at /projects with a count: {idle:?}"
         );
 
         // (2) A turn in flight with a RECENT event → 🔵 working.
@@ -22319,11 +21895,11 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            working[0].contains("📍 Текущая сессия s1 · alpha · claude · reviewer · 🔵 работает "),
+            working[0].contains("🔵 работает"),
             "working state: {working:?}"
         );
         assert!(
-            working[0].contains("контекст 41%"),
+            working[0].contains("ctx 41%"),
             "ctx still shown: {working:?}"
         );
 
@@ -22346,9 +21922,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            stuck[0].contains(
-                "📍 Текущая сессия s1 · alpha · claude · reviewer · 🔴 ЗАВИСАНИЕ: нет событий "
-            ),
+            stuck[0].contains("🔴 ЗАВИСАНИЕ: нет событий "),
             "stuck state: {stuck:?}"
         );
         assert!(
@@ -22371,7 +21945,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            fresh[0].contains("📍 Текущая сессия s1 · alpha · claude · reviewer · 🔵 работает "),
+            fresh[0].contains("🔵 работает"),
             "a just-submitted turn with a pre-turn stale event is working, not stuck: {fresh:?}"
         );
     }
@@ -22421,9 +21995,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains(
-                "👥 Прямые дочерние сессии:\n      · s2 · claude · 🟡 работает · delegated investigation"
-            ),
+            out[0].contains("дочерние: s2 · claude · 🟡 работает · delegated investigation"),
             "working child is visible from its root status: {out:?}"
         );
     }
@@ -22498,7 +22070,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            torn[0].contains(&format!("· {child} · claude · 🟡 работает ·")),
+            torn[0].contains(&format!("{child} · claude · 🟡 работает ·")),
             "a torn line elsewhere in the stream must not blind the child row: {torn:?}"
         );
 
@@ -22517,7 +22089,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            silent[0].contains(&format!("· {child} · claude · 🟡 работает ·")),
+            silent[0].contains(&format!("{child} · claude · 🟡 работает ·")),
             "an in-flight turn outranks a stream that says nothing: {silent:?}"
         );
 
@@ -22532,7 +22104,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            idle[0].contains(&format!("· {child} · claude · 🟢 ожидание ·")),
+            idle[0].contains(&format!("{child} · claude · 🟢 ожидание ·")),
             "no open turn ⇒ the file verdict stands: {idle:?}"
         );
     }
@@ -22552,12 +22124,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-           out,
-           vec![format!(
-                "🧭 → alpha/s1 (reviewer)\n📍 Текущая сессия s1 · alpha · claude · reviewer · 🟢 ожидание\n   📁 {}\n   — · — · контекст — · resume —\n   ↓ Все проекты: 1 → /projects",
-               proj.path().display()
-           )]
-       );
+            out,
+            vec![format!(
+                "🧭 s1 · alpha · claude\n🟢 ожидание · — · — · ctx —\n📁 {}\n🖥 host: local\nЗапущено: ожидание / Расход 24ч: —",
+                proj.path().display()
+            )]
+        );
     }
 
     /// v0.8.19 `/status` — a roleless session shows `—` for the role, and a
@@ -22577,12 +22149,12 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("📍 Текущая сессия s1 · alpha · claude · — · 🟢 ожидание"),
-            "roleless → role shows —, vendor still shown: {out:?}"
+            out[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
+            "roleless session remains a usable status card: {out:?}"
         );
         assert!(
-            out[0].contains("— · — · контекст — · resume —"),
-            "statusless + no-uuid → placeholders, never fabricated: {out:?}"
+            out[0].contains("🟢 ожидание · — · — · ctx —"),
+            "statusless fields stay honest placeholders: {out:?}"
         );
     }
 
@@ -22603,7 +22175,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].starts_with("🧭 → alpha/s1 (reviewer)\n📍 Текущая сессия"),
+            out[0].starts_with("🧭 s1 · alpha · claude\n"),
             "leads with the you-are-here header before the existing body: {out:?}"
         );
     }
@@ -22760,16 +22332,13 @@ mod tests {
             .unwrap();
         assert_eq!(owner.len(), 1);
         assert!(
-            owner[0].contains("📍 Текущая сессия s1 · alpha · claude · reviewer · 🟢 ожидание"),
+            owner[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
             "got: {owner:?}"
         );
     }
 
-    /// v0.8.19 `/status` — when the session's handle carries a stream-json
-    /// `vendor_uuid` (the real Anthropic `--resume` id), `/status` surfaces it
-    /// verbatim next to the sid as `resume <uuid>` (not the `resume —`
-    /// fallback). Mirrors how the live daemon's persisted handle holds the id
-    /// across restarts.
+    /// The compact rich status card deliberately keeps the vendor's internal
+    /// resume UUID out of the phone-facing summary.
     #[tokio::test]
     async fn gateway_status_shows_real_vendor_resume_uuid() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -22790,13 +22359,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains(&format!("resume {uuid}")),
-            "the real --resume uuid must show in the deep view: {out:?}"
-        );
-        assert!(
-            out[0].contains("📍 Текущая сессия s1 · alpha · claude · reviewer · 🟢 ожидание"),
+            out[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
             "got: {out:?}"
         );
+        assert!(!out[0].contains(uuid), "internal UUID leaked into: {out:?}");
     }
 
     /// v0.8.19 `/status` — registered in the command set + dispatches via
@@ -23649,7 +23215,8 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(owner_sees, vec!["📁 Текущий проект: alpha\ns1 claude"]);
+        assert_eq!(owner_sees.len(), 1);
+        assert!(owner_sees[0].contains("s1 | claude.—"));
         let owner_uses = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
@@ -23695,7 +23262,8 @@ mod tests {
             "/sessions",
         )
         .await;
-        assert_eq!(seen, vec!["📁 Текущий проект: alpha\ns1 claude"]);
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].contains("s1 | claude.—"));
         let used = gateway
             .handle_text("telegram", "339498819", "rob", "/use s1")
             .await
@@ -23952,7 +23520,9 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/projects")
             .await
             .unwrap();
-        assert_eq!(projects, vec!["alpha\nbeta"]);
+        assert_eq!(projects.len(), 1);
+        assert!(projects[0].contains("alpha | "));
+        assert!(projects[0].contains("beta | "));
 
         let cd = gateway
             .handle_text("mock", "chat-1", "alice", "/cd beta")
@@ -23977,10 +23547,9 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            sessions,
-            vec!["📁 Текущий проект: beta\ns2 claude\ns1 codex"]
-        );
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].contains("s2 | claude.—"));
+        assert!(sessions[0].contains("s1 | codex.—"));
 
         let use_first = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
@@ -24057,15 +23626,22 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions all")
             .await
             .unwrap();
-        assert_eq!(
-            sessions,
-            vec!["📁 Текущий проект: beta\ns4 claude\ns3 codex\ns2 codex\ns1 claude"]
-        );
+        assert_eq!(sessions.len(), 1);
+        for row in [
+            "s4 | claude.—",
+            "s3 | codex.—",
+            "s2 | codex.—",
+            "s1 | claude.—",
+        ] {
+            assert!(sessions[0].contains(row), "missing {row}: {}", sessions[0]);
+        }
         let projects = gateway
             .handle_text("mock", "chat-1", "alice", "/projects")
             .await
             .unwrap();
-        assert_eq!(projects, vec!["alpha\nbeta"]);
+        assert_eq!(projects.len(), 1);
+        assert!(projects[0].contains("alpha | "));
+        assert!(projects[0].contains("beta | "));
 
         let alpha_reply = gateway
             .handle_text("mock", "chat-1", "alice", "@reviewer alpha ping")
@@ -24530,10 +24106,9 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            sessions,
-            vec!["📁 Текущий проект: beta\ns2 claude\ns1 claude"]
-        );
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].contains("s2 | claude.—"));
+        assert!(sessions[0].contains("s1 | claude.—"));
 
         assert_eq!(
             restored
@@ -24604,7 +24179,8 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 Текущий проект: beta\ns1 claude"]);
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].contains("s1 | claude.—"));
 
         assert_eq!(
             restored
@@ -25071,7 +24647,8 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(before, vec!["📁 Текущий проект: alpha\ns1 claude"]);
+        assert_eq!(before.len(), 1);
+        assert!(before[0].contains("s1 | claude.—"));
 
         // /cd to beta, where no session exists yet, clears the active session.
         let cd = gateway
@@ -25098,12 +24675,12 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions all")
             .await
             .unwrap();
-        // s2's first plain message ("where am i") auto-titles it, but the title
-        // now rides the switch BUTTON, not the text row (see
-        // `session_switch_options`); s1 never sent a plain message, so it is
-        // untitled either way. s2 is roleless → empty role field
-        // (`s2 claude.beta`).
-        assert_eq!(after, vec!["📁 Текущий проект: beta\ns2 claude\ns1 claude"]);
+        // s2's first plain message ("where am i") auto-titles it; s1 never
+        // sent a plain message, so it is untitled either way. s2 is
+        // roleless → empty role field (`s2 claude.beta`).
+        assert_eq!(after.len(), 1);
+        assert!(after[0].contains("s2 | claude.—"));
+        assert!(after[0].contains("s1 | claude.—"));
     }
 
     #[tokio::test]
@@ -25346,7 +24923,7 @@ mod tests {
         )
         .await;
         assert!(
-            owner_sees.iter().any(|r| r.contains("s1 claude")),
+            owner_sees.iter().any(|r| r.contains("s1 | claude.—")),
             "owner should see its own session: {owner_sees:?}"
         );
         let owner_uses = gateway
@@ -25403,7 +24980,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            listing[0].lines().skip(1).count(),
+            listing[0]
+                .lines()
+                .filter(|line| {
+                    line.starts_with('s') && line.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
+                })
+                .count(),
             3,
             "expected 3 distinct sessions (no dedup): {}",
             listing[0]
@@ -25472,7 +25054,8 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 Текущий проект: alpha\ns1 claude"]);
+        assert_eq!(listing.len(), 1);
+        assert!(listing[0].contains("s1 | claude.—"));
 
         // `/use s1` still resolves the same (now-reviewer) session.
         let used = gateway
@@ -25483,9 +25066,9 @@ mod tests {
 
         // /help advertises /role.
         assert!(
-            render_help().contains("/role"),
+            render_help().plain.contains("/role"),
             "render_help should list /role: {}",
-            render_help()
+            render_help().plain
         );
     }
 
@@ -25542,7 +25125,8 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 Текущий проект: alpha\ns1 claude"]);
+        assert_eq!(listing.len(), 1);
+        assert!(listing[0].contains("s1 | claude.—"));
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
             .handle_text("mock", "chat-1", "alice", "still here?")
@@ -25644,23 +25228,16 @@ mod tests {
             ]
         );
 
-        // The title moved off the /sessions text row onto the switch button.
+        // The compact table does not repeat a verbose title.
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 Текущий проект: alpha\ns1 claude"]);
-        // …and the rename SURFACES on the picker button.
+        assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | —"));
         let chat = ChatKey::new("mock", "chat-1", "alice");
-        let s1_button = |g: &Gateway| {
-            g.session_switch_options(&chat, false)
-                .into_iter()
-                .find(|o| o.id == "s1")
-                .map(|o| o.label.trim_end_matches('\u{2800}').to_string())
-        };
         assert_eq!(
-            s1_button(&gateway).as_deref(),
-            Some("✓ s1 claude (my custom title)")
+            gateway.render_sessions(&chat, false).await.button_rows[0][0].label,
+            "s1 ▶"
         );
 
         // A later plain message must NOT clobber the rename via auto-title.
@@ -25672,10 +25249,12 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing2, vec!["📁 Текущий проект: alpha\ns1 claude"]);
+        assert!(listing2[0].contains("s1 | claude.— |"));
         assert_eq!(
-            s1_button(&gateway).as_deref(),
-            Some("✓ s1 claude (my custom title)"),
+            gateway
+                .session_title(gateway.sessions.get("s1").unwrap())
+                .as_deref(),
+            Some("my custom title"),
             "an explicit /rename must survive a later message (sticky user title)"
         );
     }
@@ -27178,8 +26757,8 @@ mod tests {
         );
     }
 
-    /// `/sessions` renders a delegation tree: children indented `└─ ` under
-    /// their parent; a non-local host + title annotate the row.
+    /// `/sessions` keeps delegated sessions in the same compact, recency-sorted
+    /// table as every other live session.
     #[tokio::test]
     async fn delegation_sessions_tree_indents_children() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -27224,17 +26803,19 @@ mod tests {
         // Web chat drives the fleet (`all` scope, own-pool visibility).
         let out = gw
             .render_sessions(&ChatKey::new("mock", "chat-1", "alice"), true)
-            .await;
-        // Parent row precedes the indented child row (roleless → `sid claude`).
-        let pline = format!("{parent} claude");
-        let cline = format!("└─ {child} claude");
+            .await
+            .plain;
+        // The compact table preserves the gateway's recency order; the child
+        // was created after its parent, so it leads the two rows.
+        let pline = format!("{parent} | claude.— | 🟢 ожидание | —");
+        let cline = format!("{child} | claude.— | 🟢 ожидание | —");
         let pi = out
             .find(&pline)
             .unwrap_or_else(|| panic!("parent row: {out}"));
         let ci = out
             .find(&cline)
-            .unwrap_or_else(|| panic!("indented child row: {out}"));
-        assert!(pi < ci, "child indented under parent:\n{out}");
+            .unwrap_or_else(|| panic!("child row: {out}"));
+        assert!(ci < pi, "newer child leads the compact table:\n{out}");
     }
 
     /// `ancestor_chain` (the stop-descendant + cycle basis): a child's chain

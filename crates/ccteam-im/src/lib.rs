@@ -47,6 +47,9 @@ pub mod hub;
 // TG-GATE-V2 W3 — pure parsing for `cmd:`/`cmd:?`/`cmd:noop` inline-button
 // callback data; kept gateway-borrow-free so it unit-tests standalone.
 pub mod im_callbacks;
+// TG-GATE-V2 W2 — Russian rich-text renderers for /status /sessions
+// /projects /help.
+pub mod im_views;
 pub mod latency;
 // v0.9 T3 — shared MCP protocol core + daemon-side `McpDispatch` so
 // `ccteam-web` can later mount `POST /mcp` without depending on
