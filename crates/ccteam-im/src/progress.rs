@@ -269,10 +269,14 @@ impl ProgressFold {
         self.done = true;
     }
 
-    fn bump(&mut self, cat: Category, raw_name: &str) {
+    /// `unknown_label` is the already-lowercased raw tool name
+    /// ([`count_tool`] computes it once and shares it with the detail
+    /// line, so the footer bucket and the detail line can never disagree
+    /// about an unknown tool's display name).
+    fn bump(&mut self, cat: Category, unknown_label: &str) {
         // Unknown tools fold under the wrench but keep their own label.
         let label: String = if cat.label == "инструмент" {
-            raw_name.to_lowercase()
+            unknown_label.to_string()
         } else {
             cat.label.to_string()
         };
@@ -305,13 +309,17 @@ impl ProgressFold {
         if !self.seen_ids.insert(id.to_string()) {
             return false; // start/complete pair — already counted
         }
-        self.bump(cat, raw_name);
+        // Computed once: the footer bucket ([`bump`]) and this detail line
+        // must show the SAME name for an unknown tool, not two independently
+        // formatted strings that can drift apart in case or content.
+        let unknown_label = raw_name.to_lowercase();
+        self.bump(cat, &unknown_label);
         self.tool_total += 1;
         if cat == CAT_EDIT {
             self.file_total += 1;
         }
         let label = if cat.label == "инструмент" {
-            format!("{} {raw_name}", cat.label)
+            format!("{} {unknown_label}", cat.label)
         } else {
             cat.label.to_string()
         };
@@ -829,10 +837,13 @@ mod tests {
             json!({"query": "select:..."}),
         ));
         let r = f.render("s42");
+        // Same lowercase label the footer's `toolsearch×1` bucket uses
+        // (review round 1 — detail line and bucket must never drift apart).
         assert!(
-            r.contains("🔧 инструмент ToolSearch: select:..."),
+            r.contains("🔧 инструмент toolsearch: select:..."),
             "got: {r}"
         );
+        assert!(r.contains("🔧 toolsearch ×1"), "got: {r}");
     }
 
     #[test]

@@ -1177,16 +1177,22 @@ impl Channel for TelegramChannel {
                     }
                 }
             }
-            // Rich failed (or the breaker skipped it) — fall back. A
-            // `content` that still fits the classic single-message ceiling
-            // sends exactly as before; one that doesn't needs a durable
-            // multi-part split, which is `daemon.rs`'s job (see
-            // [`RichFallbackNeedsSplit`]), not this channel's — sending
-            // nothing here and returning the typed error keeps this call
-            // side-effect-free so the caller's retry/replay bookkeeping
-            // stays correct.
+            // Rich failed (or the breaker skipped it) — fall back to the
+            // classic HTML path fed with the SAME `markdown` (review round
+            // 1: `.content`/`.plain` is the universal, deliberately
+            // unformatted fallback every channel reads verbatim, so sending
+            // it here would silently drop the bold `**sid**`/`**slug**`
+            // markers `.markdown` already carries; `text_payload` converts
+            // them to `<b>` via the classic `render_markdown` HTML path).
+            // The overflow gate stays keyed on `content` (the real business
+            // text) — that's the "does this message need a genuine durable
+            // multi-part split" decision from `daemon.rs` (see
+            // [`RichFallbackNeedsSplit`]); `text_payload` already
+            // degrades a `markdown` render that's merely longer than
+            // `content` (due to `**`/backtick decoration) to a safely
+            // truncated plain send on its own, no split needed for that.
             if message.content.encode_utf16().count() <= MAX_MESSAGE_UTF16 {
-                return self.send_classic(message).await;
+                return self.send_classic_part(message, markdown, true).await;
             }
             return Err(RichFallbackNeedsSplit.into());
         }
@@ -1973,6 +1979,44 @@ mod tests {
         assert_eq!(payload.text, "hi <b>there</b>");
         let keyboard = inline_keyboard_json(&message).unwrap();
         assert_eq!(keyboard["inline_keyboard"][0][0]["text"], "Yes");
+    }
+
+    /// Review round 1 — the classic-fallback branch in [`Channel::send`]
+    /// must feed `send_classic_part` the message's `rich_markdown` (when
+    /// present), NOT `.content`: `.content`/`.plain` is the universal,
+    /// deliberately unformatted field every channel (Lark, Slack, a fake
+    /// non-Telegram `Channel`) reads verbatim, so sending IT through
+    /// Telegram's classic HTML path would silently drop every bold
+    /// `**sid**`/`**slug**` marker `daemon.rs` only ever attaches as
+    /// `rich_markdown`. No live HTTP in this test crate, so — matching
+    /// [`send_classic_falls_back_to_html_when_rich_markdown_absent`] just
+    /// above — this proves the decision surface directly via
+    /// `text_payload`, the exact conversion `send_classic_part` runs.
+    #[test]
+    fn rich_markdown_not_content_is_the_classic_fallback_source() {
+        let message = SendMessage::new("s1 has no bold", "42")
+            .with_rich_markdown("**s1** has no bold, and neither does <script>&");
+        let markdown = message.rich_markdown.as_deref().expect("set above");
+
+        // The universal fallback field a non-Telegram channel would send
+        // verbatim carries no markup at all.
+        assert!(!message.content.contains('*'));
+
+        // `send_classic_part`'s conversion of `.content` (the WRONG source)
+        // would render no `<b>` — proving the bug this review flags.
+        let wrong = text_payload(&message.content);
+        assert!(!wrong.text.contains("<b>"));
+
+        // The FIX: converting `rich_markdown` yields the bold tag, with
+        // HTML-special characters riding along still safely escaped.
+        let right = text_payload(markdown);
+        assert!(right.formatted);
+        assert!(right.text.contains("<b>s1</b>"), "got: {}", right.text);
+        assert!(
+            right.text.contains("&lt;script&gt;&amp;"),
+            "got: {}",
+            right.text
+        );
     }
 
     /// TG-GATE-V2 W9 (N6) — `body_reports_failure` now gates BOTH the
