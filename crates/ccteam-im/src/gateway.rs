@@ -922,6 +922,20 @@ pub enum GatewayEventKind {
     /// A scheduled queue changed for this sid. Broadcast-only; web re-fetches
     /// the authoritative list instead of receiving queue contents over SSE.
     ScheduledChanged,
+    /// TG-GATE-V2 W8 — edit an ARBITRARY already-sent message by its platform
+    /// id (unlike [`GatewayEventKind::Progress`], which tracks its own
+    /// status-key → message-id map). Used for the `cmd:` confirmation
+    /// tap: the confirmation prompt itself is edited in place (keyboard
+    /// removed, text replaced with the resolution) instead of appending a
+    /// new message. The daemon egress calls [`Channel::edit_message`]
+    /// directly with this id; a failed edit (message gone/too old) falls
+    /// back to sending `content` as a new message, so the resolution is
+    /// never silently dropped.
+    EditMessage {
+        /// Platform message id of the message to edit (Telegram
+        /// `message_id`, as a string).
+        message_id: String,
+    },
 }
 
 /// User-visible text emitted asynchronously from a harness event stream.
@@ -3536,7 +3550,7 @@ impl Gateway {
             // through `handle_command`, not the token-keyed pending registry.
             match im_callbacks::parse(&reply.data) {
                 im_callbacks::CallbackAction::Choice { .. } => {}
-                action => return self.resolve_cmd_callback(&chat, action).await,
+                action => return self.resolve_cmd_callback(&chat, action, message_id).await,
             }
             return self
                 .resolve_selection(&chat, &reply.data)
@@ -4439,6 +4453,33 @@ impl Gateway {
             attachments: Vec::new(),
             options: Vec::new(),
             button_rows,
+            sid: None,
+            slug: None,
+        });
+    }
+
+    /// Edit an already-sent Telegram message in place (TG-GATE-V2 W8) —
+    /// used to resolve a `cmd:?` confirmation tap by rewriting the
+    /// confirmation prompt itself (keyboard removed, text = `content`)
+    /// instead of appending a new message. `platform_message_id` is the
+    /// tapped message's platform id, resolved by [`telegram_callback_message_id`]
+    /// from the inbound callback's `message_id`.
+    fn emit_confirmation_edit(&self, chat: &ChatKey, platform_message_id: String, content: String) {
+        self.emit_user_signal(GatewayEvent {
+            id: format!(
+                "gateway-edit-confirm-{}-{platform_message_id}",
+                chat.chat_id
+            ),
+            channel: chat.channel.clone(),
+            chat_id: chat.chat_id.clone(),
+            thread_ts: None,
+            content,
+            kind: GatewayEventKind::EditMessage {
+                message_id: platform_message_id,
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
             sid: None,
             slug: None,
         });
@@ -8311,6 +8352,7 @@ impl Gateway {
         &mut self,
         chat: &ChatKey,
         action: im_callbacks::CallbackAction,
+        message_id: &str,
     ) -> Result<Vec<RichReply>> {
         match action {
             im_callbacks::CallbackAction::Choice { .. } => Ok(Vec::new()),
@@ -8335,8 +8377,19 @@ impl Gateway {
                         return Ok(vec![RichReply::plain("Подтверждение устарело")]);
                     }
                 };
-                // TG-GATE-V2 W7b: needs egress-targeted edit by platform message id.
-                let mut replies = vec![RichReply::plain(format!("✅ {cmd}"))];
+                // TG-GATE-V2 W8 — edit the confirmation message itself
+                // in place (keyboard removed, "✅ <cmd>") instead of
+                // appending a new one; a callback with no resolvable
+                // platform message id (non-Telegram origin) keeps the
+                // prior append-a-new-message behavior.
+                let mut replies = Vec::new();
+                let ack = format!("✅ {cmd}");
+                match telegram_callback_message_id(message_id) {
+                    Some(platform_message_id) => {
+                        self.emit_confirmation_edit(chat, platform_message_id, ack)
+                    }
+                    None => replies.push(RichReply::plain(ack)),
+                }
                 match self.handle_command(chat, &cmd).await? {
                     Some(reply) => replies.push(reply),
                     None => replies.push(RichReply::plain("Неизвестная команда")),
@@ -8349,7 +8402,19 @@ impl Gateway {
                     ConfirmationResolution::Stale => {
                         Ok(vec![RichReply::plain("Подтверждение устарело")])
                     }
-                    ConfirmationResolution::Command(_) => Ok(vec![RichReply::plain("Отменено")]),
+                    ConfirmationResolution::Command(_) => {
+                        match telegram_callback_message_id(message_id) {
+                            Some(platform_message_id) => {
+                                self.emit_confirmation_edit(
+                                    chat,
+                                    platform_message_id,
+                                    "Отменено".to_string(),
+                                );
+                                Ok(Vec::new())
+                            }
+                            None => Ok(vec![RichReply::plain("Отменено")]),
+                        }
+                    }
                 }
             }
             im_callbacks::CallbackAction::Command(cmd) => {
@@ -14497,6 +14562,20 @@ fn confirm_cmd_button_rows(token: &str) -> Vec<Vec<MessageOption>> {
     } else {
         vec![row]
     }
+}
+
+/// Recover the tapped message's platform id from an inbound `ChannelMessage`
+/// id (TG-GATE-V2 W8), when it names a Telegram callback. Telegram's
+/// `handle_callback_query` stamps `id: "tg-cb-{message_id}"` for every
+/// button tap (the confirmation prompt IS that message), so a `cmd:!`/`cmd:x`
+/// resolve can target an edit at it. `None` for anything else (a non-Telegram
+/// origin, or a `message_id` that predates this convention) — the caller
+/// falls back to appending a new message.
+fn telegram_callback_message_id(message_id: &str) -> Option<String> {
+    message_id
+        .strip_prefix("tg-cb-")
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 /// Map a harness [`ChoicePrompt`] to channel-local [`MessageOption`]s. The
@@ -21868,6 +21947,123 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replies, vec!["Отменено"]);
+    }
+
+    /// TG-GATE-V2 W8 — when the tap arrives with a resolvable Telegram
+    /// message id (`"tg-cb-<n>"`, the real inbound shape from
+    /// `handle_callback_query`), a confirm resolves by EDITING the
+    /// confirmation message in place (keyboard cleared, text = "✅ <cmd>")
+    /// instead of appending a new reply; only the command's own result
+    /// still rides a reply.
+    #[tokio::test]
+    async fn cmd_confirmation_confirm_edits_the_prompt_message_when_id_known() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        let confirm_token = events
+            .try_recv()
+            .expect("confirmation picker event")
+            .button_rows[0][0]
+            .data
+            .clone();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: confirm_token,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replies,
+            vec!["Нет сессий — создайте через /new"],
+            "the ack no longer rides a reply — only the command's own result does"
+        );
+
+        let edit = events.try_recv().expect("edit event");
+        assert_eq!(edit.content, "✅ /status");
+        assert!(edit.button_rows.is_empty());
+        match edit.kind {
+            GatewayEventKind::EditMessage { ref message_id } => assert_eq!(message_id, "777"),
+            other => panic!("expected EditMessage, got {other:?}"),
+        }
+    }
+
+    /// Same edit-in-place treatment for a cancellation tap.
+    #[tokio::test]
+    async fn cmd_confirmation_cancel_edits_the_prompt_message_when_id_known() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "tg-cb-42",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        let cancel_token = events
+            .try_recv()
+            .expect("confirmation picker event")
+            .button_rows[0][1]
+            .data
+            .clone();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "tg-cb-42",
+                "",
+                &[],
+                Some(&ChoiceReply { data: cancel_token }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "cancellation rides the edit event, not a reply"
+        );
+
+        let edit = events.try_recv().expect("edit event");
+        assert_eq!(edit.content, "Отменено");
+        match edit.kind {
+            GatewayEventKind::EditMessage { ref message_id } => assert_eq!(message_id, "42"),
+            other => panic!("expected EditMessage, got {other:?}"),
+        }
     }
 
     #[tokio::test]

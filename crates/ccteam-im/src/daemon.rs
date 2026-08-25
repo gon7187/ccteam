@@ -1652,6 +1652,29 @@ fn spawn_gateway_event_consumer(
                 GatewayEventKind::Delegation { .. } => {}
                 GatewayEventKind::SessionLifecycle { .. } => {}
                 GatewayEventKind::ScheduledChanged => {}
+                // TG-GATE-V2 W8 — edit an arbitrary already-sent message
+                // (the `cmd:` confirmation prompt) in place by its
+                // platform id. A failed edit (message gone/too old) falls
+                // back to the pre-W8 behavior: send the resolution as a
+                // new message, so it is never silently dropped.
+                GatewayEventKind::EditMessage { message_id } => {
+                    if let Err(err) = channel
+                        .edit_message(&evt.chat_id, &message_id, &evt.content, &evt.button_rows)
+                        .await
+                    {
+                        tracing::warn!(
+                            channel = %evt.channel,
+                            message_id = %message_id,
+                            error = %err,
+                            "ccteam-im: confirmation edit failed, falling back to a new message"
+                        );
+                        let out = SendMessage::new(evt.content, evt.chat_id)
+                            .in_thread(evt.thread_ts)
+                            .with_button_rows(evt.button_rows);
+                        send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out)
+                            .await;
+                    }
+                }
                 // v0.8.19 — the 👀 ack reaction (IM-only; web/discord/slack keep
                 // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
                 // Activity arm's discipline: ALL fire-and-forget — log + swallow,
@@ -2362,6 +2385,7 @@ mod tests {
     /// `replay_durable_outbox`). It must be recorded `Sent` (with the
     /// partial note kept in `error`) and the channel must receive a direct
     /// "part N/M not sent" notice for only the failed parts.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn partial_fallback_failure_is_recorded_sent_not_replayed_and_notifies_failed_parts_only()
     {

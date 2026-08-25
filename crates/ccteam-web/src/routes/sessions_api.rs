@@ -2058,6 +2058,11 @@ pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
         GatewayEventKind::Delegation { .. } => ("delegation", false),
         GatewayEventKind::SessionLifecycle { .. } => ("session_lifecycle", false),
         GatewayEventKind::ScheduledChanged => ("scheduled_changed", false),
+        // TG-GATE-V2 W8 — an IM-only edit-in-place (e.g. resolving a `cmd:`
+        // confirmation tap); `is_im_only_event` filters it out before this
+        // serializer ever runs, same as `Reaction` above — the arm exists
+        // only for match exhaustiveness.
+        GatewayEventKind::EditMessage { .. } => ("edit_message", false),
     };
     let mut payload = json!({
         "id": ev.id,

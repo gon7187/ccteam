@@ -129,7 +129,10 @@ impl SessionEventRing {
 /// record them) and [`crate::routes::sessions_api`]'s pending-approval
 /// reseed path.
 pub(crate) fn is_im_only_event(ev: &GatewayEvent) -> bool {
-    matches!(ev.kind, GatewayEventKind::Reaction { .. })
+    matches!(
+        ev.kind,
+        GatewayEventKind::Reaction { .. } | GatewayEventKind::EditMessage { .. }
+    )
 }
 
 /// v0.9.0 W4 (F4) — capacity for the team view's GLOBAL replay ring

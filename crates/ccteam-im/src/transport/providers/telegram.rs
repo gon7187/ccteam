@@ -250,7 +250,7 @@ impl TelegramChannel {
             .or_else(|| cb.from.as_ref().map(|u| u.id.to_string()))
             .unwrap_or_else(|| "anonymous".to_string());
         let payload = ChannelMessage {
-            id: format!("tg-cb-{}", msg.message_id),
+            id: callback_message_id(msg.message_id),
             sender,
             reply_target: chat_id,
             content: String::new(),
@@ -1498,6 +1498,18 @@ fn parse_tg_message_id(message_id: &str) -> anyhow::Result<i64> {
         })
 }
 
+/// The `ChannelMessage::id` namespacing for a `callback_query` tap
+/// (TG-GATE-V2 W8 — separate from the `"tg-<n>"` inbound-text namespace
+/// [`parse_tg_message_id`] strips): `"tg-cb-<n>"`, where `<n>` is the raw
+/// platform id of the message CARRYING the tapped inline keyboard (Telegram
+/// echoes the same id back on every edit of that message). The gateway's
+/// `telegram_callback_message_id` strips this prefix to recover `<n>` and
+/// targets [`Channel::edit_message`] at it — resolving a `cmd:?` confirmation
+/// tap edits the confirmation prompt itself instead of appending a reply.
+fn callback_message_id(message_id: i64) -> String {
+    format!("tg-cb-{message_id}")
+}
+
 /// Build the `setMessageReaction` request body (pure + isolated so the
 /// 👀-emoji add shape and the empty-array clear shape are unit-testable
 /// without a live Bot API). `add=true` sets `reaction:[{emoji:👀}]`;
@@ -1678,6 +1690,17 @@ mod tests {
         // Genuinely non-numeric → error (id preserved in the message for the log).
         assert!(parse_tg_message_id("tg-abc").is_err());
         assert!(parse_tg_message_id("nope").is_err());
+    }
+
+    /// TG-GATE-V2 W8 — a `callback_query` tap's `ChannelMessage::id` names
+    /// the tapped message under its own `"tg-cb-<n>"` namespace (distinct
+    /// from `parse_tg_message_id`'s `"tg-<n>"` inbound-text one), so the
+    /// gateway can resolve a `cmd:?` confirmation by editing that same
+    /// message instead of appending a new one.
+    #[test]
+    fn callback_message_id_namespaces_the_platform_message_id() {
+        assert_eq!(callback_message_id(6249), "tg-cb-6249");
+        assert_eq!(callback_message_id(0), "tg-cb-0");
     }
 
     #[test]
