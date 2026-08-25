@@ -327,7 +327,10 @@ fn utf16_len(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }
 
-fn is_fence_line(line: &str) -> bool {
+/// TG-GATE-V2 W7a — `pub(crate)` so the rich-fallback split (telegram.rs)
+/// can be tested against the exact fence-line predicate it must never
+/// corrupt by appending a `(i/n)` suffix onto the same line.
+pub(crate) fn is_fence_line(line: &str) -> bool {
     line.trim_start().starts_with("```")
 }
 

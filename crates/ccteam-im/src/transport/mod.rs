@@ -610,6 +610,16 @@ pub trait Channel: Send + Sync {
     /// Human-readable platform name (matches credentials.json key).
     fn name(&self) -> &str;
 
+    /// Whether this channel can render `SendMessage::rich_markdown` (TG-GATE-V2
+    /// W7a). **Default `false`** — the daemon only sets `rich_markdown` (and
+    /// skips its own `split_for_channel` pre-splitting) for a channel that
+    /// answers `true` here; every other channel keeps today's plain-`content`
+    /// split + durable per-part ledger behavior byte-for-byte. Telegram is the
+    /// only channel that overrides this (its Bot API 10.3 Rich Messages).
+    fn supports_rich_messages(&self) -> bool {
+        false
+    }
+
     /// Send a single message. Returns the platform-side message id
     /// when available (Slack `ts`, Discord message id, …) for echo
     /// suppression in the outbound tailer.

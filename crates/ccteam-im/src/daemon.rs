@@ -32,7 +32,9 @@ use crate::gateway::{Gateway, GatewayEvent, GatewayEventKind};
 use crate::im_views::RichReply;
 use crate::latency::now_unix_ms;
 use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
-use crate::transport::providers::telegram::TelegramChannel;
+use crate::transport::providers::telegram::{
+    FallbackSplitPartialFailure as TelegramFallbackSplitPartialFailure, TelegramChannel,
+};
 use crate::transport::{Channel, ChannelMessage, SendMessage};
 use crate::{list_bots, BotRegistration};
 
@@ -1514,8 +1516,13 @@ async fn deliver_gateway_replies(
             for (seq, reply) in replies.into_iter().enumerate() {
                 let button_rows = reply.button_rows.clone();
                 let mut out = SendMessage::new(reply.plain, msg.reply_target.clone())
-                    .in_thread(msg.thread_ts.clone())
-                    .with_rich_markdown(reply.markdown);
+                    .in_thread(msg.thread_ts.clone());
+                // TG-GATE-V2 W7a — `rich_markdown` only for a channel that can
+                // render it; every other channel keeps today's plain-`content`
+                // split + durable per-part ledger behavior unchanged.
+                if channel.supports_rich_messages() {
+                    out = out.with_rich_markdown(reply.markdown);
+                }
                 if !button_rows.is_empty() {
                     out = out.with_button_rows(button_rows);
                 }
@@ -1602,11 +1609,21 @@ fn spawn_gateway_event_consumer(
             };
             match evt.kind {
                 GatewayEventKind::Answer => {
-                    let out = SendMessage::new(evt.content, evt.chat_id)
+                    // TG-GATE-V2 W7a — carry the agent's answer as
+                    // `rich_markdown` too (the SAME text as `content`, which
+                    // is already the markdown answer), but only for a
+                    // rich-capable channel; every other channel is unchanged.
+                    let rich_markdown = channel
+                        .supports_rich_messages()
+                        .then(|| evt.content.clone());
+                    let mut out = SendMessage::new(evt.content, evt.chat_id)
                         .in_thread(evt.thread_ts)
                         .with_attachments(evt.attachments)
                         .with_options(evt.options)
                         .with_button_rows(evt.button_rows);
+                    if let Some(markdown) = rich_markdown {
+                        out = out.with_rich_markdown(markdown);
+                    }
                     send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out).await;
                 }
                 GatewayEventKind::Progress { status_key, done } => {
@@ -1894,6 +1911,57 @@ async fn finish_durable_outbound_send(
             true
         }
         Err(err) => {
+            // TG-GATE-V2 W7a — a Telegram rich→classic fallback split that
+            // delivered SOME parts before a later part failed is not an
+            // ordinary send failure: this durable row's `message` holds the
+            // WHOLE original (unsplit) content, so marking it `Failed`
+            // would re-send every part — including the ones that already
+            // landed — on the next `replay_durable_outbox`. Detect that
+            // shape and record it as terminal (`Sent`, keeping the
+            // partial-failure note in `error` for visibility) instead, and
+            // tell the user directly which parts didn't make it.
+            if let Some(partial) = err.downcast_ref::<TelegramFallbackSplitPartialFailure>() {
+                append_durable_outbound(DurableOutboundRow {
+                    ts_ms: now_unix_ms_u64(),
+                    id,
+                    inbound_id: inbound_id.to_string(),
+                    channel: channel_name.to_string(),
+                    state: DurableOutboundState::Sent,
+                    message: message.clone(),
+                    platform_message_id: partial.first_id.clone(),
+                    error: Some(err.to_string()),
+                });
+                tracing::warn!(
+                    inbound_id,
+                    channel = %channel_name,
+                    failed_parts = ?partial.failed_parts,
+                    total = partial.total,
+                    "ccteam-im: telegram rich-fallback split partially failed"
+                );
+                let body = if partial.failed_parts.len() == 1 {
+                    format!(
+                        "⚠️ Часть {}/{} не отправлена",
+                        partial.failed_parts[0], partial.total
+                    )
+                } else {
+                    format!(
+                        "⚠️ Части сообщения не отправлены ({}/{} шт.)",
+                        partial.failed_parts.len(),
+                        partial.total
+                    )
+                };
+                let notice = SendMessage::new(body, message.recipient.clone())
+                    .in_thread(message.thread_ts.clone());
+                if let Err(notice_err) = channel.send(&notice).await {
+                    tracing::warn!(
+                        inbound_id,
+                        channel = %channel_name,
+                        error = %notice_err,
+                        "ccteam-im: failed to deliver rich-fallback partial-failure notice"
+                    );
+                }
+                return true;
+            }
             append_durable_outbound(DurableOutboundRow {
                 ts_ms: now_unix_ms_u64(),
                 id,
@@ -2159,6 +2227,233 @@ mod tests {
             Some("rid-123"),
             "the add handle must be replayed to remove"
         );
+    }
+
+    /// TG-GATE-V2 W7a — a rich-capable channel's `Answer` event gets
+    /// `rich_markdown` set to the SAME text as `content` (the agent's
+    /// markdown answer); a non-rich channel's `Answer` gets no
+    /// `rich_markdown` at all — zero behavior change for every channel that
+    /// isn't Telegram.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_event_carries_rich_markdown_only_for_rich_channels() {
+        use crate::transport::providers::mock::MockChannel;
+
+        let rich = MockChannel::new().with_name("rich").with_rich_support();
+        let plain = MockChannel::new().with_name("plain");
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("rich".to_string(), Arc::new(rich.clone()));
+        channels.insert("plain".to_string(), Arc::new(plain.clone()));
+        let channels = Arc::new(RwLock::new(channels));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        let consumer = spawn_gateway_event_consumer(rx, channels);
+
+        let answer = |channel: &str| GatewayEvent {
+            id: format!("answer-{channel}"),
+            channel: channel.to_string(),
+            chat_id: "chat-1".to_string(),
+            thread_ts: None,
+            content: "**bold** answer".to_string(),
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: None,
+            slug: None,
+        };
+        tx.send(answer("rich")).unwrap();
+        tx.send(answer("plain")).unwrap();
+
+        let mut rich_out = Vec::new();
+        let mut plain_out = Vec::new();
+        for _ in 0..200 {
+            rich_out = rich.outbox().await;
+            plain_out = plain.outbox().await;
+            if !rich_out.is_empty() && !plain_out.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        consumer.abort();
+
+        assert_eq!(rich_out.len(), 1);
+        assert_eq!(
+            rich_out[0].rich_markdown.as_deref(),
+            Some("**bold** answer"),
+            "a rich-capable channel's answer carries rich_markdown"
+        );
+        assert_eq!(plain_out.len(), 1);
+        assert_eq!(
+            plain_out[0].rich_markdown, None,
+            "a non-rich channel's answer never carries rich_markdown"
+        );
+        // Both channels get the same plain `content` either way.
+        assert_eq!(rich_out[0].content, "**bold** answer");
+        assert_eq!(plain_out[0].content, "**bold** answer");
+    }
+
+    /// TG-GATE-V2 W7a — `deliver_gateway_replies` (the command-reply path)
+    /// applies the same rich-gate: `rich_markdown` only rides a reply to a
+    /// channel that `supports_rich_messages`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn command_reply_carries_rich_markdown_only_for_rich_channels() {
+        use crate::transport::providers::mock::MockChannel;
+
+        let rich_msg = ChannelMessage {
+            id: "in-1".into(),
+            sender: "u1".into(),
+            reply_target: "chat-1".into(),
+            content: "/status".into(),
+            channel: "rich".into(),
+            timestamp: 0,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+        };
+        let reply = RichReply {
+            markdown: "**status**".into(),
+            plain: "status".into(),
+            button_rows: Vec::new(),
+        };
+        let rich = MockChannel::new().with_name("rich").with_rich_support();
+        deliver_gateway_replies(
+            "cid-1",
+            std::time::Instant::now(),
+            &rich_msg,
+            &rich,
+            Ok(vec![reply]),
+        )
+        .await;
+        let out = rich.outbox().await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rich_markdown.as_deref(), Some("**status**"));
+        assert_eq!(out[0].content, "status");
+
+        let plain_msg = ChannelMessage {
+            channel: "plain".into(),
+            ..rich_msg
+        };
+        let reply = RichReply {
+            markdown: "**status**".into(),
+            plain: "status".into(),
+            button_rows: Vec::new(),
+        };
+        let plain = MockChannel::new().with_name("plain");
+        deliver_gateway_replies(
+            "cid-2",
+            std::time::Instant::now(),
+            &plain_msg,
+            &plain,
+            Ok(vec![reply]),
+        )
+        .await;
+        let out = plain.outbox().await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].rich_markdown, None,
+            "a non-rich channel's command reply never carries rich_markdown"
+        );
+    }
+
+    /// TG-GATE-V2 W7a — a Telegram rich-fallback split partial failure
+    /// (`FallbackSplitPartialFailure`) must NOT be recorded as `Failed` in
+    /// the durable ledger (that would re-send the WHOLE original message —
+    /// including the parts that already landed — on the next
+    /// `replay_durable_outbox`). It must be recorded `Sent` (with the
+    /// partial note kept in `error`) and the channel must receive a direct
+    /// "part N/M not sent" notice for only the failed parts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_fallback_failure_is_recorded_sent_not_replayed_and_notifies_failed_parts_only()
+    {
+        use crate::transport::providers::mock::MockChannel;
+
+        struct PartialFailureOnce {
+            inner: MockChannel,
+            failed: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for PartialFailureOnce {
+            fn name(&self) -> &str {
+                self.inner.name()
+            }
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                // Fail exactly once (the original logical send); the
+                // follow-up partial-failure notice must go through fine.
+                if self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return self.inner.send(message).await;
+                }
+                Err(TelegramFallbackSplitPartialFailure {
+                    first_id: Some("mock-1".to_string()),
+                    total: 3,
+                    failed_parts: vec![2, 3],
+                }
+                .into())
+            }
+            async fn listen(
+                &self,
+                tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                self.inner.listen(tx).await
+            }
+        }
+
+        let _guard = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("CCTEAM_HOME", tmp.path().join(".ccteam"));
+
+        let channel = PartialFailureOnce {
+            inner: MockChannel::new().with_name("telegram"),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let message = SendMessage::new("part 1 of a long answer", "chat-1")
+            .with_rich_markdown("part 1 of a long answer");
+        let sent = finish_durable_outbound_send(
+            "row-1".to_string(),
+            "in-1",
+            "telegram",
+            &channel,
+            message,
+        )
+        .await;
+        // Terminal (not a retryable failure) — the ledger row is `Sent`.
+        assert!(
+            sent,
+            "a partial fallback failure must be terminal, not a retryable failure"
+        );
+
+        let notices = channel.inner.outbox().await;
+        assert_eq!(notices.len(), 1, "exactly one partial-failure notice sent");
+        assert!(
+            notices[0].content.contains("2") && notices[0].content.contains("3"),
+            "notice names the failed parts: {:?}",
+            notices[0].content
+        );
+        assert_eq!(notices[0].recipient, "chat-1");
+
+        let ledger = tokio::fs::read_to_string(durable_outbox_path())
+            .await
+            .unwrap();
+        let rows: Vec<DurableOutboundRow> = ledger
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1, "one ledger row for the original send");
+        assert_eq!(
+            rows[0].state,
+            DurableOutboundState::Sent,
+            "a partial fallback failure is recorded Sent, never Failed \
+             (Failed would re-send every part — including the ones that \
+             already landed — on the next replay_durable_outbox)"
+        );
+        assert_eq!(rows[0].platform_message_id.as_deref(), Some("mock-1"));
+        assert!(rows[0].error.as_deref().unwrap().contains("2/3"));
+
+        restore_env("CCTEAM_HOME", old_ccteam_home);
+        restore_env("HOME", old_home);
     }
 
     /// v0.8.19 — the stateless (Telegram) shape: `add_reaction` returns `None`,

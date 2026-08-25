@@ -314,31 +314,6 @@ fn decode_message_receive(recv: &MsgReceivePayload) -> Option<DecodedMessage> {
     })
 }
 
-/// TG-GATE-V2 W1 — fold `button_rows` into a numbered text list appended to
-/// `content`, the same non-native-button fallback shape `options` already
-/// gets on the sink-less (gateway `render_choice_text`) path. Lark's card
-/// only models one button per vertical `action` element (no row grouping),
-/// so button rows are flattened row-major into a flat numbered list rather
-/// than rendered as extra card buttons. Empty `button_rows` ⇒ `content`
-/// unchanged (zero behavior change). Pure — unit-tested without a live API.
-fn with_button_rows_numbered(content: &str, button_rows: &[Vec<MessageOption>]) -> String {
-    if button_rows.is_empty() {
-        return content.to_string();
-    }
-    let mut out = content.to_string();
-    let mut idx = 1;
-    for row in button_rows {
-        for opt in row {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&format!("{idx}. {}", opt.label));
-            idx += 1;
-        }
-    }
-    out
-}
-
 /// Build a Feishu interactive card (schema 1.0) rendering `text` plus one
 /// button per option. Each button's `value.d` carries the option's opaque
 /// callback `data` verbatim — the same payload telegram rides on
@@ -1296,24 +1271,21 @@ impl Channel for LarkChannel {
         if !message.attachments.is_empty() {
             return self.send_with_attachments(message).await;
         }
-        // TG-GATE-V2 W1 — lark has no button-ROW concept (its card is one
-        // button per `action` element, vertically stacked); button_rows
-        // folds into the same numbered-text-list treatment `options`
-        // already gets on a sink-less path, appended to the message body.
-        let body_text = with_button_rows_numbered(&message.content, &message.button_rows);
-        // Picker options → an interactive card with one button per option
-        // (symmetric to telegram's inline keyboard). The numbered-text
-        // fallback already lives in `content`, so the card body carries it
-        // too — a client that can't render buttons still sees the list.
+        // TG-GATE-V2 W7a — Lark has no button-ROW concept (its card is one
+        // button per `action` element, vertically stacked) and `button_rows`
+        // is a multi-per-row command/navigation affordance, not a picker —
+        // rendering it as a numbered dead list is worse than showing
+        // nothing, so it is dropped entirely here. Only `options` (the
+        // picker) keeps the numbered-fold-into-a-card treatment below.
         if !message.options.is_empty() {
-            let card = build_option_card(&body_text, &message.options);
+            let card = build_option_card(&message.content, &message.options);
             return self
                 .send_raw(&message.recipient, "interactive", card.to_string())
                 .await;
         }
         // Feishu quirk: `content` is a STRING containing JSON, not a
         // nested object.
-        let content = serde_json::json!({ "text": body_text }).to_string();
+        let content = serde_json::json!({ "text": message.content }).to_string();
         self.send_raw(&message.recipient, "text", content).await
     }
 
@@ -1352,18 +1324,15 @@ impl Channel for LarkChannel {
         _recipient: &str,
         message_id: &str,
         content: &str,
-        button_rows: &[Vec<MessageOption>],
+        _button_rows: &[Vec<MessageOption>],
     ) -> anyhow::Result<Option<String>> {
         // Lark addresses the edit by `message_id` in the URL path, not by
         // recipient, so `recipient` is unused here.
         let url = format!("{}/im/v1/messages/{message_id}", self.api_base());
-        // TG-GATE-V2 W5 — same numbered-text fallback `send` already gives
-        // `button_rows` (Lark has no button-row concept on a plain text
-        // edit); e.g. the progress edit's `[⛔ Прервать]` shows up as a
-        // trailing numbered line.
-        let body_text = with_button_rows_numbered(content, button_rows);
+        // TG-GATE-V2 W7a — `button_rows` is dropped entirely on Lark (see
+        // `send`'s comment): no numbered dead list on a plain text edit.
         // Same Feishu quirk as `send`: the inner value is stringified JSON.
-        let inner = serde_json::json!({ "text": body_text }).to_string();
+        let inner = serde_json::json!({ "text": content }).to_string();
         let body = serde_json::json!({
             "msg_type": "text",
             "content": inner,
