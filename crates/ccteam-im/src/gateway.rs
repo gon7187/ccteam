@@ -27,7 +27,7 @@ use ccteam_harness::{
 };
 #[cfg(test)]
 use ccteam_harness::{read_session_meta, write_session_meta};
-use futures::StreamExt;
+use futures::{future::join_all, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::pending::InteractionOrigin;
@@ -86,6 +86,25 @@ impl ChatKey {
 /// re-reading the same project N times. See
 /// [`Gateway::memoized_tenant_project_owner`] for why it never becomes a field.
 type ProjectPrincipalMemo = std::collections::HashMap<String, Option<String>>;
+
+fn format_bulk_stop_result(stopped: &[String], failures: &[String]) -> String {
+    let mut lines = Vec::new();
+    if !stopped.is_empty() {
+        lines.push(format!(
+            "Остановлено сессий: {} ({})",
+            stopped.len(),
+            stopped.join(", ")
+        ));
+    }
+    if !failures.is_empty() {
+        lines.push(format!(
+            "Ошибок остановки: {} ({})",
+            failures.len(),
+            failures.join(", ")
+        ));
+    }
+    lines.join("\n")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnOrigin {
@@ -1801,7 +1820,7 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     GatewayCommandSpec {
         name: "/stop",
         arg_hint: Some("<id>|all|project"),
-        help: "остановить сессию по id или все доступные сессии",
+        help: "остановить сессию по id, все доступные или сессии текущего проекта",
         in_menu: true,
     },
     GatewayCommandSpec {
@@ -2732,6 +2751,16 @@ impl Gateway {
         })
         .await
         .context("join body terminate")??;
+        self.finish_stopped_detached_body(sid, detached, stopped)?;
+        Ok(true)
+    }
+
+    fn finish_stopped_detached_body(
+        &mut self,
+        sid: &str,
+        detached: DetachedBody,
+        stopped: bool,
+    ) -> Result<()> {
         session_body::clear(&detached.cwd, sid);
         self.append_progress_event(
             &detached.slug,
@@ -2750,7 +2779,45 @@ impl Gateway {
             .retain(|_, v| v != sid);
         self.persist_routing()?;
         tracing::info!(session = %sid, pid = detached.body.pid, stopped, "ccteam-im: detached body stopped by user");
-        Ok(true)
+        Ok(())
+    }
+
+    async fn stop_detached_bodies_bulk(
+        &mut self,
+        sids: &BTreeSet<String>,
+    ) -> Vec<(String, Result<()>)> {
+        let jobs: Vec<(String, DetachedBody)> = sids
+            .iter()
+            .filter_map(|sid| {
+                let detached = self.detached.get(sid)?.clone();
+                self.principals.forget(sid);
+                Some((sid.clone(), detached))
+            })
+            .collect();
+        let terminated = join_all(jobs.into_iter().map(|(sid, detached)| async move {
+            let body = detached.body.clone();
+            let sid_owned = sid.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                session_body::terminate(&body, &sid_owned, std::time::Duration::from_secs(5))
+            })
+            .await
+            .context("join body terminate")
+            .and_then(|result| result);
+            (sid, detached, result)
+        }))
+        .await;
+
+        terminated
+            .into_iter()
+            .map(|(sid, detached, result)| match result {
+                Ok(true) => {
+                    self.detached.remove(&sid);
+                    let outcome = self.finish_stopped_detached_body(&sid, detached, true);
+                    (sid, outcome)
+                }
+                Ok(false) | Err(_) => (sid, Err(anyhow!("процесс не завершился"))),
+            })
+            .collect()
     }
 
     /// Queue a turn behind a detached body (the session is not driveable
@@ -3713,77 +3780,22 @@ impl Gateway {
                 self.use_session(chat, id).await.map(Some)
             }
             "/stop" => {
-                // v0.8.10 — stop one session by id, or serially stop every
-                // session visible to this chat for the requested bulk scope.
+                // v0.10.3 — stop one session by id, or every session visible
+                // to this chat for the requested bulk scope.
                 let target = parts.next().ok_or_else(|| {
                     anyhow!("Для /stop нужен id, all или project: /stop <sid>|all|project")
                 })?;
-                if matches!(target, "all" | "project") {
-                    let project = if target == "project" {
-                        let Some(project) = self.current_project_for(chat) else {
-                            return Ok(Some(
-                                "Для /stop project не выбран текущий проект: сначала используйте /cd <project>"
-                                    .to_string(),
-                            ));
-                        };
-                        Some(project)
-                    } else {
-                        None
+                let scope = target.to_ascii_lowercase();
+                if matches!(scope.as_str(), "all" | "project") {
+                    let sids = match self.bulk_stop_candidates(chat, &scope) {
+                        Ok(sids) => sids,
+                        Err(error) => return Ok(Some(error.to_string())),
                     };
-                    let mut candidates: BTreeSet<String> = self.sessions.keys().cloned().collect();
-                    candidates.extend(self.detached.keys().cloned());
-                    let mut sids = BTreeSet::new();
-                    for sid in candidates {
-                        let accessible = self
-                            .sessions
-                            .get(&sid)
-                            .map(|session| self.chat_can_access(chat, session))
-                            .unwrap_or_else(|| {
-                                self.is_session_detached(&sid)
-                                    && self.chat_can_access_sid(chat, &sid)
-                            });
-                        if !accessible {
-                            continue;
-                        }
-                        let session_project = self
-                            .sessions
-                            .get(&sid)
-                            .map(|session| session.project.as_str())
-                            .or_else(|| self.detached.get(&sid).map(|body| body.slug.as_str()));
-                        if let Some(project) = project.as_deref() {
-                            if session_project != Some(project) {
-                                continue;
-                            }
-                        }
-                        sids.insert(sid);
-                    }
                     if sids.is_empty() {
                         return Ok(Some("Нет доступных сессий для остановки".to_string()));
                     }
-                    let mut stopped = Vec::new();
-                    let mut failures = Vec::new();
-                    for sid in sids {
-                        match self.stop_session(&sid).await {
-                            Ok(()) => stopped.push(sid),
-                            Err(error) => failures.push(format!("{sid} ({error})")),
-                        }
-                    }
-                    let mut lines = Vec::new();
-                    if !stopped.is_empty() {
-                        lines.push(format!(
-                            "Остановлено сессий: {} ({})",
-                            stopped.len(),
-                            stopped.join(", ")
-                        ));
-                    }
-                    if !failures.is_empty() {
-                        lines.push(format!(
-                            "Ошибок остановки: {} ({})",
-                            failures.len(),
-                            failures.join(", ")
-                        ));
-                    }
-                    return Ok(Some(lines.join("\n")));
+                    let (stopped, failures) = self.stop_sessions_bulk(&sids).await;
+                    return Ok(Some(format_bulk_stop_result(&stopped, &failures)));
                 }
                 let sid = target.to_string();
                 // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own session.
@@ -12608,6 +12620,17 @@ impl Gateway {
         if self.stop_detached_body(sid).await? {
             return Ok(());
         }
+        self.stop_live_session(sid, false).await
+    }
+
+    async fn stop_session_reporting(&mut self, sid: &str) -> Result<()> {
+        if self.stop_detached_body(sid).await? {
+            return Ok(());
+        }
+        self.stop_live_session(sid, true).await
+    }
+
+    async fn stop_live_session(&mut self, sid: &str, report_close_error: bool) -> Result<()> {
         let session = self
             .sessions
             .get(sid)
@@ -12622,7 +12645,7 @@ impl Gateway {
         if let Some(pump) = self.event_pumps.remove(sid) {
             pump.abort();
         }
-        let _ = adapter.close_thread(&thread).await;
+        let close_error = adapter.close_thread(&thread).await.err();
         self.sessions.remove(sid);
         // Drop every current-session route that pointed at this sid so a
         // chat doesn't keep addressing a dead session.
@@ -12631,7 +12654,79 @@ impl Gateway {
             .unwrap()
             .retain(|_, v| v != sid);
         self.persist_routing()?;
+        if report_close_error {
+            if let Some(error) = close_error {
+                return Err(error.into());
+            }
+        }
         Ok(())
+    }
+
+    fn bulk_stop_candidates(&mut self, chat: &ChatKey, scope: &str) -> Result<BTreeSet<String>> {
+        let project = if scope == "project" {
+            Some(self.require_current_project(chat)?)
+        } else {
+            None
+        };
+        // The predicate is identical to single-sid `/stop`; capture `project`
+        // before the loop so route mutations cannot change the filter halfway.
+        let mut memo = ProjectPrincipalMemo::new();
+        let mut candidates: BTreeSet<String> = self.sessions.keys().cloned().collect();
+        candidates.extend(self.detached.keys().cloned());
+        let mut sids = BTreeSet::new();
+        for sid in candidates {
+            let (accessible, session_project) = if let Some(session) = self.sessions.get(&sid) {
+                (
+                    self.chat_can_access_with(chat, session, &mut memo),
+                    session.project.clone(),
+                )
+            } else if self.is_session_detached(&sid) {
+                let Ok((slug, _cwd, meta)) = self.find_meta_for_sid(&sid) else {
+                    continue;
+                };
+                (
+                    self.project_owner_visible_with(chat, &slug, &meta.owner, &mut memo),
+                    slug,
+                )
+            } else {
+                continue;
+            };
+            if accessible
+                && project
+                    .as_deref()
+                    .is_none_or(|project| project == session_project)
+            {
+                sids.insert(sid);
+            }
+        }
+        Ok(sids)
+    }
+
+    async fn stop_sessions_bulk(&mut self, sids: &BTreeSet<String>) -> (Vec<String>, Vec<String>) {
+        let detached_sids: BTreeSet<String> = sids
+            .iter()
+            .filter(|sid| self.is_session_detached(sid))
+            .cloned()
+            .collect();
+        let mut stopped = Vec::new();
+        let mut failures = Vec::new();
+
+        for (sid, result) in self.stop_detached_bodies_bulk(&detached_sids).await {
+            match result {
+                Ok(()) => stopped.push(sid),
+                Err(error) => failures.push(format!("{sid} ({error})")),
+            }
+        }
+        for sid in sids {
+            if detached_sids.contains(sid) {
+                continue;
+            }
+            match self.stop_session_reporting(sid).await {
+                Ok(()) => stopped.push(sid.clone()),
+                Err(error) => failures.push(format!("{sid} ({error})")),
+            }
+        }
+        (stopped, failures)
     }
 
     /// Interrupt a session's CURRENTLY-RUNNING turn without destroying it (the
@@ -15938,6 +16033,7 @@ mod tests {
         /// v0.9 T2 — `close_thread` call count (stop path + discarded zombie
         /// resume both close).
         closes: AtomicUsize,
+        close_failures_remaining: Arc<AtomicUsize>,
     }
 
     impl Default for FakeAdapter {
@@ -15990,6 +16086,7 @@ mod tests {
                 title_surface: false,
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
+                close_failures_remaining: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -16041,6 +16138,11 @@ mod tests {
 
         fn with_start_barrier(mut self, barrier: Arc<TestStartBarrier>) -> Self {
             self.start_barrier = Some(barrier);
+            self
+        }
+
+        fn with_close_failures(self, count: usize) -> Self {
+            self.close_failures_remaining.store(count, Ordering::SeqCst);
             self
         }
     }
@@ -16269,6 +16371,22 @@ mod tests {
 
         async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
             self.closes.fetch_add(1, Ordering::SeqCst);
+            let mut remaining = self.close_failures_remaining.load(Ordering::SeqCst);
+            while remaining > 0 {
+                match self.close_failures_remaining.compare_exchange(
+                    remaining,
+                    remaining - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => {
+                        return Err(HarnessError::ShutdownFailed(
+                            "fake close failure".to_string(),
+                        ));
+                    }
+                    Err(current) => remaining = current,
+                }
+            }
             Ok(())
         }
 
@@ -16705,13 +16823,223 @@ mod tests {
             .unwrap();
 
         let reply = gateway
-            .handle_text("mock", "chat-1", "alice", "/stop all")
+            .handle_text("mock", "chat-1", "alice", "/stop ALL")
             .await
             .unwrap();
 
-        assert!(reply[0].contains("Остановлено сессий: 1 (s1)"), "{reply:?}");
+        assert_eq!(reply[0].lines().next(), Some("Остановлено сессий: 1 (s1)"));
         assert!(!gateway.sessions.contains_key("s1"));
         assert!(gateway.sessions.contains_key("s2"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_stops_own_detached_body_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sid1, sid2);
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            gateway.bind_operator_allowlist("mock", ["chat-1".to_string(), "chat-2".to_string()]);
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+            sid1 = gateway
+                .sessions
+                .keys()
+                .next()
+                .cloned()
+                .expect("first session");
+            gateway
+                .handle_text("mock", "chat-2", "bob", "/new claude")
+                .await
+                .unwrap();
+            sid2 = gateway
+                .sessions
+                .keys()
+                .find(|sid| *sid != &sid1)
+                .cloned()
+                .expect("second session");
+        }
+        let mut own_body = plant_body(tmp.path(), &sid1);
+        let mut foreign_body = plant_body(tmp.path(), &sid2);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restarted = Gateway::new(fake, "alpha", tmp.path());
+        restarted.enable_persistence(tmp.path()).unwrap();
+        restarted.bind_operator_allowlist("mock", ["chat-1".to_string(), "chat-2".to_string()]);
+        restarted.resume_restored_sessions().await;
+        assert!(restarted.is_session_detached(&sid1));
+        assert!(restarted.is_session_detached(&sid2));
+
+        let reply = restarted
+            .handle_text("mock", "chat-1", "alice", "/stop all")
+            .await
+            .unwrap();
+        assert_eq!(
+            reply[0].lines().next(),
+            Some(format!("Остановлено сессий: 1 ({sid1})").as_str())
+        );
+        assert!(!restarted.is_session_detached(&sid1));
+        assert!(restarted.is_session_detached(&sid2));
+        own_body.wait().expect("own detached body stopped");
+        assert!(
+            ccteam_harness::execution::session_body::body_is_alive(
+                &restarted.detached[&sid2].body,
+                &sid2
+            ),
+            "foreign body still alive"
+        );
+        foreign_body.kill().unwrap();
+        foreign_body.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_guest_leaves_foreign_live_and_detached_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid_live;
+        let sid_detached;
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            gateway.bind_operator_allowlist("mock", ["chat-1".to_string(), "chat-2".to_string()]);
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+            sid_live = gateway
+                .sessions
+                .keys()
+                .next()
+                .cloned()
+                .expect("live session");
+            gateway
+                .handle_text("mock", "chat-2", "bob", "/new claude")
+                .await
+                .unwrap();
+            sid_detached = gateway
+                .sessions
+                .keys()
+                .find(|sid| *sid != &sid_live)
+                .cloned()
+                .expect("detached session");
+        }
+        let mut detached_body = plant_body(tmp.path(), &sid_detached);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string(), "chat-2".to_string()]);
+        gateway.resume_restored_sessions().await;
+
+        let reply = gateway
+            .handle_text("mock", "guest-chat", "guest", "/stop all")
+            .await
+            .unwrap();
+        assert_eq!(
+            reply[0].lines().next(),
+            Some("Нет доступных сессий для остановки")
+        );
+        assert!(gateway.sessions.contains_key(&sid_live));
+        assert!(gateway.is_session_detached(&sid_detached));
+        detached_body.kill().unwrap();
+        detached_body.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_keeps_another_tenant_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("user:uaaa"));
+        seed_owned_project(&paths, "beta", Some("user:ubbb"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        gateway
+            .handle_text("telegram@uaaa", "chat-a", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram@ubbb", "chat-b", "bob", "/new claude")
+            .await
+            .unwrap();
+
+        let reply = gateway
+            .handle_text("telegram@uaaa", "chat-a", "alice", "/stop all")
+            .await
+            .unwrap();
+        assert_eq!(reply[0].lines().next(), Some("Остановлено сессий: 1 (s1)"));
+        assert!(!gateway.sessions.contains_key("s1"));
+        assert!(gateway.sessions.contains_key("s2"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_reports_partial_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_close_failures(1));
+        let adapter: Arc<dyn HarnessAdapter> = fake.clone();
+        let mut gateway = Gateway::new(adapter, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/stop all")
+            .await
+            .unwrap();
+        let summary: Vec<&str> = reply[0].lines().take(2).collect();
+        assert_eq!(
+            summary,
+            vec![
+                "Остановлено сессий: 1 (s2)",
+                "Ошибок остановки: 1 (s1 (shutdown failed: fake close failure))"
+            ]
+        );
+        assert!(!gateway.sessions.contains_key("s1"));
+        assert!(!gateway.sessions.contains_key("s2"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_keeps_tenant_session_from_operator() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, operator_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("user:uaaa"));
+        seed_owned_project(&paths, "operator", None);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "operator", &operator_dir);
+        gateway.enable_project_creation(paths);
+        gateway.bind_operator_allowlist("telegram", ["admin-chat".to_string()]);
+        gateway
+            .handle_text("telegram@uaaa", "tenant-chat", "alice", "/cd alpha")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram@uaaa", "tenant-chat", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "admin-chat", "admin", "/new claude")
+            .await
+            .unwrap();
+
+        let reply = gateway
+            .handle_text("telegram", "admin-chat", "admin", "/stop all")
+            .await
+            .unwrap();
+        assert_eq!(reply[0].lines().next(), Some("Остановлено сессий: 1 (s2)"));
+        assert!(
+            !gateway.sessions.contains_key("s2"),
+            "operator session stopped"
+        );
+        assert!(
+            gateway.sessions.contains_key("s1"),
+            "tenant session survived"
+        );
     }
 
     #[tokio::test]
@@ -16752,7 +17080,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(reply[0].contains("Остановлено сессий: 1 (s2)"), "{reply:?}");
+        assert_eq!(reply[0].lines().next(), Some("Остановлено сессий: 1 (s2)"));
         assert!(gateway.sessions.contains_key("s1"));
         assert!(!gateway.sessions.contains_key("s2"));
         assert!(gateway.sessions.contains_key("s3"));
@@ -16761,16 +17089,22 @@ mod tests {
     #[tokio::test]
     async fn gateway_stop_project_refuses_without_current_project() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("mock:owner"));
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
-        gateway.projects.clear();
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        gateway.bind_operator_allowlist("mock", ["owner-chat".to_string()]);
 
         let reply = gateway
-            .handle_text("mock", "chat-1", "alice", "/stop project")
+            .handle_text("mock", "guest-chat", "guest", "/stop project")
             .await
             .unwrap();
 
-        assert!(reply[0].contains("не выбран текущий проект"), "{reply:?}");
+        assert!(
+            reply[0].contains("Этот чат ещё не привязан к ccteam"),
+            "{reply:?}"
+        );
     }
 
     #[tokio::test]
@@ -16798,6 +17132,7 @@ mod tests {
             .expect("/stop must be registered in GATEWAY_COMMANDS");
         assert_eq!(spec.arg_hint, Some("<id>|all|project"));
         assert!(spec.help.contains("все доступные"), "{}", spec.help);
+        assert!(spec.help.contains("проекта"), "{}", spec.help);
     }
 
     /// v0.8.23 review §1.3-D item 9 — `SessionView::waiting_approval` mirrors
