@@ -29,6 +29,7 @@ use tokio::sync::Mutex;
 use crate::acl::AclPolicy;
 use crate::credentials::{self, Credentials};
 use crate::gateway::{Gateway, GatewayEvent, GatewayEventKind};
+use crate::im_views::RichReply;
 use crate::latency::now_unix_ms;
 use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
 use crate::transport::providers::telegram::TelegramChannel;
@@ -1399,7 +1400,7 @@ fn spawn_inbound_consumer(
                     let replies = gateway
                         .lock()
                         .await
-                        .handle_message(
+                        .handle_message_rich(
                             &msg.channel,
                             &msg.reply_target,
                             &msg.sender,
@@ -1481,7 +1482,7 @@ fn spawn_inbound_consumer(
             let replies = gateway
                 .lock()
                 .await
-                .handle_message(
+                .handle_message_rich(
                     &msg.channel,
                     &msg.reply_target,
                     &msg.sender,
@@ -1506,12 +1507,13 @@ async fn deliver_gateway_replies(
     route_t0: std::time::Instant,
     msg: &ChannelMessage,
     channel: &(dyn Channel + Send + Sync),
-    replies: Result<Vec<String>>,
+    replies: Result<Vec<RichReply>>,
 ) {
     match replies {
         Ok(replies) => {
             for (seq, reply) in replies.into_iter().enumerate() {
-                let out = SendMessage::new(reply, msg.reply_target.clone())
+                // TG-GATE-V2: attach rich_markdown/button_rows after W1 merge.
+                let out = SendMessage::new(reply.plain, msg.reply_target.clone())
                     .in_thread(msg.thread_ts.clone());
                 send_gateway_outbound(cid, seq, &msg.channel, channel, out).await;
             }

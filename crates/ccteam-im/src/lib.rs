@@ -44,6 +44,7 @@ pub mod hitl;
 // so the primitives leaf stays free of an async HTTP + sha2 dependency (the
 // `core` half is just the base-URL constant + path utils in `ccteam_core::hub`).
 pub mod hub;
+pub mod im_views;
 pub mod latency;
 // v0.9 T3 — shared MCP protocol core + daemon-side `McpDispatch` so
 // `ccteam-web` can later mount `POST /mcp` without depending on
