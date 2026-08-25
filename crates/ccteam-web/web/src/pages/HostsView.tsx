@@ -48,7 +48,7 @@ import {
 } from "../lib/hostsApi";
 import { importProject } from "../lib/dashboardApi";
 import { copyText } from "../lib/clipboard";
-import { makeT, type Lang } from "../lib/i18n";
+import { makeT, tr, type Lang } from "../lib/i18n";
 import { vendorDotClass } from "../lib/vendors";
 import { fetchVendorLatests, isOutdated, npmPackageForVendor } from "../lib/vendorLatest";
 import { getVendorQuotas, type VendorQuota } from "../lib/vendorQuotaApi";
@@ -189,10 +189,10 @@ export default function HostsView({
       setState({ kind: "ready", hosts });
     } catch (e) {
       if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
-      const message = e instanceof Error ? e.message : "加载失败";
+      const message = e instanceof Error ? e.message : tr(lang, "加载失败", "Load failed", "Не удалось загрузить");
       setState((prev) => (prev.kind === "ready" ? prev : { kind: "error", message }));
     }
-  }, []);
+  }, [lang]);
 
   useEffect(() => {
     let cancelled = false;
@@ -203,13 +203,13 @@ export default function HostsView({
       .catch((e) => {
         if (cancelled) return;
         if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
-        const message = e instanceof Error ? e.message : "加载失败";
+        const message = e instanceof Error ? e.message : tr(lang, "加载失败", "Load failed", "Не удалось загрузить");
         setState((prev) => (prev.kind === "ready" ? prev : { kind: "error", message }));
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [lang]);
 
   // Latest published versions for the Update CTA — fired once over the whole
   // vendor axis (mirrors the Team roster); `fetchVendorLatests` drops the
@@ -267,7 +267,12 @@ export default function HostsView({
     } catch (e) {
       if (!(e instanceof Error && e.message === "UNAUTHENTICATED")) {
         setActionError(
-          `注册 MCP 失败（${vendor}）: ${e instanceof Error ? e.message : "未知错误"}`,
+          tr(
+            lang,
+            `注册 MCP 失败（${vendor}）: ${e instanceof Error ? e.message : "未知错误"}`,
+            `MCP registration failed (${vendor}): ${e instanceof Error ? e.message : "Unknown error"}`,
+            `Не удалось зарегистрировать MCP (${vendor}): ${e instanceof Error ? e.message : "Неизвестная ошибка"}`,
+          ),
         );
       }
     } finally {
@@ -400,7 +405,7 @@ export default function HostsView({
             fontSize: 13.5,
           }}
         >
-          探测主机失败: {state.message}
+          {tr(lang, "探测主机失败", "Host probe failed", "Не удалось проверить хост")}: {state.message}
         </div>
       ) : (
         state.hosts.map((h) =>
