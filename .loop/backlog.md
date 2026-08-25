@@ -31,12 +31,14 @@
 
 ### RU-I18N-2 web SPA 俄语化收尾:补全遗漏的 ru 串(owner 直驱 2026-08-25)
 - **状态**:完成(f3c4579) · **冲突域**:`crates/ccteam-web/web/src` · **建议入口**:haiku 侦察清单 → codex gpt-5.6-luna 执行(worktree `ru-i18n-2`,基 origin/dev)
+- **验证**:2026-08-25 haiku 侦察(误报「104 缺 ru 键」,实际 `zh\ru=∅`)→ codex gpt-5.6-luna 落 `5c476b9d`(4 键 + 30 条 ru 分支,WorkflowView 三元全补,Hosts/Access/Settings 硬编码收 `tr`)+ `f3c4579b`(补漏 `tr` import —— `make web-check` 不跑 tsc,luna 自报的「tsc 绿」为假;`npx tsc -b` 现为门禁)+ 终审修 HostsView `langRef`(语言切换不再重探主机)、`workflowBuiltIn` 阴性、i18n 测死断言删;vitest 706/706,tsc/eslint 0。
 - **背景**:origin/dev 已合入俄语化(`I18N` 表 + `tr(lang, zh, en, ru)`),但 web 界面仍有未覆盖处:硬编码中/英文串、`ru` 分支落英文、aria/title/placeholder/toast 漏译。
 - **规格**:①侦察产出「文件:行 → 串 → 现状」清单;②补译走既有机制(`I18N` 加键 / `tr` 加 ru 参数),不引新 i18n 库;③术语一致(会话/项目/工作区/主机/租户等沿用已有 ru 词);④zh/en 零变更;⑤`i18n.test.ts` 若有「三语键齐全」不变量测试则扩展覆盖。
 - **DoD**:侦察清单全部关闭;`make web-check`(vitest/tsc/eslint)绿;writeback 绿。
 
 ### FINAL-CYCLE-1 收口循环(owner 直驱 2026-08-25):全 diff 二次 review(opus max + codex gpt-5.6-sol max)→ 修补 → 合 dev → push → dev→main PR → 部署重启 TG 网关
-- **状态**:进行中(规划会话 · 2026-08-25;merge dev `012f0ab3` 已落,余 push/PR #188 CI/部署重启) · **冲突域**:全仓(串行,仅规划会话) · **建议入口**:规划会话调度;机械步骤(commit/push/PR)可派便宜 agent
+- **状态**:进行中(规划会话·2026-08-25)
+- **验证**:2026-08-25 opus max + gpt-5.6-sol max 终审全 diff(`origin/dev..integ-fix`,15 文件)→ 两轮修补(luna s54,`c201a146`/`9e2dd86a`,opus 复核 MERGE)→ merge dev `012f0ab3` → push 至 fork `gon7187/ccteam` dev(注意:本机 origin = fork,upstream `firstintent` 的 PR #188 是另一周期,不动)→ fork 内 dev→main PR。余项:部署重启本机 daemon(校 `/proc/<pid>/exe` build sha)+ TG 真机验证。 · **冲突域**:全仓(串行,仅规划会话) · **建议入口**:规划会话调度;机械步骤(commit/push/PR)可派便宜 agent
 - **DoD**:两位 reviewer 零阻塞项;`make test-baseline` 只增;clippy 0;fmt;PR 开出并 CI 绿;本机 daemon 换装重启后 TG 真机验证 `/stop all` + 富文本回复(核 `/proc/<pid>/exe` build sha = 磁盘 binary,见 state.md 教训)。
 
 ### STOP-HONEST-1 单 sid `/stop <sid>` 与 bulk 路径同一诚实等级(TG-STOP-1 终审遗留)
