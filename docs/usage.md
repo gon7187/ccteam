@@ -279,7 +279,7 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 /use <id>                  Switch to session s<N>; stopped sessions cold-resume from disk.
 /role <role>               Change the current session role in place; handle stays the same.
 /interrupt [id]            Interrupt an in-flight turn; keep the session. Omit id for current.
-/stop <id>|all|project     Stop one session by id, or preview all sessions visible to this chat / visible sessions of the current project; bulk scopes require confirmation.
+/stop <id>|all|project     Stop one session by id; in Telegram, all/project show a confirmation button, while other channels stop sessions visible to this chat / visible sessions of the current project immediately.
 
 # Inspect / onboard
 /sessions [all]            List sessions for current project; all = across projects.

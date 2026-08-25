@@ -404,7 +404,12 @@ impl ProgressFold {
     }
 }
 
-fn russian_count_word<'a>(count: usize, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
+pub(crate) fn russian_count_word<'a>(
+    count: usize,
+    one: &'a str,
+    few: &'a str,
+    many: &'a str,
+) -> &'a str {
     let remainder = count % 100;
     if (11..=14).contains(&remainder) {
         return many;

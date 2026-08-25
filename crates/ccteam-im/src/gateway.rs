@@ -113,10 +113,19 @@ fn format_bulk_stop_preview(sids: &BTreeSet<String>) -> String {
         preview.push("…");
     }
     format!(
-        "Будут остановлены {} сессий: {}",
+        "Будут остановлены {} {}: {}",
         sids.len(),
+        crate::progress::russian_count_word(sids.len(), "сессия", "сессии", "сессий"),
         preview.join(", ")
     )
+}
+
+fn classify_detached_termination(result: Result<bool>) -> Result<()> {
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(anyhow!("процесс не завершился")),
+        Err(error) => Err(error),
+    }
 }
 
 fn bulk_stop_options(scope: &str, count: usize) -> Vec<MessageOption> {
@@ -1848,7 +1857,7 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     GatewayCommandSpec {
         name: "/stop",
         arg_hint: Some("<id>|all|project"),
-        help: "остановить сессию по id, все доступные или сессии текущего проекта",
+        help: "остановить сессию по id, все доступные или видимые сессии текущего проекта",
         in_menu: true,
     },
     GatewayCommandSpec {
@@ -2764,31 +2773,30 @@ impl Gateway {
     }
 
     /// An EXPLICIT user stop of a detached body (`/stop`, `session_stop`,
-    /// project stop): SIGTERM → grace → SIGKILL, then forget it. Returns
+    /// project stop): SIGTERM → grace → SIGKILL, then forget it on confirmed
+    /// termination. Returns
     /// `Ok(true)` when `sid` was detached and is now stopped; `Ok(false)` when
     /// `sid` was not detached (the caller continues with its own path).
     pub(crate) async fn stop_detached_body(&mut self, sid: &str) -> Result<bool> {
-        let Some(detached) = self.detached.remove(sid) else {
+        let Some(detached) = self.detached.get(sid).cloned() else {
             return Ok(false);
         };
-        self.principals.forget(sid);
         let body = detached.body.clone();
         let sid_owned = sid.to_string();
-        let stopped = tokio::task::spawn_blocking(move || {
+        let termination = tokio::task::spawn_blocking(move || {
             session_body::terminate(&body, &sid_owned, std::time::Duration::from_secs(5))
         })
         .await
-        .context("join body terminate")??;
-        self.finish_stopped_detached_body(sid, detached, stopped)?;
+        .context("join body terminate")
+        .and_then(|result| result);
+        classify_detached_termination(termination)?;
+        self.detached.remove(sid);
+        self.principals.forget(sid);
+        self.finish_stopped_detached_body(sid, detached)?;
         Ok(true)
     }
 
-    fn finish_stopped_detached_body(
-        &mut self,
-        sid: &str,
-        detached: DetachedBody,
-        stopped: bool,
-    ) -> Result<()> {
+    fn finish_stopped_detached_body(&mut self, sid: &str, detached: DetachedBody) -> Result<()> {
         session_body::clear(&detached.cwd, sid);
         self.append_progress_event(
             &detached.slug,
@@ -2806,7 +2814,7 @@ impl Gateway {
             .unwrap()
             .retain(|_, v| v != sid);
         self.persist_routing()?;
-        tracing::info!(session = %sid, pid = detached.body.pid, stopped, "ccteam-im: detached body stopped by user");
+        tracing::info!(session = %sid, pid = detached.body.pid, "ccteam-im: detached body stopped by user");
         Ok(())
     }
 
@@ -2818,7 +2826,6 @@ impl Gateway {
             .iter()
             .filter_map(|sid| {
                 let detached = self.detached.get(sid)?.clone();
-                self.principals.forget(sid);
                 Some((sid.clone(), detached))
             })
             .collect();
@@ -2837,14 +2844,17 @@ impl Gateway {
 
         terminated
             .into_iter()
-            .map(|(sid, detached, result)| match result {
-                Ok(true) => {
-                    self.detached.remove(&sid);
-                    let outcome = self.finish_stopped_detached_body(&sid, detached, true);
-                    (sid, outcome)
-                }
-                Ok(false) | Err(_) => (sid, Err(anyhow!("процесс не завершился"))),
-            })
+            .map(
+                |(sid, detached, result)| match classify_detached_termination(result) {
+                    Ok(()) => {
+                        self.detached.remove(&sid);
+                        self.principals.forget(&sid);
+                        let outcome = self.finish_stopped_detached_body(&sid, detached);
+                        (sid, outcome)
+                    }
+                    Err(error) => (sid, Err(error)),
+                },
+            )
             .collect()
     }
 
@@ -3822,16 +3832,16 @@ impl Gateway {
                     if sids.is_empty() {
                         return Ok(Some("Нет доступных сессий для остановки".to_string()));
                     }
-                    let preview = format_bulk_stop_preview(&sids);
                     if Self::channel_supports_buttons(&chat.channel) {
                         self.emit_list_options(
                             chat,
-                            preview,
+                            format_bulk_stop_preview(&sids),
                             bulk_stop_options(&scope, sids.len()),
                         );
                         return Ok(None);
                     }
-                    return Ok(Some(preview));
+                    let (stopped, failures) = self.stop_sessions_bulk(&sids).await;
+                    return Ok(Some(format_bulk_stop_result(&stopped, &failures)));
                 }
                 let sid = target.to_string();
                 // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own session.
@@ -4203,7 +4213,8 @@ impl Gateway {
                 }
                 // Recompute at tap time: a stale preview is never trusted; a
                 // session born since the preview is included, and a dead one
-                // simply drops out of this fresh ACL-filtered set.
+                // simply drops out of this fresh ACL-filtered set. No nonce is
+                // needed because ACL is re-checked for this chat at tap time.
                 let (stopped, failures) = self.stop_sessions_bulk(&sids).await;
                 return Ok(vec![format_bulk_stop_result(&stopped, &failures)]);
             }
@@ -12690,15 +12701,31 @@ impl Gateway {
             .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
         let thread = session.thread.clone();
         let adapter = Arc::clone(&session.adapter);
-        // The secret dies with the session — before the close, so a racing
-        // `/mcp` call from the dying child cannot slip through behind it.
-        self.principals.forget(sid);
-        // Abort the pump before closing so no stale pump keeps draining the
-        // retired transcript (mirrors switch_current_role).
-        if let Some(pump) = self.event_pumps.remove(sid) {
-            pump.abort();
+        if report_close_error {
+            // Bulk reporting must keep every gateway fact intact when close
+            // fails: the idempotent close can then be retried safely.
+            adapter
+                .close_thread(&thread)
+                .await
+                .map_err(anyhow::Error::from)?;
+        } else {
+            // Preserve the public single-sid teardown order for web/MCP.
+            self.principals.forget(sid);
+            if let Some(pump) = self.event_pumps.remove(sid) {
+                pump.abort();
+            }
+            let _ = adapter.close_thread(&thread).await;
         }
-        let close_error = adapter.close_thread(&thread).await.err();
+        if report_close_error {
+            self.principals.forget(sid);
+            if let Some(pump) = self.event_pumps.remove(sid) {
+                pump.abort();
+            }
+        }
+        self.finish_stopped_live_session(sid)
+    }
+
+    fn finish_stopped_live_session(&mut self, sid: &str) -> Result<()> {
         self.sessions.remove(sid);
         // Drop every current-session route that pointed at this sid so a
         // chat doesn't keep addressing a dead session.
@@ -12707,15 +12734,10 @@ impl Gateway {
             .unwrap()
             .retain(|_, v| v != sid);
         self.persist_routing()?;
-        if report_close_error {
-            if let Some(error) = close_error {
-                return Err(error.into());
-            }
-        }
         Ok(())
     }
 
-    fn bulk_stop_candidates(&mut self, chat: &ChatKey, scope: &str) -> Result<BTreeSet<String>> {
+    fn bulk_stop_candidates(&self, chat: &ChatKey, scope: &str) -> Result<BTreeSet<String>> {
         let project = if scope == "project" {
             Some(self.require_current_project(chat)?)
         } else {
@@ -16924,7 +16946,7 @@ mod tests {
             "ALL",
         )
         .await;
-        assert_eq!(preview.content, "Будут остановлены 1 сессий: s1");
+        assert_eq!(preview.content, "Будут остановлены 1 сессия: s1");
         assert_eq!(
             preview
                 .options
@@ -16937,6 +16959,49 @@ mod tests {
         assert_eq!(reply, vec!["Остановлено сессий: 1 (s1)".to_string()]);
         assert!(!gateway.sessions.contains_key("s1"));
         assert!(gateway.sessions.contains_key("s2"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_non_button_channel_stops_immediately() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/stop all")
+            .await
+            .unwrap();
+        assert_eq!(
+            reply[0].lines().next(),
+            Some("Остановлено сессий: 2 (s1, s2)")
+        );
+        assert!(gateway.sessions.is_empty());
+    }
+
+    #[test]
+    fn detached_termination_classification_reports_failures() {
+        assert!(classify_detached_termination(Ok(true)).is_ok());
+        assert_eq!(
+            classify_detached_termination(Ok(false))
+                .unwrap_err()
+                .to_string(),
+            "процесс не завершился"
+        );
+        assert_eq!(
+            classify_detached_termination(Err(anyhow!("kill failed")))
+                .unwrap_err()
+                .to_string(),
+            "kill failed"
+        );
     }
 
     #[tokio::test]
@@ -16992,7 +17057,7 @@ mod tests {
         .await;
         assert_eq!(
             preview.content,
-            format!("Будут остановлены 1 сессий: {sid1}")
+            format!("Будут остановлены 1 сессия: {sid1}")
         );
         assert_eq!(
             preview
@@ -17098,7 +17163,7 @@ mod tests {
             "all",
         )
         .await;
-        assert_eq!(preview.content, "Будут остановлены 1 сессий: s1");
+        assert_eq!(preview.content, "Будут остановлены 1 сессия: s1");
         let reply = tap_stop(&mut gateway, "telegram@uaaa", "chat-a", "alice", "all").await;
         assert_eq!(reply, vec!["Остановлено сессий: 1 (s1)".to_string()]);
         assert!(!gateway.sessions.contains_key("s1"));
@@ -17130,7 +17195,7 @@ mod tests {
             "all",
         )
         .await;
-        assert_eq!(preview.content, "Будут остановлены 2 сессий: s1, s2");
+        assert_eq!(preview.content, "Будут остановлены 2 сессии: s1, s2");
         let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", "all").await;
         let summary: Vec<&str> = reply[0].lines().take(2).collect();
         assert_eq!(
@@ -17140,8 +17205,10 @@ mod tests {
                 "Ошибок остановки: 1 (s1 (shutdown failed: fake close failure))"
             ]
         );
-        assert!(!gateway.sessions.contains_key("s1"));
+        assert!(gateway.sessions.contains_key("s1"));
         assert!(!gateway.sessions.contains_key("s2"));
+        gateway.stop_session("s1").await.unwrap();
+        assert!(!gateway.sessions.contains_key("s1"));
     }
 
     #[tokio::test]
@@ -17177,7 +17244,7 @@ mod tests {
             "all",
         )
         .await;
-        assert_eq!(preview.content, "Будут остановлены 1 сессий: s2");
+        assert_eq!(preview.content, "Будут остановлены 1 сессия: s2");
         let reply = tap_stop(&mut gateway, "telegram", "admin-chat", "admin", "all").await;
         assert_eq!(reply, vec!["Остановлено сессий: 1 (s2)".to_string()]);
         assert!(
@@ -17233,7 +17300,7 @@ mod tests {
             "project",
         )
         .await;
-        assert_eq!(preview.content, "Будут остановлены 1 сессий: s2");
+        assert_eq!(preview.content, "Будут остановлены 1 сессия: s2");
         assert_eq!(
             preview
                 .options
@@ -17269,7 +17336,7 @@ mod tests {
             "all",
         )
         .await;
-        assert_eq!(preview.content, "Будут остановлены 1 сессий: s1");
+        assert_eq!(preview.content, "Будут остановлены 1 сессия: s1");
         let reply = gateway
             .handle_message(
                 "telegram",
@@ -17308,7 +17375,7 @@ mod tests {
             "all",
         )
         .await;
-        assert_eq!(preview.content, "Будут остановлены 1 сессий: s1");
+        assert_eq!(preview.content, "Будут остановлены 1 сессия: s1");
         gateway
             .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
