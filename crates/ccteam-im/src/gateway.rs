@@ -1800,8 +1800,8 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/stop",
-        arg_hint: Some("<id>"),
-        help: "остановить (удалить) сессию по id",
+        arg_hint: Some("<id>|all|project"),
+        help: "остановить сессию по id или все доступные сессии",
         in_menu: true,
     },
     GatewayCommandSpec {
@@ -3713,24 +3713,79 @@ impl Gateway {
                 self.use_session(chat, id).await.map(Some)
             }
             "/stop" => {
-                // v0.8.10 — stop (destroy) a session BY ID. Completes the session
-                // lifecycle: /new (create) · /clear (recycle) · /use (switch) ·
-                // /stop (destroy). Uses the SAME `stop_session` the web API's
-                // `POST /sessions/{sid}/stop` calls, so the verb is unified across
-                // IM and web. A session id is REQUIRED — a bare `/stop` is rejected
-                // because silently destroying the current session is too easy to
-                // fat-finger. `stop_session` aborts the pump, closes the vendor
-                // thread, drops the record, and clears any `current_session` route
-                // pointing at it (so stopping the current session leaves the next
-                // message to spawn a fresh default).
-                let sid = parts
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Для /stop нужен id сессии: /stop <sid> (без id команда небезопасна)"
-                        )
-                    })?
-                    .to_string();
+                // v0.8.10 — stop one session by id, or serially stop every
+                // session visible to this chat for the requested bulk scope.
+                let target = parts.next().ok_or_else(|| {
+                    anyhow!("Для /stop нужен id, all или project: /stop <sid>|all|project")
+                })?;
+                if matches!(target, "all" | "project") {
+                    let project = if target == "project" {
+                        let Some(project) = self.current_project_for(chat) else {
+                            return Ok(Some(
+                                "Для /stop project не выбран текущий проект: сначала используйте /cd <project>"
+                                    .to_string(),
+                            ));
+                        };
+                        Some(project)
+                    } else {
+                        None
+                    };
+                    let mut candidates: BTreeSet<String> = self.sessions.keys().cloned().collect();
+                    candidates.extend(self.detached.keys().cloned());
+                    let mut sids = BTreeSet::new();
+                    for sid in candidates {
+                        let accessible = self
+                            .sessions
+                            .get(&sid)
+                            .map(|session| self.chat_can_access(chat, session))
+                            .unwrap_or_else(|| {
+                                self.is_session_detached(&sid)
+                                    && self.chat_can_access_sid(chat, &sid)
+                            });
+                        if !accessible {
+                            continue;
+                        }
+                        let session_project = self
+                            .sessions
+                            .get(&sid)
+                            .map(|session| session.project.as_str())
+                            .or_else(|| self.detached.get(&sid).map(|body| body.slug.as_str()));
+                        if let Some(project) = project.as_deref() {
+                            if session_project != Some(project) {
+                                continue;
+                            }
+                        }
+                        sids.insert(sid);
+                    }
+                    if sids.is_empty() {
+                        return Ok(Some("Нет доступных сессий для остановки".to_string()));
+                    }
+                    let mut stopped = Vec::new();
+                    let mut failures = Vec::new();
+                    for sid in sids {
+                        match self.stop_session(&sid).await {
+                            Ok(()) => stopped.push(sid),
+                            Err(error) => failures.push(format!("{sid} ({error})")),
+                        }
+                    }
+                    let mut lines = Vec::new();
+                    if !stopped.is_empty() {
+                        lines.push(format!(
+                            "Остановлено сессий: {} ({})",
+                            stopped.len(),
+                            stopped.join(", ")
+                        ));
+                    }
+                    if !failures.is_empty() {
+                        lines.push(format!(
+                            "Ошибок остановки: {} ({})",
+                            failures.len(),
+                            failures.join(", ")
+                        ));
+                    }
+                    return Ok(Some(lines.join("\n")));
+                }
+                let sid = target.to_string();
                 // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own session.
                 // A detached body (alive from before a restart) is stoppable
                 // through the same gate, resolved from its meta.json owner.
@@ -16631,6 +16686,118 @@ mod tests {
         gateway.stop_session("s1").await.unwrap();
         assert!(gateway.session_views().is_empty());
         assert!(gateway.stop_session("s1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_stops_only_visible_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string(), "chat-2".to_string()]);
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-2", "bob", "/new claude")
+            .await
+            .unwrap();
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/stop all")
+            .await
+            .unwrap();
+
+        assert!(reply[0].contains("Остановлено сессий: 1 (s1)"), "{reply:?}");
+        assert!(!gateway.sessions.contains_key("s1"));
+        assert!(gateway.sessions.contains_key("s2"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_project_stops_only_current_project_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
+        gateway.register_project("beta", tmp.path());
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/cd beta")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/cd alpha")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/cd beta")
+            .await
+            .unwrap();
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/stop project")
+            .await
+            .unwrap();
+
+        assert!(reply[0].contains("Остановлено сессий: 1 (s2)"), "{reply:?}");
+        assert!(gateway.sessions.contains_key("s1"));
+        assert!(!gateway.sessions.contains_key("s2"));
+        assert!(gateway.sessions.contains_key("s3"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_project_refuses_without_current_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.projects.clear();
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/stop project")
+            .await
+            .unwrap();
+
+        assert!(reply[0].contains("не выбран текущий проект"), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_reports_empty_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/stop all")
+            .await
+            .unwrap();
+
+        assert!(
+            reply[0].contains("Нет доступных сессий для остановки"),
+            "{reply:?}"
+        );
+    }
+
+    #[test]
+    fn gateway_stop_spec_advertises_bulk_scopes() {
+        let spec = GATEWAY_COMMANDS
+            .iter()
+            .find(|command| command.name == "/stop")
+            .expect("/stop must be registered in GATEWAY_COMMANDS");
+        assert_eq!(spec.arg_hint, Some("<id>|all|project"));
+        assert!(spec.help.contains("все доступные"), "{}", spec.help);
     }
 
     /// v0.8.23 review §1.3-D item 9 — `SessionView::waiting_approval` mirrors

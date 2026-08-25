@@ -279,7 +279,7 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 /use <id>                  Switch to session s<N>; stopped sessions cold-resume from disk.
 /role <role>               Change the current session role in place; handle stays the same.
 /interrupt [id]            Interrupt an in-flight turn; keep the session. Omit id for current.
-/stop <id>                 Destroy a session.
+/stop <id>|all|project     Destroy one session, all visible sessions, or the current project's sessions.
 
 # Inspect / onboard
 /sessions [all]            List sessions for current project; all = across projects.

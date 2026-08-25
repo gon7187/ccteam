@@ -270,7 +270,7 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 /use <id>                  切到会话 s<N>(已停止的会话会自动从磁盘冷恢复)
 /role <role>               把当前会话换成另一个角色(原地重启,句柄 s<N> 不变)
 /interrupt [id]            打断正在跑的回合,保留会话(省略 id = 当前)
-/stop <id>                 销毁一个会话
+/stop <id>|all|project     按 id 销毁会话，或销毁所有可见会话 / 当前项目会话
 
 # 查看 / 接入
 /sessions [all]            列当前项目的会话(带 vendor · role · model · 上下文用量);`all` = 跨所有项目
