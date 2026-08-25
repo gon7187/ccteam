@@ -295,8 +295,13 @@ impl ProgressFold {
     }
 
     /// Count a tool once (de-duped by `item.id`), bump its category, and
-    /// record a preview line. Returns whether state changed.
-    fn count_tool(&mut self, id: &str, cat: Category, raw_name: &str, preview: String) -> bool {
+    /// record a preview line. `content` is the tool-specific detail (args
+    /// preview / command / path); the category label is prefixed here so
+    /// every detail line reads `<emoji> <label>: <content>` instead of the
+    /// raw (often English) tool name. Unknown tools keep their raw name
+    /// after the fallback label so nothing is silently dropped. Returns
+    /// whether state changed.
+    fn count_tool(&mut self, id: &str, cat: Category, raw_name: &str, content: String) -> bool {
         if !self.seen_ids.insert(id.to_string()) {
             return false; // start/complete pair — already counted
         }
@@ -305,7 +310,12 @@ impl ProgressFold {
         if cat == CAT_EDIT {
             self.file_total += 1;
         }
-        self.push_recent(format!("{} {preview}", cat.emoji));
+        let label = if cat.label == "инструмент" {
+            format!("{} {raw_name}", cat.label)
+        } else {
+            cat.label.to_string()
+        };
+        self.push_recent(format!("{} {label}: {content}", cat.emoji));
         true
     }
 
@@ -318,8 +328,7 @@ impl ProgressFold {
             ThreadEvent::ItemStarted { item } | ThreadEvent::ItemCompleted { item } => {
                 match &item.details {
                     ThreadItemDetails::ToolCall { name, args } => {
-                        let preview = format!("{name}({})", preview_args(args));
-                        self.count_tool(&item.id, tool_category(name), name, preview)
+                        self.count_tool(&item.id, tool_category(name), name, preview_args(args))
                     }
                     ThreadItemDetails::CommandExecution { cmd, .. } => {
                         let preview = format!("$ {}", literal_preview(&truncate_for_preview(cmd)));
@@ -779,18 +788,51 @@ mod tests {
 
     #[test]
     fn activity_for_summary_matches_the_fold_preview() {
-        // THE no-drift guarantee: the activity summary reuses the SAME helpers
-        // the IM fold renders, so a tool's activity summary equals what the
-        // fold pushed into its `recent` detail line (minus the emoji prefix).
+        // THE no-drift guarantee: the activity summary and the fold's detail
+        // line both derive from the same `preview_args` helper, so the arg
+        // preview embedded in one is embedded in the other too (the fold
+        // additionally prefixes the localized category label).
         let ev = started_tool("t1", "Read", json!({"file_path": "/etc/hosts"}));
         let act = activity_for(&ev).expect("activity");
         let mut f = ProgressFold::new();
         f.apply(&ev);
         let detail = f.render("s42");
-        // The fold's detail line is `📖 Read(/etc/hosts)`; the activity summary
-        // is the same `Read(/etc/hosts)` payload (no emoji).
         assert_eq!(act.summary, "Read(/etc/hosts)");
-        assert!(detail.contains(&act.summary), "fold detail: {detail}");
+        assert!(
+            detail.contains("📖 чтение: /etc/hosts"),
+            "fold detail: {detail}"
+        );
+    }
+
+    #[test]
+    fn bash_tool_detail_line_uses_category_label_not_raw_name() {
+        let mut f = ProgressFold::new();
+        f.apply(&started_tool(
+            "t1",
+            "Bash",
+            json!({"command": "ls graphify-out/graph.json"}),
+        ));
+        let r = f.render("s42");
+        assert!(
+            r.contains("🔧 команда: ls graphify-out/graph.json"),
+            "got: {r}"
+        );
+        assert!(!r.contains("Bash("), "raw tool name leaked: {r}");
+    }
+
+    #[test]
+    fn unknown_tool_detail_line_keeps_raw_name_after_fallback_label() {
+        let mut f = ProgressFold::new();
+        f.apply(&started_tool(
+            "t1",
+            "ToolSearch",
+            json!({"query": "select:..."}),
+        ));
+        let r = f.render("s42");
+        assert!(
+            r.contains("🔧 инструмент ToolSearch: select:..."),
+            "got: {r}"
+        );
     }
 
     #[test]

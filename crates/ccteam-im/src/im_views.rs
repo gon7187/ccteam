@@ -152,7 +152,7 @@ pub fn render_status(view: &StatusView) -> RichReply {
         markdown_details,
     );
     let plain = format!(
-        "🧭 {} · {} · {}\n{} · {} · {} · ctx {}\n📁 {}\n🖥 host: {}\n{}",
+        "🧭 **{}** · {} · {}\n{} · {} · {} · ctx {}\n📁 {}\n🖥 host: {}\n{}",
         view.sid,
         view.project,
         view.vendor,
@@ -217,7 +217,7 @@ pub fn render_sessions(view: &SessionsView) -> RichReply {
         escape_code(&view.project)
     );
     let mut plain = format!(
-        "Сессии · {}\nsid | vendor.model | статус | ctx",
+        "**Сессии** · {}\nsid | vendor.model | статус | ctx",
         view.project
     );
     for session in &shown {
@@ -292,7 +292,7 @@ pub fn render_sessions(view: &SessionsView) -> RichReply {
 /// Render the compact project table and project-switch buttons.
 pub fn render_projects(view: &ProjectsView) -> RichReply {
     let mut markdown = String::from("**Проекты**\n\n| slug | путь | сессий |\n| --- | --- | --- |");
-    let mut plain = String::from("Проекты\nslug | путь | сессий");
+    let mut plain = String::from("**Проекты**\nslug | путь | сессий");
     let mut buttons = Vec::new();
     for project in &view.projects {
         markdown.push_str(&format!(
@@ -302,7 +302,7 @@ pub fn render_projects(view: &ProjectsView) -> RichReply {
             project.sessions
         ));
         plain.push_str(&format!(
-            "\n{} | {} | {}",
+            "\n**{}** | {} | {}",
             project.slug, project.path, project.sessions
         ));
         let label = if project.current {
@@ -335,7 +335,7 @@ pub fn render_help(commands: &[CommandView]) -> RichReply {
         ("Прочее", &["/mcp", "/inbox", "/help"]),
     ];
     let mut markdown = String::from("**Команды шлюза**");
-    let mut plain = String::from("Команды шлюза");
+    let mut plain = String::from("**Команды шлюза**");
     for (title, names) in GROUPS {
         let group = commands
             .iter()
@@ -345,7 +345,7 @@ pub fn render_help(commands: &[CommandView]) -> RichReply {
             continue;
         }
         markdown.push_str(&format!("\n\n**{title}**"));
-        plain.push_str(&format!("\n\n{title}"));
+        plain.push_str(&format!("\n\n**{title}**"));
         for command in group {
             let usage = command_usage(command);
             markdown.push_str(&format!(
@@ -402,9 +402,16 @@ fn plain_session_row(session: &SessionRow) -> String {
 }
 
 fn plain_session_line(session: &SessionRow) -> String {
+    // Bold only the bare sid, not the tree-indent prefix, so a nested row's
+    // sid still appears as a plain `**s2**` substring after `└─ `.
+    let prefix = if session.tree_depth == 0 {
+        String::new()
+    } else {
+        format!("{}└─ ", "   ".repeat(session.tree_depth - 1))
+    };
     format!(
-        "{} | {} | {} | {}",
-        session_display_sid(session),
+        "{prefix}**{}** | {} | {} | {}",
+        session.sid,
         session_vendor_model(session),
         session.status,
         session.context
@@ -513,7 +520,10 @@ mod tests {
             reply.markdown,
             "🧭 **s42** · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 `/root/projects/ccteam`\n🖥 host: local\n<blockquote expandable>Запущено: ожидает\nРоль: reviewer\nresume 123e4567-e89b-12d3-a456-426614174000\n🤖 Выполняется: workflow (1)\n⚡ Использование: 5h 17% (→19:00)\n👥 Прямые дочерние сессии: s56 · codex · gpt-5.6-terra · 🟡 работает · title\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\nРасход проекта 24ч: $1.23</blockquote>"
         );
-        assert_eq!(reply.plain.lines().next(), Some("🧭 s42 · ccteam · claude"));
+        assert_eq!(
+            reply.plain.lines().next(),
+            Some("🧭 **s42** · ccteam · claude")
+        );
         assert_eq!(reply.button_rows[1][0].data, "cmd:?/new");
         assert_eq!(reply.button_rows[1][1].data, "cmd:?/stop s42");
         assert_eq!(reply.button_rows[2][0].label, "⛔ s56");
@@ -568,7 +578,7 @@ mod tests {
         assert!(reply.markdown.contains("<blockquote expandable>"));
         assert!(reply
             .markdown
-            .contains("s11 | claude.opus | 🟢 ожидание | 38%"));
+            .contains("**s11** | claude.opus | 🟢 ожидание | 38%"));
         assert!(reply.markdown.contains("| `└─ s2` | claude.opus @edge |"));
         assert!(reply.markdown.contains("pid 4242"));
         assert!(reply
@@ -584,6 +594,43 @@ mod tests {
             .iter()
             .flatten()
             .all(|button| button.data.len() <= 64));
+    }
+
+    /// TG-FMT-1 — `.plain` is what actually reaches Telegram on the classic
+    /// HTML fallback path (`text_payload` → `telegram_html::render_markdown`),
+    /// so the bold `**sid**` markers must survive round-tripping through it,
+    /// and any HTML-special characters that ride along in another cell must
+    /// come out escaped rather than corrupting the surrounding `<b>` tag.
+    #[test]
+    fn sessions_plain_bold_sid_survives_html_special_chars_in_other_cells() {
+        let sessions = vec![SessionRow {
+            sid: "s1".into(),
+            vendor_model: "claude.<script>&\"".into(),
+            status: "🟢 ожидание".into(),
+            context: "38%".into(),
+            title: None,
+            current: false,
+            tree_depth: 0,
+            host: None,
+        }];
+        let reply = render_sessions(&SessionsView {
+            project: "ccteam".into(),
+            sessions,
+            elsewhere: 0,
+            detached: Vec::new(),
+        });
+        assert!(
+            reply.plain.contains("**s1** | claude.<script>&\""),
+            "got: {}",
+            reply.plain
+        );
+        let html = crate::telegram_html::render_markdown(&reply.plain).html;
+        assert!(html.contains("<b>s1</b>"), "got: {html}");
+        assert!(
+            html.contains("claude.&lt;script&gt;&amp;\""),
+            "special chars must be escaped, not left raw: {html}"
+        );
+        assert!(!html.contains("<script>"), "unescaped tag leaked: {html}");
     }
 
     #[test]
@@ -604,7 +651,7 @@ mod tests {
         assert_eq!(reply.button_rows[0][0].label, "✓ ccteam");
         assert_eq!(
             reply.plain,
-            "Проекты\nslug | путь | сессий\nccteam | /root/projects/ccteam | 2"
+            "**Проекты**\nslug | путь | сессий\n**ccteam** | /root/projects/ccteam | 2"
         );
     }
 

@@ -20051,7 +20051,7 @@ mod tests {
         );
         let sessions = gateway.render_sessions(&tenant, true).await.plain;
         assert!(
-            sessions.contains(&format!("{child} | claude.— | 🟢 ожидание | —")),
+            sessions.contains(&format!("**{child}** | claude.— | 🟢 ожидание | —")),
             "the tenant's session list must include its delegated child: {sessions}"
         );
     }
@@ -21811,7 +21811,7 @@ mod tests {
             .await
             .unwrap();
         assert!(mock[0].contains("slug | путь | сессий"));
-        assert!(mock[0].contains("alpha |"));
+        assert!(mock[0].contains("**alpha** |"));
     }
 
     /// `/sessions` has `cmd:/use` buttons in its rich reply and a table fallback.
@@ -21850,7 +21850,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mock.len(), 1);
-        assert!(mock[0].contains("s2 | claude.—"), "{}", mock[0]);
+        assert!(mock[0].contains("**s2** | claude.—"), "{}", mock[0]);
     }
 
     /// Session buttons carry the `cmd:/use <sid>` callback and the focused
@@ -21918,7 +21918,7 @@ mod tests {
             .await
             .unwrap();
         assert!(listing[0].contains("sid | vendor.model | статус | ctx"));
-        assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | —"));
+        assert!(listing[0].contains("**s1** | claude.— | 🟢 ожидание | —"));
     }
 
     /// Session buttons retain Telegram's eight-button row bound.
@@ -22604,7 +22604,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bare.len(), 1);
-        assert!(bare[0].contains("s1 | claude.— | 🟢 ожидание | —"));
+        assert!(bare[0].contains("**s1** | claude.— | 🟢 ожидание | —"));
 
         // Now report a model + effort + usage → suffix appears with the
         // TOTAL window (absolute, via `format_tokens`) + percent — no project
@@ -22625,7 +22625,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(with_status.len(), 1);
-        assert!(with_status[0].contains("s1 | claude.opus-4-8[1m] | 🟢 ожидание | 19%"));
+        assert!(with_status[0].contains("**s1** | claude.opus-4-8[1m] | 🟢 ожидание | 19%"));
 
         // A non-[1m] model, no effort, renders against the 200k baseline.
         fake.set_status(ThreadStatus {
@@ -22644,7 +22644,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(baseline.len(), 1);
-        assert!(baseline[0].contains("s1 | claude.sonnet-4-5 | 🟢 ожидание | 94%"));
+        assert!(baseline[0].contains("**s1** | claude.sonnet-4-5 | 🟢 ожидание | 94%"));
     }
 
     /// Every vendor's IM row carries its lowercase vendor right after the sid
@@ -22705,8 +22705,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(before.len(), 1);
-        let s2 = before[0].find("s2 | claude.—").unwrap();
-        let s1 = before[0].find("s1 | claude.—").unwrap();
+        let s2 = before[0].find("**s2** | claude.—").unwrap();
+        let s1 = before[0].find("**s1** | claude.—").unwrap();
         assert!(s2 < s1, "newer s2 remains first: {}", before[0]);
 
         // Tag s1 (the OLDER session) with an outstanding approval.
@@ -22725,8 +22725,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after.len(), 1);
-        let s1 = after[0].find("s1 | claude.— | ⏳ ожидание | —").unwrap();
-        let s2 = after[0].find("s2 | claude.—").unwrap();
+        let s1 = after[0]
+            .find("**s1** | claude.— | ⏳ ожидание | —")
+            .unwrap();
+        let s2 = after[0].find("**s2** | claude.—").unwrap();
         assert!(s1 < s2, "s1 pinned to the top: {}", after[0]);
     }
 
@@ -22809,8 +22811,9 @@ mod tests {
         assert_eq!(idle.len(), 1, "one message: {idle:?}");
         // /status remains the CURRENT session's card, not the fleet table.
         assert!(
-            idle[0]
-                .contains("🧭 s1 · alpha · claude\n🟢 ожидание · claude-opus-4-8 · max · ctx 41%"),
+            idle[0].contains(
+                "🧭 **s1** · alpha · claude\n🟢 ожидание · claude-opus-4-8 · max · ctx 41%"
+            ),
             "current-session header: {idle:?}"
         );
 
@@ -23064,7 +23067,7 @@ mod tests {
             .unwrap();
         assert!(
             out[0].contains(&format!(
-                "🧭 s1 · alpha · claude\n🟢 ожидание · — · — · ctx —\n📁 {}\n🖥 host: local",
+                "🧭 **s1** · alpha · claude\n🟢 ожидание · — · — · ctx —\n📁 {}\n🖥 host: local",
                 proj.path().display()
             )),
             "status card header changed: {out:?}"
@@ -23127,7 +23130,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
+            out[0].contains("🧭 **s1** · alpha · claude\n🟢 ожидание"),
             "roleless session remains a usable status card: {out:?}"
         );
         assert!(
@@ -23153,7 +23156,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].starts_with("🧭 s1 · alpha · claude\n"),
+            out[0].starts_with("🧭 **s1** · alpha · claude\n"),
             "leads with the you-are-here header before the existing body: {out:?}"
         );
     }
@@ -23310,7 +23313,7 @@ mod tests {
             .unwrap();
         assert_eq!(owner.len(), 1);
         assert!(
-            owner[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
+            owner[0].contains("🧭 **s1** · alpha · claude\n🟢 ожидание"),
             "got: {owner:?}"
         );
     }
@@ -23336,7 +23339,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
+            out[0].contains("🧭 **s1** · alpha · claude\n🟢 ожидание"),
             "got: {out:?}"
         );
         assert!(out[0].contains(uuid), "resume UUID missing from: {out:?}");
@@ -24193,7 +24196,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owner_sees.len(), 1);
-        assert!(owner_sees[0].contains("s1 | claude.—"));
+        assert!(owner_sees[0].contains("**s1** | claude.—"));
         let owner_uses = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
@@ -24240,7 +24243,7 @@ mod tests {
         )
         .await;
         assert_eq!(seen.len(), 1);
-        assert!(seen[0].contains("s1 | claude.—"));
+        assert!(seen[0].contains("**s1** | claude.—"));
         let used = gateway
             .handle_text("telegram", "339498819", "rob", "/use s1")
             .await
@@ -24498,8 +24501,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(projects.len(), 1);
-        assert!(projects[0].contains("alpha | "));
-        assert!(projects[0].contains("beta | "));
+        assert!(projects[0].contains("**alpha** | "));
+        assert!(projects[0].contains("**beta** | "));
 
         let cd = gateway
             .handle_text("mock", "chat-1", "alice", "/cd beta")
@@ -24525,8 +24528,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sessions.len(), 1);
-        assert!(sessions[0].contains("s2 | claude.—"));
-        assert!(sessions[0].contains("s1 | codex.—"));
+        assert!(sessions[0].contains("**s2** | claude.—"));
+        assert!(sessions[0].contains("**s1** | codex.—"));
 
         let use_first = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
@@ -24605,10 +24608,10 @@ mod tests {
             .unwrap();
         assert_eq!(sessions.len(), 1);
         for row in [
-            "s4 | claude.—",
-            "s3 | codex.—",
-            "s2 | codex.—",
-            "s1 | claude.—",
+            "**s4** | claude.—",
+            "**s3** | codex.—",
+            "**s2** | codex.—",
+            "**s1** | claude.—",
         ] {
             assert!(sessions[0].contains(row), "missing {row}: {}", sessions[0]);
         }
@@ -24617,8 +24620,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(projects.len(), 1);
-        assert!(projects[0].contains("alpha | "));
-        assert!(projects[0].contains("beta | "));
+        assert!(projects[0].contains("**alpha** | "));
+        assert!(projects[0].contains("**beta** | "));
 
         let alpha_reply = gateway
             .handle_text("mock", "chat-1", "alice", "@reviewer alpha ping")
@@ -25084,8 +25087,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sessions.len(), 1);
-        assert!(sessions[0].contains("s2 | claude.—"));
-        assert!(sessions[0].contains("s1 | claude.—"));
+        assert!(sessions[0].contains("**s2** | claude.—"));
+        assert!(sessions[0].contains("**s1** | claude.—"));
 
         assert_eq!(
             restored
@@ -25157,7 +25160,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sessions.len(), 1);
-        assert!(sessions[0].contains("s1 | claude.—"));
+        assert!(sessions[0].contains("**s1** | claude.—"));
 
         assert_eq!(
             restored
@@ -25625,7 +25628,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(before.len(), 1);
-        assert!(before[0].contains("s1 | claude.—"));
+        assert!(before[0].contains("**s1** | claude.—"));
 
         // /cd to beta, where no session exists yet, clears the active session.
         let cd = gateway
@@ -25656,8 +25659,8 @@ mod tests {
         // sent a plain message, so it is untitled either way. s2 is
         // roleless → empty role field (`s2 claude.beta`).
         assert_eq!(after.len(), 1);
-        assert!(after[0].contains("s2 | claude.—"));
-        assert!(after[0].contains("s1 | claude.—"));
+        assert!(after[0].contains("**s2** | claude.—"));
+        assert!(after[0].contains("**s1** | claude.—"));
     }
 
     #[tokio::test]
@@ -25900,7 +25903,7 @@ mod tests {
         )
         .await;
         assert!(
-            owner_sees.iter().any(|r| r.contains("s1 | claude.—")),
+            owner_sees.iter().any(|r| r.contains("**s1** | claude.—")),
             "owner should see its own session: {owner_sees:?}"
         );
         let owner_uses = gateway
@@ -25960,7 +25963,8 @@ mod tests {
             listing[0]
                 .lines()
                 .filter(|line| {
-                    line.starts_with('s') && line.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
+                    let sid = line.strip_prefix("**").unwrap_or(line);
+                    sid.starts_with('s') && sid.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
                 })
                 .count(),
             3,
@@ -26032,7 +26036,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listing.len(), 1);
-        assert!(listing[0].contains("s1 | claude.—"));
+        assert!(listing[0].contains("**s1** | claude.—"));
 
         // `/use s1` still resolves the same (now-reviewer) session.
         let used = gateway
@@ -26103,7 +26107,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listing.len(), 1);
-        assert!(listing[0].contains("s1 | claude.—"));
+        assert!(listing[0].contains("**s1** | claude.—"));
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
             .handle_text("mock", "chat-1", "alice", "still here?")
@@ -26211,7 +26215,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | —"));
+        assert!(listing[0].contains("**s1** | claude.— | 🟢 ожидание | —"));
         let chat = ChatKey::new("mock", "chat-1", "alice");
         assert_eq!(
             gateway.render_sessions(&chat, false).await.button_rows[0][0].label,
@@ -26227,7 +26231,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert!(listing2[0].contains("s1 | claude.— |"));
+        assert!(listing2[0].contains("**s1** | claude.— |"));
         assert_eq!(
             gateway
                 .session_title(gateway.sessions.get("s1").unwrap())
@@ -27785,8 +27789,8 @@ mod tests {
             .plain;
         // A visible parent roots the child regardless of its newer recency;
         // the child keeps its compact row but gains a delegation indent.
-        let pline = format!("{parent} | claude.— | 🟢 ожидание | —");
-        let cline = format!("└─ {child} | claude.— | 🟢 ожидание | —");
+        let pline = format!("**{parent}** | claude.— | 🟢 ожидание | —");
+        let cline = format!("└─ **{child}** | claude.— | 🟢 ожидание | —");
         let pi = out
             .find(&pline)
             .unwrap_or_else(|| panic!("parent row: {out}"));
