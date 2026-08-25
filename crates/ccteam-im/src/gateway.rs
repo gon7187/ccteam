@@ -30,6 +30,7 @@ use ccteam_harness::{read_session_meta, write_session_meta};
 use futures::{future::join_all, StreamExt};
 use serde::{Deserialize, Serialize};
 
+use crate::im_callbacks;
 use crate::pending::InteractionOrigin;
 use crate::transport::{ChannelAttachment, ChoiceReply, MessageOption};
 use crate::BotRegistration;
@@ -3464,6 +3465,12 @@ impl Gateway {
             // resolved here, before the token-keyed choice path.
             if let Some(nav) = reply.data.strip_prefix("nav:") {
                 return self.resolve_nav_selection(&chat, nav).await;
+            }
+            // TG-GATE-V2 W3 — `cmd:`/`cmd:?`/`cmd:noop` inline buttons route
+            // through `handle_command`, not the token-keyed pending registry.
+            match im_callbacks::parse(&reply.data) {
+                im_callbacks::CallbackAction::Choice { .. } => {}
+                action => return self.resolve_cmd_callback(&chat, action).await,
             }
             return self.resolve_selection(&chat, &reply.data).await;
         }
@@ -8289,6 +8296,62 @@ impl Gateway {
                 .await);
         }
         self.apply_pending(chat, p, selection).await
+    }
+
+    /// Route a `cmd:` inline-button tap (TG-GATE-V2 W3): `Command` runs the
+    /// named command exactly as if typed, `Confirm` renders a Russian
+    /// yes/no prompt, `Noop` cancels one. Never called with
+    /// [`im_callbacks::CallbackAction::Choice`] — the caller
+    /// (`handle_message`) filters that arm to the existing token-keyed
+    /// [`Self::resolve_selection`] path instead.
+    ///
+    /// **Identity check.** `cmd:` payloads are self-describing and carry no
+    /// pending-registry token (unlike `resolve_selection`'s `{token}:{idx}`,
+    /// there is nothing stored at render time to look a tapper up against);
+    /// a rendered command can bake in concrete args (e.g. `cmd:/stop s42`),
+    /// so any principal able to tap the button can act on the args as
+    /// written. The one fact available here is `chat` itself, which
+    /// `handle_message` builds straight from the inbound tap's own
+    /// `(channel, chat_id, user_id)`. For Telegram, `chat_id == user_id`
+    /// holds exactly when the tap landed in the bot's own private chat with
+    /// that user (Telegram gives a private chat's `chat.id` the member's own
+    /// `user.id`); a group chat's shared `chat_id` never equals any single
+    /// member's `user_id`. Requiring equality here is what the brief calls
+    /// "tapper's user == message's chat user": it keeps privileged `cmd:`
+    /// taps to the person the bot is DMing and out of any chat the button
+    /// might otherwise be visible in. A mismatch answers nothing (the
+    /// transport already ack'd the callback) and returns no reply.
+    async fn resolve_cmd_callback(
+        &mut self,
+        chat: &ChatKey,
+        action: im_callbacks::CallbackAction,
+    ) -> Result<Vec<String>> {
+        if chat.chat_id != chat.user_id {
+            return Ok(Vec::new());
+        }
+        match action {
+            im_callbacks::CallbackAction::Choice { .. } => Ok(Vec::new()),
+            im_callbacks::CallbackAction::Noop => Ok(vec!["Отменено".to_string()]),
+            im_callbacks::CallbackAction::Confirm(cmd) => {
+                // TG-GATE-V2: switch to `SendMessage::button_rows` once W1's
+                // transport contract lands — for now the two confirmation
+                // buttons ride the existing `options` (one per row) via
+                // `emit_list_options`, same as the project/session pickers.
+                let options = confirm_cmd_options(&cmd);
+                self.emit_list_options(chat, confirm_prompt_text(&cmd), options);
+                Ok(Vec::new())
+            }
+            im_callbacks::CallbackAction::Command(cmd) => {
+                let first = cmd.split_whitespace().next().unwrap_or_default();
+                if !Self::is_gateway_command(first) {
+                    return Ok(vec!["Неизвестная команда".to_string()]);
+                }
+                match self.handle_command(chat, &cmd).await? {
+                    Some(reply) => Ok(vec![reply]),
+                    None => Ok(vec!["Неизвестная команда".to_string()]),
+                }
+            }
+        }
     }
 
     /// Ask about a session's ccteam tool face the FIRST time it is activated
@@ -14338,6 +14401,34 @@ fn pending_key(chat: &ChatKey, session_id: &str) -> String {
 /// button whose payload would exceed it; slugs/sids are short, so this only
 /// guards a pathological slug and never the common case.
 const TELEGRAM_CALLBACK_MAX: usize = 64;
+
+/// Russian confirmation text for a `cmd:?<cmd>` inline-button tap (TG-GATE-V2
+/// W3 — see `im_callbacks` namespace doc).
+fn confirm_prompt_text(cmd: &str) -> String {
+    format!("Точно выполнить `{cmd}`?")
+}
+
+/// `[✅ Да][❌ Отмена]` buttons for a `cmd:?<cmd>` confirmation (TG-GATE-V2
+/// W3): "Да" re-taps as the bare `cmd:<cmd>` (runs it), "Отмена" taps
+/// `cmd:noop`. Dropped (like the nav pickers) if a pathologically long `cmd`
+/// would blow Telegram's `callback_data` cap.
+fn confirm_cmd_options(cmd: &str) -> Vec<MessageOption> {
+    vec![
+        MessageOption {
+            data: format!("cmd:{cmd}"),
+            label: "✅ Да".to_string(),
+            id: "yes".to_string(),
+        },
+        MessageOption {
+            data: "cmd:noop".to_string(),
+            label: "❌ Отмена".to_string(),
+            id: "no".to_string(),
+        },
+    ]
+    .into_iter()
+    .filter(|o: &MessageOption| o.data.len() <= TELEGRAM_CALLBACK_MAX)
+    .collect()
+}
 
 /// Max display columns a session title may occupy inside a `/sessions` switch
 /// button label. A longer title is clipped with `…` so one verbose title can't
@@ -21659,6 +21750,184 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replies, vec!["Некорректный выбор"]);
+    }
+
+    /// A `cmd:<command>` tap in the bot's own private chat (`chat_id ==
+    /// user_id` — see [`Gateway::resolve_cmd_callback`]'s identity-check
+    /// doc) runs the command exactly like typed text: `cmd:/status` reaches
+    /// `handle_command`'s `/status` arm, same reply as typing `/status`.
+    #[tokio::test]
+    async fn cmd_callback_routes_to_handle_command() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+
+        let typed = gateway
+            .handle_text("telegram", "42", "42", "/status")
+            .await
+            .unwrap();
+        let via_button = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(via_button, typed);
+    }
+
+    /// `cmd:?<command>` renders a Russian confirmation with `[✅ Да][❌
+    /// Отмена]` buttons — no direct text reply (the prompt is delivered as
+    /// a picker event, matching the project/session pickers), "Да" re-taps
+    /// as the bare `cmd:<command>`, "Отмена" taps `cmd:noop`.
+    #[tokio::test]
+    async fn cmd_confirm_callback_renders_yes_no_buttons() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/stop s1".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "confirmation rides the picker event, not a direct reply"
+        );
+
+        let event = events.try_recv().expect("confirmation picker event");
+        assert_eq!(event.content, "Точно выполнить `/stop s1`?");
+        assert_eq!(
+            event.options,
+            vec![
+                MessageOption {
+                    data: "cmd:/stop s1".to_string(),
+                    label: "✅ Да".to_string(),
+                    id: "yes".to_string(),
+                },
+                MessageOption {
+                    data: "cmd:noop".to_string(),
+                    label: "❌ Отмена".to_string(),
+                    id: "no".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// `cmd:noop` (the confirmation's "Отмена" button) just says so.
+    #[tokio::test]
+    async fn cmd_noop_callback_cancels() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:noop".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies, vec!["Отменено"]);
+    }
+
+    /// A `cmd:` command that isn't one of `GATEWAY_COMMANDS` (typo, or a
+    /// stale button from an older build) reports unknown rather than
+    /// silently falling through as agent turn text.
+    #[tokio::test]
+    async fn cmd_callback_unknown_command_reports_unknown() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/bogus-command".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies, vec!["Неизвестная команда"]);
+    }
+
+    /// A `cmd:` tap from a DIFFERENT user than the chat it landed in
+    /// (`chat_id != user_id` — a group chat, per
+    /// [`Gateway::resolve_cmd_callback`]'s identity-check doc) is ignored
+    /// silently: no reply, no command run, no confirmation rendered.
+    #[tokio::test]
+    async fn cmd_callback_wrong_user_is_ignored() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "group-9",
+                "intruder",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+
+        let confirm_replies = gateway
+            .handle_message(
+                "telegram",
+                "group-9",
+                "intruder",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/stop s1".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(confirm_replies.is_empty());
+        assert!(
+            events.try_recv().is_err(),
+            "wrong-user cmd:? must not render a confirmation picker"
+        );
     }
 
     /// `strip_vendor_prefix` drops a leading `{vendor}` + separator from a
