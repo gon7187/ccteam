@@ -3615,13 +3615,17 @@ impl Gateway {
         if Self::is_gateway_command(text) {
             return Ok(Vec::new());
         }
-        if Self::channel_supports_buttons(channel) && !text.trim_start().starts_with('/') {
+        if Self::channel_supports_buttons(channel)
+            && attachments.is_empty()
+            && !text.trim_start().starts_with('/')
+        {
             if let Some(template) = self.quick_template_for_text(text) {
+                let preview = quick_template_preview(&template.prefix);
                 self.pending_prefix.insert(chat.clone(), template.prefix);
                 self.persist_routing()?;
                 return Ok(vec![RichReply::plain(format!(
-                    "Template {} armed — send the task",
-                    template.label
+                    "Template {} armed — send the task\n{preview}",
+                    template.label,
                 ))]);
             }
         }
@@ -3634,6 +3638,8 @@ impl Gateway {
                 if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![RichReply::plain(format!("Выбран @{handle}"))]);
                 }
+                let payload =
+                    self.consume_quick_template_prefix(channel, &chat, &payload, attachments)?;
                 let turn =
                     wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
                 return self
@@ -3650,6 +3656,8 @@ impl Gateway {
                 if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![RichReply::plain(format!("Выбран @{handle}"))]);
                 }
+                let payload =
+                    self.consume_quick_template_prefix(channel, &chat, &payload, attachments)?;
                 let turn =
                     wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
                 return self
@@ -3688,18 +3696,7 @@ impl Gateway {
                 }
             }
         }
-        let payload = if text.trim_start().starts_with('/') {
-            text.to_string()
-        } else if Self::channel_supports_buttons(channel) && attachments.is_empty() {
-            if let Some(prefix) = self.pending_prefix.remove(&chat) {
-                self.persist_routing()?;
-                format!("{prefix} {text}")
-            } else {
-                text.to_string()
-            }
-        } else {
-            text.to_string()
-        };
+        let payload = self.consume_quick_template_prefix(channel, &chat, text, attachments)?;
         let turn = wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
         let mut replies = self.submit_to_current(&chat, message_id, turn).await?;
         if chat.channel != "web" && text.split_whitespace().next() == Some("/model") {
@@ -3741,12 +3738,13 @@ impl Gateway {
         user_id: &str,
         text: &str,
         has_selection: bool,
+        has_attachments: bool,
     ) -> bool {
         if has_selection {
             return false;
         }
         let chat = ChatKey::new(channel, chat_id, user_id);
-        if self.is_quick_template_interaction(&chat, text) {
+        if self.is_quick_template_interaction(&chat, text, !has_attachments) {
             return false;
         }
         if self.has_current_session(channel, chat_id, user_id) {
@@ -3801,7 +3799,7 @@ impl Gateway {
             && crate::router::parse_first_mention(text).is_none();
         let candidate = if candidate_shape {
             let g = crate::latency::gateway_lock(&gateway, "im.turn.candidate").await;
-            !g.is_quick_template_interaction(&chat, text)
+            !g.is_quick_template_interaction(&chat, text, attachments.is_empty())
                 && !g.has_current_session(channel, chat_id, user_id)
         } else {
             false
@@ -4200,61 +4198,78 @@ impl Gateway {
                     Ok(Some(self.render_quick_templates()))
                 }
             }
-            "/help" => {
-                let telegram = Self::channel_supports_buttons(&chat.channel);
-                let reply = render_help(telegram);
-                Ok(Some(if telegram {
-                    reply.with_reply_keyboard(self.quick_template_keyboard())
-                } else {
-                    reply
-                }))
-            }
+            "/help" => Ok(Some(render_help())),
             _ => Ok(None),
         }
     }
 
+    fn with_quick_templates<T>(&self, f: impl FnOnce(&[QuickTemplate]) -> T) -> T {
+        if let Some(config) = self.config.as_ref() {
+            if let Ok(config) = config.get() {
+                return f(&config.im.quick_templates);
+            }
+        }
+        let defaults = CcteamConfig::default();
+        f(&defaults.im.quick_templates)
+    }
+
     fn quick_templates(&self) -> Vec<QuickTemplate> {
-        self.config
-            .as_ref()
-            .and_then(|config| config.get().ok())
-            .map(|config| config.im.quick_templates.clone())
-            .unwrap_or_else(|| CcteamConfig::default().im.quick_templates)
-            .into_iter()
-            .map(|mut template| {
-                template.label = template.label.trim().to_string();
-                template
-            })
-            .collect()
+        self.with_quick_templates(|templates| {
+            templates
+                .iter()
+                .map(|template| QuickTemplate {
+                    label: template.label.trim().to_string(),
+                    prefix: template.prefix.clone(),
+                })
+                .collect()
+        })
+    }
+
+    fn quick_template_matches(&self, text: &str) -> bool {
+        let text = text.trim();
+        self.with_quick_templates(|templates| {
+            templates
+                .iter()
+                .any(|template| template.label.trim() == text)
+        })
     }
 
     fn quick_template_for_text(&self, text: &str) -> Option<QuickTemplate> {
         let text = text.trim();
-        self.quick_templates()
-            .into_iter()
-            .find(|template| template.label == text)
+        self.with_quick_templates(|templates| {
+            templates
+                .iter()
+                .find(|template| template.label.trim() == text)
+                .map(|template| QuickTemplate {
+                    label: template.label.trim().to_string(),
+                    prefix: template.prefix.clone(),
+                })
+        })
     }
 
-    fn is_quick_template_interaction(&self, chat: &ChatKey, text: &str) -> bool {
-        Self::channel_supports_buttons(&chat.channel)
+    fn is_quick_template_interaction(
+        &self,
+        chat: &ChatKey,
+        text: &str,
+        attachments_empty: bool,
+    ) -> bool {
+        attachments_empty
+            && Self::channel_supports_buttons(&chat.channel)
             && !text.trim_start().starts_with('/')
-            && (self.pending_prefix.contains_key(chat)
-                || self.quick_template_for_text(text).is_some())
-    }
-
-    fn quick_template_keyboard(&self) -> ReplyKeyboard {
-        ReplyKeyboard::Buttons(
-            self.quick_templates()
-                .into_iter()
-                .map(|template| vec![template.label])
-                .collect(),
-        )
+            && self.quick_template_matches(text)
     }
 
     fn render_quick_templates(&self) -> RichReply {
         let templates = self.quick_templates();
         let list = templates
             .iter()
-            .map(|template| format!("• {}", template.label))
+            .map(|template| {
+                format!(
+                    "• {}\n  {}",
+                    template.label,
+                    quick_template_preview(&template.prefix)
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         RichReply::plain(format!("Quick templates:\n{list}")).with_reply_keyboard(
@@ -4265,6 +4280,26 @@ impl Gateway {
                     .collect(),
             ),
         )
+    }
+
+    fn consume_quick_template_prefix(
+        &mut self,
+        channel: &str,
+        chat: &ChatKey,
+        text: &str,
+        attachments: &[ChannelAttachment],
+    ) -> Result<String> {
+        if !Self::channel_supports_buttons(channel)
+            || !attachments.is_empty()
+            || text.trim_start().starts_with('/')
+        {
+            return Ok(text.to_string());
+        }
+        let Some(prefix) = self.pending_prefix.remove(chat) else {
+            return Ok(text.to_string());
+        };
+        self.persist_routing()?;
+        Ok(format!("{prefix} {text}"))
     }
 
     fn handle_inbox_command(&mut self, chat: &ChatKey, trimmed: &str) -> Result<String> {
@@ -14849,10 +14884,9 @@ fn render_choice_text(prompt: &ChoicePrompt) -> String {
 }
 
 /// Render the `/help` body from [`GATEWAY_COMMANDS`].
-fn render_help(include_quick_templates: bool) -> RichReply {
+fn render_help() -> RichReply {
     let commands = GATEWAY_COMMANDS
         .iter()
-        .filter(|command| include_quick_templates || command.name != "/keys")
         .map(|command| CommandView {
             name: command.name.to_string(),
             arg_hint: command.arg_hint.map(str::to_string),
@@ -14860,6 +14894,18 @@ fn render_help(include_quick_templates: bool) -> RichReply {
         })
         .collect::<Vec<_>>();
     im_views::render_help(&commands)
+}
+
+fn quick_template_preview(prefix: &str) -> String {
+    const PREVIEW_CHARS: usize = 80;
+    let first_line = prefix.lines().next().unwrap_or_default().trim();
+    let mut chars = first_line.chars();
+    let preview = chars.by_ref().take(PREVIEW_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 fn plain_replies(replies: Vec<String>) -> Vec<RichReply> {
@@ -15276,7 +15322,7 @@ mod tests {
             .iter()
             .any(|english| spec.description.contains(english))
         }));
-        assert!(render_help(true).plain.contains("Команды шлюза"));
+        assert!(render_help().plain.contains("Команды шлюза"));
     }
 
     #[test]
@@ -15362,7 +15408,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             armed,
-            vec![format!("Template {} armed — send the task", template.label)]
+            vec![format!(
+                "Template {} armed — send the task\nCheck status for the vendors available on this project first, then plan and deco…",
+                template.label
+            )]
         );
         assert!(fake.submissions.lock().await.is_empty());
         let routing: serde_json::Value = serde_json::from_slice(
@@ -15396,7 +15445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quick_template_fresh_chat_bypasses_shared_spawn_and_prefixes_next_message() {
+    async fn quick_template_fresh_chat_arms_inline_then_consumes_in_shared_spawn() {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let gateway = Arc::new(tokio::sync::Mutex::new(Gateway::new(
@@ -15412,6 +15461,7 @@ mod tests {
                 "chat-1",
                 "alice",
                 &template.label,
+                false,
                 false,
             ),
             "a template tap must arm synchronously instead of entering the background spawn path"
@@ -15431,11 +15481,24 @@ mod tests {
         assert_eq!(
             armed,
             vec![RichReply::plain(format!(
-                "Template {} armed — send the task",
-                template.label
+                "Template {} armed — send the task\n{}",
+                template.label,
+                quick_template_preview(&template.prefix),
             ))]
         );
         assert_eq!(fake.starts.load(Ordering::SeqCst), 0);
+
+        assert!(
+            gateway.lock().await.inbound_may_spawn(
+                "telegram",
+                "chat-1",
+                "alice",
+                "repair the test",
+                false,
+                false,
+            ),
+            "the consuming message must use the shared spawn path"
+        );
 
         Gateway::handle_message_shared(
             gateway,
@@ -15453,6 +15516,7 @@ mod tests {
             fake.submissions.lock().await[0].1,
             format!("{} repair the test", template.prefix)
         );
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -15499,7 +15563,7 @@ mod tests {
             .handle_message_rich("lark", "chat-1", "alice", "lark-3", "/help", &[], None)
             .await
             .unwrap();
-        assert!(!help[0].plain.contains("/keys"));
+        assert!(help[0].plain.contains("/keys"));
         assert_eq!(help[0].reply_keyboard, None);
     }
 
@@ -15509,6 +15573,15 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
         let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let template = CcteamConfig::default().im.quick_templates.remove(0);
+        assert!(gateway.inbound_may_spawn(
+            "telegram",
+            "chat-1",
+            "alice",
+            &template.label,
+            false,
+            true,
+        ));
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -15524,8 +15597,6 @@ mod tests {
             .write()
             .unwrap()
             .insert(chat.clone(), sid);
-        let template = CcteamConfig::default().im.quick_templates.remove(0);
-
         gateway
             .handle_message(
                 "telegram",
@@ -15574,6 +15645,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quick_template_label_caption_with_attachment_is_submitted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .current_session
+            .write()
+            .unwrap()
+            .insert(chat.clone(), sid);
+        let template = CcteamConfig::default().im.quick_templates.remove(0);
+
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-1",
+                &template.label,
+                &[img("/tmp/label.png")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let submitted = fake.submissions.lock().await[0].1.clone();
+        assert!(submitted.contains(&template.label));
+        assert!(submitted.contains("image_path=\"/tmp/label.png\""));
+        assert!(!gateway.pending_prefix.contains_key(&chat));
+    }
+
+    #[tokio::test]
     async fn quick_template_labels_trim_before_render_and_match() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_root = tmp.path().join("config");
@@ -15609,7 +15722,66 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(armed[0].plain, "Template Custom armed — send the task");
+        assert_eq!(
+            armed[0].plain,
+            "Template Custom armed — send the task\nCustom task:"
+        );
+    }
+
+    #[tokio::test]
+    async fn quick_template_prefixes_handle_submission_and_clears_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let template = CcteamConfig::default().im.quick_templates.remove(0);
+
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude codex")
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-1",
+                &template.label,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-2",
+                "@codex do X",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fake.submissions.lock().await[0].1,
+            format!("{} do X", template.prefix)
+        );
+        assert!(!gateway
+            .pending_prefix
+            .contains_key(&ChatKey::new("telegram", "chat-1", "alice")));
+    }
+
+    #[test]
+    fn quick_template_list_includes_prefix_preview() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gateway = Gateway::new(Arc::new(FakeAdapter::default()), "alpha", tmp.path());
+
+        let reply = gateway.render_quick_templates();
+        assert!(reply.plain.contains(
+            "• 🎯 Commander\n  Check status for the vendors available on this project first, then plan and deco…"
+        ));
     }
 
     #[tokio::test]
@@ -15698,7 +15870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn help_carries_the_default_quick_template_keyboard() {
+    async fn help_carries_no_quick_template_keyboard() {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", tmp.path());
@@ -15708,17 +15880,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            replies[0].reply_keyboard,
-            Some(ReplyKeyboard::Buttons(
-                CcteamConfig::default()
-                    .im
-                    .quick_templates
-                    .into_iter()
-                    .map(|template| vec![template.label])
-                    .collect(),
-            ))
-        );
+        assert_eq!(replies[0].reply_keyboard, None);
     }
 
     #[test]
@@ -26620,9 +26782,9 @@ mod tests {
 
         // /help advertises /role.
         assert!(
-            render_help(true).plain.contains("/role"),
+            render_help().plain.contains("/role"),
             "render_help should list /role: {}",
-            render_help(true).plain
+            render_help().plain
         );
     }
 

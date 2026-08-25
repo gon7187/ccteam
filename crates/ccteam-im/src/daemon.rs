@@ -1457,6 +1457,7 @@ fn spawn_inbound_consumer(
                     &msg.sender,
                     &clean_payload,
                     msg.selection.is_some(),
+                    !msg.attachments.is_empty(),
                 )
             };
             if may_spawn {

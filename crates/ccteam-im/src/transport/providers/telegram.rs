@@ -1087,8 +1087,10 @@ fn build_rich_send_body(message: &SendMessage, markdown: &str) -> serde_json::Va
     {
         body["reply_parameters"] = serde_json::json!({ "message_id": rt });
     }
-    if let Some(reply_markup) = reply_markup_json(message) {
-        body["reply_markup"] = reply_markup;
+    if rows.is_empty() {
+        if let Some(reply_keyboard) = message.reply_keyboard.as_ref() {
+            body["reply_markup"] = reply_keyboard_json(reply_keyboard);
+        }
     }
     body
 }
@@ -1859,7 +1861,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_send_body_carries_reply_keyboard_and_prefers_inline_buttons() {
+    fn rich_send_body_carries_reply_keyboard_without_duplicate_inline_buttons() {
         let reply_keyboard =
             crate::transport::ReplyKeyboard::Buttons(vec![vec!["🎯 Commander".to_string()]]);
         let keyboard_only = SendMessage::new("hello", "42")
@@ -1871,11 +1873,9 @@ mod tests {
         );
 
         let with_inline = keyboard_only.with_options(vec![opt("choice:1", "Choose", None)]);
-        assert_eq!(
-            build_rich_send_body(&with_inline, "**hello**")["reply_markup"],
-            serde_json::json!({
-                "inline_keyboard": [[{"text": "Choose", "callback_data": "choice:1"}]]
-            })
+        assert!(
+            build_rich_send_body(&with_inline, "**hello**")["reply_markup"].is_null(),
+            "rich buttons stay in rich_message markdown, not reply_markup"
         );
     }
 
