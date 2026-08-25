@@ -22535,7 +22535,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replies.len(), 1);
-        assert!(replies[0].markdown.contains("| `alpha` |"));
+        assert!(replies[0].markdown.contains("| **alpha** |"));
         let datas = replies[0]
             .button_rows
             .iter()
@@ -22569,7 +22569,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replies.len(), 1);
-        assert!(replies[0].markdown.contains("| `s1` |"));
+        assert!(replies[0].markdown.contains("| **s1** |"));
         assert_eq!(
             replies[0]
                 .button_rows

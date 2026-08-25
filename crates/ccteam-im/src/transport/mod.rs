@@ -531,10 +531,13 @@ pub struct SendMessage {
     pub options: Vec<MessageOption>,
     /// TG-GATE-V2 W1 — Rich Messages markdown (Bot API 10.3
     /// `InputRichMessage.markdown`). When `Some`, Telegram tries
-    /// `sendRichMessage` first; on any error it falls back to `content` via
-    /// HTML (`telegram_html`) then plain text. `None` ⇒ zero behavior
-    /// change (classic `sendMessage`/HTML path only). Ignored by every
-    /// other channel.
+    /// `sendRichMessage` first; on any error it falls back to classic
+    /// `sendMessage` fed with THIS SAME markdown (rendered to HTML via
+    /// `telegram_html`, review round 1/2) as long as the rendered payload
+    /// fits Telegram's message ceiling; only when it doesn't does it fall
+    /// through to `content` (unformatted, but never silently truncated).
+    /// `None` ⇒ zero behavior change (classic `sendMessage`/HTML path on
+    /// `content` only). Ignored by every other channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rich_markdown: Option<String>,
     /// TG-GATE-V2 W1 — button rows (1..=8 buttons per row), rendered ABOVE

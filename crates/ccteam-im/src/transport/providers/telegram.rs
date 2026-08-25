@@ -75,6 +75,13 @@ pub struct TelegramChannel {
     /// TG-GATE-V2 W9 (N5) — messages seen while the breaker has been open,
     /// counting the half-open probes out at [`RICH_HALF_OPEN_PROBE_EVERY`].
     rich_probe_counter: std::sync::atomic::AtomicU32,
+    /// Review round 2 — overridable only from this module's own `tests`
+    /// (a private field is visible to descendant modules in Rust), so a
+    /// oneshot local `TcpListener` responder can stand in for
+    /// `api.telegram.org` and prove `Channel::send`'s rich→classic
+    /// fallback selector against a REAL request body, not just the
+    /// decision-adjacent pure functions the rest of this file's tests use.
+    api_base: String,
 }
 
 /// TG-GATE-V2 W9 (N5) — half-open probe cadence: simpler than a wall-clock
@@ -103,6 +110,7 @@ impl TelegramChannel {
             rich_failures: std::sync::atomic::AtomicU32::new(0),
             rich_disabled: std::sync::atomic::AtomicBool::new(false),
             rich_probe_counter: std::sync::atomic::AtomicU32::new(0),
+            api_base: "https://api.telegram.org".to_string(),
         }
     }
 
@@ -130,7 +138,7 @@ impl TelegramChannel {
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{}", self.bot_token, method)
+        format!("{}/bot{}/{}", self.api_base, self.bot_token, method)
     }
 
     /// Whether a chat is permitted. An empty allowlist means whatever this
@@ -1201,14 +1209,30 @@ impl Channel for TelegramChannel {
                     }
                 }
             }
-            // Rich failed (or the breaker skipped it) — fall back. A
-            // `content` that still fits the classic single-message ceiling
-            // sends exactly as before; one that doesn't needs a durable
-            // multi-part split, which is `daemon.rs`'s job (see
-            // [`RichFallbackNeedsSplit`]), not this channel's — sending
-            // nothing here and returning the typed error keeps this call
-            // side-effect-free so the caller's retry/replay bookkeeping
-            // stays correct.
+            // Rich failed (or the breaker skipped it) — fall back to the
+            // classic HTML path fed with `markdown` (review round 1:
+            // `.content`/`.plain` is the universal, deliberately
+            // unformatted fallback every channel reads verbatim, so sending
+            // it here would silently drop the bold `**sid**`/`**slug**`
+            // markers `.markdown` already carries; `text_payload` converts
+            // them to `<b>` via the classic `render_markdown` HTML path).
+            //
+            // Review round 2 — `text_payload` degrading an over-long
+            // render to a truncated PLAIN send is fine when the source is
+            // `.content` (the real business text; a caller who reaches
+            // here already checked it fits, see below), but silently
+            // truncating `markdown` would drop the tail of a message that
+            // never needed truncation at all — `markdown`'s decoration
+            // (`**`/backticks/the `/status` `<blockquote>`) can push a
+            // render over the ceiling even when `.content` comfortably
+            // fits. So: use `markdown` ONLY when ITS rendered length also
+            // fits; otherwise fall through to the pre-existing
+            // `.content`-based path below (lossless split, bold lost —
+            // acceptable per review). No durable markdown splitter here —
+            // rejected as scope creep.
+            if render_markdown(markdown).text_utf16_len <= MAX_MESSAGE_UTF16 {
+                return self.send_classic_part(message, markdown, true).await;
+            }
             if message.content.encode_utf16().count() <= MAX_MESSAGE_UTF16 {
                 return self.send_classic(message).await;
             }
@@ -2048,6 +2072,214 @@ mod tests {
         assert_eq!(payload.text, "hi <b>there</b>");
         let keyboard = inline_keyboard_json(&message).unwrap();
         assert_eq!(keyboard["inline_keyboard"][0][0]["text"], "Yes");
+    }
+
+    /// Review round 1 — the classic-fallback branch in [`Channel::send`]
+    /// must feed `send_classic_part` the message's `rich_markdown` (when
+    /// present), NOT `.content`: `.content`/`.plain` is the universal,
+    /// deliberately unformatted field every channel (Lark, Slack, a fake
+    /// non-Telegram `Channel`) reads verbatim, so sending IT through
+    /// Telegram's classic HTML path would silently drop every bold
+    /// `**sid**`/`**slug**` marker `daemon.rs` only ever attaches as
+    /// `rich_markdown`. No live HTTP in this test crate, so — matching
+    /// [`send_classic_falls_back_to_html_when_rich_markdown_absent`] just
+    /// above — this proves the decision surface directly via
+    /// `text_payload`, the exact conversion `send_classic_part` runs.
+    #[test]
+    fn rich_markdown_not_content_is_the_classic_fallback_source() {
+        let message = SendMessage::new("s1 has no bold", "42")
+            .with_rich_markdown("**s1** has no bold, and neither does <script>&");
+        let markdown = message.rich_markdown.as_deref().expect("set above");
+
+        // The universal fallback field a non-Telegram channel would send
+        // verbatim carries no markup at all.
+        assert!(!message.content.contains('*'));
+
+        // `send_classic_part`'s conversion of `.content` (the WRONG source)
+        // would render no `<b>` — proving the bug this review flags.
+        let wrong = text_payload(&message.content);
+        assert!(!wrong.text.contains("<b>"));
+
+        // The FIX: converting `rich_markdown` yields the bold tag, with
+        // HTML-special characters riding along still safely escaped.
+        let right = text_payload(markdown);
+        assert!(right.formatted);
+        assert!(right.text.contains("<b>s1</b>"), "got: {}", right.text);
+        assert!(
+            right.text.contains("&lt;script&gt;&amp;"),
+            "got: {}",
+            right.text
+        );
+    }
+
+    /// (request-line, body) pairs a [`spawn_sequential_http`] responder saw.
+    type SeenRequests = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// Spawn a local HTTP/1.1 responder that answers exactly `responses.len()`
+    /// sequential requests in order (mirrors `lark_onboarding_test`'s
+    /// `spawn_oneshot_http`, extended to more than one call so a rich→classic
+    /// fallback round-trip — two real requests — can be observed). Returns
+    /// the `http://127.0.0.1:<port>` base URL and the (request-line, body)
+    /// pairs actually received, in order.
+    fn spawn_sequential_http(responses: &'static [&'static str]) -> (String, SeenRequests) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_thread = seen.clone();
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_length = 0usize;
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            req.extend_from_slice(&buf[..n]);
+                            if header_end.is_none() {
+                                if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    let end = pos + 4;
+                                    header_end = Some(end);
+                                    let headers = String::from_utf8_lossy(&req[..end]);
+                                    content_length = headers
+                                        .lines()
+                                        .find_map(|line| {
+                                            let (name, value) = line.split_once(':')?;
+                                            name.eq_ignore_ascii_case("content-length")
+                                                .then(|| value.trim().parse::<usize>().ok())
+                                                .flatten()
+                                        })
+                                        .unwrap_or(0);
+                                }
+                            }
+                            if let Some(end) = header_end {
+                                if req.len().saturating_sub(end) >= content_length {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let end = header_end.unwrap_or(req.len());
+                let request_line = String::from_utf8_lossy(&req[..end])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let body = String::from_utf8_lossy(&req[end..]).to_string();
+                seen_thread.lock().unwrap().push((request_line, body));
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// Review round 2 — the round-1 regression test above never called
+    /// `send`, so it would stay green even if the fallback branch in
+    /// `Channel::send` regressed back to `.content`. This exercises the
+    /// REAL selector against a real (local) HTTP round-trip: the rich
+    /// attempt fails with a 200-but-`ok:false` body (a real Bot API
+    /// degraded shape, TG-GATE-V2 W9), forcing the classic fallback, whose
+    /// actual request body must carry the `<b>` Telegram renders and the
+    /// `parse_mode: HTML` that makes it render — proving the fix at the
+    /// wire level, not just at the pure-function level.
+    #[tokio::test]
+    async fn send_falls_back_to_classic_html_with_bold_when_rich_fails() {
+        let (base, seen) = spawn_sequential_http(&[
+            r#"{"ok":false,"description":"rich messages unsupported"}"#,
+            r#"{"ok":true,"result":{"message_id":1}}"#,
+        ]);
+        let mut ch = TelegramChannel::new("t".into(), vec![]);
+        ch.api_base = base;
+        let message = SendMessage::new("s1 has no bold", "42")
+            .with_rich_markdown("**s1** has no bold, and neither does <script>&");
+
+        let id = ch.send(&message).await.unwrap();
+        assert_eq!(id.as_deref(), Some("1"));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "rich attempt then classic fallback: {seen:?}"
+        );
+        assert!(
+            seen[0].0.contains("sendRichMessage"),
+            "first call must be the rich attempt: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[1].0.contains("sendMessage") && !seen[1].0.contains("sendRichMessage"),
+            "second call must be the classic fallback: {:?}",
+            seen[1]
+        );
+        let classic_body = &seen[1].1;
+        assert!(
+            classic_body.contains("<b>s1</b>"),
+            "classic body dropped the bold sid: {classic_body}"
+        );
+        assert!(
+            classic_body.contains("&lt;script&gt;&amp;"),
+            "classic body must escape HTML specials from markdown: {classic_body}"
+        );
+        assert!(
+            classic_body.contains(r#""parse_mode":"HTML""#),
+            "classic body must ask Telegram to parse the HTML: {classic_body}"
+        );
+    }
+
+    /// Review round 2 — the overflow gate must stay keyed on whether
+    /// `markdown`'s RENDERED payload fits, not `.content`'s raw length:
+    /// a `markdown` that's simply longer visible text than `.content` (not
+    /// just `**`/backtick decoration `text_payload`'s own truncation
+    /// safety net already tolerates) must fall through to the untruncated
+    /// `.content` path rather than let `text_payload` silently truncate
+    /// `markdown` into a shorter, bold-losing message nobody asked for.
+    #[tokio::test]
+    async fn send_uses_content_untruncated_when_markdown_render_overflows_but_content_fits() {
+        let short_content = "short base content that easily fits under the limit";
+        let oversized_markdown = "y".repeat(MAX_MESSAGE_UTF16 + 200);
+        let (base, seen) = spawn_sequential_http(&[
+            r#"{"ok":false,"description":"rich messages unsupported"}"#,
+            r#"{"ok":true,"result":{"message_id":7}}"#,
+        ]);
+        let mut ch = TelegramChannel::new("t".into(), vec![]);
+        ch.api_base = base;
+        let message = SendMessage::new(short_content, "42").with_rich_markdown(oversized_markdown);
+
+        let id = ch.send(&message).await.unwrap();
+        assert_eq!(id.as_deref(), Some("7"));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "rich attempt then classic fallback: {seen:?}"
+        );
+        let classic_body: serde_json::Value =
+            serde_json::from_str(&seen[1].1).expect("classic body is JSON");
+        assert_eq!(
+            classic_body["text"], short_content,
+            "must send the untruncated `.content`, not a truncated `markdown`"
+        );
+        assert!(
+            !classic_body["text"].as_str().unwrap().ends_with('…'),
+            "content must not be truncated: {classic_body}"
+        );
     }
 
     /// TG-GATE-V2 W9 (N6) — `body_reports_failure` now gates BOTH the

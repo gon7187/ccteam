@@ -61,6 +61,59 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
             continue;
         }
 
+        // Review round 2 — `im_views::render_status`/`render_sessions`
+        // splice a literal `<blockquote expandable>…</blockquote>` (a
+        // Telegram Rich Message extension our own `> ` syntax below has no
+        // way to produce) straight into `.markdown`. Left alone, the
+        // classic HTML fallback (this function) would treat the raw tag as
+        // plain text and escape it into visible `&lt;blockquote…`. Render
+        // it as the same tag instead — Telegram's classic `parse_mode=HTML`
+        // accepts `<blockquote>`/`<blockquote expandable>` too — rather
+        // than stripping it to bare text, so the collapsible-detail UX
+        // survives the fallback path as well as the Rich Message one.
+        if let Some((expandable, first_content)) = strip_html_blockquote_open(line) {
+            let mut quote = Fragment::default();
+            let mut cursor = index;
+            let mut content = first_content;
+            loop {
+                let raw_line = lines[cursor];
+                let has_newline = raw_line.ends_with('\n');
+                if let Some(before_close) = content.strip_suffix("</blockquote>") {
+                    append_fragment(&mut quote, render_inline(before_close, true, true));
+                    cursor += 1;
+                    break;
+                }
+                append_fragment(&mut quote, render_inline(content, true, true));
+                if has_newline {
+                    append_escaped_text(&mut quote, "\n");
+                }
+                cursor += 1;
+                if cursor >= lines.len() {
+                    break;
+                }
+                let next_raw = lines[cursor];
+                content = next_raw.strip_suffix('\n').unwrap_or(next_raw);
+            }
+            let mut html = String::from(if expandable {
+                "<blockquote expandable>"
+            } else {
+                "<blockquote>"
+            });
+            html.push_str(&quote.html);
+            html.push_str("</blockquote>");
+            append_fragment(
+                &mut out,
+                Fragment {
+                    html,
+                    text_utf16_len: quote.text_utf16_len,
+                    has_non_whitespace: quote.has_non_whitespace,
+                    contains_code: quote.contains_code,
+                },
+            );
+            index = cursor;
+            continue;
+        }
+
         if is_blockquote_line(line) {
             let mut quote = Fragment::default();
             let mut cursor = index;
@@ -351,6 +404,19 @@ fn is_blockquote_line(line: &str) -> bool {
     strip_blockquote(line).is_some()
 }
 
+/// Recognize `im_views`' literal `<blockquote expandable>`/`<blockquote>`
+/// opening tag at the start of a line, returning whether it was the
+/// expandable variant plus whatever content follows the tag on that same
+/// line (the tag and the first content line are glued together with no
+/// separating newline in `.markdown`, e.g. `<blockquote expandable>Роль: …`).
+fn strip_html_blockquote_open(line: &str) -> Option<(bool, &str)> {
+    if let Some(rest) = line.strip_prefix("<blockquote expandable>") {
+        Some((true, rest))
+    } else {
+        line.strip_prefix("<blockquote>").map(|rest| (false, rest))
+    }
+}
+
 fn fence_length(line: &str) -> Option<usize> {
     let trimmed = line.trim_start();
     let length = trimmed.bytes().take_while(|byte| *byte == b'`').count();
@@ -623,6 +689,28 @@ mod tests {
             rendered.html,
             "<b>Heading</b>\n• bullet\n• another\n1. numbered\n<blockquote>quoted</blockquote>"
         );
+    }
+
+    /// Review round 2 — `im_views::render_status`'s literal
+    /// `<blockquote expandable>…</blockquote>` (glued to its neighboring
+    /// content lines with no separating newline) must render as a real
+    /// `<blockquote expandable>` tag on the classic HTML fallback path,
+    /// not escape into visible `&lt;blockquote…` text.
+    #[test]
+    fn renders_the_expandable_html_blockquote_im_views_splices_in() {
+        let rendered = render_markdown(
+            "header line\n<blockquote expandable>Роль: reviewer\n**bold** & <tag></blockquote>",
+        );
+        assert_eq!(
+            rendered.html,
+            "header line\n<blockquote expandable>Роль: reviewer\n<b>bold</b> &amp; &lt;tag&gt;</blockquote>"
+        );
+    }
+
+    #[test]
+    fn renders_the_plain_html_blockquote_without_the_expandable_attribute() {
+        let rendered = render_markdown("<blockquote>one line only</blockquote>");
+        assert_eq!(rendered.html, "<blockquote>one line only</blockquote>");
     }
 
     #[test]

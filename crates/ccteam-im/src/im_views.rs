@@ -307,8 +307,8 @@ pub fn render_projects(view: &ProjectsView) -> RichReply {
     let mut buttons = Vec::new();
     for project in &view.projects {
         markdown.push_str(&format!(
-            "\n| `{}` | `{}` | {} |",
-            escape_code(&project.slug),
+            "\n| **{}** | `{}` | {} |",
+            escape_markdown(&project.slug),
             escape_code(&project.path),
             project.sessions
         ));
@@ -402,8 +402,8 @@ fn command_button_styled(
 
 fn markdown_session_row(session: &SessionRow) -> String {
     format!(
-        "\n| `{}` | {} | {} | {} |",
-        escape_code(&session_display_sid(session)),
+        "\n| **{}** | {} | {} | {} |",
+        escape_markdown(&session_display_sid(session)),
         escape_markdown(&session_vendor_model(session)),
         escape_markdown(&session.status),
         escape_markdown(&session.context),
@@ -577,12 +577,12 @@ mod tests {
 
         assert!(reply
             .markdown
-            .contains("| `s1` | claude.opus | ⏳ ожидание | 38% |"));
+            .contains("| **s1** | claude.opus | ⏳ ожидание | 38% |"));
         assert!(reply.markdown.contains("<blockquote expandable>"));
         assert!(reply
             .markdown
             .contains("s11 | claude.opus | 🟢 ожидание | 38%"));
-        assert!(reply.markdown.contains("| `└─ s2` | claude.opus @edge |"));
+        assert!(reply.markdown.contains("| **└─ s2** | claude.opus @edge |"));
         assert!(reply.markdown.contains("pid 4242"));
         assert!(reply
             .markdown
@@ -599,6 +599,45 @@ mod tests {
             .all(|button| button.data.len() <= 64));
     }
 
+    /// TG-FMT-1 review round 1 — bold lives ONLY in `.markdown` (the Telegram
+    /// Rich Messages field); `.plain` is the universal fallback every
+    /// channel (Lark, Slack, the classic Telegram send) reads verbatim and
+    /// must stay unformatted. `render_markdown` (the Telegram classic-path
+    /// HTML converter) must turn the sid's `**` into `<b>` while escaping
+    /// HTML-special characters riding along in another cell, without
+    /// corrupting the surrounding tag.
+    #[test]
+    fn sessions_markdown_bold_sid_survives_html_special_chars_in_other_cells() {
+        let sessions = vec![SessionRow {
+            sid: "s1".into(),
+            vendor_model: "claude.<script>&\"".into(),
+            status: "🟢 ожидание".into(),
+            context: "38%".into(),
+            title: None,
+            current: false,
+            tree_depth: 0,
+            host: None,
+        }];
+        let reply = render_sessions(&SessionsView {
+            project: "ccteam".into(),
+            sessions,
+            elsewhere: 0,
+            detached: Vec::new(),
+        });
+        assert!(
+            !reply.plain.contains('*'),
+            ".plain must stay unformatted for non-Telegram channels: {}",
+            reply.plain
+        );
+        let html = crate::telegram_html::render_markdown(&reply.markdown).html;
+        assert!(html.contains("<b>s1</b>"), "got: {html}");
+        assert!(
+            html.contains("claude.&lt;script&gt;&amp;\""),
+            "special chars must be escaped, not left raw: {html}"
+        );
+        assert!(!html.contains("<script>"), "unescaped tag leaked: {html}");
+    }
+
     #[test]
     fn projects_render_a_table_and_switch_commands() {
         let reply = render_projects(&ProjectsView {
@@ -612,7 +651,7 @@ mod tests {
 
         assert!(reply
             .markdown
-            .contains("| `ccteam` | `/root/projects/ccteam` | 2 |"));
+            .contains("| **ccteam** | `/root/projects/ccteam` | 2 |"));
         assert_eq!(reply.button_rows[0][0].data, "cmd:/cd ccteam");
         assert_eq!(reply.button_rows[0][0].label, "✓ ccteam");
         assert_eq!(
