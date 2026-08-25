@@ -33,7 +33,7 @@ use crate::im_views::RichReply;
 use crate::latency::now_unix_ms;
 use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
 use crate::transport::providers::telegram::{
-    FallbackSplitPartialFailure as TelegramFallbackSplitPartialFailure, TelegramChannel,
+    RichFallbackNeedsSplit as TelegramRichFallbackNeedsSplit, TelegramChannel,
 };
 use crate::transport::{Channel, ChannelMessage, SendMessage};
 use crate::{list_bots, BotRegistration};
@@ -1842,13 +1842,47 @@ async fn send_gateway_outbound(
         return;
     }
 
-    // Multi-part: each part is its own durable row, id =
-    // `{inbound_id}-{seq}-{part}`, sent in order (same logical message ⇒
-    // serial). The ledger keeps one Queued+Sent/Failed pair per part.
+    // Multi-part: id prefix = `{inbound_id}-{seq}`, one durable row per
+    // part beneath it (`{prefix}-{part}`).
+    let id_prefix = format!("{inbound_id}-{seq}");
+    send_split_parts(
+        &id_prefix,
+        inbound_id,
+        channel_name,
+        channel,
+        parts,
+        &message,
+    )
+    .await;
+}
+
+/// Send `parts` (already computed by the caller) as one durable outbound
+/// row EACH, id = `{id_prefix}-{part_idx}`, in order (same logical message ⇒
+/// serial send). A late part's failure does not abort the loop — every part
+/// gets its own delivery attempt and its own `Sent`/`Failed` ledger row, so
+/// a later replay only re-sends the parts that actually failed, never the
+/// ones that already landed. A partial failure surfaces one best-effort
+/// notice (sent directly, not itself split or laddered through the ledger)
+/// naming only the failed parts.
+///
+/// Shared by [`send_gateway_outbound`]'s own multi-part branch (a
+/// non-rich message pre-split at [`Channel::max_message_len`]) and
+/// [`finish_durable_outbound_send`]'s [`TelegramRichFallbackNeedsSplit`]
+/// catch (a rich message whose classic fallback didn't fit either — see
+/// that error's docs for why the split has to happen here, not in the
+/// channel).
+async fn send_split_parts(
+    id_prefix: &str,
+    inbound_id: &str,
+    channel_name: &str,
+    channel: &(dyn Channel + Send + Sync),
+    parts: Vec<String>,
+    message: &SendMessage,
+) {
     let total = parts.len();
     let mut failed_parts: Vec<usize> = Vec::new();
     for (part_idx, part) in parts.into_iter().enumerate() {
-        let id = format!("{inbound_id}-{seq}-{part_idx}");
+        let id = format!("{id_prefix}-{part_idx}");
         let mut part_msg = message.clone();
         part_msg.content = part;
         let sent =
@@ -1858,10 +1892,6 @@ async fn send_gateway_outbound(
         }
     }
 
-    // Failure visible: a partial split (some parts delivered, some not) is
-    // confusing silence today — surface one line back to the chat. Sent
-    // directly (not split / not laddered through the ledger) since it is a
-    // best-effort UX notice.
     if !failed_parts.is_empty() {
         let body = if failed_parts.len() == 1 {
             format!(
@@ -1934,55 +1964,51 @@ async fn finish_durable_outbound_send(
             true
         }
         Err(err) => {
-            // TG-GATE-V2 W7a — a Telegram rich→classic fallback split that
-            // delivered SOME parts before a later part failed is not an
-            // ordinary send failure: this durable row's `message` holds the
-            // WHOLE original (unsplit) content, so marking it `Failed`
-            // would re-send every part — including the ones that already
-            // landed — on the next `replay_durable_outbox`. Detect that
-            // shape and record it as terminal (`Sent`, keeping the
-            // partial-failure note in `error` for visibility) instead, and
-            // tell the user directly which parts didn't make it.
-            if let Some(partial) = err.downcast_ref::<TelegramFallbackSplitPartialFailure>() {
+            // TG-GATE-V2 W9 — a rich message whose classic fallback ALSO
+            // doesn't fit a single message needs a genuine multi-part
+            // split: this durable row's `message` holds the WHOLE original
+            // (unsplit, still-rich) content, so marking it `Failed` would
+            // re-send the whole thing whole on the next
+            // `replay_durable_outbox` (duplicating whatever a partial split
+            // already delivered) — mark THIS row terminal instead (`Sent`,
+            // nothing to replay it against) and hand the actual sending off
+            // to `send_split_parts`, which gives each part ITS OWN durable
+            // row (so a crash mid-split, or a single failed part, replays
+            // correctly — see that function's docs).
+            if err
+                .downcast_ref::<TelegramRichFallbackNeedsSplit>()
+                .is_some()
+            {
                 append_durable_outbound(DurableOutboundRow {
                     ts_ms: now_unix_ms_u64(),
-                    id,
+                    id: id.clone(),
                     inbound_id: inbound_id.to_string(),
                     channel: channel_name.to_string(),
                     state: DurableOutboundState::Sent,
                     message: message.clone(),
-                    platform_message_id: partial.first_id.clone(),
-                    error: Some(err.to_string()),
+                    platform_message_id: None,
+                    error: Some(
+                        "rich message too long for classic fallback; split into parts".to_string(),
+                    ),
                 });
-                tracing::warn!(
+                let mut split_message = message.clone();
+                split_message.rich_markdown = None;
+                let limit = channel
+                    .max_message_len()
+                    .unwrap_or(split_message.content.encode_utf16().count().max(1));
+                let parts = crate::sanitize::split_for_channel(&split_message.content, limit);
+                // Boxed: this cycles back through `queue_and_send_durable_part`
+                // → `finish_durable_outbound_send`, and a recursive async fn
+                // call needs indirection to have a known size.
+                Box::pin(send_split_parts(
+                    &id,
                     inbound_id,
-                    channel = %channel_name,
-                    failed_parts = ?partial.failed_parts,
-                    total = partial.total,
-                    "ccteam-im: telegram rich-fallback split partially failed"
-                );
-                let body = if partial.failed_parts.len() == 1 {
-                    format!(
-                        "⚠️ Часть {}/{} не отправлена",
-                        partial.failed_parts[0], partial.total
-                    )
-                } else {
-                    format!(
-                        "⚠️ Части сообщения не отправлены ({}/{} шт.)",
-                        partial.failed_parts.len(),
-                        partial.total
-                    )
-                };
-                let notice = SendMessage::new(body, message.recipient.clone())
-                    .in_thread(message.thread_ts.clone());
-                if let Err(notice_err) = channel.send(&notice).await {
-                    tracing::warn!(
-                        inbound_id,
-                        channel = %channel_name,
-                        error = %notice_err,
-                        "ccteam-im: failed to deliver rich-fallback partial-failure notice"
-                    );
-                }
+                    channel_name,
+                    channel,
+                    parts,
+                    &split_message,
+                ))
+                .await;
                 return true;
             }
             append_durable_outbound(DurableOutboundRow {
@@ -2378,41 +2404,53 @@ mod tests {
         );
     }
 
-    /// TG-GATE-V2 W7a — a Telegram rich-fallback split partial failure
-    /// (`FallbackSplitPartialFailure`) must NOT be recorded as `Failed` in
-    /// the durable ledger (that would re-send the WHOLE original message —
-    /// including the parts that already landed — on the next
-    /// `replay_durable_outbox`). It must be recorded `Sent` (with the
-    /// partial note kept in `error`) and the channel must receive a direct
-    /// "part N/M not sent" notice for only the failed parts.
+    /// TG-GATE-V2 W9 — a rich message that fails its rich attempt AND
+    /// overflows the classic single-message ceiling (`Channel::send`
+    /// returns [`TelegramRichFallbackNeedsSplit`], per that error's design)
+    /// must deliver via the ORDINARY plain-split path: each part gets its
+    /// own durable row (`Sent`/`Failed` independently), the base row is
+    /// marked terminal so it's never replayed whole, and a
+    /// `replay_durable_outbox` afterwards resends ONLY the one part that
+    /// actually failed — never the parts that already landed, never the
+    /// base row.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn partial_fallback_failure_is_recorded_sent_not_replayed_and_notifies_failed_parts_only()
-    {
+    async fn rich_fallback_needs_split_delivers_via_plain_path_each_own_row_replays_only_failed_part(
+    ) {
         use crate::transport::providers::mock::MockChannel;
 
-        struct PartialFailureOnce {
+        /// Simulates a real Telegram channel's contract: a message CARRYING
+        /// `rich_markdown` always needs the split signal (this test's
+        /// content is deliberately over the classic ceiling); every OTHER
+        /// (plain, per-part) send goes to the inner mock, except the
+        /// designated middle-part content, which fails exactly once (so a
+        /// later replay of that one part succeeds).
+        struct SplitOnRichFailOnce {
             inner: MockChannel,
-            failed: std::sync::atomic::AtomicBool,
+            fail_once_content: String,
+            failed_once: std::sync::atomic::AtomicBool,
         }
 
         #[async_trait::async_trait]
-        impl Channel for PartialFailureOnce {
+        impl Channel for SplitOnRichFailOnce {
             fn name(&self) -> &str {
                 self.inner.name()
             }
+            fn max_message_len(&self) -> Option<usize> {
+                self.inner.max_message_len()
+            }
             async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
-                // Fail exactly once (the original logical send); the
-                // follow-up partial-failure notice must go through fine.
-                if self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    return self.inner.send(message).await;
+                if message.rich_markdown.is_some() {
+                    return Err(TelegramRichFallbackNeedsSplit.into());
                 }
-                Err(TelegramFallbackSplitPartialFailure {
-                    first_id: Some("mock-1".to_string()),
-                    total: 3,
-                    failed_parts: vec![2, 3],
+                if message.content == self.fail_once_content
+                    && !self
+                        .failed_once
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    anyhow::bail!("mock: simulated failure for the middle part (once)");
                 }
-                .into())
+                self.inner.send(message).await
             }
             async fn listen(
                 &self,
@@ -2429,52 +2467,128 @@ mod tests {
         std::env::set_var("HOME", tmp.path());
         std::env::set_var("CCTEAM_HOME", tmp.path().join(".ccteam"));
 
-        let channel = PartialFailureOnce {
-            inner: MockChannel::new().with_name("telegram"),
-            failed: std::sync::atomic::AtomicBool::new(false),
-        };
-        let message = SendMessage::new("part 1 of a long answer", "chat-1")
-            .with_rich_markdown("part 1 of a long answer");
+        let block = |c: char| c.to_string().repeat(30);
+        let content = format!("{}\n\n{}\n\n{}", block('A'), block('B'), block('C'));
+        let limit = 40usize;
+        let parts = crate::sanitize::split_for_channel(&content, limit);
+        assert_eq!(
+            parts.len(),
+            3,
+            "test setup: expected 3 parts, got {parts:?}"
+        );
+        let middle = parts[1].clone();
+
+        let mock = MockChannel::new()
+            .with_name("telegram")
+            .with_max_message_len(limit);
+        let inner_handle = mock.clone(); // shares the outbox Arc for later assertions
+        let channel = Arc::new(SplitOnRichFailOnce {
+            inner: mock,
+            fail_once_content: middle.clone(),
+            failed_once: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        let message = SendMessage::new(content.clone(), "chat-1").with_rich_markdown(content);
         let sent = finish_durable_outbound_send(
             "row-1".to_string(),
             "in-1",
             "telegram",
-            &channel,
+            channel.as_ref(),
             message,
         )
         .await;
-        // Terminal (not a retryable failure) — the ledger row is `Sent`.
         assert!(
             sent,
-            "a partial fallback failure must be terminal, not a retryable failure"
+            "the base row is terminal once split, not a retryable whole-message failure"
         );
 
-        let notices = channel.inner.outbox().await;
-        assert_eq!(notices.len(), 1, "exactly one partial-failure notice sent");
+        let delivered = inner_handle.outbox().await;
         assert!(
-            notices[0].content.contains("2") && notices[0].content.contains("3"),
-            "notice names the failed parts: {:?}",
-            notices[0].content
+            delivered.iter().all(|m| m.rich_markdown.is_none()),
+            "every delivered part goes out via the plain (non-rich) path: {delivered:?}"
         );
-        assert_eq!(notices[0].recipient, "chat-1");
+        assert!(
+            delivered.iter().any(|m| m.content == parts[0]),
+            "part 1 delivered"
+        );
+        assert!(
+            delivered.iter().any(|m| m.content == parts[2]),
+            "part 3 delivered"
+        );
+        assert!(
+            !delivered.iter().any(|m| m.content == middle),
+            "part 2 must NOT have been delivered yet — its first attempt failed"
+        );
+        // Exactly one best-effort "part didn't make it" notice, on top of
+        // the 2 delivered parts.
+        assert_eq!(
+            delivered.len(),
+            3,
+            "2 parts + 1 failure notice: {delivered:?}"
+        );
 
+        let mut latest: HashMap<String, DurableOutboundRow> = HashMap::new();
         let ledger = tokio::fs::read_to_string(durable_outbox_path())
             .await
             .unwrap();
-        let rows: Vec<DurableOutboundRow> = ledger
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(rows.len(), 1, "one ledger row for the original send");
+        for line in ledger.lines() {
+            let row: DurableOutboundRow = serde_json::from_str(line).unwrap();
+            latest.insert(row.id.clone(), row);
+        }
         assert_eq!(
-            rows[0].state,
+            latest.get("row-1").unwrap().state,
             DurableOutboundState::Sent,
-            "a partial fallback failure is recorded Sent, never Failed \
-             (Failed would re-send every part — including the ones that \
-             already landed — on the next replay_durable_outbox)"
+            "base row terminal — never replayed whole"
         );
-        assert_eq!(rows[0].platform_message_id.as_deref(), Some("mock-1"));
-        assert!(rows[0].error.as_deref().unwrap().contains("2/3"));
+        assert_eq!(
+            latest.get("row-1-0").unwrap().state,
+            DurableOutboundState::Sent
+        );
+        assert_eq!(
+            latest.get("row-1-1").unwrap().state,
+            DurableOutboundState::Failed,
+            "the middle part gets its OWN row and its OWN Failed state"
+        );
+        assert_eq!(
+            latest.get("row-1-2").unwrap().state,
+            DurableOutboundState::Sent
+        );
+
+        // Replay: only the failed part (`row-1-1`) is retryable; the
+        // already-`Sent` rows (base + parts 1 and 3) are skipped.
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert(
+            "telegram".to_string(),
+            channel.clone() as Arc<dyn Channel + Send + Sync>,
+        );
+        replay_durable_outbox(&channels).await;
+
+        let after_replay = inner_handle.outbox().await;
+        assert_eq!(
+            after_replay.len(),
+            delivered.len() + 1,
+            "replay sends exactly the one previously-failed part, nothing else: {after_replay:?}"
+        );
+        assert!(
+            after_replay.iter().filter(|m| m.content == middle).count() == 1,
+            "the middle part is now delivered exactly once"
+        );
+        assert!(
+            after_replay
+                .iter()
+                .filter(|m| m.content == parts[0])
+                .count()
+                == 1,
+            "part 1 must NOT be re-sent by replay"
+        );
+        assert!(
+            after_replay
+                .iter()
+                .filter(|m| m.content == parts[2])
+                .count()
+                == 1,
+            "part 3 must NOT be re-sent by replay"
+        );
 
         restore_env("CCTEAM_HOME", old_ccteam_home);
         restore_env("HOME", old_home);

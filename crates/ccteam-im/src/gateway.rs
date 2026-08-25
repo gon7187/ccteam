@@ -84,6 +84,12 @@ impl ChatKey {
     }
 }
 
+/// TG-GATE-V2 W9 — per-chat cap on outstanding `cmd:?<cmd>` confirmations
+/// (see [`Gateway::evict_oldest_confirmations`]).
+const MAX_COMMAND_CONFIRMATIONS_PER_CHAT: usize = 64;
+/// TG-GATE-V2 W9 — global cap across all chats.
+const MAX_COMMAND_CONFIRMATIONS_GLOBAL: usize = 1024;
+
 #[derive(Debug, Clone)]
 struct PendingCommandConfirmation {
     chat: ChatKey,
@@ -1912,8 +1918,8 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/stop",
-        arg_hint: Some("<id>|all|project"),
-        help: "остановить сессию по id, все доступные или видимые сессии текущего проекта",
+        arg_hint: Some("<id>|all|project|children"),
+        help: "остановить сессию по id, все доступные, видимые сессии текущего проекта или только прямых детей текущей сессии",
         in_menu: true,
     },
     GatewayCommandSpec {
@@ -3818,6 +3824,22 @@ impl Gateway {
     }
 
     async fn handle_command(&mut self, chat: &ChatKey, text: &str) -> Result<Option<RichReply>> {
+        self.handle_command_inner(chat, text, false).await
+    }
+
+    /// `already_confirmed` is `true` only for the ONE re-entry that follows a
+    /// tapped `cmd:!<token>` confirmation ([`Self::resolve_cmd_callback`]'s
+    /// `Confirmed` arm) — the tap itself WAS the yes/no choice, so a bulk
+    /// `/stop` reached this way must execute directly instead of raising a
+    /// SECOND confirmation prompt on top of the one the user just answered.
+    /// A typed `/stop all|project|children` (this function's normal `false`
+    /// entry) keeps its own preview-then-confirm prompt unchanged.
+    async fn handle_command_inner(
+        &mut self,
+        chat: &ChatKey,
+        text: &str,
+        already_confirmed: bool,
+    ) -> Result<Option<RichReply>> {
         let trimmed = text.trim();
         if !trimmed.starts_with('/') {
             return Ok(None);
@@ -3933,20 +3955,30 @@ impl Gateway {
             }
             "/stop" => {
                 // v0.10.3 — stop one session by id, or every session visible
-                // to this chat for the requested bulk scope.
+                // to this chat for the requested bulk scope (`children` =
+                // direct children of the chat's current session only —
+                // NEVER the parent itself, unlike `all`).
                 let target = parts.next().ok_or_else(|| {
-                    anyhow!("Для /stop нужен id, all или project: /stop <sid>|all|project")
+                    anyhow!(
+                        "Для /stop нужен id, all, project или children: /stop <sid>|all|project|children"
+                    )
                 })?;
                 let scope = target.to_ascii_lowercase();
-                if matches!(scope.as_str(), "all" | "project") {
-                    let (sids, project) = match self.bulk_stop_candidates(chat, &scope) {
+                if matches!(scope.as_str(), "all" | "project" | "children") {
+                    let (sids, project, parent) = match self.bulk_stop_candidates(chat, &scope) {
                         Ok(snapshot) => snapshot,
                         Err(error) => return Ok(Some(RichReply::plain(error.to_string()))),
                     };
                     if sids.is_empty() {
                         return Ok(Some(RichReply::plain("Нет доступных сессий для остановки")));
                     }
-                    if Self::channel_supports_buttons(&chat.channel) {
+                    // A confirmed `cmd:!<token>` tap re-enters here with
+                    // `already_confirmed` set — the tap itself WAS the
+                    // yes/no answer, so executing straight away (instead of
+                    // raising this second preview-confirm prompt on top of
+                    // it) is the fix, not a bypass. A typed `/stop …`
+                    // (`already_confirmed == false`) always gets the prompt.
+                    if !already_confirmed && Self::channel_supports_buttons(&chat.channel) {
                         let nanos = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|duration| duration.as_nanos())
@@ -3976,6 +4008,7 @@ impl Gateway {
                                 user_id: chat.user_id.clone(),
                                 scope,
                                 project: project.clone(),
+                                parent: parent.clone(),
                                 snapshot: sids.iter().cloned().collect(),
                             },
                             Instant::now() + gateway_pending_ttl(),
@@ -8313,6 +8346,7 @@ impl Gateway {
             user_id,
             scope: _,
             project,
+            parent,
             snapshot,
         } = &p.origin
         {
@@ -8325,7 +8359,7 @@ impl Gateway {
                 return Ok(vec!["Отменено".to_string()]);
             }
             return Ok(self
-                .stop_bulk_snapshot(&bulk_chat, project.as_deref(), &snapshot)
+                .stop_bulk_snapshot(&bulk_chat, project.as_deref(), parent.as_deref(), &snapshot)
                 .await);
         }
         self.apply_pending(chat, p, selection).await
@@ -8390,7 +8424,10 @@ impl Gateway {
                     }
                     None => replies.push(RichReply::plain(ack)),
                 }
-                match self.handle_command(chat, &cmd).await? {
+                // `already_confirmed: true` — this tap WAS the yes/no
+                // answer; a bulk `/stop` must execute directly, not raise a
+                // second confirmation on top of the one just answered.
+                match self.handle_command_inner(chat, &cmd, true).await? {
                     Some(reply) => replies.push(reply),
                     None => replies.push(RichReply::plain("Неизвестная команда")),
                 }
@@ -8434,6 +8471,20 @@ impl Gateway {
         let now = Instant::now();
         self.pending_command_confirmations
             .retain(|_, pending| !pending.expired(now));
+        // TG-GATE-V2 W9 — cap the live set so a chat spamming `cmd:?…` taps
+        // (or many chats doing it at once) can't grow this map without
+        // bound between TTL sweeps; evict the OLDEST entries first (a
+        // confirmation nobody tapped yet is the least likely to matter).
+        Self::evict_oldest_confirmations(
+            &mut self.pending_command_confirmations,
+            Some(&chat),
+            MAX_COMMAND_CONFIRMATIONS_PER_CHAT - 1,
+        );
+        Self::evict_oldest_confirmations(
+            &mut self.pending_command_confirmations,
+            None,
+            MAX_COMMAND_CONFIRMATIONS_GLOBAL - 1,
+        );
         loop {
             let token = ccteam_core::session_secret::mint()[..8].to_string();
             if self.pending_command_confirmations.contains_key(&token) {
@@ -8452,8 +8503,37 @@ impl Gateway {
         }
     }
 
+    /// Evict entries beyond `cap`, oldest (smallest `created_at`) first.
+    /// `chat = Some(_)` scopes the cap to that chat's own entries (the
+    /// per-chat cap); `None` scopes it to the whole map (the global cap).
+    fn evict_oldest_confirmations(
+        map: &mut BTreeMap<String, PendingCommandConfirmation>,
+        chat: Option<&ChatKey>,
+        cap: usize,
+    ) {
+        let mut scoped: Vec<(String, Instant)> = map
+            .iter()
+            .filter(|(_, pending)| chat.is_none_or(|chat| pending.chat == *chat))
+            .map(|(token, pending)| (token.clone(), pending.created_at))
+            .collect();
+        if scoped.len() <= cap {
+            return;
+        }
+        scoped.sort_by_key(|(_, created_at)| *created_at);
+        let evict_count = scoped.len() - cap;
+        for (token, _) in scoped.into_iter().take(evict_count) {
+            map.remove(&token);
+        }
+    }
+
     fn take_command_confirmation(&mut self, chat: &ChatKey, token: &str) -> ConfirmationResolution {
         let now = Instant::now();
+        // TG-GATE-V2 W9 — sweep expired entries on EVERY callback, not just
+        // on registration: a chat that never taps a stale confirmation
+        // again would otherwise leave it parked until the next register
+        // call from anybody.
+        self.pending_command_confirmations
+            .retain(|_, pending| !pending.expired(now));
         let Some(pending) = self.pending_command_confirmations.get(token).cloned() else {
             return ConfirmationResolution::Stale;
         };
@@ -9544,22 +9624,12 @@ impl Gateway {
         // Pull the focused session's live facts from its harness.
         let status = s.adapter.thread_status(&s.thread).await.ok();
         let running = s.adapter.running_tasks(&s.thread).await;
-        // Account usage belongs to a vendor account, not a session. Keep the
-        // vendor boundary intact while borrowing a same-vendor live session
-        // when the focused one has not received its rate-limit snapshot yet.
-        let mut account = s.adapter.account_usage(&s.thread).await;
-        if account.is_none() {
-            let vendor = s.adapter.vendor();
-            for other in &visible {
-                if other.adapter.vendor() != vendor {
-                    continue;
-                }
-                if let Some(usage) = other.adapter.account_usage(&other.thread).await {
-                    account = Some(usage);
-                    break;
-                }
-            }
-        }
+        // Account usage belongs to a vendor account, not a session, but it is
+        // rendered here as an attribute of THIS session's card — borrowing
+        // another same-vendor session's snapshot when the focused one hasn't
+        // received its own would silently mislabel whose usage is shown.
+        // None renders as "—" below; no cross-session borrow.
+        let account = s.adapter.account_usage(&s.thread).await;
 
         // State: a turn in flight ⇒ 🔵 working; silent past the idle window ⇒
         // 🔴 stuck — EXCEPT a BLOCKING subagent is an AUTHORITATIVE "still
@@ -12962,53 +13032,88 @@ impl Gateway {
         Ok(())
     }
 
+    /// The chat's currently-focused sid, for `/stop children`'s "direct
+    /// children of the chat's current session" scope. `None` when the chat
+    /// has no session focused (the caller turns that into a user-facing
+    /// error, matching [`Self::require_current_project`]'s style).
+    fn require_current_session_id(&self, chat: &ChatKey) -> Result<String> {
+        self.current_session
+            .read()
+            .ok()
+            .and_then(|m| m.get(chat).cloned())
+            .ok_or_else(|| {
+                anyhow!("Нет текущей сессии для /stop children — выберите через /use <id>")
+            })
+    }
+
     fn bulk_stop_candidates(
         &self,
         chat: &ChatKey,
         scope: &str,
-    ) -> Result<(BTreeSet<String>, Option<String>)> {
+    ) -> Result<(BTreeSet<String>, Option<String>, Option<String>)> {
         let project = if scope == "project" {
             Some(self.require_current_project(chat)?)
+        } else {
+            None
+        };
+        let parent = if scope == "children" {
+            Some(self.require_current_session_id(chat)?)
         } else {
             None
         };
         let mut candidates: BTreeSet<String> = self.sessions.keys().cloned().collect();
         candidates.extend(self.detached.keys().cloned());
         Ok((
-            self.bulk_stop_visible_snapshot(chat, project.as_deref(), &candidates),
+            self.bulk_stop_visible_snapshot(
+                chat,
+                project.as_deref(),
+                parent.as_deref(),
+                &candidates,
+            ),
             project,
+            parent,
         ))
     }
 
     /// Re-run the single-sid ACL/aliveness predicate only over a captured set.
     /// A confirmation is a snapshot: later sessions are never admitted, while
     /// sessions that disappeared or became invisible are dropped at tap time.
+    /// `parent`, when set (`children` scope), additionally requires the
+    /// candidate's `parent_sid` to match it — direct children only, never
+    /// grandchildren or the parent itself.
     fn bulk_stop_visible_snapshot(
         &self,
         chat: &ChatKey,
         project: Option<&str>,
+        parent: Option<&str>,
         candidates: &BTreeSet<String>,
     ) -> BTreeSet<String> {
         let mut memo = ProjectPrincipalMemo::new();
         let mut sids = BTreeSet::new();
         for sid in candidates {
-            let (accessible, session_project) = if let Some(session) = self.sessions.get(sid) {
-                (
-                    self.chat_can_access_with(chat, session, &mut memo),
-                    session.project.clone(),
-                )
-            } else if self.is_session_detached(sid) {
-                let Ok((slug, _cwd, meta)) = self.find_meta_for_sid(sid) else {
+            let (accessible, session_project, session_parent) =
+                if let Some(session) = self.sessions.get(sid) {
+                    (
+                        self.chat_can_access_with(chat, session, &mut memo),
+                        session.project.clone(),
+                        session.parent_sid.clone(),
+                    )
+                } else if self.is_session_detached(sid) {
+                    let Ok((slug, _cwd, meta)) = self.find_meta_for_sid(sid) else {
+                        continue;
+                    };
+                    (
+                        self.project_owner_visible_with(chat, &slug, &meta.owner, &mut memo),
+                        slug,
+                        meta.parent_sid.clone(),
+                    )
+                } else {
                     continue;
                 };
-                (
-                    self.project_owner_visible_with(chat, &slug, &meta.owner, &mut memo),
-                    slug,
-                )
-            } else {
-                continue;
-            };
-            if accessible && project.is_none_or(|project| project == session_project) {
+            if accessible
+                && project.is_none_or(|project| project == session_project)
+                && parent.is_none_or(|parent| Some(parent) == session_parent.as_deref())
+            {
                 sids.insert(sid.clone());
             }
         }
@@ -13019,9 +13124,10 @@ impl Gateway {
         &mut self,
         chat: &ChatKey,
         project: Option<&str>,
+        parent: Option<&str>,
         snapshot: &BTreeSet<String>,
     ) -> Vec<String> {
-        let visible = self.bulk_stop_visible_snapshot(chat, project, snapshot);
+        let visible = self.bulk_stop_visible_snapshot(chat, project, parent, snapshot);
         let dropped: Vec<String> = snapshot.difference(&visible).cloned().collect();
         let (stopped, failures) = self.stop_sessions_bulk(&visible).await;
         let mut lines = Vec::new();
@@ -17591,6 +17697,166 @@ mod tests {
         assert!(gateway.sessions.contains_key("s3"));
     }
 
+    /// `/stop children` — direct children of the chat's CURRENT session
+    /// only. Contrast with `/stop all`, which would stop every session
+    /// visible to the chat, INCLUDING the current (parent) session itself —
+    /// that is exactly the footgun this scope exists to avoid.
+    #[tokio::test]
+    async fn gateway_stop_children_stops_only_direct_children_of_current_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+
+        // s1 = parent (stays current); s2, s3 = its direct children; s4 =
+        // an unrelated top-level session (no parent) that must survive.
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway.sessions.get_mut("s2").unwrap().parent_sid = Some("s1".to_string());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway.sessions.get_mut("s3").unwrap().parent_sid = Some("s1".to_string());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        // s4 stays parentless — a grandchild would also stay untouched, but
+        // there is no cheap way to build one here without the delegation
+        // plumbing; parent-vs-sibling-vs-unrelated already proves the
+        // predicate is `parent_sid == current`, not "reachable from current".
+
+        // Refocus the chat on s1 (the last `/new` moved focus to s4).
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        gateway
+            .current_session
+            .write()
+            .unwrap()
+            .insert(chat, "s1".to_string());
+
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "children",
+        )
+        .await;
+        assert_eq!(
+            preview
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stop-children", "stop-cancel"]
+        );
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
+        assert_eq!(reply, vec!["Остановлено сессий: 2 (s2, s3)".to_string()]);
+        assert!(gateway.sessions.contains_key("s1"), "parent must survive");
+        assert!(!gateway.sessions.contains_key("s2"));
+        assert!(!gateway.sessions.contains_key("s3"));
+        assert!(
+            gateway.sessions.contains_key("s4"),
+            "unrelated session must survive"
+        );
+    }
+
+    /// A confirmed `cmd:!<token>` tap for a bulk `/stop` must execute
+    /// directly — NOT raise a second preview/confirm prompt on top of the
+    /// one the tap just answered. Typed `/stop children` (exercised above)
+    /// keeps its own preview-then-confirm prompt; this proves the OTHER
+    /// entry point (the gateway `cmd:?/stop children` confirm-wrapped
+    /// button `im_views::render_status` renders) skips the double-ask.
+    #[tokio::test]
+    async fn gateway_stop_children_confirmed_cmd_tap_executes_without_second_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway.sessions.get_mut("s2").unwrap().parent_sid = Some("s1".to_string());
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        gateway
+            .current_session
+            .write()
+            .unwrap()
+            .insert(chat, "s1".to_string());
+
+        // `cmd:?/stop children` — the confirm-wrapped inline button.
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/stop children".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "the yes/no confirmation prompt goes out via the event sink, not a reply: {replies:?}"
+        );
+
+        // Tap the "yes" (`cmd:!<token>`) button the confirm prompt just
+        // registered.
+        let confirm_token = {
+            let confirmations = gateway.pending_command_confirmations.clone();
+            confirmations
+                .keys()
+                .next()
+                .cloned()
+                .expect("a confirmation must have been registered")
+        };
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("cmd:!{confirm_token}"),
+                }),
+            )
+            .await
+            .unwrap();
+        // Exactly the ack + bulk-stop RESULT — never a second yes/no prompt.
+        assert_eq!(
+            replies.len(),
+            2,
+            "ack + direct bulk-stop result: {replies:?}"
+        );
+        assert!(
+            replies[1].contains("Остановлено сессий: 1 (s2)"),
+            "must execute the stop directly: {replies:?}"
+        );
+        assert!(gateway.sessions.contains_key("s1"));
+        assert!(!gateway.sessions.contains_key("s2"));
+    }
+
     #[tokio::test]
     async fn gateway_stop_all_cancel_leaves_sessions_alive() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -17777,7 +18043,7 @@ mod tests {
             .iter()
             .find(|command| command.name == "/stop")
             .expect("/stop must be registered in GATEWAY_COMMANDS");
-        assert_eq!(spec.arg_hint, Some("<id>|all|project"));
+        assert_eq!(spec.arg_hint, Some("<id>|all|project|children"));
         assert!(spec.help.contains("все доступные"), "{}", spec.help);
         assert!(spec.help.contains("проекта"), "{}", spec.help);
     }
@@ -21844,6 +22110,72 @@ mod tests {
         assert_eq!(no.id, "no");
         assert_eq!(no.style, Some(ButtonStyle::Danger));
         assert_eq!(no.data, format!("cmd:x{}", &yes.data[5..]));
+    }
+
+    /// TG-GATE-V2 W9 — [`Gateway::evict_oldest_confirmations`] is the
+    /// primitive both caps ride on: it must keep the NEWEST entries and drop
+    /// the oldest, and a `chat`-scoped call must never touch another chat's
+    /// entries even when evicting to make room.
+    #[test]
+    fn evict_oldest_confirmations_keeps_newest_and_respects_scope() {
+        let base = Instant::now();
+        let chat_a = ChatKey::new("telegram", "a", "a");
+        let chat_b = ChatKey::new("telegram", "b", "b");
+        let mut map: BTreeMap<String, PendingCommandConfirmation> = BTreeMap::new();
+        let mk = |chat: &ChatKey, offset_secs: u64| PendingCommandConfirmation {
+            chat: chat.clone(),
+            command: "/status".to_string(),
+            created_at: base + Duration::from_secs(offset_secs),
+            ttl: Duration::from_secs(300),
+        };
+        for (token, offset) in [("a0", 0), ("a1", 1), ("a2", 2), ("a3", 3), ("a4", 4)] {
+            map.insert(token.to_string(), mk(&chat_a, offset));
+        }
+        for (token, offset) in [("b0", 10), ("b1", 11)] {
+            map.insert(token.to_string(), mk(&chat_b, offset));
+        }
+
+        // Per-chat scope: cap chat_a to 3 — must drop its 2 OLDEST (a0, a1)
+        // and never touch chat_b's entries.
+        Gateway::evict_oldest_confirmations(&mut map, Some(&chat_a), 3);
+        assert_eq!(
+            map.keys().cloned().collect::<Vec<_>>(),
+            vec!["a2", "a3", "a4", "b0", "b1"],
+            "kept the 3 newest chat_a entries + both untouched chat_b entries"
+        );
+
+        // Global scope: cap the whole map to 4 — drops the single oldest
+        // entry remaining (a2), regardless of which chat it belongs to.
+        Gateway::evict_oldest_confirmations(&mut map, None, 4);
+        assert_eq!(
+            map.keys().cloned().collect::<Vec<_>>(),
+            vec!["a3", "a4", "b0", "b1"]
+        );
+
+        // Under the cap: a no-op, not an error.
+        Gateway::evict_oldest_confirmations(&mut map, None, 10);
+        assert_eq!(map.len(), 4);
+    }
+
+    /// Wiring test: registering more than [`MAX_COMMAND_CONFIRMATIONS_PER_CHAT`]
+    /// confirmations for ONE chat never lets that chat's live set grow past
+    /// the cap — an IM chat spamming `cmd:?…` taps can't grow the map
+    /// without bound between TTL sweeps.
+    #[tokio::test]
+    async fn register_command_confirmation_caps_per_chat() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let chat = ChatKey::new("telegram", "spammer", "spammer");
+        for _ in 0..(MAX_COMMAND_CONFIRMATIONS_PER_CHAT + 10) {
+            gateway.register_command_confirmation(chat.clone(), "/status".to_string());
+        }
+        let for_chat = gateway
+            .pending_command_confirmations
+            .values()
+            .filter(|pending| pending.chat == chat)
+            .count();
+        assert_eq!(for_chat, MAX_COMMAND_CONFIRMATIONS_PER_CHAT);
     }
 
     /// Confirmation tokens bind the rendered prompt to the tapper, including

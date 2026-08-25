@@ -50,6 +50,9 @@ pub enum InteractionOrigin {
         scope: String,
         /// Project resolved when the preview was created, for `project` scope.
         project: Option<String>,
+        /// Parent sid resolved when the preview was created, for `children`
+        /// scope (the chat's then-current session).
+        parent: Option<String>,
         /// Candidate sids captured by the preview.
         snapshot: Vec<String>,
     },

@@ -190,9 +190,12 @@ pub fn render_status(view: &StatusView) -> RichReply {
         .collect::<Vec<_>>();
     button_rows.extend(child_stops.chunks(8).map(|row| row.to_vec()));
     if !view.child_stop_sids.is_empty() {
+        // `/stop children` (NOT `/stop all`, which stops every session
+        // visible to this chat, including the parent itself) — direct
+        // children of the CURRENT session only.
         if let Some(stop_all) = command_button_styled(
             "⛔ Остановить все дочерние",
-            "?/stop all",
+            "?/stop children",
             Some(ButtonStyle::Danger),
         ) {
             button_rows.push(vec![stop_all]);
@@ -519,7 +522,7 @@ mod tests {
         assert_eq!(reply.button_rows[2].len(), 8);
         assert_eq!(reply.button_rows[3][0].label, "⛔ s85");
         assert_eq!(reply.button_rows[4][0].label, "⛔ Остановить все дочерние");
-        assert_eq!(reply.button_rows[4][0].data, "cmd:?/stop all");
+        assert_eq!(reply.button_rows[4][0].data, "cmd:?/stop children");
         assert_eq!(reply.button_rows[4][0].style, Some(ButtonStyle::Danger));
         assert!(reply.button_rows.iter().all(|row| row.len() <= 8));
         assert!(reply

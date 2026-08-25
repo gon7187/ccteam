@@ -63,12 +63,25 @@ pub struct TelegramChannel {
     /// share one counter — both hit the same Bot API surface). Any success
     /// resets it to 0 (a transient blip must not trip the breaker).
     rich_failures: std::sync::atomic::AtomicU32,
-    /// TG-GATE-V2 W7a — sticky circuit breaker: once 3 consecutive rich
-    /// failures land, this flips permanently (process lifetime, reset
-    /// never) so every later send/edit skips the rich attempt outright
-    /// instead of paying its latency + failing it again.
+    /// TG-GATE-V2 W7a — circuit breaker: once 3 consecutive rich failures
+    /// land, this flips so every later send/edit skips the rich attempt
+    /// outright instead of paying its latency + failing it again. TG-GATE-V2
+    /// W9 (N5) made it half-open rather than permanently sticky: every
+    /// [`RICH_HALF_OPEN_PROBE_EVERY`]th message lets ONE rich attempt
+    /// through as a probe; a successful probe resets this back to `false`
+    /// (see [`Self::record_rich_outcome`]), so a transient outage recovers
+    /// without a process restart.
     rich_disabled: std::sync::atomic::AtomicBool,
+    /// TG-GATE-V2 W9 (N5) — messages seen while the breaker has been open,
+    /// counting the half-open probes out at [`RICH_HALF_OPEN_PROBE_EVERY`].
+    rich_probe_counter: std::sync::atomic::AtomicU32,
 }
+
+/// TG-GATE-V2 W9 (N5) — half-open probe cadence: simpler than a wall-clock
+/// timer (no `Instant` bookkeeping, deterministic in tests), and message
+/// volume is the thing that actually matters — a quiet bot shouldn't burn a
+/// probe every 10 minutes for no reason, a busy one recovers just as fast.
+const RICH_HALF_OPEN_PROBE_EVERY: u32 = 50;
 
 impl TelegramChannel {
     /// Build with the @BotFather token and allowed chat IDs (empty =
@@ -89,6 +102,7 @@ impl TelegramChannel {
             rich_fallback_logged: Mutex::new(std::collections::HashSet::new()),
             rich_failures: std::sync::atomic::AtomicU32::new(0),
             rich_disabled: std::sync::atomic::AtomicBool::new(false),
+            rich_probe_counter: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -430,18 +444,35 @@ impl TelegramChannel {
 
     /// TG-GATE-V2 W7a — whether the sticky rich-message circuit breaker has
     /// tripped for this bot instance (3 consecutive failures, never reset).
+    /// `true` ⇒ skip the rich attempt for THIS message. TG-GATE-V2 W9
+    /// (N5) half-open: while the breaker is tripped, every
+    /// [`RICH_HALF_OPEN_PROBE_EVERY`]th call still returns `false` — one
+    /// probe message is allowed the rich attempt, and [`Self::record_rich_outcome`]
+    /// reopens the circuit on its success.
     fn rich_circuit_open(&self) -> bool {
-        self.rich_disabled
-            .load(std::sync::atomic::Ordering::Relaxed)
+        use std::sync::atomic::Ordering;
+        if !self.rich_disabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let count = self.rich_probe_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        count % RICH_HALF_OPEN_PROBE_EVERY != 0
     }
 
     /// Record one rich attempt's outcome. A success resets the consecutive
-    /// streak; the 3rd consecutive failure flips [`Self::rich_disabled`] and
-    /// logs once (never again — the breaker never resets for this process).
+    /// failure streak AND (TG-GATE-V2 W9 N5) reopens the breaker if it was
+    /// tripped — a half-open probe succeeding IS the recovery signal; the
+    /// 3rd consecutive failure (re-)trips [`Self::rich_disabled`] and logs
+    /// once per trip.
     fn record_rich_outcome(&self, ok: bool) {
         use std::sync::atomic::Ordering;
         if ok {
             self.rich_failures.store(0, Ordering::Relaxed);
+            if self.rich_disabled.swap(false, Ordering::Relaxed) {
+                tracing::info!(
+                    channel = %self.name,
+                    "rich messages re-enabled for this bot (half-open probe succeeded)"
+                );
+            }
             return;
         }
         let failures = self.rich_failures.fetch_add(1, Ordering::Relaxed) + 1;
@@ -515,78 +546,21 @@ impl TelegramChannel {
 
     /// The classic `sendMessage` path (HTML → plain retry), extended with
     /// [`SendMessage::button_rows`] ⊕ [`SendMessage::options`] as an
-    /// `inline_keyboard`. Splits internally at [`MAX_MESSAGE_UTF16`] when
-    /// `content` overflows it (reached either directly, for a non-rich
-    /// message, or as the rich-fallback path for a long `rich_markdown`
-    /// message whose plain `content` the daemon left unsplit).
+    /// `inline_keyboard`. TG-GATE-V2 W9 — this ONLY ever sends a single
+    /// message now: splitting an over-long message is the daemon's job (it
+    /// owns the durable per-part outbox — see [`RichFallbackNeedsSplit`] and
+    /// `daemon.rs`'s `finish_durable_outbound_send`), never this channel's.
+    /// `content` reaching here already fits [`MAX_MESSAGE_UTF16`] in every
+    /// production path: the daemon pre-splits a non-rich message at
+    /// [`Channel::max_message_len`] before calling [`Channel::send`], and
+    /// [`Channel::send`]'s rich-fallback branch returns
+    /// [`RichFallbackNeedsSplit`] instead of calling this when `content`
+    /// doesn't fit. An over-long `content` reaching here anyway (e.g. a
+    /// direct caller that bypasses both) degrades to a single truncated
+    /// message via [`text_payload`]'s existing safety net rather than a 400.
     async fn send_classic(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
-        if message.content.encode_utf16().count() <= MAX_MESSAGE_UTF16 {
-            return self
-                .send_classic_part(message, &message.content, true)
-                .await;
-        }
-        let parts = split_for_fallback(&message.content, MAX_MESSAGE_UTF16);
-        let total = parts.len();
-        let mut first_id = None;
-        let mut failed_parts: Vec<usize> = Vec::new();
-        for (i, part) in parts.into_iter().enumerate() {
-            let idx = i + 1;
-            // TG-GATE-V2 W7a — the suffix rides its OWN line after a blank
-            // line so it can never land on (and corrupt) a part whose last
-            // line is a ``` fence marker (`telegram_html::is_fence_line`);
-            // `split_for_fallback` already reserved room for it in the
-            // per-part budget.
-            let numbered = if total > 1 {
-                format!("{part}\n\n({idx}/{total})")
-            } else {
-                part
-            };
-            // Buttons ride the LAST part only, so they appear once the
-            // full message has been read.
-            //
-            // TG-GATE-V2 W7a — each part is delivered/accounted
-            // individually: a late part's failure no longer aborts the
-            // whole call via `?` (which would otherwise report NOTHING
-            // about the parts that already landed); it is recorded and the
-            // loop keeps going, so every part gets its own delivery
-            // attempt.
-            match self
-                .send_classic_part(message, &numbered, idx == total)
-                .await
-            {
-                Ok(id) => {
-                    if first_id.is_none() {
-                        first_id = id;
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        channel = %self.name,
-                        part = idx,
-                        total,
-                        error = %err,
-                        "telegram: rich-fallback split part failed to send"
-                    );
-                    failed_parts.push(idx);
-                }
-            }
-        }
-        if failed_parts.is_empty() {
-            Ok(first_id)
-        } else {
-            // A downcastable partial-failure so a caller with a durable
-            // retry/replay path (daemon.rs) can tell this apart from an
-            // ordinary single-message error: it must NOT re-send the whole
-            // logical message on replay (that would duplicate the parts
-            // that already landed), and can notify the user about only the
-            // parts that actually failed.
-            Err(FallbackSplitPartialFailure {
-                first_id,
-                total,
-                failed_parts,
-            }
-            .into())
-        }
+        self.send_classic_part(message, &message.content, true)
+            .await
     }
 
     /// Send one classic `sendMessage` part with `text` as the body
@@ -647,6 +621,17 @@ impl TelegramChannel {
                 resp_text
             );
         }
+        // TG-GATE-V2 W9 (N6) — same `{"ok":false}`-with-HTTP-200 shape
+        // `try_send_rich`/`try_edit_rich` already guard against
+        // (`body_reports_failure`); the classic path had no equivalent, so a
+        // degraded-server-side 200 read as delivered.
+        if body_reports_failure(&resp_text) {
+            anyhow::bail!(
+                "telegram sendMessage {} → 200 with ok:false: {}",
+                message.recipient,
+                resp_text
+            );
+        }
         let id = extract_message_id(&resp_text);
         tracing::info!(
             event = "latency",
@@ -700,6 +685,13 @@ impl TelegramChannel {
         }
         if !status.is_success() {
             anyhow::bail!("telegram editMessageText {recipient}#{message_id} → {status}: {text}");
+        }
+        // TG-GATE-V2 W9 (N6) — same `{"ok":false}`-with-HTTP-200 guard as
+        // the classic send path (`body_reports_failure`).
+        if body_reports_failure(&text) {
+            anyhow::bail!(
+                "telegram editMessageText {recipient}#{message_id} → 200 with ok:false: {text}"
+            );
         }
         // editMessageText returns the (same) edited Message; the id is
         // stable, so echo it back for the daemon's status bookkeeping.
@@ -946,54 +938,33 @@ fn body_reports_failure(text: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// TG-GATE-V2 W7a — split `content` for the rich→classic fallback ladder,
-/// reserving room for the trailing `\n\n({i}/{n})` part-count suffix BEFORE
-/// splitting, so appending it can never push a part back over
-/// [`MAX_MESSAGE_UTF16`] (a 400 the caller can't recover from). A first pass
-/// at the FULL budget learns the part count so the exact worst-case suffix
-/// width (`i == n == total`) can be reserved; a second pass then splits
-/// against that reduced budget.
-fn split_for_fallback(content: &str, max_units: usize) -> Vec<String> {
-    let first_pass = crate::sanitize::split_for_channel(content, max_units);
-    if first_pass.len() <= 1 {
-        return first_pass;
-    }
-    let total = first_pass.len();
-    let suffix_len = format!("\n\n({total}/{total})").encode_utf16().count();
-    let budget = max_units.saturating_sub(suffix_len).max(1);
-    crate::sanitize::split_for_channel(content, budget)
-}
+/// TG-GATE-V2 W9 — returned (wrapped in an `anyhow::Error`) by
+/// [`Channel::send`] when the rich attempt failed AND `content` overflows
+/// [`MAX_MESSAGE_UTF16`], so the classic single-message fallback can't carry
+/// it either. NOTHING is sent when this is returned — splitting a message
+/// into a durably-replayable set of parts requires the caller's OWN outbox
+/// (each part needs its own ledger row so a crash mid-split can't replay an
+/// already-delivered part, and a genuinely-failed part CAN be replayed on
+/// its own); that caller is `daemon.rs`'s `finish_durable_outbound_send`,
+/// which re-runs the ordinary non-rich split-and-send path
+/// (`rich_markdown` cleared → `Channel::max_message_len` →
+/// `crate::sanitize::split_for_channel`) for this message on catching it.
+/// Downcastable so that catch site can tell this apart from an ordinary
+/// send failure (which DOES get recorded `Failed` and retried whole on
+/// replay).
+#[derive(Debug, Default)]
+pub struct RichFallbackNeedsSplit;
 
-/// TG-GATE-V2 W7a — returned (wrapped in an `anyhow::Error`) by
-/// [`TelegramChannel::send_classic`] when the rich→classic fallback split
-/// into more than one Telegram message and at least one part failed to
-/// send. Downcastable so a caller with a durable retry/replay path
-/// (daemon.rs) can tell a genuine multi-part partial failure apart from an
-/// ordinary single-message error: it must NOT treat the whole logical send
-/// as failed (that would re-send the already-delivered parts on the next
-/// replay) and instead notify the user about only the parts that failed.
-#[derive(Debug)]
-pub struct FallbackSplitPartialFailure {
-    /// Platform message id of the first part that DID send, if any.
-    pub first_id: Option<String>,
-    /// Total number of parts the fallback split into.
-    pub total: usize,
-    /// 1-based indices of the parts that failed to send.
-    pub failed_parts: Vec<usize>,
-}
-
-impl std::fmt::Display for FallbackSplitPartialFailure {
+impl std::fmt::Display for RichFallbackNeedsSplit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "telegram rich-fallback split: {}/{} parts failed to send",
-            self.failed_parts.len(),
-            self.total
+            "telegram: rich message failed and classic content overflows {MAX_MESSAGE_UTF16} UTF-16 units; needs a split send"
         )
     }
 }
 
-impl std::error::Error for FallbackSplitPartialFailure {}
+impl std::error::Error for RichFallbackNeedsSplit {}
 
 fn should_retry_plain(status: reqwest::StatusCode, response_text: &str) -> bool {
     let description = serde_json::from_str::<serde_json::Value>(response_text)
@@ -1190,10 +1161,10 @@ impl Channel for TelegramChannel {
         // branch never runs, so a caller that never opts in keeps today's
         // behavior byte-for-byte.
         if let Some(markdown) = message.rich_markdown.as_deref() {
-            // TG-GATE-V2 W7a — the sticky circuit breaker skips the rich
-            // attempt entirely once it has tripped (3 consecutive
-            // failures), so a persistently-broken rich path stops paying
-            // its latency + retry cost on every single message.
+            // TG-GATE-V2 W7a — the circuit breaker skips the rich attempt
+            // entirely once it has tripped (3 consecutive failures, half-open
+            // per TG-GATE-V2 W9 N5), so a persistently-broken rich path
+            // stops paying its latency + retry cost on every single message.
             if !self.rich_circuit_open() {
                 match self.try_send_rich(message, markdown).await {
                     Ok(id) => {
@@ -1206,6 +1177,18 @@ impl Channel for TelegramChannel {
                     }
                 }
             }
+            // Rich failed (or the breaker skipped it) — fall back. A
+            // `content` that still fits the classic single-message ceiling
+            // sends exactly as before; one that doesn't needs a durable
+            // multi-part split, which is `daemon.rs`'s job (see
+            // [`RichFallbackNeedsSplit`]), not this channel's — sending
+            // nothing here and returning the typed error keeps this call
+            // side-effect-free so the caller's retry/replay bookkeeping
+            // stays correct.
+            if message.content.encode_utf16().count() <= MAX_MESSAGE_UTF16 {
+                return self.send_classic(message).await;
+            }
+            return Err(RichFallbackNeedsSplit.into());
         }
         self.send_classic(message).await
     }
@@ -1990,6 +1973,80 @@ mod tests {
         assert_eq!(payload.text, "hi <b>there</b>");
         let keyboard = inline_keyboard_json(&message).unwrap();
         assert_eq!(keyboard["inline_keyboard"][0][0]["text"], "Yes");
+    }
+
+    /// TG-GATE-V2 W9 (N6) — `body_reports_failure` now gates BOTH the
+    /// classic `sendMessage` path (`send_classic_part`) and `editMessageText`
+    /// (`edit_classic`), not just the rich Bot API calls: a Telegram 200 with
+    /// `{"ok":false}` must read as a failure everywhere this crate treats an
+    /// HTTP 200 as delivered.
+    #[test]
+    fn body_reports_failure_flags_200_with_ok_false() {
+        assert!(body_reports_failure(
+            r#"{"ok":false,"description":"blocked"}"#
+        ));
+        assert!(!body_reports_failure(r#"{"ok":true,"result":{}}"#));
+        // Missing/unparseable `ok` is NOT a failure — matches every OTHER
+        // Bot API call site in this file, which only inspects HTTP status.
+        assert!(!body_reports_failure("not json"));
+        assert!(!body_reports_failure("{}"));
+    }
+
+    /// TG-GATE-V2 W9 (N5) — half-open: once the breaker trips (3
+    /// consecutive failures), it stays closed for almost a full probe
+    /// window's worth of calls, then opens for exactly one probe; a failed
+    /// probe re-closes it for another full window.
+    #[test]
+    fn rich_circuit_half_opens_every_nth_call_after_tripping() {
+        let ch = TelegramChannel::new("t".to_string(), vec![]);
+        assert!(!ch.rich_circuit_open(), "starts closed (no failures yet)");
+        ch.record_rich_outcome(false);
+        ch.record_rich_outcome(false);
+        assert!(!ch.rich_circuit_open(), "2 failures — not tripped yet");
+        ch.record_rich_outcome(false);
+        // Tripped now. The next RICH_HALF_OPEN_PROBE_EVERY-1 calls stay open
+        // (rich skipped); the RICH_HALF_OPEN_PROBE_EVERY-th lets a probe
+        // through.
+        for i in 1..RICH_HALF_OPEN_PROBE_EVERY {
+            assert!(
+                ch.rich_circuit_open(),
+                "call {i} after trip must still skip rich"
+            );
+        }
+        assert!(
+            !ch.rich_circuit_open(),
+            "the {RICH_HALF_OPEN_PROBE_EVERY}th call is the half-open probe"
+        );
+        // A failed probe re-closes the circuit for another full window.
+        ch.record_rich_outcome(false);
+        for i in 1..RICH_HALF_OPEN_PROBE_EVERY {
+            assert!(
+                ch.rich_circuit_open(),
+                "call {i} after a failed probe must still skip rich"
+            );
+        }
+    }
+
+    /// A successful half-open probe reopens the breaker outright — every
+    /// subsequent call goes through the rich path again, not just every
+    /// Nth one.
+    #[test]
+    fn rich_circuit_reopens_on_successful_probe() {
+        let ch = TelegramChannel::new("t".to_string(), vec![]);
+        ch.record_rich_outcome(false);
+        ch.record_rich_outcome(false);
+        ch.record_rich_outcome(false);
+        for _ in 1..RICH_HALF_OPEN_PROBE_EVERY {
+            assert!(ch.rich_circuit_open());
+        }
+        assert!(!ch.rich_circuit_open(), "the probe call");
+        ch.record_rich_outcome(true);
+        for i in 0..RICH_HALF_OPEN_PROBE_EVERY * 2 {
+            assert!(
+                !ch.rich_circuit_open(),
+                "call {i} after a successful probe must stay open (breaker reset)"
+            );
+        }
     }
 
     #[test]
