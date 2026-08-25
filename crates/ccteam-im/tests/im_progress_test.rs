@@ -220,7 +220,7 @@ fn agent_delta(id: &str, text: &str) -> ThreadEvent {
 }
 
 fn is_status(text: &str) -> bool {
-    ["⏳", "💭", "✍️", "✅"].iter().any(|p| text.starts_with(p))
+    ["▶️", "✅"].iter().any(|p| text.starts_with(p))
 }
 
 /// Run the daemon over one `/new` + one trigger message with `script` as
@@ -302,6 +302,12 @@ async fn progress_edits_one_status_message_not_spam() {
         status_sends, 1,
         "expected exactly one status seed in outbox, got: {outbox:?}"
     );
+    let status = outbox
+        .iter()
+        .find(|content| content.starts_with("▶️"))
+        .expect("terminal progress seed");
+    assert!(status.contains("работает · "), "status: {status}");
+    assert!(status.contains("```text\n"), "status: {status}");
     // The answer is its own (new) message. It carries the v0.8.23 review
     // §3.2-5 context echo suffix on a focused answer, so match on a prefix.
     assert!(
@@ -324,7 +330,7 @@ async fn progress_edits_one_status_message_not_spam() {
     // The status was edited (≥1 edit), and finalized to a ✅ summary.
     assert!(!edits.is_empty(), "status message was never edited");
     assert!(
-        edits.iter().any(|(_, c)| c.starts_with("✅ done")),
+        edits.iter().any(|(_, c)| c.starts_with("✅ готово · ")),
         "status was not finalized, edits: {edits:?}"
     );
     // A tool count surfaced in some status text.
@@ -332,7 +338,7 @@ async fn progress_edits_one_status_message_not_spam() {
         outbox
             .iter()
             .chain(edits.iter().map(|(_, c)| c))
-            .any(|c| c.contains("bash ×1")),
+            .any(|c| c.contains("команда ×1")),
         "no folded tool count appeared"
     );
     std::env::remove_var("CCTEAM_IM_PROGRESS");
