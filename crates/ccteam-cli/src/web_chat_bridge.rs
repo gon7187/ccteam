@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(
             clicked.selection,
             Some(ChoiceReply {
-                data: "tok:2".into()
+                data: "tok:2".into(),
                 callback_ephemeral: None,
             })
         );
