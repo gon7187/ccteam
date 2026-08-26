@@ -72,9 +72,10 @@ type DraftRoutes = Arc<StdMutex<HashMap<DraftRouteKey, DraftRoute>>>;
 type DraftFinalizations = Arc<StdMutex<HashMap<String, Arc<AtomicU8>>>>;
 
 const FINAL_PENDING: u8 = 0;
-const FINALIZING: u8 = 1;
+const FINAL_ANSWER_IN_FLIGHT: u8 = 1;
 const FINAL_SENT: u8 = 2;
 const FINAL_CANCELLED: u8 = 3;
+const FINALIZING: u8 = 4;
 
 struct DraftKeepaliveState {
     recipient: String,
@@ -1928,6 +1929,14 @@ fn spawn_gateway_event_consumer(
                         .sid
                         .as_deref()
                         .and_then(|sid| draft_finalizations.lock().unwrap().get(sid).cloned());
+                    if let Some(state) = finalization.as_ref() {
+                        let _ = state.compare_exchange(
+                            FINAL_PENDING,
+                            FINAL_ANSWER_IN_FLIGHT,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                    }
                     let sent =
                         send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out)
                             .await;
@@ -2489,23 +2498,35 @@ fn schedule_draft_finalization(
     let finalizations = finalizations.clone();
     tokio::spawn(async move {
         tokio::time::sleep(DRAFT_FINALIZATION_GRACE).await;
-        if state
-            .compare_exchange(
-                FINAL_PENDING,
-                FINALIZING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            send_completed_draft(channel, completion).await;
-            state.store(FINAL_SENT, Ordering::Release);
-            let mut entries = finalizations.lock().unwrap();
-            if entries
-                .get(&sid)
-                .is_some_and(|current| Arc::ptr_eq(current, &state))
-            {
-                entries.remove(&sid);
+        loop {
+            match state.load(Ordering::Acquire) {
+                FINAL_SENT | FINAL_CANCELLED | FINALIZING => return,
+                FINAL_ANSWER_IN_FLIGHT => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                FINAL_PENDING => {
+                    if state
+                        .compare_exchange(
+                            FINAL_PENDING,
+                            FINALIZING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        send_completed_draft(channel, completion).await;
+                        state.store(FINAL_SENT, Ordering::Release);
+                        let mut entries = finalizations.lock().unwrap();
+                        if entries
+                            .get(&sid)
+                            .is_some_and(|current| Arc::ptr_eq(current, &state))
+                        {
+                            entries.remove(&sid);
+                        }
+                    }
+                    return;
+                }
+                _ => return,
             }
         }
     });
