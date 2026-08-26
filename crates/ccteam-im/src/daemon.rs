@@ -1860,7 +1860,18 @@ enum DurableOutboundState {
     Failed,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_OUTBOX_PATH: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 fn durable_outbox_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_OUTBOX_PATH.with(|path| path.borrow().clone()) {
+        return path;
+    }
     crate::default_ccteam_root_public()
         .join("state")
         .join("im")
@@ -2642,8 +2653,7 @@ mod tests {
     /// Persistent rich rejection must stay inside the transport contract:
     /// the daemon has one already-partitioned row, while the transport may
     /// emit several classic messages without creating nested ledger rows.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn rich_fallback_needs_split_is_handled_inside_transport_without_new_rows() {
         use crate::transport::providers::mock::MockChannel;
 
@@ -2685,12 +2695,8 @@ mod tests {
             }
         }
 
-        let _guard = env_lock();
         let tmp = TempDir::new().unwrap();
-        let old_home = std::env::var_os("HOME");
-        let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
-        std::env::set_var("HOME", tmp.path());
-        std::env::set_var("CCTEAM_HOME", tmp.path().join(".ccteam"));
+        let _outbox = isolate_outbox(&tmp);
 
         let mock = MockChannel::new().with_name("telegram");
         let inner = mock.clone();
@@ -2717,22 +2723,14 @@ mod tests {
             .map(|line| serde_json::from_str::<DurableOutboundRow>(line).unwrap().id)
             .collect();
         assert_eq!(ids, ["in-1-0".to_string()].into_iter().collect());
-
-        restore_env("CCTEAM_HOME", old_ccteam_home);
-        restore_env("HOME", old_home);
     }
 
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn crash_after_partition_write_replays_all_parts_in_order() {
         use crate::transport::providers::mock::MockChannel;
 
-        let _guard = env_lock();
         let tmp = TempDir::new().unwrap();
-        let old_home = std::env::var_os("HOME");
-        let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
-        std::env::set_var("HOME", tmp.path());
-        std::env::set_var("CCTEAM_HOME", tmp.path().join(".ccteam"));
+        let _outbox = isolate_outbox(&tmp);
 
         let parts = vec![
             SendMessage::new("part one", "chat-1"),
@@ -2776,19 +2774,12 @@ mod tests {
                 .count(),
             3
         );
-
-        restore_env("CCTEAM_HOME", old_ccteam_home);
-        restore_env("HOME", old_home);
     }
 
     #[test]
     fn queue_split_parts_keeps_plain_and_rich_payloads_per_row() {
-        let _guard = env_lock();
         let tmp = TempDir::new().unwrap();
-        let old_home = std::env::var_os("HOME");
-        let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
-        std::env::set_var("HOME", tmp.path());
-        std::env::set_var("CCTEAM_HOME", tmp.path().join(".ccteam"));
+        let _outbox = isolate_outbox(&tmp);
 
         let parts = vec![
             SendMessage::new("plain one", "chat-1").with_rich_markdown("**rich one**"),
@@ -2801,9 +2792,6 @@ mod tests {
         assert_eq!(queued[1].1.rich_markdown.as_deref(), Some("**rich two**"));
         let raw = std::fs::read_to_string(durable_outbox_path()).unwrap();
         assert_eq!(raw.lines().count(), 2);
-
-        restore_env("CCTEAM_HOME", old_ccteam_home);
-        restore_env("HOME", old_home);
     }
 
     /// v0.8.19 — the stateless (Telegram) shape: `add_reaction` returns `None`,
@@ -2961,6 +2949,29 @@ mod tests {
         LOCK.get_or_init(|| StdMutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct OutboxScope {
+        previous: Option<PathBuf>,
+    }
+
+    impl Drop for OutboxScope {
+        fn drop(&mut self) {
+            TEST_OUTBOX_PATH.with(|path| {
+                path.replace(self.previous.take());
+            });
+        }
+    }
+
+    fn isolate_outbox(tmp: &TempDir) -> OutboxScope {
+        let path = tmp
+            .path()
+            .join(".ccteam")
+            .join("state")
+            .join("im")
+            .join("outbound.jsonl");
+        let previous = TEST_OUTBOX_PATH.with(|slot| slot.replace(Some(path)));
+        OutboxScope { previous }
     }
 
     fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
