@@ -28806,7 +28806,6 @@ mod tests {
         gw.enable_project_creation(paths.clone());
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gw.set_event_sink(etx);
-        tokio::spawn(async move { while erx.recv().await.is_some() {} });
 
         let mk = |depth: u32| DelegationParent {
             sid: "sPARENT".into(),
@@ -28879,18 +28878,37 @@ mod tests {
         .unwrap_err();
         assert!(e3.to_string().contains("ceiling"), "delegated: {e3}");
 
-        // All three emitted a `delegation_denied` with the right reason.
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        let events =
-            ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha")).unwrap();
-        let reasons: Vec<&str> = events
-            .iter()
-            .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("delegation_denied"))
-            .filter_map(|e| e.get("reason").and_then(|v| v.as_str()))
-            .collect();
-        assert!(reasons.contains(&"depth"), "reasons: {reasons:?}");
-        assert!(reasons.contains(&"children"), "reasons: {reasons:?}");
-        assert!(reasons.contains(&"delegated"), "reasons: {reasons:?}");
+        // Broadcast is synchronous; the journal append intentionally is not.
+        // Observe the live contract instead of timing an unrelated write task.
+        let mut reasons = Vec::new();
+        while reasons.len() < 3 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), erx.recv())
+                .await
+                .expect("delegation guardrail event timed out")
+                .expect("delegation event channel stays open");
+            if let GatewayEventKind::Delegation {
+                relation,
+                reason: Some(reason),
+                ..
+            } = event.kind
+            {
+                if relation == "denied" {
+                    reasons.push(reason);
+                }
+            }
+        }
+        assert!(
+            reasons.iter().any(|reason| reason == "depth"),
+            "reasons: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|reason| reason == "children"),
+            "reasons: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|reason| reason == "delegated"),
+            "reasons: {reasons:?}"
+        );
     }
 
     /// The Ambient budget gate denies a spawn when the vendor's 24h project
@@ -28919,7 +28937,6 @@ mod tests {
         gw.enable_project_creation(paths.clone());
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gw.set_event_sink(etx);
-        tokio::spawn(async move { while erx.recv().await.is_some() {} });
 
         let e = gw
             .create_delegated_session(
@@ -28940,13 +28957,18 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("budget"), "budget: {e}");
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        let events =
-            ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha")).unwrap();
-        assert!(events.iter().any(|e| {
-            e.get("event").and_then(|v| v.as_str()) == Some("delegation_denied")
-                && e.get("reason").and_then(|v| v.as_str()) == Some("budget")
-        }));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), erx.recv())
+            .await
+            .expect("delegation budget event timed out")
+            .expect("delegation event channel stays open");
+        assert!(matches!(
+            event.kind,
+            GatewayEventKind::Delegation {
+                relation,
+                reason: Some(reason),
+                ..
+            } if relation == "denied" && reason == "budget"
+        ));
     }
 
     /// Chaos: a durable watch + a completed child turn on disk, loaded by a
