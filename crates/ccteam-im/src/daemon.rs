@@ -3615,7 +3615,7 @@ mod tests {
 
     /// TG-GATE-V2 W10 — `button_rows`/`options` must land on the LAST
     /// part only: a tapper acting on a middle part would be acting on an
-    /// incomplete reply. `rich_markdown` is cleared on every part.
+    /// incomplete reply. Rich parts retain their independently-sendable Markdown.
     #[test]
     fn queue_split_parts_keeps_buttons_only_on_the_last_part() {
         // TG-GATE-V2 W11 — `queue_split_parts` durably appends every part
@@ -3658,9 +3658,9 @@ mod tests {
         assert_eq!(queued.len(), 3);
 
         for (idx, (_, part_msg)) in queued.iter().enumerate() {
-            assert!(
-                part_msg.rich_markdown.is_none(),
-                "part {idx} must never carry rich_markdown"
+            assert_eq!(
+                part_msg.rich_markdown.as_deref(),
+                Some(part_msg.content.as_str())
             );
             if idx == 2 {
                 assert_eq!(part_msg.button_rows, button_rows, "last part keeps buttons");
