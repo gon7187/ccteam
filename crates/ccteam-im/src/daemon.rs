@@ -2088,7 +2088,6 @@ async fn deliver_progress(
                 });
             }
 
-            let mut draft_failed_now = false;
             if let (Some(sid), Some(draft_id)) = (draft_sid, handle.draft_id) {
                 let state_failed = draft_keepalives
                     .get(&status_key)
@@ -2096,7 +2095,6 @@ async fn deliver_progress(
                     .unwrap_or(false);
                 if state_failed {
                     draft_failed(draft_failures, sid);
-                    draft_failed_now = true;
                 } else {
                     let markdown = crate::progress::draft_markdown(&content);
                     if let Some(keepalive) = draft_keepalives.get(&status_key) {
@@ -2142,7 +2140,6 @@ async fn deliver_progress(
                         }
                         Err(err) => {
                             draft_failed(draft_failures, sid);
-                            draft_failed_now = true;
                             tracing::warn!(
                                 channel = %channel_name,
                                 status_key = %status_key,
@@ -2154,12 +2151,10 @@ async fn deliver_progress(
                     }
                 }
             }
-            if draft_failed_now {
-                if let Some(draft_id) = handle.draft_id {
-                    remove_draft_route(draft_routes, channel_name, &handle.recipient, draft_id);
-                }
-                stop_keepalive(draft_keepalives, &status_key);
+            if let Some(draft_id) = handle.draft_id {
+                remove_draft_route(draft_routes, channel_name, &handle.recipient, draft_id);
             }
+            stop_keepalive(draft_keepalives, &status_key);
             let seed = SendMessage::new(content, handle.recipient.clone())
                 .in_thread(thread_ts)
                 .with_button_rows(button_rows);
