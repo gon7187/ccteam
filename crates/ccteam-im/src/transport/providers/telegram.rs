@@ -911,6 +911,8 @@ struct RichBlockObject {
     #[serde(default)]
     language: Option<String>,
     #[serde(default)]
+    size: Option<i64>,
+    #[serde(default)]
     expression: Option<String>,
     #[serde(default)]
     name: Option<String>,
@@ -1052,10 +1054,13 @@ fn rich_block_to_text(block: &RichBlock) -> Option<String> {
     };
     match block.kind.as_str() {
         "paragraph" | "footer" => block.text.as_ref().map(rich_text_to_text),
-        "heading" => block
-            .text
-            .as_ref()
-            .map(|text| format!("# {}", rich_text_to_text(text))),
+        "heading" => block.text.as_ref().map(|text| {
+            let level = block
+                .size
+                .filter(|size| (1..=6).contains(size))
+                .unwrap_or(1) as usize;
+            format!("{} {}", "#".repeat(level), rich_text_to_text(text))
+        }),
         "pre" => block.text.as_ref().map(|text| {
             let language = block.language.as_deref().unwrap_or_default();
             format!(
@@ -1112,7 +1117,14 @@ fn rich_block_to_text(block: &RichBlock) -> Option<String> {
                 .join("\n")
         }),
         "blockquote" => block.blocks.as_deref().map(|blocks| {
-            rich_blocks_to_text(blocks)
+            let mut content = rich_blocks_to_text(blocks);
+            if let Some(credit) = &block.credit {
+                let credit = rich_text_to_text(credit);
+                if !credit.is_empty() {
+                    content = nonempty_join([content, credit]);
+                }
+            }
+            content
                 .lines()
                 .map(|line| format!("> {line}"))
                 .collect::<Vec<_>>()
@@ -3065,6 +3077,7 @@ mod tests {
             "blocks": [
                 {"type": "paragraph", "text": ["Hello ", {"type": "bold", "text": "world"}]},
                 {"type": "heading", "size": 2, "text": "Title"},
+                {"type": "heading", "size": 6, "text": "Small title"},
                 {"type": "pre", "language": "rust", "text": "fn main() {}"},
                 {"type": "list", "items": [
                     {"label": "one", "blocks": []},
@@ -3074,7 +3087,7 @@ mod tests {
                     [{"text": "Name"}, {"text": "Value"}],
                     [{"text": "x"}, {"text": ["42", {"type": "code", "text": "!"}]}]
                 ]},
-                {"type": "blockquote", "blocks": [{"type": "paragraph", "text": "quoted"}]},
+                {"type": "blockquote", "blocks": [{"type": "paragraph", "text": "quoted"}], "credit": "source"},
                 {"type": "details", "summary": "More", "blocks": [{"type": "paragraph", "text": "content"}]},
                 {"type": "future_block", "text": {"type": "future_text", "text": "ignored"}},
                 {"type": "paragraph", "text": [
@@ -3087,7 +3100,7 @@ mod tests {
 
         assert_eq!(
             rich_message_to_text(&rich),
-            "Hello world\n\n# Title\n\n```rust\nfn main() {}\n```\n\n- one\n2. two\n\n| Name | Value |\n| x | 42! |\n\n> quoted\n\nMore\n\ncontent\n\n🙂$x^2$"
+            "Hello world\n\n## Title\n\n###### Small title\n\n```rust\nfn main() {}\n```\n\n- one\n2. two\n\n| Name | Value |\n| x | 42! |\n\n> quoted\n> \n> source\n\nMore\n\ncontent\n\n🙂$x^2$"
         );
     }
 
