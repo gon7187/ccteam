@@ -603,9 +603,10 @@ pub fn progress_cost_contribution(event: &Value) -> Option<ProgressCostContribut
         }),
         Some(CHAT_TURN_COMPLETED) => {
             let vendor = vendor?;
-            // Codex emits the priced `agent_done` row for the same turn. Its
-            // paneless chat mirror is activity/token telemetry only; pricing
-            // it here would double-count the turn.
+            // Invariant: codex is today the only adapter emitting priced
+            // `agent_done`; a new vendor bridging `agent_done` must also be
+            // excluded from pricing `chat_turn_completed`, or its cost
+            // double-counts. Codex's paneless chat mirror is telemetry only.
             if vendor == "codex" {
                 return None;
             }

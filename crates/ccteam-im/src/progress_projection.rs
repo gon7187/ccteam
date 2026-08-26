@@ -615,6 +615,9 @@ fn turn_source(kind: &str) -> Option<TurnSource> {
     }
 }
 
+// Invariant: codex is today the only adapter emitting priced `agent_done`;
+// a new vendor bridging `agent_done` must also be excluded from pricing
+// `chat_turn_completed`, or its cost double-counts.
 fn turn_identity(event: &Value) -> Option<TurnIdentity> {
     let sid = ccteam_core::progress::event_sid(event)
         .filter(|value| !value.is_empty())
