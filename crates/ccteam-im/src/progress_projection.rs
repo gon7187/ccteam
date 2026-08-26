@@ -123,6 +123,9 @@ pub struct ProjectProjectionSnapshot {
     pub tokens_24h: u64,
     /// Whether at least one 24-hour row has a trustworthy USD amount.
     pub cost_24h_priced: bool,
+    /// Turns in the trailing 24-hour window that carried tokens but no
+    /// trustworthy USD amount (unknown model / subscription pricing).
+    pub cost_24h_unpriced_turns: u32,
     /// Delegation lifecycle and rolling counters.
     pub delegations: DelegationProjection,
     /// Low-frequency workflow facts needed by the legacy workflow summary.
@@ -193,6 +196,7 @@ struct CostBucket {
     total: f64,
     count: u32,
     priced: u32,
+    unpriced: u32,
     tokens: u64,
     by_vendor: BTreeMap<String, f64>,
 }
@@ -655,7 +659,8 @@ fn fold_turn(state: &mut SlugState, event: &Value, source: TurnSource, now: Date
             fold_cost(state, cost, event, now);
         }
         if tokens > 0 {
-            fold_tokens(state, tokens, recent_event_minute(event, now), now);
+            let priced = cost.as_ref().is_some_and(|value| value.is_priced);
+            fold_tokens(state, tokens, priced, recent_event_minute(event, now), now);
         }
         return;
     };
@@ -683,7 +688,13 @@ fn fold_turn(state: &mut SlugState, event: &Value, source: TurnSource, now: Date
         fold_cost(state, cost, event, now);
     }
     if tokens > 0 {
-        fold_tokens(state, tokens, folded.event_minute, now);
+        fold_tokens(
+            state,
+            tokens,
+            folded.cost_usd.is_some(),
+            folded.event_minute,
+            now,
+        );
     }
     state.folded_turns.insert(identity, folded);
 }
@@ -712,6 +723,9 @@ fn unfold_turn(state: &mut SlugState, turn: &FoldedTurn) {
         if let Some(event_minute) = turn.event_minute {
             if let Some(bucket) = state.minute_cost.get_mut(&event_minute) {
                 bucket.tokens = bucket.tokens.saturating_sub(turn.tokens);
+                if turn.cost_usd.is_none() {
+                    bucket.unpriced = bucket.unpriced.saturating_sub(1);
+                }
             }
         }
     }
@@ -752,12 +766,21 @@ fn fold_cost(
     }
 }
 
-fn fold_tokens(state: &mut SlugState, tokens: u64, event_minute: Option<i64>, now: DateTime<Utc>) {
+fn fold_tokens(
+    state: &mut SlugState,
+    tokens: u64,
+    priced: bool,
+    event_minute: Option<i64>,
+    now: DateTime<Utc>,
+) {
     let oldest = minute(now).saturating_sub(MINUTES_24H);
     state.minute_cost.retain(|minute, _| *minute >= oldest);
     if let Some(event_minute) = event_minute {
         let bucket = state.minute_cost.entry(event_minute).or_default();
         bucket.tokens = bucket.tokens.saturating_add(tokens);
+        if !priced {
+            bucket.unpriced = bucket.unpriced.saturating_add(1);
+        }
     }
 }
 
@@ -873,6 +896,11 @@ fn snapshot(state: &SlugState, now: DateTime<Utc>) -> ProjectProjectionSnapshot 
             .minute_cost
             .range(oldest..)
             .any(|(_, bucket)| bucket.priced > 0),
+        cost_24h_unpriced_turns: state
+            .minute_cost
+            .range(oldest..)
+            .map(|(_, bucket)| bucket.unpriced)
+            .fold(0u32, u32::saturating_add),
         delegations,
         workflow_events: state.workflow_events.clone(),
         last_unscoped: state.last_unscoped.clone(),

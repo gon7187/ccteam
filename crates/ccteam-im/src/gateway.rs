@@ -9989,10 +9989,12 @@ impl Gateway {
             .as_ref()
             .map(|projection| {
                 let snapshot = projection.project_snapshot(&s.project);
-                let usd = if snapshot.cost_24h_priced {
-                    format!("${:.2}", snapshot.cost.cost_24h_usd)
-                } else {
-                    "$—".to_string()
+                // A mixed window (some turns priced, some not) must not read
+                // as a complete total: mark it as a lower bound.
+                let usd = match (snapshot.cost_24h_priced, snapshot.cost_24h_unpriced_turns) {
+                    (false, _) => "$—".to_string(),
+                    (true, 0) => format!("${:.2}", snapshot.cost.cost_24h_usd),
+                    (true, n) => format!("≥${:.2} (+{n} без цены)", snapshot.cost.cost_24h_usd),
                 };
                 format!(
                     "💰 Расход проекта 24ч: {usd} · {} токенов",
@@ -23945,6 +23947,54 @@ mod tests {
         assert!(
             out[0].contains("💰 Расход проекта 24ч: $— · 1.2k токенов"),
             "unknown cost must remain unknown while tokens stay visible: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_status_marks_mixed_window_cost_as_lower_bound() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let path = paths.progress_jsonl("alpha");
+        ccteam_core::progress::append_event(
+            &path,
+            &serde_json::json!({
+                "event": ccteam_harness::execution::progress_bridge::AGENT_DONE,
+                "session_id": "s1",
+                "vendor": "claude",
+                "cost_usd": 1.25,
+                "usage": {"input_tokens": 1_000, "output_tokens": 200},
+                "ts": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .unwrap();
+        ccteam_core::progress::append_event(
+            &path,
+            &serde_json::json!({
+                "event": ccteam_harness::execution::progress_bridge::CHAT_TURN_COMPLETED,
+                "sid": "s2",
+                "turn_id": "turn-1",
+                "vendor": "claude",
+                "model": "claude-fable-5",
+                "usage": {"output_tokens": 800},
+                "ts": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .unwrap();
+
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            out[0].contains("💰 Расход проекта 24ч: ≥$1.25 (+1 без цены) · 2.0k токенов"),
+            "mixed window must be shown as a lower bound: {out:?}"
         );
     }
 
