@@ -1224,6 +1224,10 @@ fn rich_block_to_text(block: &RichBlock) -> Option<String> {
                 .map(|expression| format!("${expression}$"))
                 .unwrap_or_else(|| "[mathematical_expression]".to_string()),
         ),
+        // Bot API defines `thinking` as draft-only, so it cannot be received
+        // in an inbound Message; keep it explicit and skip it if Telegram
+        // ever sends one anyway.
+        "thinking" => None,
         _ => None,
     }
 }
@@ -3138,6 +3142,16 @@ mod tests {
             rich_message_to_text(&rich),
             "[photo]\n\n[video]\n\n[audio]\n\n[document: report.pdf]\n\n[animation]\n\n[voice_note]\n\n[map]\n\n[buttons: Open | More!]\n\n---\n\n[anchor: section]\n\n$a+b$"
         );
+    }
+
+    #[test]
+    fn rich_message_thinking_block_is_explicitly_skipped() {
+        let rich: RichMessage = serde_json::from_value(serde_json::json!({
+            "blocks": [{"type": "thinking", "text": "draft-only"}]
+        }))
+        .expect("thinking block is valid JSON");
+
+        assert_eq!(rich_message_to_text(&rich), "");
     }
 
     #[test]
