@@ -584,16 +584,46 @@ pub fn load_or_recover_progress_checkpoint(
 }
 
 /// Extract the one lifetime cost formula shared by projection and checkpoint
-/// folding. Only `agent_done` contributes; missing/non-numeric cost is zero.
+/// folding. Terminal legacy rows carry their resolved USD amount; paneless
+/// `chat_turn_completed` rows carry usage and are priced here instead.
 pub fn progress_cost_contribution(event: &Value) -> Option<ProgressCostContribution<'_>> {
-    (event_kind_name(event) == Some(AGENT_DONE)).then(|| ProgressCostContribution {
-        cost_usd: event.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0),
-        vendor: event.get("vendor").and_then(Value::as_str),
-        sid: event
-            .get("sid")
-            .and_then(Value::as_str)
-            .or_else(|| event.get("session_id").and_then(Value::as_str)),
-    })
+    let vendor = event.get("vendor").and_then(Value::as_str);
+    let sid = event
+        .get("sid")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("session_id").and_then(Value::as_str));
+    match event_kind_name(event) {
+        Some(AGENT_DONE) => Some(ProgressCostContribution {
+            cost_usd: event.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0),
+            vendor,
+            sid,
+        }),
+        Some(CHAT_TURN_COMPLETED) => {
+            let vendor = vendor?;
+            let cost_vendor = match vendor {
+                "claude" => ccteam_cost::Vendor::Claude,
+                "codex" => ccteam_cost::Vendor::Codex,
+                "grok" => ccteam_cost::Vendor::Grok,
+                "opencode" => ccteam_cost::Vendor::Opencode,
+                "kimi" => ccteam_cost::Vendor::Kimi,
+                "pi" => ccteam_cost::Vendor::Pi,
+                "dsh" => ccteam_cost::Vendor::Dsh,
+                _ => return None,
+            };
+            let usage = serde_json::from_value::<ccteam_cost::UnifiedTokenUsage>(
+                event.get("usage")?.clone(),
+            )
+            .ok()?;
+            let model = event.get("model").and_then(Value::as_str).unwrap_or("");
+            let cost = ccteam_cost::resolve_turn_cost(&usage, cost_vendor, model)?;
+            Some(ProgressCostContribution {
+                cost_usd: cost,
+                vendor: Some(vendor),
+                sid,
+            })
+        }
+        _ => None,
+    }
 }
 
 pub fn append_event(path: &Path, event: &Value) -> Result<()> {
@@ -1306,6 +1336,19 @@ pub fn build_chat_turn_completed_event(
     usage: &ccteam_cost::UnifiedTokenUsage,
     model: Option<&str>,
 ) -> Value {
+    build_chat_turn_completed_event_with_vendor(role, sid, turn_id, usage, model, None)
+}
+
+/// Build a paneless terminal turn row with the vendor needed for shared cost
+/// pricing. The vendor is additive so older hook-produced rows remain valid.
+pub fn build_chat_turn_completed_event_with_vendor(
+    role: &str,
+    sid: &str,
+    turn_id: &str,
+    usage: &ccteam_cost::UnifiedTokenUsage,
+    model: Option<&str>,
+    vendor: Option<&str>,
+) -> Value {
     let mut ev = json!({
         "event": CHAT_TURN_COMPLETED,
         "role": role,
@@ -1316,6 +1359,9 @@ pub fn build_chat_turn_completed_event(
     });
     if let Some(model) = model.filter(|m| !m.is_empty()) {
         ev["model"] = Value::String(model.to_string());
+    }
+    if let Some(vendor) = vendor.filter(|v| !v.is_empty()) {
+        ev["vendor"] = Value::String(vendor.to_string());
     }
     ev
 }
@@ -1797,6 +1843,37 @@ mod tests {
         let lines: Vec<_> = body.lines().collect();
         assert_eq!(lines.len(), 1);
         assert_eq!(serde_json::from_str::<Value>(lines[0]).unwrap(), event);
+    }
+
+    #[test]
+    fn chat_turn_completed_contributes_priced_cost_to_project_ledger() {
+        let event = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "vendor": "claude",
+            "model": "claude-sonnet-4-6",
+            "usage": {"output_tokens": 1_000_000},
+        });
+
+        let contribution = progress_cost_contribution(&event).expect("priced chat turn");
+        assert_eq!(contribution.vendor, Some("claude"));
+        assert_eq!(contribution.sid, Some("s1"));
+        assert!((contribution.cost_usd - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn chat_turn_completed_builder_carries_vendor_for_pricing() {
+        let event = build_chat_turn_completed_event_with_vendor(
+            "worker",
+            "s1",
+            "turn-1",
+            &ccteam_cost::UnifiedTokenUsage::default(),
+            Some("gpt-5.5"),
+            Some("codex"),
+        );
+
+        assert_eq!(event["vendor"], "codex");
+        assert_eq!(event["model"], "gpt-5.5");
     }
 
     #[test]

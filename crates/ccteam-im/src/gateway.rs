@@ -6348,12 +6348,13 @@ impl Gateway {
                                     (&evt, progress_path.as_ref())
                                 {
                                     let ev =
-                                        ccteam_core::progress::build_chat_turn_completed_event(
+                                        ccteam_core::progress::build_chat_turn_completed_event_with_vendor(
                                             &session.role,
                                             &session_id,
                                             "",
                                             &ccteam_harness::UnifiedTokenUsage::default(),
                                             None,
+                                            Some(vendor_str(session.vendor)),
                                         );
                                     if let Err(err) =
                                         ccteam_core::progress::append_event(ppath, &ev)
@@ -6384,12 +6385,13 @@ impl Gateway {
                                 Some(ppath),
                             ) = (turn_terminal_accounting(&evt), progress_path.as_ref())
                             {
-                                let ev = ccteam_core::progress::build_chat_turn_completed_event(
+                                let ev = ccteam_core::progress::build_chat_turn_completed_event_with_vendor(
                                     &session.role,
                                     &session_id,
                                     turn_id,
                                     usage,
                                     model,
+                                    Some(vendor_str(session.vendor)),
                                 );
                                 if let Err(err) =
                                     ccteam_core::progress::append_event(ppath, &ev)

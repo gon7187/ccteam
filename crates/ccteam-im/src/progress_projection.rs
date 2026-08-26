@@ -800,6 +800,32 @@ mod tests {
     }
 
     #[test]
+    fn chat_turn_completed_rows_feed_project_24h_cost() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        let now = fixed_now();
+        write_lines(
+            &paths.progress_jsonl("chat-cost"),
+            &[json!({
+                "event": CHAT_TURN_COMPLETED,
+                "sid": "s1",
+                "vendor": "codex",
+                "model": "gpt-5.5",
+                "usage": {"output_tokens": 1_000_000},
+                "ts": now.to_rfc3339(),
+            })],
+        );
+
+        let projection = projection(paths);
+        projection.hydrate_now(&["chat-cost".to_string()]).unwrap();
+        let snapshot = projection.project_snapshot("chat-cost");
+
+        assert!((snapshot.cost.cost_24h_usd - 30.0).abs() < 1e-9);
+        assert_eq!(snapshot.cost.cost_24h_by_vendor["codex"], 30.0);
+        assert_eq!(snapshot.sessions["s1"].tokens_total, Some(1_000_000));
+    }
+
+    #[test]
     fn mixed_fixture_projects_cost_sessions_delegations_tail_and_corruption() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
