@@ -1758,10 +1758,6 @@ fn spawn_gateway_event_consumer(
                                 }
                             }
                         }
-                        if let Err(err) = channel.answer_callback(&callback.callback_query_id).await
-                        {
-                            tracing::warn!(channel = %evt.channel, error = %err, "ccteam-im: callback answer failed");
-                        }
                         continue;
                     }
                     let mut out = SendMessage::new(evt.content.clone(), evt.chat_id.clone())
@@ -1822,9 +1818,6 @@ fn spawn_gateway_event_consumer(
                                 .await;
                             }
                         }
-                    }
-                    if let Err(err) = channel.answer_callback(&callback.callback_query_id).await {
-                        tracing::warn!(channel = %evt.channel, error = %err, "ccteam-im: callback answer failed");
                     }
                 }
                 // v0.8.19 — the 👀 ack reaction (IM-only; web/discord/slack keep
@@ -2737,7 +2730,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn confirmed_ephemeral_stop_edits_outcome_without_public_send() {
+    async fn confirmed_ephemeral_stop_error_edits_without_public_send() {
         struct RecordingChannel {
             sends: Arc<StdMutex<Vec<SendMessage>>>,
             edits: Arc<StdMutex<Vec<String>>>,
@@ -2785,6 +2778,13 @@ mod tests {
         let fake = Arc::new(ClaudeStreamJsonAdapter::new());
         let project = TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", project.path());
+        gateway
+            .handle_text("telegram", "-100", "7", "/new claude")
+            .await
+            .unwrap();
+        let blocker = project.path().join("routing-blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        gateway.enable_persistence(&blocker).unwrap();
         let mut events = gateway.subscribe_events();
         gateway.set_event_sink(tx);
         let callback = crate::transport::CallbackEphemeral {
@@ -2841,12 +2841,12 @@ mod tests {
         consumer.abort();
 
         assert_eq!(
-            *channel.edits.lock().unwrap(),
-            vec![
-                "Точно выполнить `/stop s1`?".to_string(),
-                "Сессия s1 недоступна этому чату".to_string(),
-            ]
+            channel.edits.lock().unwrap().first().cloned(),
+            Some("Точно выполнить `/stop s1`?".to_string())
         );
+        let edits = channel.edits.lock().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert!(edits[1].contains("directory"), "{}", edits[1]);
         assert!(channel.sends.lock().unwrap().is_empty());
     }
 
@@ -2854,7 +2854,7 @@ mod tests {
     async fn unknown_ephemeral_edit_suppresses_all_follow_up_sends() {
         struct UnknownChannel {
             sends: Arc<StdMutex<Vec<SendMessage>>>,
-            answers: Arc<StdMutex<Vec<String>>>,
+            processed: Arc<std::sync::atomic::AtomicBool>,
         }
 
         #[async_trait::async_trait]
@@ -2882,21 +2882,15 @@ mod tests {
                 _content: &str,
                 _button_rows: &[Vec<crate::transport::MessageOption>],
             ) -> crate::transport::EphemeralDelivery {
+                self.processed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 crate::transport::EphemeralDelivery::Unknown(anyhow::anyhow!("connection reset"))
-            }
-
-            async fn answer_callback(&self, callback_query_id: &str) -> anyhow::Result<()> {
-                self.answers
-                    .lock()
-                    .unwrap()
-                    .push(callback_query_id.to_string());
-                Ok(())
             }
         }
 
         let channel = Arc::new(UnknownChannel {
             sends: Arc::new(StdMutex::new(Vec::new())),
-            answers: Arc::new(StdMutex::new(Vec::new())),
+            processed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         let mut channels: ChannelMap = HashMap::new();
         channels.insert("telegram".to_string(), channel.clone());
@@ -2927,7 +2921,7 @@ mod tests {
         .unwrap();
 
         for _ in 0..200 {
-            if !channel.answers.lock().unwrap().is_empty() {
+            if channel.processed.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -2935,7 +2929,6 @@ mod tests {
         consumer.abort();
 
         assert!(channel.sends.lock().unwrap().is_empty());
-        assert_eq!(*channel.answers.lock().unwrap(), vec!["cb-1"]);
     }
 
     /// TG-GATE-V2 W7a — a rich-capable channel's `Answer` event gets

@@ -10,7 +10,7 @@
 //! end-to-end verification ships post-token-paste.
 
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -69,9 +69,6 @@ pub struct TelegramChannel {
     rich_fallback_logged: Mutex<std::collections::HashSet<String>>,
     /// Failure kinds already logged for an ephemeral→legacy fallback.
     ephemeral_fallback_logged: Mutex<std::collections::HashSet<String>>,
-    /// Callback acknowledgement state, shared by the delivery path and its
-    /// five-second safety guard.
-    callback_answers: Arc<StdMutex<std::collections::HashMap<String, CallbackAnswerState>>>,
     /// TG-GATE-V2 W7a — consecutive rich-message failures (send + edit
     /// share one counter — both hit the same Bot API surface). Any success
     /// resets it to 0 (a transient blip must not trip the breaker).
@@ -103,65 +100,6 @@ pub struct TelegramChannel {
 /// probe every 10 minutes for no reason, a busy one recovers just as fast.
 const RICH_HALF_OPEN_PROBE_EVERY: u32 = 50;
 
-#[derive(Debug, Clone, Copy)]
-enum CallbackAnswerState {
-    Pending,
-    Answering,
-    Answered(Instant),
-}
-
-#[cfg(test)]
-const CALLBACK_ANSWER_DELAY: Duration = Duration::from_millis(50);
-#[cfg(not(test))]
-const CALLBACK_ANSWER_DELAY: Duration = Duration::from_secs(5);
-
-async fn answer_callback_once(
-    http: reqwest::Client,
-    url: String,
-    answers: Arc<StdMutex<std::collections::HashMap<String, CallbackAnswerState>>>,
-    callback_query_id: String,
-) -> anyhow::Result<()> {
-    let should_send = {
-        let mut answered = answers.lock().expect("callback answer lock");
-        answered.retain(|_, state| {
-            !matches!(state, CallbackAnswerState::Answered(at) if at.elapsed() >= Duration::from_secs(60))
-        });
-        match answered.get(&callback_query_id).copied() {
-            Some(CallbackAnswerState::Pending) => {
-                answered.insert(callback_query_id.clone(), CallbackAnswerState::Answering);
-                true
-            }
-            Some(CallbackAnswerState::Answering | CallbackAnswerState::Answered(_)) => false,
-            None => {
-                answered.insert(callback_query_id.clone(), CallbackAnswerState::Answering);
-                true
-            }
-        }
-    };
-    if !should_send {
-        return Ok(());
-    }
-
-    let result = http
-        .post(url)
-        .json(&serde_json::json!({ "callback_query_id": &callback_query_id }))
-        .send()
-        .await
-        .and_then(|response| response.error_for_status())
-        .map(|_| ());
-    let mut answered = answers.lock().expect("callback answer lock");
-    if let Some(state) = answered.get_mut(&callback_query_id) {
-        if matches!(state, CallbackAnswerState::Answering) {
-            *state = if result.is_ok() {
-                CallbackAnswerState::Answered(Instant::now())
-            } else {
-                CallbackAnswerState::Pending
-            };
-        }
-    }
-    result.map_err(Into::into)
-}
-
 impl TelegramChannel {
     /// Build with the @BotFather token and allowed chat IDs (empty =
     /// open). The chat-ID allowlist is enforced inside [`Channel::listen`]
@@ -183,7 +121,6 @@ impl TelegramChannel {
             name: "telegram".to_string(),
             rich_fallback_logged: Mutex::new(std::collections::HashSet::new()),
             ephemeral_fallback_logged: Mutex::new(std::collections::HashSet::new()),
-            callback_answers: Arc::new(StdMutex::new(std::collections::HashMap::new())),
             rich_failures: std::sync::atomic::AtomicU32::new(0),
             rich_disabled: std::sync::atomic::AtomicBool::new(false),
             rich_probe_counter: std::sync::atomic::AtomicU32::new(0),
@@ -399,12 +336,12 @@ impl TelegramChannel {
             .and_then(|u| u.username.clone())
             .or_else(|| cb.from.as_ref().map(|u| u.id.to_string()))
             .unwrap_or_else(|| "anonymous".to_string());
+        // Telegram callback-id validity after answerCallbackQuery is unverified
+        // for ephemeral group sends. Confirm this on a live group; if the id is
+        // consumed, send the ephemeral response first and answer immediately
+        // afterwards in this same handler, synchronously, with no timer.
         let callback_ephemeral = callback_ephemeral_context(&cb, msg);
-        if callback_ephemeral.is_some() {
-            self.schedule_callback_answer(cb.id.clone());
-        } else if let Err(err) = self.answer_callback(&cb.id).await {
-            tracing::warn!(error = %err, "telegram callback answer failed");
-        }
+        let _ = self.answer_callback(&cb.id).await;
         let payload = ChannelMessage {
             id: callback_message_id(msg.message_id),
             sender,
@@ -420,18 +357,6 @@ impl TelegramChannel {
             }),
         };
         let _ = tx.send(payload).await;
-    }
-
-    fn schedule_callback_answer(&self, callback_query_id: String) {
-        let http = self.http.clone();
-        let url = self.api_url("answerCallbackQuery");
-        let answers = Arc::clone(&self.callback_answers);
-        tokio::spawn(async move {
-            tokio::time::sleep(CALLBACK_ANSWER_DELAY).await;
-            if let Err(err) = answer_callback_once(http, url, answers, callback_query_id).await {
-                tracing::warn!(error = %err, "telegram callback safety answer failed");
-            }
-        });
     }
 
     /// POST a `setMessageReaction` body (the shared transport for both
@@ -2060,13 +1985,13 @@ impl Channel for TelegramChannel {
     }
 
     async fn answer_callback(&self, callback_query_id: &str) -> anyhow::Result<()> {
-        answer_callback_once(
-            self.http.clone(),
-            self.api_url("answerCallbackQuery"),
-            Arc::clone(&self.callback_answers),
-            callback_query_id.to_string(),
-        )
-        .await
+        self.http
+            .post(self.api_url("answerCallbackQuery"))
+            .json(&serde_json::json!({ "callback_query_id": callback_query_id }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     async fn edit_ephemeral_message(
@@ -2959,7 +2884,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_callback_answers_immediately_before_forwarding() {
-        let (base, seen) = spawn_concurrent_http(&[r#"{"ok":true,"result":true}"#]);
+        let (base, seen) = spawn_sequential_http(&[r#"{"ok":true,"result":true}"#]);
         let channel = TelegramChannel::new("t".into(), vec![]).with_api_base(base);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         channel
@@ -2986,6 +2911,38 @@ mod tests {
             .is_none());
         assert_eq!(seen.lock().unwrap().len(), 1);
         assert!(seen.lock().unwrap()[0].0.contains("answerCallbackQuery"));
+    }
+
+    #[tokio::test]
+    async fn group_callback_answers_immediately_before_forwarding() {
+        let (base, seen) = spawn_sequential_http(&[r#"{"ok":true,"result":true}"#]);
+        let channel = TelegramChannel::new("t".into(), vec![]).with_api_base(base);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        channel
+            .handle_callback_query(
+                &tx,
+                serde_json::from_value(serde_json::json!({
+                    "id": "cb-group",
+                    "from": {"id": 7},
+                    "data": "cmd:/status",
+                    "message": {
+                        "message_id": 1,
+                        "date": 0,
+                        "chat": {"id": -100, "type": "group"}
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let forwarded = rx.recv().await.expect("group callback forwarded");
+        assert!(forwarded
+            .selection
+            .and_then(|selection| selection.callback_ephemeral)
+            .is_some());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].0.contains("answerCallbackQuery"));
     }
 
     #[test]
@@ -3254,243 +3211,84 @@ mod tests {
         );
     }
 
-    /// (request-line, body) pairs a concurrent fake responder saw.
+    /// (request-line, body) pairs a [`spawn_sequential_http`] responder saw.
     type SeenRequests = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
 
-    fn spawn_http(
-        responses: &'static [&'static str],
-        delayed_method: Option<(&'static str, Duration)>,
-        route_by_method: bool,
-    ) -> (String, SeenRequests) {
+    /// Spawn a local HTTP/1.1 responder that answers exactly `responses.len()`
+    /// sequential requests in order (mirrors `lark_onboarding_test`'s
+    /// `spawn_oneshot_http`, extended to more than one call so a rich→classic
+    /// fallback round-trip — two real requests — can be observed). Returns
+    /// the `http://127.0.0.1:<port>` base URL and the (request-line, body)
+    /// pairs actually received, in order.
+    fn spawn_sequential_http(responses: &'static [&'static str]) -> (String, SeenRequests) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_thread = seen.clone();
-        let answer_index = std::sync::Arc::new(AtomicUsize::new(0));
         std::thread::spawn(move || {
-            let mut workers = Vec::new();
-            for (accept_index, _) in responses.iter().enumerate() {
+            for response in responses {
                 let Ok((mut stream, _)) = listener.accept() else {
                     break;
                 };
-                let seen_thread = seen_thread.clone();
-                let answer_index = answer_index.clone();
-                workers.push(std::thread::spawn(move || {
-                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                    let mut req = Vec::new();
-                    let mut buf = [0u8; 4096];
-                    let mut header_end = None;
-                    let mut content_length = 0usize;
-                    loop {
-                        match stream.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                req.extend_from_slice(&buf[..n]);
-                                if header_end.is_none() {
-                                    if let Some(pos) =
-                                        req.windows(4).position(|w| w == b"\r\n\r\n")
-                                    {
-                                        let end = pos + 4;
-                                        header_end = Some(end);
-                                        let headers = String::from_utf8_lossy(&req[..end]);
-                                        content_length = headers
-                                            .lines()
-                                            .find_map(|line| {
-                                                let (name, value) = line.split_once(':')?;
-                                                name.eq_ignore_ascii_case("content-length")
-                                                    .then(|| value.trim().parse::<usize>().ok())
-                                                    .flatten()
-                                            })
-                                            .unwrap_or(0);
-                                    }
-                                }
-                                if let Some(end) = header_end {
-                                    if req.len().saturating_sub(end) >= content_length {
-                                        break;
-                                    }
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_length = 0usize;
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            req.extend_from_slice(&buf[..n]);
+                            if header_end.is_none() {
+                                if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    let end = pos + 4;
+                                    header_end = Some(end);
+                                    let headers = String::from_utf8_lossy(&req[..end]);
+                                    content_length = headers
+                                        .lines()
+                                        .find_map(|line| {
+                                            let (name, value) = line.split_once(':')?;
+                                            name.eq_ignore_ascii_case("content-length")
+                                                .then(|| value.trim().parse::<usize>().ok())
+                                                .flatten()
+                                        })
+                                        .unwrap_or(0);
                                 }
                             }
-                            Err(_) => break,
+                            if let Some(end) = header_end {
+                                if req.len().saturating_sub(end) >= content_length {
+                                    break;
+                                }
+                            }
                         }
+                        Err(_) => break,
                     }
-                    let end = header_end.unwrap_or(req.len());
-                    let request_line = String::from_utf8_lossy(&req[..end])
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .to_string();
-                    let body = String::from_utf8_lossy(&req[end..]).to_string();
-                    seen_thread.lock().unwrap().push((request_line.clone(), body));
-                    let response_index = if route_by_method
-                        && request_line.contains("sendRichMessage")
-                    {
-                        0
-                    } else if route_by_method {
-                        1 + answer_index.fetch_add(1, Ordering::SeqCst)
-                    } else {
-                        accept_index
-                    };
-                    let response = responses
-                        .get(response_index)
-                        .or_else(|| responses.last())
-                        .expect("fake HTTP response");
-                    if let Some((method, delay)) = delayed_method {
-                        if request_line.contains(method) {
-                            std::thread::sleep(delay);
-                        }
-                    }
-                    let resp = if response.starts_with("HTTP/") {
-                        response.to_string()
-                    } else {
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            response.len(),
-                            response
-                        )
-                    };
-                    let _ = stream.write_all(resp.as_bytes());
-                    let _ = stream.flush();
-                }));
-            }
-            for worker in workers {
-                let _ = worker.join();
+                }
+                let end = header_end.unwrap_or(req.len());
+                let request_line = String::from_utf8_lossy(&req[..end])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let body = String::from_utf8_lossy(&req[end..]).to_string();
+                seen_thread.lock().unwrap().push((request_line, body));
+                let resp = if response.starts_with("HTTP/") {
+                    response.to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response.len(),
+                        response
+                    )
+                };
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
             }
         });
         (format!("http://{addr}"), seen)
-    }
-
-    fn spawn_concurrent_http(responses: &'static [&'static str]) -> (String, SeenRequests) {
-        spawn_http(responses, None, false)
-    }
-
-    fn spawn_concurrent_http_with_delay(
-        responses: &'static [&'static str],
-        delayed_method: &'static str,
-        delay: Duration,
-    ) -> (String, SeenRequests) {
-        spawn_http(responses, Some((delayed_method, delay)), true)
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delayed_ephemeral_delivery_and_safety_timer_answer_once() {
-        let (base, seen) = spawn_concurrent_http_with_delay(
-            &[
-                r#"{"ok":true,"result":{"message_id":1}}"#,
-                r#"{"ok":true,"result":true}"#,
-            ],
-            "sendRichMessage",
-            Duration::from_millis(200),
-        );
-        let channel = TelegramChannel::new("t".into(), vec![]).with_api_base(base);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        channel
-            .handle_callback_query(
-                &tx,
-                serde_json::from_value(serde_json::json!({
-                    "id": "cb-delayed",
-                    "from": {"id": 7},
-                    "data": "cmd:/status",
-                    "message": {
-                        "message_id": 1,
-                        "date": 0,
-                        "chat": {"id": -100, "type": "group"}
-                    }
-                }))
-                .unwrap(),
-            )
-            .await;
-        let callback = rx
-            .recv()
-            .await
-            .and_then(|message| message.selection)
-            .and_then(|selection| selection.callback_ephemeral)
-            .expect("group callback context");
-
-        assert!(matches!(
-            channel
-                .send_ephemeral(
-                    &SendMessage::new("done", "-100")
-                        .with_rich_markdown("done")
-                        .with_callback_ephemeral(callback.callback_query_id.clone(), 7),
-                )
-                .await,
-            EphemeralDelivery::Delivered(_)
-        ));
-        channel
-            .answer_callback(&callback.callback_query_id)
-            .await
-            .unwrap();
-
-        let seen = seen.lock().unwrap();
-        assert_eq!(
-            seen.iter()
-                .filter(|(request, _)| request.contains("answerCallbackQuery"))
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn failed_safety_answer_can_be_retried_after_ephemeral_delivery() {
-        let (base, seen) = spawn_concurrent_http_with_delay(
-            &[
-                r#"{"ok":true,"result":{"message_id":1}}"#,
-                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                r#"{"ok":true,"result":true}"#,
-            ],
-            "sendRichMessage",
-            Duration::from_millis(200),
-        );
-        let channel = TelegramChannel::new("t".into(), vec![]).with_api_base(base);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        channel
-            .handle_callback_query(
-                &tx,
-                serde_json::from_value(serde_json::json!({
-                    "id": "cb-retry",
-                    "from": {"id": 7},
-                    "data": "cmd:/status",
-                    "message": {
-                        "message_id": 1,
-                        "date": 0,
-                        "chat": {"id": -100, "type": "group"}
-                    }
-                }))
-                .unwrap(),
-            )
-            .await;
-        let callback = rx
-            .recv()
-            .await
-            .and_then(|message| message.selection)
-            .and_then(|selection| selection.callback_ephemeral)
-            .expect("group callback context");
-
-        assert!(matches!(
-            channel
-                .send_ephemeral(
-                    &SendMessage::new("done", "-100")
-                        .with_rich_markdown("done")
-                        .with_callback_ephemeral(callback.callback_query_id.clone(), 7),
-                )
-                .await,
-            EphemeralDelivery::Delivered(_)
-        ));
-        channel
-            .answer_callback(&callback.callback_query_id)
-            .await
-            .unwrap();
-
-        let seen = seen.lock().unwrap();
-        assert_eq!(
-            seen.iter()
-                .filter(|(request, _)| request.contains("answerCallbackQuery"))
-                .count(),
-            2
-        );
     }
 
     /// Review round 2 — the round-1 regression test above never called
@@ -3504,7 +3302,7 @@ mod tests {
     /// wire level, not just at the pure-function level.
     #[tokio::test]
     async fn send_falls_back_to_classic_html_with_bold_when_rich_fails() {
-        let (base, seen) = spawn_concurrent_http(&[
+        let (base, seen) = spawn_sequential_http(&[
             r#"{"ok":false,"description":"rich messages unsupported"}"#,
             r#"{"ok":true,"result":{"message_id":1}}"#,
         ]);
@@ -3553,7 +3351,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_ephemeral_message_uses_its_own_endpoint_and_identifier() {
-        let (base, seen) = spawn_concurrent_http(&[r#"{"ok":true,"result":true}"#]);
+        let (base, seen) = spawn_sequential_http(&[r#"{"ok":true,"result":true}"#]);
         let mut ch = TelegramChannel::new("t".into(), vec![]);
         ch.api_base = base;
         let callback = crate::transport::CallbackEphemeral {
@@ -3584,67 +3382,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ephemeral_delivery_precedes_callback_answer() {
-        let (base, seen) = spawn_concurrent_http_with_delay(
-            &[
-                r#"{"ok":true,"result":{"message_id":1}}"#,
-                r#"{"ok":true,"result":true}"#,
-            ],
-            "sendRichMessage",
-            Duration::from_millis(50),
-        );
-        let ch = Arc::new(TelegramChannel::new("t".into(), vec![]).with_api_base(base));
-        let message = SendMessage::new("confirm", "-100")
-            .with_rich_markdown("confirm")
-            .with_callback_ephemeral("cb-42", 7);
-
-        let send_channel = ch.clone();
-        let send_task = tokio::spawn(async move { send_channel.send_ephemeral(&message).await });
-        for _ in 0..100 {
-            if seen
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(request, _)| request.contains("sendRichMessage"))
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        assert!(
-            seen.lock()
-                .unwrap()
-                .iter()
-                .any(|(request, _)| request.contains("sendRichMessage")),
-            "the delayed send must be in flight before the ack starts"
-        );
-
-        let answer_channel = ch.clone();
-        let answer_task =
-            tokio::spawn(async move { answer_channel.answer_callback("cb-42").await });
-        let (send_result, answer_result) = tokio::join!(send_task, answer_task);
-        assert!(matches!(
-            send_result.unwrap(),
-            crate::transport::EphemeralDelivery::Delivered(_)
-        ));
-        answer_result.unwrap().unwrap();
-
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 2);
-        let send_index = seen
-            .iter()
-            .position(|(request, _)| request.contains("sendRichMessage"))
-            .expect("rich ephemeral send request");
-        let answer_index = seen
-            .iter()
-            .position(|(request, _)| request.contains("answerCallbackQuery"))
-            .expect("callback answer request");
-        assert!(send_index < answer_index, "{seen:?}");
-    }
-
-    #[tokio::test]
     async fn rejected_ephemeral_rich_send_falls_back_to_classic_once() {
-        let (base, seen) = spawn_concurrent_http(&[
+        let (base, seen) = spawn_sequential_http(&[
             "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             r#"{"ok":true,"result":{"message_id":1}}"#,
         ]);
@@ -3666,7 +3405,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_ephemeral_rich_send_does_not_retry() {
-        let (base, seen) = spawn_concurrent_http(&[
+        let (base, seen) = spawn_sequential_http(&[
             "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         ]);
         let mut ch = TelegramChannel::new("t".into(), vec![]);
@@ -3684,7 +3423,7 @@ mod tests {
 
     #[tokio::test]
     async fn classic_fallback_strips_inline_rows_and_keeps_the_keyboard() {
-        let (base, seen) = spawn_concurrent_http(&[
+        let (base, seen) = spawn_sequential_http(&[
             r#"{"ok":false,"description":"rich messages unsupported"}"#,
             r#"{"ok":true,"result":{"message_id":2}}"#,
         ]);
@@ -3721,7 +3460,7 @@ mod tests {
     async fn send_uses_content_untruncated_when_markdown_render_overflows_but_content_fits() {
         let short_content = "short base content that easily fits under the limit";
         let oversized_markdown = "y".repeat(MAX_MESSAGE_UTF16 + 200);
-        let (base, seen) = spawn_concurrent_http(&[
+        let (base, seen) = spawn_sequential_http(&[
             r#"{"ok":false,"description":"rich messages unsupported"}"#,
             r#"{"ok":true,"result":{"message_id":7}}"#,
         ]);
@@ -3752,7 +3491,7 @@ mod tests {
 
     #[tokio::test]
     async fn rich_fallback_sends_long_plain_as_sequential_classic_messages() {
-        let (base, seen) = spawn_concurrent_http(&[
+        let (base, seen) = spawn_sequential_http(&[
             r#"{"ok":false,"description":"rich messages unsupported"}"#,
             r#"{"ok":true,"result":{"message_id":1}}"#,
             r#"{"ok":true,"result":{"message_id":2}}"#,
@@ -3784,7 +3523,7 @@ mod tests {
 
     #[tokio::test]
     async fn rich_fallback_long_plain_attaches_buttons_only_to_final_classic_chunk() {
-        let (base, seen) = spawn_concurrent_http(&[
+        let (base, seen) = spawn_sequential_http(&[
             r#"{"ok":false,"description":"rich messages unsupported"}"#,
             r#"{"ok":true,"result":{"message_id":1}}"#,
             r#"{"ok":false,"description":"rich messages unsupported"}"#,

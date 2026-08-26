@@ -3565,10 +3565,17 @@ impl Gateway {
             // `nav:use:<sid>` — with no pending-registry token), so it is
             // resolved here, before the token-keyed choice path.
             if let Some(nav) = reply.data.strip_prefix("nav:") {
-                let replies = self
-                    .resolve_nav_selection(&chat, nav)
-                    .await
-                    .map(plain_replies)?;
+                let replies = match self.resolve_nav_selection(&chat, nav).await {
+                    Ok(replies) => plain_replies(replies),
+                    Err(error) => {
+                        return self.route_callback_error(
+                            &chat,
+                            reply.callback_ephemeral.as_ref(),
+                            message_id,
+                            error,
+                        )
+                    }
+                };
                 return Ok(self.route_callback_replies(
                     &chat,
                     reply.callback_ephemeral.as_ref(),
@@ -3581,14 +3588,25 @@ impl Gateway {
             match im_callbacks::parse(&reply.data) {
                 im_callbacks::CallbackAction::Choice { .. } => {}
                 action => {
-                    let replies = self
+                    let replies = match self
                         .resolve_cmd_callback(
                             &chat,
                             action,
                             message_id,
                             reply.callback_ephemeral.as_ref(),
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(replies) => replies,
+                        Err(error) => {
+                            return self.route_callback_error(
+                                &chat,
+                                reply.callback_ephemeral.as_ref(),
+                                message_id,
+                                error,
+                            )
+                        }
+                    };
                     return Ok(self.route_callback_replies(
                         &chat,
                         reply.callback_ephemeral.as_ref(),
@@ -3597,10 +3615,17 @@ impl Gateway {
                     ));
                 }
             }
-            let replies = self
-                .resolve_selection(&chat, &reply.data)
-                .await
-                .map(plain_replies)?;
+            let replies = match self.resolve_selection(&chat, &reply.data).await {
+                Ok(replies) => plain_replies(replies),
+                Err(error) => {
+                    return self.route_callback_error(
+                        &chat,
+                        reply.callback_ephemeral.as_ref(),
+                        message_id,
+                        error,
+                    )
+                }
+            };
             return Ok(self.route_callback_replies(
                 &chat,
                 reply.callback_ephemeral.as_ref(),
@@ -4742,6 +4767,25 @@ impl Gateway {
             content,
         );
         Vec::new()
+    }
+
+    fn route_callback_error(
+        &self,
+        chat: &ChatKey,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+        message_id: &str,
+        error: anyhow::Error,
+    ) -> Result<Vec<RichReply>> {
+        let Some(callback) = callback else {
+            return Err(error);
+        };
+        self.emit_ephemeral_reply(
+            chat,
+            callback,
+            telegram_callback_message_id(message_id),
+            error.to_string(),
+        );
+        Ok(Vec::new())
     }
 
     fn emit_ephemeral_reply(
@@ -23445,6 +23489,74 @@ mod tests {
         );
         let outcome = events.try_recv().expect("ephemeral outcome event");
         assert_eq!(outcome.content, "Сессия s1 недоступна этому чату");
+        assert!(matches!(
+            outcome.kind,
+            GatewayEventKind::EphemeralAnswer { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirmed_ephemeral_command_error_routes_without_public_reply() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway
+            .handle_text("telegram", "-100", "7", "/new claude")
+            .await
+            .unwrap();
+
+        let blocker = proj.path().join("routing-blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        gateway.routing_path = Some(blocker.join("routing.json"));
+
+        let mut events = gateway.subscribe_events();
+        let callback = crate::transport::CallbackEphemeral {
+            callback_query_id: "cb-stop-error".to_string(),
+            receiver_user_id: 7,
+            replace_callback_query_message: false,
+            ephemeral_message_id: Some(99),
+        };
+        gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/stop s1".to_string(),
+                    callback_ephemeral: Some(callback.clone()),
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = events.try_recv().expect("confirmation event");
+        let confirm_data = confirmation.button_rows[0][0].data.clone();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: confirm_data,
+                    callback_ephemeral: Some(callback),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(replies.is_empty());
+        let outcome = events.try_recv().expect("ephemeral error event");
+        assert!(
+            outcome.content.contains("File exists"),
+            "{}",
+            outcome.content
+        );
         assert!(matches!(
             outcome.kind,
             GatewayEventKind::EphemeralAnswer { .. }
