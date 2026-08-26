@@ -534,6 +534,20 @@ pub struct CallbackEphemeral {
     pub ephemeral_message_id: Option<i64>,
 }
 
+/// Outcome of a Telegram callback-bound ephemeral operation.
+///
+/// `Unknown` means the request may have reached Telegram despite the missing
+/// response, so retrying would duplicate user-visible output.
+#[derive(Debug)]
+pub enum EphemeralDelivery {
+    /// Telegram accepted the operation.
+    Delivered(Option<String>),
+    /// Telegram explicitly rejected the operation; a fallback is safe.
+    Rejected(anyhow::Error),
+    /// The request may have applied, so no follow-up send is safe.
+    Unknown(anyhow::Error),
+}
+
 /// Message to send through a channel.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SendMessage {
@@ -690,6 +704,21 @@ pub trait Channel: Send + Sync {
     /// suppression in the outbound tailer.
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>>;
 
+    /// Send a callback-bound ephemeral message. Providers without Telegram's
+    /// acknowledgement ambiguity treat a send error as an explicit rejection.
+    async fn send_ephemeral(&self, message: &SendMessage) -> EphemeralDelivery {
+        match self.send(message).await {
+            Ok(id) => EphemeralDelivery::Delivered(id),
+            Err(err) => EphemeralDelivery::Rejected(err),
+        }
+    }
+
+    /// Complete the client-side callback spinner. Telegram overrides this;
+    /// other channels have no equivalent operation.
+    async fn answer_callback(&self, _callback_query_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Edit a Telegram ephemeral message. Other transports deliberately do
     /// not implement this separate identifier space.
     async fn edit_ephemeral_message(
@@ -698,8 +727,8 @@ pub trait Channel: Send + Sync {
         _callback: &CallbackEphemeral,
         _content: &str,
         _button_rows: &[Vec<MessageOption>],
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("ephemeral message edits are unsupported")
+    ) -> EphemeralDelivery {
+        EphemeralDelivery::Rejected(anyhow::anyhow!("ephemeral message edits are unsupported"))
     }
 
     /// Long-running inbound listener (see trait-level docs).

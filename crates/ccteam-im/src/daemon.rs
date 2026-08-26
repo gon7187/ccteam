@@ -34,7 +34,7 @@ use crate::latency::now_unix_ms;
 use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
 #[cfg(feature = "telegram")]
 use crate::transport::providers::telegram::TelegramChannel;
-use crate::transport::{Channel, ChannelMessage, SendMessage};
+use crate::transport::{Channel, ChannelMessage, EphemeralDelivery, SendMessage};
 use crate::{list_bots, BotRegistration};
 
 /// V0.6.1 F132 — keyed map of live IM Channels, keyed by
@@ -1703,7 +1703,7 @@ fn spawn_gateway_event_consumer(
                     fallback_edit_message_id,
                 } => {
                     if callback.ephemeral_message_id.is_some() {
-                        if channel
+                        match channel
                             .edit_ephemeral_message(
                                 &evt.chat_id,
                                 &callback,
@@ -1711,61 +1711,103 @@ fn spawn_gateway_event_consumer(
                                 &evt.button_rows,
                             )
                             .await
-                            .is_ok()
                         {
-                            continue;
+                            EphemeralDelivery::Delivered(_) => {}
+                            EphemeralDelivery::Unknown(err) => tracing::warn!(
+                                channel = %evt.channel,
+                                error = %err,
+                                "ccteam-im: ephemeral edit outcome unknown; suppressing duplicate fallback"
+                            ),
+                            EphemeralDelivery::Rejected(err) => {
+                                tracing::warn!(channel = %evt.channel, error = %err, "ccteam-im: ephemeral edit rejected; retrying as a new ephemeral message");
+                                let mut retry = callback.clone();
+                                retry.replace_callback_query_message = false;
+                                let mut out =
+                                    SendMessage::new(evt.content.clone(), evt.chat_id.clone())
+                                        .in_thread(evt.thread_ts.clone())
+                                        .with_button_rows(evt.button_rows.clone());
+                                out.callback_ephemeral = Some(retry);
+                                match channel.send_ephemeral(&out).await {
+                                    EphemeralDelivery::Delivered(_) => {}
+                                    EphemeralDelivery::Unknown(err) => tracing::warn!(
+                                        channel = %evt.channel,
+                                        error = %err,
+                                        "ccteam-im: ephemeral retry outcome unknown; suppressing plain fallback"
+                                    ),
+                                    EphemeralDelivery::Rejected(err) => {
+                                        tracing::warn!(channel = %evt.channel, error = %err, "ccteam-im: ephemeral retry rejected; falling back to a plain message");
+                                        let out = SendMessage::new(
+                                            evt.content.clone(),
+                                            evt.chat_id.clone(),
+                                        )
+                                        .in_thread(evt.thread_ts.clone())
+                                        .with_button_rows(evt.button_rows.clone());
+                                        send_gateway_outbound(
+                                            &evt.id,
+                                            0,
+                                            &evt.channel,
+                                            channel.as_ref(),
+                                            out,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
                         }
-                        let mut retry = callback.clone();
-                        retry.replace_callback_query_message = false;
-                        let mut out = SendMessage::new(evt.content.clone(), evt.chat_id.clone())
-                            .in_thread(evt.thread_ts.clone())
-                            .with_button_rows(evt.button_rows.clone());
-                        out.callback_ephemeral = Some(retry);
-                        if channel.send(&out).await.is_ok() {
-                            continue;
+                        if let Err(err) = channel.answer_callback(&callback.callback_query_id).await
+                        {
+                            tracing::warn!(channel = %evt.channel, error = %err, "ccteam-im: callback answer failed");
                         }
-                        let out = SendMessage::new(evt.content, evt.chat_id)
-                            .in_thread(evt.thread_ts)
-                            .with_button_rows(evt.button_rows);
-                        send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out)
-                            .await;
                         continue;
                     }
                     let mut out = SendMessage::new(evt.content.clone(), evt.chat_id.clone())
                         .in_thread(evt.thread_ts.clone())
                         .with_button_rows(evt.button_rows.clone())
                         .with_callback_ephemeral(
-                            callback.callback_query_id,
+                            callback.callback_query_id.clone(),
                             callback.receiver_user_id,
                         );
                     if channel.supports_rich_messages() {
                         out = out.with_rich_markdown(evt.content.clone());
                     }
-                    if let Err(err) = channel.send(&out).await {
-                        tracing::warn!(
+                    match channel.send_ephemeral(&out).await {
+                        EphemeralDelivery::Delivered(_) => {}
+                        EphemeralDelivery::Unknown(err) => tracing::warn!(
                             channel = %evt.channel,
                             error = %err,
-                            "ccteam-im: ephemeral callback response failed; using prior delivery path"
-                        );
-                        if let Some(message_id) = fallback_edit_message_id {
-                            if let Err(edit_err) = channel
-                                .edit_message(
-                                    &evt.chat_id,
-                                    &message_id,
-                                    &evt.content,
-                                    &evt.button_rows,
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    channel = %evt.channel,
-                                    message_id,
-                                    error = %edit_err,
-                                    "ccteam-im: confirmation edit failed, falling back to a new message"
-                                );
-                                let out = SendMessage::new(evt.content, evt.chat_id)
-                                    .in_thread(evt.thread_ts)
-                                    .with_button_rows(evt.button_rows);
+                            "ccteam-im: ephemeral send outcome unknown; suppressing duplicate fallback"
+                        ),
+                        EphemeralDelivery::Rejected(err) => {
+                            tracing::warn!(channel = %evt.channel, error = %err, "ccteam-im: ephemeral callback response rejected; using prior delivery path");
+                            if let Some(message_id) = fallback_edit_message_id {
+                                if let Err(edit_err) = channel
+                                    .edit_message(
+                                        &evt.chat_id,
+                                        &message_id,
+                                        &evt.content,
+                                        &evt.button_rows,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(channel = %evt.channel, message_id, error = %edit_err, "ccteam-im: confirmation edit failed, falling back to a new message");
+                                    let out =
+                                        SendMessage::new(evt.content.clone(), evt.chat_id.clone())
+                                            .in_thread(evt.thread_ts.clone())
+                                            .with_button_rows(evt.button_rows.clone());
+                                    send_gateway_outbound(
+                                        &evt.id,
+                                        0,
+                                        &evt.channel,
+                                        channel.as_ref(),
+                                        out,
+                                    )
+                                    .await;
+                                }
+                            } else {
+                                let out =
+                                    SendMessage::new(evt.content.clone(), evt.chat_id.clone())
+                                        .in_thread(evt.thread_ts.clone())
+                                        .with_button_rows(evt.button_rows.clone());
                                 send_gateway_outbound(
                                     &evt.id,
                                     0,
@@ -1775,13 +1817,10 @@ fn spawn_gateway_event_consumer(
                                 )
                                 .await;
                             }
-                        } else {
-                            let out = SendMessage::new(evt.content, evt.chat_id)
-                                .in_thread(evt.thread_ts)
-                                .with_button_rows(evt.button_rows);
-                            send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out)
-                                .await;
                         }
+                    }
+                    if let Err(err) = channel.answer_callback(&callback.callback_query_id).await {
+                        tracing::warn!(channel = %evt.channel, error = %err, "ccteam-im: callback answer failed");
                     }
                 }
                 // v0.8.19 — the 👀 ack reaction (IM-only; web/discord/slack keep
@@ -2525,12 +2564,14 @@ mod tests {
                 callback: &crate::transport::CallbackEphemeral,
                 _content: &str,
                 _button_rows: &[Vec<crate::transport::MessageOption>],
-            ) -> anyhow::Result<()> {
+            ) -> crate::transport::EphemeralDelivery {
                 self.ephemeral_edits
                     .lock()
                     .unwrap()
                     .push(callback.ephemeral_message_id.unwrap());
-                anyhow::bail!("ephemeral edit failed")
+                crate::transport::EphemeralDelivery::Rejected(anyhow::anyhow!(
+                    "ephemeral edit failed"
+                ))
             }
 
             async fn edit_message(
@@ -2605,6 +2646,178 @@ mod tests {
             Some(false)
         );
         assert!(sends[1].callback_ephemeral.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_ephemeral_answer_edits_in_place_without_public_send() {
+        struct RecordingChannel {
+            sends: Arc<StdMutex<Vec<SendMessage>>>,
+            edits: Arc<StdMutex<Vec<i64>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for RecordingChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                self.sends.lock().unwrap().push(message.clone());
+                Ok(Some("public-message".to_string()))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn edit_ephemeral_message(
+                &self,
+                _chat_id: &str,
+                callback: &crate::transport::CallbackEphemeral,
+                _content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> crate::transport::EphemeralDelivery {
+                self.edits
+                    .lock()
+                    .unwrap()
+                    .push(callback.ephemeral_message_id.unwrap());
+                crate::transport::EphemeralDelivery::Delivered(None)
+            }
+        }
+
+        let channel = Arc::new(RecordingChannel {
+            sends: Arc::new(StdMutex::new(Vec::new())),
+            edits: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), channel.clone());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let consumer = spawn_gateway_event_consumer(rx, Arc::new(RwLock::new(channels)));
+
+        tx.send(GatewayEvent {
+            id: "stale-ephemeral".to_string(),
+            channel: "telegram".to_string(),
+            chat_id: "-100".to_string(),
+            thread_ts: None,
+            content: "Подтверждение устарело".to_string(),
+            kind: GatewayEventKind::EphemeralAnswer {
+                callback: crate::transport::CallbackEphemeral {
+                    callback_query_id: "cb-1".to_string(),
+                    receiver_user_id: 7,
+                    replace_callback_query_message: false,
+                    ephemeral_message_id: Some(99),
+                },
+                fallback_edit_message_id: Some("ordinary-1".to_string()),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: None,
+            slug: None,
+        })
+        .unwrap();
+
+        for _ in 0..200 {
+            if !channel.edits.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        consumer.abort();
+
+        assert_eq!(*channel.edits.lock().unwrap(), vec![99]);
+        assert!(channel.sends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_ephemeral_edit_suppresses_all_follow_up_sends() {
+        struct UnknownChannel {
+            sends: Arc<StdMutex<Vec<SendMessage>>>,
+            answers: Arc<StdMutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for UnknownChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                self.sends.lock().unwrap().push(message.clone());
+                Ok(Some("must-not-send".to_string()))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn edit_ephemeral_message(
+                &self,
+                _chat_id: &str,
+                _callback: &crate::transport::CallbackEphemeral,
+                _content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> crate::transport::EphemeralDelivery {
+                crate::transport::EphemeralDelivery::Unknown(anyhow::anyhow!("connection reset"))
+            }
+
+            async fn answer_callback(&self, callback_query_id: &str) -> anyhow::Result<()> {
+                self.answers
+                    .lock()
+                    .unwrap()
+                    .push(callback_query_id.to_string());
+                Ok(())
+            }
+        }
+
+        let channel = Arc::new(UnknownChannel {
+            sends: Arc::new(StdMutex::new(Vec::new())),
+            answers: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), channel.clone());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let consumer = spawn_gateway_event_consumer(rx, Arc::new(RwLock::new(channels)));
+
+        tx.send(GatewayEvent {
+            id: "unknown-ephemeral".to_string(),
+            channel: "telegram".to_string(),
+            chat_id: "-100".to_string(),
+            thread_ts: None,
+            content: "Отменено".to_string(),
+            kind: GatewayEventKind::EphemeralAnswer {
+                callback: crate::transport::CallbackEphemeral {
+                    callback_query_id: "cb-1".to_string(),
+                    receiver_user_id: 7,
+                    replace_callback_query_message: false,
+                    ephemeral_message_id: Some(99),
+                },
+                fallback_edit_message_id: Some("ordinary-1".to_string()),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: None,
+            slug: None,
+        })
+        .unwrap();
+
+        for _ in 0..200 {
+            if !channel.answers.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        consumer.abort();
+
+        assert!(channel.sends.lock().unwrap().is_empty());
+        assert_eq!(*channel.answers.lock().unwrap(), vec!["cb-1"]);
     }
 
     /// TG-GATE-V2 W7a — a rich-capable channel's `Answer` event gets

@@ -8631,7 +8631,7 @@ impl Gateway {
                     ConfirmationResolution::Command(cmd) => cmd,
                     ConfirmationResolution::Foreign => return Ok(Vec::new()),
                     ConfirmationResolution::Stale => {
-                        return Ok(vec![RichReply::plain("Подтверждение устарело")]);
+                        return Ok(self.emit_stale_confirmation(chat, callback, message_id));
                     }
                 };
                 // TG-GATE-V2 W8 — edit the confirmation message itself
@@ -8667,7 +8667,7 @@ impl Gateway {
                 match self.take_command_confirmation(chat, &token) {
                     ConfirmationResolution::Foreign => Ok(Vec::new()),
                     ConfirmationResolution::Stale => {
-                        Ok(vec![RichReply::plain("Подтверждение устарело")])
+                        Ok(self.emit_stale_confirmation(chat, callback, message_id))
                     }
                     ConfirmationResolution::Command(_) => {
                         match (callback, telegram_callback_message_id(message_id)) {
@@ -8703,6 +8703,26 @@ impl Gateway {
                     None => Ok(vec![RichReply::plain("Неизвестная команда")]),
                 }
             }
+        }
+    }
+
+    fn emit_stale_confirmation(
+        &self,
+        chat: &ChatKey,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+        message_id: &str,
+    ) -> Vec<RichReply> {
+        match (callback, telegram_callback_message_id(message_id)) {
+            (Some(callback), Some(platform_message_id)) => {
+                self.emit_confirmation_ephemeral(
+                    chat,
+                    callback.clone(),
+                    platform_message_id,
+                    "Подтверждение устарело".to_string(),
+                );
+                Vec::new()
+            }
+            _ => vec![RichReply::plain("Подтверждение устарело")],
         }
     }
 
@@ -23420,6 +23440,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(expired, vec!["Подтверждение устарело"]);
+    }
+
+    #[tokio::test]
+    async fn stale_ephemeral_confirmation_emits_an_ephemeral_edit() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-99",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:!deadbeef".to_string(),
+                    callback_ephemeral: Some(crate::transport::CallbackEphemeral {
+                        callback_query_id: "cb-42".to_string(),
+                        receiver_user_id: 7,
+                        replace_callback_query_message: false,
+                        ephemeral_message_id: Some(99),
+                    }),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            replies.is_empty(),
+            "stale callback must not become public text"
+        );
+        match events.try_recv().expect("ephemeral stale event").kind {
+            GatewayEventKind::EphemeralAnswer { callback, .. } => {
+                assert_eq!(callback.ephemeral_message_id, Some(99));
+            }
+            other => panic!("expected EphemeralAnswer, got {other:?}"),
+        }
     }
 
     /// A `cmd:` command that isn't one of `GATEWAY_COMMANDS` (typo, or a
