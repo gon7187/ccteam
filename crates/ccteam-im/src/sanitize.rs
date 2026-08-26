@@ -373,7 +373,7 @@ fn split_rich_lines(block: &str, budget: usize) -> Vec<String> {
             if !current.is_empty() {
                 parts.push(std::mem::take(&mut current));
             }
-            parts.extend(raw_split(line, budget));
+            parts.extend(raw_split_bytes(line, budget));
         } else {
             if current.len() + line.len() > budget && !current.is_empty() {
                 parts.push(std::mem::take(&mut current));
@@ -409,7 +409,7 @@ fn split_rich_fence(block: &str, budget: usize) -> Vec<String> {
             continue;
         }
         let room = budget - open_line.len() - close_line.len() - 1;
-        for chunk in raw_split(line, room.max(1)) {
+        for chunk in raw_split_bytes(line, room.max(1)) {
             if current.len() + chunk.len() + close_line.len() + 1 > budget && current != open_line {
                 finish_fence_part(&mut parts, &mut current, &close_line);
                 current = open_line.clone();
@@ -446,6 +446,58 @@ fn raw_split(text: &str, budget: usize) -> Vec<String> {
         rest = &rest[cut..];
     }
     parts
+}
+
+/// Byte-budgeted counterpart used by Rich Message Markdown. Rich Telegram
+/// parts are capped in UTF-8 bytes, while classic Telegram parts use UTF-16.
+fn raw_split_bytes(text: &str, budget: usize) -> Vec<String> {
+    let budget = budget.max(1);
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.len() <= budget {
+            parts.push(rest.to_string());
+            break;
+        }
+        let cut = pick_byte_cut(rest, budget);
+        parts.push(rest[..cut].to_string());
+        rest = &rest[cut..];
+    }
+    parts
+}
+
+fn pick_byte_cut(s: &str, budget: usize) -> usize {
+    let min_fill = budget / 2;
+    let mut hard_cut = 0;
+    let mut first_char_end = 0;
+    let mut last_line = 0;
+    let mut last_ws = 0;
+    for (index, ch) in s.char_indices() {
+        let end = index + ch.len_utf8();
+        if first_char_end == 0 {
+            first_char_end = end;
+        }
+        if end > budget {
+            break;
+        }
+        hard_cut = end;
+        if end >= min_fill {
+            if ch == '\n' {
+                last_line = end;
+            } else if ch.is_whitespace() {
+                last_ws = end;
+            }
+        }
+    }
+    if last_line > 0 {
+        last_line
+    } else if last_ws > 0 {
+        last_ws
+    } else if hard_cut > 0 {
+        hard_cut
+    } else {
+        first_char_end
+    }
 }
 
 /// Byte index (always on a char boundary, always `> 0`) at which to cut
