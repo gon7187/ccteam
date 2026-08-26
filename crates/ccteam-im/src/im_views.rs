@@ -145,7 +145,7 @@ pub fn render_status(view: &StatusView) -> RichReply {
     details.push(view.cost_24h.clone());
     let markdown_details = details
         .iter()
-        .map(|line| escape_markdown(line))
+        .map(|line| escape_status_markdown(line))
         .collect::<Vec<_>>()
         .join("\n");
     let markdown_details = format!(
@@ -155,15 +155,15 @@ pub fn render_status(view: &StatusView) -> RichReply {
     let plain_details = format!("{}\n🔁 resume {}", details.join("\n"), view.resume);
     let markdown = format!(
         "🧭 **{}** · {} · {}\n{} · {} · {} · ctx {}\n📁 `{}`\n🖥 host: {}\n<blockquote expandable>{}</blockquote>",
-        escape_markdown(&view.sid),
-        escape_markdown(&view.project),
-        escape_markdown(&view.vendor),
-        escape_markdown(&view.state),
-        escape_markdown(&view.model),
-        escape_markdown(&view.effort),
-        escape_markdown(&view.context),
-        escape_code(&view.path),
-        escape_markdown(&view.host),
+        escape_status_markdown(&view.sid),
+        escape_status_markdown(&view.project),
+        escape_status_markdown(&view.vendor),
+        escape_status_markdown(&view.state),
+        escape_status_markdown(&view.model),
+        escape_status_markdown(&view.effort),
+        escape_status_markdown(&view.context),
+        escape_status_code(&view.path),
+        escape_status_markdown(&view.host),
         markdown_details,
     );
     let plain = format!(
@@ -467,6 +467,16 @@ fn escape_code(value: &str) -> String {
     value.replace('`', "\\`").replace(['\r', '\n'], " ")
 }
 
+fn escape_status_code(value: &str) -> String {
+    escape_code(value).replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn escape_status_markdown(value: &str) -> String {
+    escape_markdown(value)
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn escape_markdown(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -552,6 +562,31 @@ mod tests {
             .flatten()
             .all(|button| button.data.len() <= 64));
         assert_eq!(super::escape_markdown("x*y"), "x\\*y");
+    }
+
+    #[test]
+    fn status_escapes_html_tags_in_child_titles() {
+        let reply = render_status(&StatusView {
+            sid: "s78".into(),
+            project: "ccteam".into(),
+            vendor: "codex".into(),
+            state: "🟢 ожидание".into(),
+            model: "gpt-5.6-terra".into(),
+            effort: "—".into(),
+            context: "—".into(),
+            path: "/tmp/ccteam".into(),
+            host: "local".into(),
+            detail_lines: vec!["  • s79 · x</blockquote><tg-button-row>".into()],
+            cost_24h: "💰 Расход проекта 24ч: $0.00".into(),
+            resume: "—".into(),
+            child_stop_sids: Vec::new(),
+        });
+
+        assert_eq!(reply.markdown.matches("</blockquote>").count(), 1);
+        assert!(!reply.markdown.contains("<tg-button-row>"));
+        assert!(reply
+            .markdown
+            .contains("&lt;/blockquote&gt;&lt;tg-button-row&gt;"));
     }
 
     #[test]
