@@ -381,6 +381,7 @@ fn table_cell_text(cell: &str) -> String {
         }
         truncated.push('…');
         plain = truncated;
+        return plain;
     }
     plain
 }

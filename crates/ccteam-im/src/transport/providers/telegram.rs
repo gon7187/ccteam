@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 use anyhow::Context as _;
@@ -29,6 +30,7 @@ use crate::transport::{
 
 /// `getUpdates` long-poll seconds.
 const POLL_TIMEOUT_SECS: u64 = 25;
+const ALLOWED_UPDATE_TYPES: &str = r#"["message","callback_query"]"#;
 
 /// Conservative per-message ceiling in **UTF-16 code units**. Telegram's
 /// hard `sendMessage` limit is 4096 UTF-16 units; we reserve headroom for
@@ -811,6 +813,11 @@ struct TgUpdate {
     // v0.8.5 D3 — inline-keyboard button clicks.
     #[serde(default)]
     callback_query: Option<TgCallbackQuery>,
+    // Keep edits raw and tolerant: malformed edits must not reject a batch or
+    // stall the offset. They are acknowledged but not re-dispatched because
+    // the gateway has no edit/reconciliation contract.
+    #[serde(default)]
+    edited_message: Option<Value>,
 }
 
 /// An inline-keyboard button click (v0.8.5 D3).
@@ -841,6 +848,15 @@ struct TgMessage {
     document: Option<TgDocument>,
     #[serde(default)]
     caption: Option<String>,
+    // Bot API 10.3 — entities use UTF-16 offsets and are preferred for
+    // command normalization when Telegram supplied them.
+    #[serde(default)]
+    entities: Vec<TgEntity>,
+    #[serde(default)]
+    caption_entities: Vec<TgEntity>,
+    // Bot API 10.3 — present for rich messages whose text is empty.
+    #[serde(default)]
+    rich_message: Option<RichMessage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -853,6 +869,464 @@ struct TgUser {
     id: i64,
     #[serde(default)]
     username: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgEntity {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    offset: i64,
+    #[serde(default)]
+    length: i64,
+}
+
+/// Bot API 10.3's rich-message object. Fields are intentionally permissive:
+/// new block kinds must be ignored, not make the whole inbound update fail.
+#[derive(Debug, Deserialize)]
+struct RichMessage {
+    #[serde(default)]
+    blocks: Vec<RichBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RichBlock {
+    Object(Box<RichBlockObject>),
+    Unknown(Value),
+}
+
+#[derive(Debug, Deserialize)]
+struct RichBlockObject {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    text: Option<RichText>,
+    #[serde(default)]
+    blocks: Option<Vec<RichBlock>>,
+    #[serde(default)]
+    items: Option<Vec<RichBlockListItem>>,
+    #[serde(default)]
+    cells: Option<Vec<Vec<RichBlockTableCell>>>,
+    #[serde(default)]
+    summary: Option<RichText>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    size: Option<i64>,
+    #[serde(default)]
+    expression: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    document: Option<Value>,
+    #[serde(default)]
+    buttons: Option<Vec<RichMessageButton>>,
+    #[serde(default)]
+    caption: Option<Value>,
+    #[serde(default)]
+    credit: Option<RichText>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RichMessageButton {
+    #[serde(default)]
+    text: Option<RichText>,
+}
+
+/// RichText is string | array of RichText | typed object in Bot API 10.3.
+/// Keeping its payload as JSON lets unknown text variants be skipped safely.
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+struct RichText(Value);
+
+#[derive(Debug, Deserialize)]
+struct RichBlockListItem {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    blocks: Option<Vec<RichBlock>>,
+    #[serde(default)]
+    value: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RichBlockTableCell {
+    #[serde(default)]
+    text: Option<RichText>,
+}
+
+const KNOWN_RICH_TEXT_TYPES: &[&str] = &[
+    "bold",
+    "italic",
+    "underline",
+    "strikethrough",
+    "spoiler",
+    "date_time",
+    "text_mention",
+    "subscript",
+    "superscript",
+    "marked",
+    "code",
+    "custom_emoji",
+    "mathematical_expression",
+    "url",
+    "email_address",
+    "phone_number",
+    "bank_card_number",
+    "mention",
+    "hashtag",
+    "cashtag",
+    "bot_command",
+    "button",
+    "anchor",
+    "anchor_link",
+    "reference",
+    "reference_link",
+];
+
+fn rich_text_to_text(text: &RichText) -> String {
+    match &text.0 {
+        Value::String(value) => value.clone(),
+        Value::Array(runs) => runs
+            .iter()
+            .map(|run| rich_text_to_text(&RichText(run.clone())))
+            .collect(),
+        Value::Object(object) => {
+            let Some(kind) = object.get("type").and_then(Value::as_str) else {
+                return String::new();
+            };
+            if !KNOWN_RICH_TEXT_TYPES.contains(&kind) {
+                return String::new();
+            }
+            if kind == "custom_emoji" {
+                return object
+                    .get("alternative_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            if kind == "mathematical_expression" {
+                return object
+                    .get("expression")
+                    .and_then(Value::as_str)
+                    .map(|expression| format!("${expression}$"))
+                    .unwrap_or_default();
+            }
+            object
+                .get("text")
+                .map(|value| rich_text_to_text(&RichText(value.clone())))
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+fn nonempty_join(parts: impl IntoIterator<Item = String>) -> String {
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn rich_blocks_to_text(blocks: &[RichBlock]) -> String {
+    nonempty_join(blocks.iter().filter_map(rich_block_to_text))
+}
+
+fn rich_caption_to_text(caption: &Value) -> String {
+    caption
+        .get("text")
+        .map(|text| rich_text_to_text(&RichText(text.clone())))
+        .unwrap_or_default()
+}
+
+fn rich_media_placeholder(label: String, caption: Option<&Value>) -> String {
+    let caption = caption.map(rich_caption_to_text).unwrap_or_default();
+    nonempty_join([label, caption])
+}
+
+fn rich_block_to_text(block: &RichBlock) -> Option<String> {
+    let block = match block {
+        RichBlock::Object(block) => block,
+        RichBlock::Unknown(value) => {
+            let _ = value;
+            return None;
+        }
+    };
+    match block.kind.as_str() {
+        "paragraph" | "footer" => block.text.as_ref().map(rich_text_to_text),
+        "heading" => block.text.as_ref().map(|text| {
+            let level = block
+                .size
+                .filter(|size| (1..=6).contains(size))
+                .unwrap_or(1) as usize;
+            format!("{} {}", "#".repeat(level), rich_text_to_text(text))
+        }),
+        "pre" => block.text.as_ref().map(|text| {
+            let language = block.language.as_deref().unwrap_or_default();
+            format!(
+                "```{language}\n{}\n```",
+                rich_text_to_text(text).trim_end_matches('\n')
+            )
+        }),
+        "list" => block.items.as_ref().map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let label = item.label.as_deref().unwrap_or_default();
+                    let nested = item
+                        .blocks
+                        .as_deref()
+                        .map(rich_blocks_to_text)
+                        .unwrap_or_default();
+                    let body = nonempty_join([label.to_string(), nested]);
+                    if body.is_empty() {
+                        return None;
+                    }
+                    let marker = item
+                        .value
+                        .map(|value| format!("{value}."))
+                        .unwrap_or_else(|| "-".to_string());
+                    let mut lines = body.lines();
+                    let first = format!("{marker} {}", lines.next().unwrap_or_default());
+                    let rest = lines.map(|line| format!("  {line}"));
+                    Some(
+                        std::iter::once(first)
+                            .chain(rest)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        "table" => block.cells.as_ref().map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let cells = row
+                        .iter()
+                        .map(|cell| {
+                            cell.text
+                                .as_ref()
+                                .map(rich_text_to_text)
+                                .unwrap_or_default()
+                        })
+                        .collect::<Vec<_>>();
+                    format!("| {} |", cells.join(" | "))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        "blockquote" => block.blocks.as_deref().map(|blocks| {
+            let mut content = rich_blocks_to_text(blocks);
+            if let Some(credit) = &block.credit {
+                let credit = rich_text_to_text(credit);
+                if !credit.is_empty() {
+                    content = nonempty_join([content, credit]);
+                }
+            }
+            content
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        "expandable_blockquote" | "pullquote" => block.text.as_ref().map(|text| {
+            let mut content = rich_text_to_text(text);
+            if let Some(credit) = &block.credit {
+                let credit = rich_text_to_text(credit);
+                if !credit.is_empty() {
+                    content = nonempty_join([content, credit]);
+                }
+            }
+            content
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        "details" => block.summary.as_ref().map(|summary| {
+            nonempty_join([
+                rich_text_to_text(summary),
+                block
+                    .blocks
+                    .as_deref()
+                    .map(rich_blocks_to_text)
+                    .unwrap_or_default(),
+            ])
+        }),
+        "collage" | "slideshow" => block.caption.as_ref().map(rich_caption_to_text),
+        "photo" => Some(rich_media_placeholder(
+            "[photo]".to_string(),
+            block.caption.as_ref(),
+        )),
+        "video" => Some(rich_media_placeholder(
+            "[video]".to_string(),
+            block.caption.as_ref(),
+        )),
+        "audio" => Some(rich_media_placeholder(
+            "[audio]".to_string(),
+            block.caption.as_ref(),
+        )),
+        "animation" => Some(rich_media_placeholder(
+            "[animation]".to_string(),
+            block.caption.as_ref(),
+        )),
+        "voice_note" => Some(rich_media_placeholder(
+            "[voice_note]".to_string(),
+            block.caption.as_ref(),
+        )),
+        "document" => {
+            let label = block
+                .document
+                .as_ref()
+                .and_then(|document| document.get("file_name"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(|name| format!("[document: {name}]"))
+                .unwrap_or_else(|| "[document]".to_string());
+            Some(rich_media_placeholder(label, block.caption.as_ref()))
+        }
+        "map" => Some(rich_media_placeholder(
+            "[map]".to_string(),
+            block.caption.as_ref(),
+        )),
+        "buttons" => {
+            let labels = block
+                .buttons
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|button| button.text.as_ref().map(rich_text_to_text))
+                .filter(|label| !label.is_empty())
+                .collect::<Vec<_>>();
+            let label = if labels.is_empty() {
+                "[buttons]".to_string()
+            } else {
+                format!("[buttons: {}]", labels.join(" | "))
+            };
+            Some(label)
+        }
+        "divider" => Some("---".to_string()),
+        "anchor" => Some(
+            block
+                .name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .map(|name| format!("[anchor: {name}]"))
+                .unwrap_or_else(|| "[anchor]".to_string()),
+        ),
+        "mathematical_expression" => Some(
+            block
+                .expression
+                .as_deref()
+                .map(|expression| format!("${expression}$"))
+                .unwrap_or_else(|| "[mathematical_expression]".to_string()),
+        ),
+        // Bot API defines `thinking` as draft-only, so it cannot be received
+        // in an inbound Message; keep it explicit and skip it if Telegram
+        // ever sends one anyway.
+        "thinking" => None,
+        _ => None,
+    }
+}
+
+fn rich_message_to_text(message: &RichMessage) -> String {
+    rich_blocks_to_text(&message.blocks)
+}
+
+fn should_dispatch_inbound_content(content: &str) -> bool {
+    !content.trim().is_empty()
+}
+
+fn should_dispatch_inbound_message(content: &str, has_attachment: bool) -> bool {
+    should_dispatch_inbound_content(content) || has_attachment
+}
+
+fn utf16_offset_to_byte(text: &str, offset: i64) -> Option<usize> {
+    if offset < 0 {
+        return None;
+    }
+    let offset = offset as usize;
+    let mut units = 0;
+    for (byte, character) in text.char_indices() {
+        if units == offset {
+            return Some(byte);
+        }
+        units += character.len_utf16();
+    }
+    (units == offset).then_some(text.len())
+}
+
+fn normalize_inbound_text_with_heuristic<'a>(
+    text: &'a str,
+    entities: &[TgEntity],
+    own_username: Option<&str>,
+) -> (Cow<'a, str>, bool) {
+    if entities.is_empty() {
+        let normalized = strip_bot_mention(text, own_username);
+        let used_heuristic = own_username.is_none() && normalized.as_ref() != text;
+        return (normalized, used_heuristic);
+    }
+    let Some(entity) = entities
+        .iter()
+        .find(|entity| entity.kind == "bot_command" && entity.offset == 0)
+    else {
+        return (Cow::Borrowed(text), false);
+    };
+    let Some(start) = utf16_offset_to_byte(text, entity.offset) else {
+        return (Cow::Borrowed(text), false);
+    };
+    let Some(end_units) = entity.offset.checked_add(entity.length) else {
+        return (Cow::Borrowed(text), false);
+    };
+    let Some(end) = utf16_offset_to_byte(text, end_units) else {
+        return (Cow::Borrowed(text), false);
+    };
+    let token = &text[start..end];
+    let Some((command, mention)) = token.split_once('@') else {
+        return (Cow::Borrowed(text), false);
+    };
+    if !command.starts_with('/') || mention.is_empty() {
+        return (Cow::Borrowed(text), false);
+    }
+    let used_heuristic = own_username.is_none();
+    let matches_bot = own_username
+        .map(|username| mention.eq_ignore_ascii_case(username))
+        .unwrap_or_else(|| mention.to_ascii_lowercase().ends_with("bot"));
+    if !matches_bot {
+        return (Cow::Borrowed(text), false);
+    }
+    (
+        Cow::Owned(format!("{}{}{}", &text[..start], command, &text[end..])),
+        used_heuristic,
+    )
+}
+
+fn message_content<'a>(message: &'a TgMessage, own_username: Option<&str>) -> (Cow<'a, str>, bool) {
+    if let Some(text) = message.text.as_deref().filter(|text| !text.is_empty()) {
+        return normalize_inbound_text_with_heuristic(text, &message.entities, own_username);
+    }
+    if let Some(caption) = message
+        .caption
+        .as_deref()
+        .filter(|caption| !caption.is_empty())
+    {
+        return normalize_inbound_text_with_heuristic(
+            caption,
+            &message.caption_entities,
+            own_username,
+        );
+    }
+    let rich = message
+        .rich_message
+        .as_ref()
+        .map(rich_message_to_text)
+        .unwrap_or_default();
+    let (normalized, used_heuristic) =
+        normalize_inbound_text_with_heuristic(&rich, &[], own_username);
+    (Cow::Owned(normalized.into_owned()), used_heuristic)
 }
 
 /// One size of an inbound photo (Telegram sends an ascending-size array;
@@ -1344,6 +1818,7 @@ impl Channel for TelegramChannel {
                 .query(&[
                     ("timeout", POLL_TIMEOUT_SECS.to_string()),
                     ("offset", offset.to_string()),
+                    ("allowed_updates", ALLOWED_UPDATE_TYPES.to_string()),
                 ])
                 .send()
                 .await;
@@ -1377,6 +1852,12 @@ impl Channel for TelegramChannel {
                     self.handle_callback_query(&tx, cb).await;
                     continue;
                 }
+                if upd.edited_message.is_some() {
+                    tracing::debug!(update_id = upd.update_id, "telegram edited_message ignored");
+                    // Edits are intentionally not re-dispatched: the gateway
+                    // has no update-in-place or duplicate-turn contract.
+                    continue;
+                }
                 if let Some(m) = upd.message {
                     let chat_id = m.chat.id.to_string();
                     if !self.chat_allowed(&chat_id) {
@@ -1397,16 +1878,12 @@ impl Channel for TelegramChannel {
                     let recv_ms = now_unix_ms();
                     let tg_date_ms = (m.date.max(0) as u128).saturating_mul(1000);
                     let tg_age_ms = recv_ms.saturating_sub(tg_date_ms);
-                    // V0.8.4 P2a — caption is the text for media messages.
-                    let content = m
-                        .text
-                        .clone()
-                        .or_else(|| m.caption.clone())
-                        .unwrap_or_default();
                     let own_username = self.cached_bot_username();
-                    let content = match strip_bot_mention(&content, own_username.as_deref()) {
+                    let (content, used_heuristic) = message_content(&m, own_username.as_deref());
+                    let content = match content {
                         Cow::Owned(normalized) => {
-                            if own_username.is_none()
+                            if used_heuristic
+                                && own_username.is_none()
                                 && !self
                                     .unknown_bot_mention_warned
                                     .swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -1417,11 +1894,19 @@ impl Channel for TelegramChannel {
                             }
                             normalized
                         }
-                        Cow::Borrowed(_) => content,
+                        Cow::Borrowed(content) => content.to_string(),
                     };
+                    let pending_attachment = pick_attachment(&m);
+                    if !should_dispatch_inbound_message(&content, pending_attachment.is_some()) {
+                        tracing::debug!(
+                            cid = %cid,
+                            "telegram: inbound message has no dispatchable content or attachment"
+                        );
+                        continue;
+                    }
                     let mut attachments = Vec::new();
                     let mut rejected_notice: Option<String> = None;
-                    if let Some(pending) = pick_attachment(&m) {
+                    if let Some(pending) = pending_attachment {
                         match self.stage_attachment(&cid, &pending).await {
                             Ok(Some(att)) => attachments.push(att),
                             Ok(None) => {
@@ -1449,9 +1934,13 @@ impl Channel for TelegramChannel {
                         {
                             tracing::warn!(cid = %cid, error = %err, "telegram: rejection notice send failed");
                         }
-                        if content.is_empty() {
-                            continue;
-                        }
+                    }
+                    if !should_dispatch_inbound_content(&content) && attachments.is_empty() {
+                        tracing::debug!(
+                            cid = %cid,
+                            "telegram: inbound message has no dispatchable content after attachment staging"
+                        );
+                        continue;
                     }
                     let content_len = content.len();
                     tracing::info!(
@@ -2595,5 +3084,226 @@ mod tests {
             let numbered = format!("{part} ({}/{total})", i + 1);
             assert!(numbered.ends_with(&format!("({}/{total})", i + 1)));
         }
+    }
+
+    #[test]
+    fn rich_message_fixture_flattens_supported_blocks() {
+        let rich: RichMessage = serde_json::from_value(serde_json::json!({
+            "blocks": [
+                {"type": "paragraph", "text": ["Hello ", {"type": "bold", "text": "world"}]},
+                {"type": "heading", "size": 2, "text": "Title"},
+                {"type": "heading", "size": 6, "text": "Small title"},
+                {"type": "pre", "language": "rust", "text": "fn main() {}"},
+                {"type": "list", "items": [
+                    {"label": "one", "blocks": []},
+                    {"label": "two", "value": 2, "blocks": []}
+                ]},
+                {"type": "table", "cells": [
+                    [{"text": "Name"}, {"text": "Value"}],
+                    [{"text": "x"}, {"text": ["42", {"type": "code", "text": "!"}]}]
+                ]},
+                {"type": "blockquote", "blocks": [{"type": "paragraph", "text": "quoted"}], "credit": "source"},
+                {"type": "details", "summary": "More", "blocks": [{"type": "paragraph", "text": "content"}]},
+                {"type": "future_block", "text": {"type": "future_text", "text": "ignored"}},
+                {"type": "paragraph", "text": [
+                    {"type": "custom_emoji", "alternative_text": "🙂"},
+                    {"type": "mathematical_expression", "expression": "x^2"}
+                ]}
+            ]
+        }))
+        .expect("saved Bot API fixture is valid");
+
+        assert_eq!(
+            rich_message_to_text(&rich),
+            "Hello world\n\n## Title\n\n###### Small title\n\n```rust\nfn main() {}\n```\n\n- one\n2. two\n\n| Name | Value |\n| x | 42! |\n\n> quoted\n> \n> source\n\nMore\n\ncontent\n\n🙂$x^2$"
+        );
+    }
+
+    #[test]
+    fn rich_message_fixture_preserves_media_only_blocks() {
+        let rich: RichMessage = serde_json::from_value(serde_json::json!({
+            "blocks": [
+                {"type": "photo", "photo": []},
+                {"type": "video", "video": {}},
+                {"type": "audio", "audio": {}},
+                {"type": "document", "document": {"file_name": "report.pdf"}},
+                {"type": "animation", "animation": {}},
+                {"type": "voice_note", "voice_note": {}},
+                {"type": "map", "location": {"latitude": 1.0, "longitude": 2.0}, "zoom": 10},
+                {"type": "buttons", "buttons": [{"text": "Open"}, {"text": ["More", {"type": "bold", "text": "!"}]}]},
+                {"type": "divider"},
+                {"type": "anchor", "name": "section"},
+                {"type": "mathematical_expression", "expression": "a+b"}
+            ]
+        }))
+        .expect("media rich blocks are valid");
+
+        assert_eq!(
+            rich_message_to_text(&rich),
+            "[photo]\n\n[video]\n\n[audio]\n\n[document: report.pdf]\n\n[animation]\n\n[voice_note]\n\n[map]\n\n[buttons: Open | More!]\n\n---\n\n[anchor: section]\n\n$a+b$"
+        );
+    }
+
+    #[test]
+    fn rich_message_thinking_block_is_explicitly_skipped() {
+        let rich: RichMessage = serde_json::from_value(serde_json::json!({
+            "blocks": [{"type": "thinking", "text": "draft-only"}]
+        }))
+        .expect("thinking block is valid JSON");
+
+        assert_eq!(rich_message_to_text(&rich), "");
+    }
+
+    #[test]
+    fn rich_message_fixture_skips_unknown_text_and_malformed_blocks() {
+        let rich: RichMessage = serde_json::from_value(serde_json::json!({
+            "blocks": [
+                {"type": "paragraph", "text": ["keep", {"type": "future_text", "text": "drop"}]},
+                {"type": "future_block", "blocks": "not-an-array"},
+                "not-a-block"
+            ]
+        }))
+        .expect("unknown rich blocks must not reject the message");
+
+        assert_eq!(rich_message_to_text(&rich), "keep");
+    }
+
+    #[test]
+    fn entity_command_normalization_uses_utf16_entity_span() {
+        let entities = vec![TgEntity {
+            kind: "bot_command".into(),
+            offset: 0,
+            length: "/go@MyBot".encode_utf16().count() as i64,
+        }];
+        assert_eq!(
+            normalize_inbound_text_with_heuristic("/go@MyBot 😀", &entities, Some("mybot")).0,
+            "/go 😀"
+        );
+    }
+
+    #[test]
+    fn entity_command_path_does_not_use_heuristic_for_non_command_entities() {
+        let entities = vec![TgEntity {
+            kind: "mention".into(),
+            offset: 0,
+            length: 8,
+        }];
+        assert_eq!(
+            normalize_inbound_text_with_heuristic("/go@MyBot", &entities, Some("mybot")).0,
+            "/go@MyBot"
+        );
+        assert_eq!(
+            normalize_inbound_text_with_heuristic("/go@MyBot", &[], Some("mybot")).0,
+            "/go"
+        );
+    }
+
+    #[test]
+    fn entity_command_path_reports_when_heuristic_fired() {
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "date": 0,
+            "chat": {"id": 5},
+            "text": "/go@mybot",
+            "entities": [{"type": "bot_command", "offset": 0, "length": 9}]
+        }))
+        .expect("entity command update is valid");
+
+        assert!(message_content(&message, None).1);
+    }
+
+    #[test]
+    fn rich_message_content_uses_command_normalization() {
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "date": 0,
+            "chat": {"id": 5},
+            "text": "",
+            "rich_message": {"blocks": [{"type": "paragraph", "text": "/status@mybot"}]}
+        }))
+        .expect("rich command update is valid");
+
+        assert_eq!(message_content(&message, Some("mybot")).0, "/status");
+    }
+
+    #[test]
+    fn whitespace_content_is_not_dispatchable() {
+        assert!(!should_dispatch_inbound_content(" \n\t"));
+        assert!(should_dispatch_inbound_content("[photo]"));
+    }
+
+    #[test]
+    fn attachment_only_message_remains_dispatchable_with_empty_content() {
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "date": 0,
+            "chat": {"id": 5},
+            "photo": [{"file_id": "photo-1"}]
+        }))
+        .expect("photo message is valid");
+        let (content, _) = message_content(&message, Some("mybot"));
+
+        assert!(content.is_empty());
+        assert!(pick_attachment(&message).is_some());
+        assert!(should_dispatch_inbound_message(content.as_ref(), true));
+    }
+
+    #[test]
+    fn textless_rich_message_without_media_is_not_dispatchable() {
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "date": 0,
+            "chat": {"id": 5},
+            "text": "",
+            "rich_message": {"blocks": [{"type": "future_block"}]}
+        }))
+        .expect("unknown rich block is valid");
+        let (content, _) = message_content(&message, Some("mybot"));
+
+        assert!(!should_dispatch_inbound_message(content.as_ref(), false));
+    }
+
+    #[test]
+    fn empty_message_text_uses_rich_message_and_caption_entities_are_supported() {
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "date": 0,
+            "chat": {"id": 5},
+            "text": "",
+            "rich_message": {"blocks": [{"type": "paragraph", "text": "rich"}]}
+        }))
+        .expect("rich message update is valid");
+        assert_eq!(message_content(&message, Some("mybot")).0, "rich");
+
+        let caption: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 2,
+            "date": 0,
+            "chat": {"id": 5},
+            "caption": "/go@MyBot",
+            "caption_entities": [{"type": "bot_command", "offset": 0, "length": 9}]
+        }))
+        .expect("caption entity update is valid");
+        assert_eq!(message_content(&caption, Some("mybot")).0, "/go");
+    }
+
+    #[test]
+    fn edited_message_update_deserializes_without_being_a_message_update() {
+        let update: TgUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 7,
+            "edited_message": {"message_id": 8, "date": 9, "chat": {"id": 10}, "text": "edit"}
+        }))
+        .expect("edited_message is a valid update variant");
+        assert!(update.message.is_none());
+        assert!(update.edited_message.is_some());
+    }
+
+    #[test]
+    fn malformed_edited_message_does_not_reject_the_update() {
+        let update: TgUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 7,
+            "edited_message": {"message_id": "not-an-integer"}
+        }))
+        .expect("malformed edits must be tolerated");
+        assert!(update.edited_message.is_some());
     }
 }
