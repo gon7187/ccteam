@@ -268,7 +268,7 @@ pub fn split_rich_markdown_numbered(markdown: &str, limit: usize) -> Vec<String>
             current.push_str(&block);
         }
     }
-    if !current.is_empty() {
+    if !current.trim().is_empty() {
         parts.push(current);
     }
     if parts.len() == 1 {
