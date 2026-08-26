@@ -202,39 +202,70 @@ pub fn split_for_channel_numbered(text: &str, limit: usize) -> Vec<String> {
 }
 
 /// Split Rich Message Markdown into independently valid numbered parts.
-/// Fenced blocks are the only block type that may be split; each fragment is
-/// closed and re-opened with the original info string.
+/// Tables, quotes and details are atomic. If one of those exceeds the ceiling,
+/// it is cut only at line boundaries: the documented Rich Message ceiling wins.
 pub fn split_rich_markdown_numbered(markdown: &str, limit: usize) -> Vec<String> {
     if markdown.len() <= limit {
         return vec![markdown.to_string()];
     }
     let budget = limit.saturating_sub(24).max(1);
+    let lines: Vec<&str> = markdown.split_inclusive('\n').collect();
+    let mut blocks = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let bare = lines[i].trim_end_matches('\n');
+        let mut end = i + 1;
+        let trimmed = bare.trim_start();
+        if trimmed.starts_with("```") {
+            while end < lines.len() {
+                let line = lines[end].trim_end_matches('\n').trim_start();
+                end += 1;
+                if line.starts_with("```") {
+                    break;
+                }
+            }
+        } else if trimmed.starts_with("<details") {
+            while end < lines.len() && !lines[end - 1].contains("</details>") {
+                end += 1;
+            }
+        } else if trimmed.starts_with("<blockquote") {
+            while end < lines.len() && !lines[end - 1].contains("</blockquote>") {
+                end += 1;
+            }
+        } else if trimmed.starts_with('>') {
+            while end < lines.len() && lines[end].trim_start().starts_with('>') {
+                end += 1;
+            }
+        } else if end < lines.len()
+            && bare.contains('|')
+            && is_table_separator(lines[end].trim_end_matches('\n'))
+        {
+            end += 1;
+            while end < lines.len() && lines[end].contains('|') {
+                end += 1;
+            }
+        }
+        blocks.push(lines[i..end].concat());
+        i = end;
+    }
     let mut parts = Vec::new();
     let mut current = String::new();
-    let mut fence: Option<String> = None;
-    for line in markdown.split_inclusive('\n') {
-        let bare = line.trim_end_matches('\n');
-        let fence_line = bare.trim_start().starts_with("```");
-        let closes_fence = fence_line && fence.is_some();
-        if fence_line && fence.is_none() {
-            fence = Some(bare.trim_start()[3..].trim().to_string());
-        }
-        if current.len() + line.len() > budget && !current.trim().is_empty() {
-            if let Some(info) = &fence {
-                if !current.ends_with('\n') {
-                    current.push('\n');
-                }
-                current.push_str("```");
-                parts.push(current);
-                current = format!("```{info}\n");
-            } else {
+    for block in blocks {
+        if block.len() > budget {
+            if !current.trim().is_empty() {
                 parts.push(current);
                 current = String::new();
             }
-        }
-        current.push_str(line);
-        if closes_fence {
-            fence = None;
+            if block.trim_start().starts_with("```") {
+                parts.extend(split_rich_fence(&block, budget));
+            } else {
+                parts.extend(split_rich_lines(&block, budget));
+            }
+        } else if current.len() + block.len() > budget && !current.trim().is_empty() {
+            parts.push(current);
+            current = block;
+        } else {
+            current.push_str(&block);
         }
     }
     if !current.is_empty() {
@@ -249,6 +280,53 @@ pub fn split_rich_markdown_numbered(markdown: &str, limit: usize) -> Vec<String>
         .enumerate()
         .map(|(i, part)| format!("{}\n\n({}/{total})", part.trim_end(), i + 1))
         .collect()
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let cells: Vec<_> = line.trim().trim_matches('|').split('|').collect();
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let cell = cell.trim();
+            !cell.is_empty() && cell.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
+        })
+}
+
+fn split_rich_lines(block: &str, budget: usize) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for line in block.split_inclusive('\n') {
+        if current.len() + line.len() > budget && !current.is_empty() {
+            parts.push(current);
+            current = String::new();
+        }
+        current.push_str(line);
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+fn split_rich_fence(block: &str, budget: usize) -> Vec<String> {
+    let mut lines = block.split_inclusive('\n');
+    let opener = lines.next().unwrap_or_default().trim_end_matches('\n');
+    let prefix = format!("{opener}\n");
+    let mut parts = Vec::new();
+    let mut current = prefix.clone();
+    for line in lines {
+        if line.trim_start().starts_with("```") {
+            continue;
+        }
+        if current.len() + line.len() + 4 > budget && current != prefix {
+            current.push_str("```\n");
+            parts.push(current);
+            current = prefix.clone();
+        }
+        current.push_str(line);
+    }
+    current.push_str("```");
+    parts.push(current);
+    parts
 }
 
 /// Greedy length-budgeted split that preserves every byte (no fence
@@ -651,6 +729,27 @@ mod tests {
                     % 2,
                 0,
                 "{part:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rich_split_keeps_tables_quotes_and_details_atomic() {
+        let table = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let quote = "> one\n> two\n";
+        let details = "<details>\n<summary>x</summary>\nbody\n</details>\n";
+        let markdown = format!(
+            "{}\n{}\n{}\n{}",
+            "before\n".repeat(10),
+            table,
+            quote,
+            details
+        );
+        let parts = split_rich_markdown_numbered(&markdown, 100);
+        for block in [table, quote, details] {
+            assert!(
+                parts.iter().any(|part| part.contains(block)),
+                "lost atomic block: {block:?}"
             );
         }
     }
