@@ -126,6 +126,9 @@ pub struct ProjectProjectionSnapshot {
     /// Turns in the trailing 24-hour window that carried tokens but no
     /// trustworthy USD amount (unknown model / subscription pricing).
     pub cost_24h_unpriced_turns: u32,
+    /// The trailing 24-hour window lost rolling metadata to a journal
+    /// rotation (`.1` archive) — 24h sums are lower bounds, not totals.
+    pub cost_24h_window_truncated: bool,
     /// Delegation lifecycle and rolling counters.
     pub delegations: DelegationProjection,
     /// Low-frequency workflow facts needed by the legacy workflow summary.
@@ -248,6 +251,10 @@ struct SlugState {
     lifetime_cost: f64,
     lifetime_by_vendor: BTreeMap<String, f64>,
     minute_cost: BTreeMap<i64, CostBucket>,
+    /// Minute at which rolling 24h metadata was last truncated by a rotation
+    /// (runtime rotation, or an archive observed at rehydration). The
+    /// checkpoint keeps lifetime totals only, so the window stays fail-closed.
+    window_truncated_minute: Option<i64>,
     folded_turns: HashMap<TurnIdentity, FoldedTurn>,
     sessions: HashMap<String, SessionProjection>,
     delegations: DelegationProjection,
@@ -515,6 +522,11 @@ impl ProgressProjection {
             if let Some(checkpoint) = checkpoint.as_ref() {
                 apply_checkpoint(&mut state, checkpoint);
             }
+            state.window_truncated_minute = if rotated {
+                Some(minute((self.clock)()))
+            } else {
+                archive_truncation_minute(&path)
+            };
             *write_lock(&projection.state) = state;
         }
         if rotated {
@@ -784,6 +796,15 @@ fn fold_tokens(
     }
 }
 
+/// Minute of the `.1` archive's last modification, if one exists: its events
+/// are not replayed into the rolling window, so the window is incomplete
+/// until 24h after that point.
+fn archive_truncation_minute(active_path: &Path) -> Option<i64> {
+    let archive = progress_bridge::progress_archive_path(active_path);
+    let modified = std::fs::metadata(archive).ok()?.modified().ok()?;
+    Some(minute(DateTime::<Utc>::from(modified)))
+}
+
 fn apply_checkpoint(state: &mut SlugState, checkpoint: &ProgressCheckpoint) {
     state.lifetime_cost = checkpoint.cost_total_usd;
     state.lifetime_by_vendor = checkpoint.cost_total_by_vendor.clone();
@@ -901,6 +922,9 @@ fn snapshot(state: &SlugState, now: DateTime<Utc>) -> ProjectProjectionSnapshot 
             .range(oldest..)
             .map(|(_, bucket)| bucket.unpriced)
             .fold(0u32, u32::saturating_add),
+        cost_24h_window_truncated: state
+            .window_truncated_minute
+            .is_some_and(|truncated| truncated >= oldest),
         delegations,
         workflow_events: state.workflow_events.clone(),
         last_unscoped: state.last_unscoped.clone(),
@@ -1269,6 +1293,27 @@ mod tests {
         assert!(snapshot.sessions.contains_key("s2"));
         assert_eq!(snapshot.offset, std::fs::metadata(&path).unwrap().len());
         assert_eq!(projection.metrics().rotations, 1);
+        assert!(
+            snapshot.cost_24h_window_truncated,
+            "a runtime rotation must mark the 24h window as incomplete"
+        );
+    }
+
+    #[test]
+    fn archive_present_at_hydration_marks_window_truncated() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        let path = paths.progress_jsonl("archived");
+        write_lines(&path, &[agent_done("s1", "claude", 1.0, fixed_now())]);
+        let archive = progress_bridge::progress_archive_path(&path);
+        std::fs::write(&archive, "{}\n").unwrap();
+        let projection = projection(paths);
+        projection.hydrate_now(&["archived".to_string()]).unwrap();
+        assert!(
+            projection
+                .project_snapshot("archived")
+                .cost_24h_window_truncated
+        );
     }
 
     #[test]
