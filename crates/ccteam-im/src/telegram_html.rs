@@ -4,6 +4,8 @@
 //! this deliberately renders the useful Markdown shapes and escapes every
 //! other character as text. It is not a general Markdown parser.
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 /// Rendered Telegram HTML plus the visible UTF-16 length after entity parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedMarkdown {
@@ -290,7 +292,7 @@ fn render_table(lines: &[&str], start: usize) -> Option<(Fragment, usize, bool)>
         .map(|column| {
             cells
                 .iter()
-                .map(|row| row[column].chars().count())
+                .map(|row| row[column].width())
                 .max()
                 .unwrap_or(0)
         })
@@ -328,10 +330,7 @@ fn append_table_row(body: &mut String, row: &[String], widths: &[usize]) {
             body.push_str(" | ");
         }
         body.push_str(cell);
-        body.extend(std::iter::repeat_n(
-            ' ',
-            widths[column] - cell.chars().count(),
-        ));
+        body.extend(std::iter::repeat_n(' ', widths[column] - cell.width()));
     }
 }
 
@@ -363,9 +362,19 @@ fn is_table_separator_cell(cell: &str) -> bool {
 fn table_cell_text(cell: &str) -> String {
     let rendered = render_inline(cell, true, true);
     let mut plain = strip_rendered_tags(&rendered.html);
-    if plain.chars().count() > 24 {
-        plain = plain.chars().take(23).collect();
-        plain.push('…');
+    if plain.width() > 24 {
+        let mut truncated = String::new();
+        let mut width = 0;
+        for character in plain.chars() {
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if width + character_width > 23 {
+                break;
+            }
+            truncated.push(character);
+            width += character_width;
+        }
+        truncated.push('…');
+        plain = truncated;
     }
     plain
 }
@@ -1228,6 +1237,15 @@ mod tests {
         assert_eq!(
             render_markdown("> before\n> ```\n> code\n> ```\n> after\n").html,
             "<blockquote>before\n</blockquote><pre><code>code\n</code></pre>\n<blockquote>after\n</blockquote>"
+        );
+    }
+
+    #[test]
+    fn pads_table_columns_by_display_width() {
+        assert_eq!(
+            render_markdown("| 名称 | Значение |\n| --- | --- |\n| 😀😀 | x |\n| 甲 | long |\n")
+                .html,
+            "<pre>名称 | Значение\n-----+---------\n😀😀 | x\n甲   | long</pre>\n"
         );
     }
 }
