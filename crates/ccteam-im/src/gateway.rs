@@ -9793,12 +9793,27 @@ impl Gateway {
         // Pull the focused session's live facts from its harness.
         let status = s.adapter.thread_status(&s.thread).await.ok();
         let running = s.adapter.running_tasks(&s.thread).await;
-        // Account usage belongs to a vendor account, not a session, but it is
-        // rendered here as an attribute of THIS session's card — borrowing
-        // another same-vendor session's snapshot when the focused one hasn't
-        // received its own would silently mislabel whose usage is shown.
-        // None renders as "—" below; no cross-session borrow.
-        let account = s.adapter.account_usage(&s.thread).await;
+        // Account usage belongs to a vendor account, not a session. Query one
+        // visible session per supported vendor and omit vendors with no real
+        // account-usage channel; never print a fabricated zero.
+        let usage_sources = [
+            (AgentVendor::Claude, "CC"),
+            (AgentVendor::Codex, "CX"),
+            (AgentVendor::Opencode, "OC"),
+        ]
+        .into_iter()
+        .filter_map(|(vendor, label)| {
+            visible
+                .iter()
+                .copied()
+                .find(|session| session.vendor == vendor)
+                .map(|session| (label, session))
+        })
+        .collect::<Vec<_>>();
+        let account_usages = join_all(usage_sources.iter().map(|(label, session)| async move {
+            (*label, session.adapter.account_usage(&session.thread).await)
+        }))
+        .await;
 
         // State: a turn in flight ⇒ 🔵 working; silent past the idle window ⇒
         // 🔴 stuck — EXCEPT a BLOCKING subagent is an AUTHORITATIVE "still
@@ -9886,7 +9901,7 @@ impl Gateway {
                     .ok()
                     .and_then(|status| status.model)
                     .filter(|model| !model.is_empty())
-                    .map(|model| strip_vendor_prefix(vendor_str(child.vendor), &model).to_string())
+                    .map(|model| model.to_string())
                     .unwrap_or_else(|| "—".to_string());
                 let title = self
                     .session_title(child)
@@ -9922,28 +9937,42 @@ impl Gateway {
                 detail_lines.push(format!("{marker} {shown}"));
             }
         }
-        if let Some(usage) = account.as_ref() {
-            let usage = format_account_usage(usage);
-            if !usage.is_empty() {
-                detail_lines.push(usage);
-            }
+        let usage_lines = account_usages
+            .into_iter()
+            .filter_map(|(label, usage)| {
+                usage
+                    .as_ref()
+                    .and_then(format_account_usage)
+                    .map(|usage| format!("{label}: {usage}"))
+            })
+            .collect::<Vec<_>>();
+        if !usage_lines.is_empty() {
+            detail_lines.push(String::new());
+            detail_lines.push("⚡️ Использование:".to_string());
+            detail_lines.extend(usage_lines);
         }
         if !child_summary.is_empty() {
+            detail_lines.push(String::new());
             detail_lines.push(format!("👥 Дочерние ({}):", child_summary.len()));
-            detail_lines.extend(
-                child_summary
-                    .into_iter()
-                    .map(|child| format!("  • {child}")),
-            );
+            for (index, child) in child_summary.into_iter().enumerate() {
+                if index > 0 {
+                    detail_lines.push(String::new());
+                }
+                detail_lines.push(format!("  • {child}"));
+            }
         }
         let same_project_sessions = visible
             .iter()
             .filter(|other| other.project == s.project && other.id != s.id)
             .count();
         if same_project_sessions > 0 {
+            detail_lines.push(String::new());
             detail_lines.push(format!(
                 "↓ Другие сессии проекта: {same_project_sessions} → /sessions"
             ));
+        }
+        if same_project_sessions == 0 {
+            detail_lines.push(String::new());
         }
         detail_lines.push(format!(
             "↓ Все проекты: {} → /projects",
@@ -14663,23 +14692,23 @@ fn format_running_tasks(running: &[RunningTask]) -> String {
     out
 }
 
-/// Render [`AccountUsage`] as the `/status` dashboard usage line:
-/// `⚡ Использование: 5h 17% (→19:00) · неделя 78%⚠ (→06/29) · лимит 46% · max`. Each field is
-/// omitted when the vendor didn't report it; an empty result = nothing to show.
-fn format_account_usage(u: &AccountUsage) -> String {
+/// Render the account-usage payload after its vendor label:
+/// `5h 17% (19:00) · неделя 78% (06/29) · max`. Each field is omitted when
+/// the vendor didn't report it; an empty result means no usage line.
+fn format_account_usage(u: &AccountUsage) -> Option<String> {
     // Short reset hint from an ISO-8601 `resets_at`: HH:MM for the 5-hour window,
     // MM/DD for the weekly. Empty when unparseable.
     fn reset_hm(iso: &Option<String>) -> String {
         iso.as_deref()
             .and_then(|s| s.split('T').nth(1))
-            .map(|t| format!(" (→{})", &t[..t.len().min(5)]))
+            .map(|t| format!(" ({})", &t[..t.len().min(5)]))
             .unwrap_or_default()
     }
     fn reset_md(iso: &Option<String>) -> String {
         iso.as_deref()
             .and_then(|s| s.split('T').next())
             .and_then(|d| d.get(5..)) // "06-29" from "2026-06-29"
-            .map(|md| format!(" (→{})", md.replace('-', "/")))
+            .map(|md| format!(" ({})", md.replace('-', "/")))
             .unwrap_or_default()
     }
     let mut parts: Vec<String> = Vec::new();
@@ -14701,12 +14730,12 @@ fn format_account_usage(u: &AccountUsage) -> String {
         parts.push(format!("лимит {p}%"));
     }
     if parts.is_empty() {
-        return String::new();
+        return None;
     }
     if let Some(sub) = u.subscription.as_deref() {
         parts.push(sub.to_string());
     }
-    format!("⚡ Использование: {}", parts.join(" · "))
+    Some(parts.join(" · "))
 }
 
 fn humanize_dur(d: std::time::Duration) -> String {
@@ -23801,7 +23830,7 @@ mod tests {
             .unwrap();
         assert!(
             out[0].contains(&format!(
-                "🧭 s1 · alpha · claude\n🟢 ожидание · — · — · ctx —\n📁 {}\n🖥 host: local",
+                "🧭 s1 · alpha · claude\n🟢 ожидание · — · — · ctx —\n📁 {}\n\n",
                 proj.path().display()
             )),
             "status card header changed: {out:?}"
@@ -23907,9 +23936,8 @@ mod tests {
         assert_eq!(out, vec!["Нет сессий — создайте через /new"]);
     }
 
-    /// v0.8.20 /status v2 ③ — the account-usage line renders 5h / weekly /
-    /// credits with reset hints, a ⚠ on a `warning` weekly, and the
-    /// subscription tail; an all-None usage renders the empty string.
+    /// /status account usage renders only vendor-reported windows, reset hints,
+    /// and the subscription tail; an all-None usage renders no line.
     #[test]
     fn format_account_usage_renders_windows_resets_and_warning() {
         let u = AccountUsage {
@@ -23921,12 +23949,12 @@ mod tests {
             weekly_severity: Some("warning".into()),
             credits_pct: Some(46),
         };
-        let s = format_account_usage(&u);
-        assert!(s.contains("5h 17% (→19:00)"), "{s}");
-        assert!(s.contains("неделя 78%⚠ (→06/29)"), "{s}");
+        let s = format_account_usage(&u).unwrap();
+        assert!(s.contains("5h 17% (19:00)"), "{s}");
+        assert!(s.contains("неделя 78%⚠ (06/29)"), "{s}");
         assert!(s.contains("лимит 46%"), "{s}");
         assert!(s.ends_with("· max"), "{s}");
-        assert_eq!(format_account_usage(&AccountUsage::default()), "");
+        assert_eq!(format_account_usage(&AccountUsage::default()), None);
     }
 
     /// `/status` running-task block — background workflows (`local_workflow`)
