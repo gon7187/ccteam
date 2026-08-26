@@ -911,9 +911,23 @@ struct RichBlockObject {
     #[serde(default)]
     language: Option<String>,
     #[serde(default)]
+    expression: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    document: Option<Value>,
+    #[serde(default)]
+    buttons: Option<Vec<RichMessageButton>>,
+    #[serde(default)]
     caption: Option<Value>,
     #[serde(default)]
     credit: Option<RichText>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RichMessageButton {
+    #[serde(default)]
+    text: Option<RichText>,
 }
 
 /// RichText is string | array of RichText | typed object in Bot API 10.3.
@@ -1016,6 +1030,18 @@ fn rich_blocks_to_text(blocks: &[RichBlock]) -> String {
     nonempty_join(blocks.iter().filter_map(rich_block_to_text))
 }
 
+fn rich_caption_to_text(caption: &Value) -> String {
+    caption
+        .get("text")
+        .map(|text| rich_text_to_text(&RichText(text.clone())))
+        .unwrap_or_default()
+}
+
+fn rich_media_placeholder(label: String, caption: Option<&Value>) -> String {
+    let caption = caption.map(rich_caption_to_text).unwrap_or_default();
+    nonempty_join([label, caption])
+}
+
 fn rich_block_to_text(block: &RichBlock) -> Option<String> {
     let block = match block {
         RichBlock::Object(block) => block,
@@ -1116,18 +1142,87 @@ fn rich_block_to_text(block: &RichBlock) -> Option<String> {
                     .unwrap_or_default(),
             ])
         }),
-        "collage" | "slideshow" => block.caption.as_ref().map(|caption| {
-            caption
-                .get("text")
-                .map(|text| rich_text_to_text(&RichText(text.clone())))
+        "collage" | "slideshow" => block
+            .caption
+            .as_ref()
+            .map(|caption| rich_caption_to_text(caption)),
+        "photo" => Some(rich_media_placeholder(
+            "[photo]".to_string(),
+            block.caption.as_ref(),
+        )),
+        "video" => Some(rich_media_placeholder(
+            "[video]".to_string(),
+            block.caption.as_ref(),
+        )),
+        "audio" => Some(rich_media_placeholder(
+            "[audio]".to_string(),
+            block.caption.as_ref(),
+        )),
+        "animation" => Some(rich_media_placeholder(
+            "[animation]".to_string(),
+            block.caption.as_ref(),
+        )),
+        "voice_note" => Some(rich_media_placeholder(
+            "[voice_note]".to_string(),
+            block.caption.as_ref(),
+        )),
+        "document" => {
+            let label = block
+                .document
+                .as_ref()
+                .and_then(|document| document.get("file_name"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(|name| format!("[document: {name}]"))
+                .unwrap_or_else(|| "[document]".to_string());
+            Some(rich_media_placeholder(label, block.caption.as_ref()))
+        }
+        "map" => Some(rich_media_placeholder(
+            "[map]".to_string(),
+            block.caption.as_ref(),
+        )),
+        "buttons" => {
+            let labels = block
+                .buttons
+                .as_deref()
                 .unwrap_or_default()
-        }),
+                .iter()
+                .filter_map(|button| button.text.as_ref().map(rich_text_to_text))
+                .filter(|label| !label.is_empty())
+                .collect::<Vec<_>>();
+            let label = if labels.is_empty() {
+                "[buttons]".to_string()
+            } else {
+                format!("[buttons: {}]", labels.join(" | "))
+            };
+            Some(label)
+        }
+        "divider" => Some("---".to_string()),
+        "anchor" => Some(
+            block
+                .name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .map(|name| format!("[anchor: {name}]"))
+                .unwrap_or_else(|| "[anchor]".to_string()),
+        ),
+        "mathematical_expression" => Some(
+            block
+                .expression
+                .as_deref()
+                .map(|expression| format!("${expression}$"))
+                .unwrap_or_else(|| "[mathematical_expression]".to_string()),
+        ),
         _ => None,
     }
 }
 
 fn rich_message_to_text(message: &RichMessage) -> String {
     rich_blocks_to_text(&message.blocks)
+}
+
+fn should_dispatch_inbound_content(content: &str) -> bool {
+    !content.trim().is_empty()
 }
 
 fn utf16_offset_to_byte(text: &str, offset: i64) -> Option<usize> {
@@ -1813,9 +1908,13 @@ impl Channel for TelegramChannel {
                         {
                             tracing::warn!(cid = %cid, error = %err, "telegram: rejection notice send failed");
                         }
-                        if content.is_empty() {
+                        if !should_dispatch_inbound_content(&content) {
                             continue;
                         }
+                    }
+                    if !should_dispatch_inbound_content(&content) {
+                        tracing::debug!(cid = %cid, "telegram: inbound message has no dispatchable content");
+                        continue;
                     }
                     let content_len = content.len();
                     tracing::info!(
@@ -2994,6 +3093,31 @@ mod tests {
     }
 
     #[test]
+    fn rich_message_fixture_preserves_media_only_blocks() {
+        let rich: RichMessage = serde_json::from_value(serde_json::json!({
+            "blocks": [
+                {"type": "photo", "photo": []},
+                {"type": "video", "video": {}},
+                {"type": "audio", "audio": {}},
+                {"type": "document", "document": {"file_name": "report.pdf"}},
+                {"type": "animation", "animation": {}},
+                {"type": "voice_note", "voice_note": {}},
+                {"type": "map", "location": {"latitude": 1.0, "longitude": 2.0}, "zoom": 10},
+                {"type": "buttons", "buttons": [{"text": "Open"}, {"text": ["More", {"type": "bold", "text": "!"}]}]},
+                {"type": "divider"},
+                {"type": "anchor", "name": "section"},
+                {"type": "mathematical_expression", "expression": "a+b"}
+            ]
+        }))
+        .expect("media rich blocks are valid");
+
+        assert_eq!(
+            rich_message_to_text(&rich),
+            "[photo]\n\n[video]\n\n[audio]\n\n[document: report.pdf]\n\n[animation]\n\n[voice_note]\n\n[map]\n\n[buttons: Open | More!]\n\n---\n\n[anchor: section]\n\n$a+b$"
+        );
+    }
+
+    #[test]
     fn rich_message_fixture_skips_unknown_text_and_malformed_blocks() {
         let rich: RichMessage = serde_json::from_value(serde_json::json!({
             "blocks": [
@@ -3035,6 +3159,12 @@ mod tests {
             normalize_inbound_text("/go@MyBot", &[], Some("mybot")),
             "/go"
         );
+    }
+
+    #[test]
+    fn whitespace_content_is_not_dispatchable() {
+        assert!(!should_dispatch_inbound_content(" \n\t"));
+        assert!(should_dispatch_inbound_content("[photo]"));
     }
 
     #[test]
