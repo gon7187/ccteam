@@ -4669,6 +4669,32 @@ impl Gateway {
             .map(|owner| reply_target_for_owner(&owner))
     }
 
+    /// A managed parent is the authority that created a delegation edge. Its
+    /// child inherits the project tenant principal when one exists, otherwise
+    /// the live parent's owner. An enrolled external parent retains the caller
+    /// fallback; a managed parent that vanished after origin validation is an
+    /// explicit refusal, never a silent `user:web-api` child.
+    fn delegated_owner(
+        &self,
+        project: &str,
+        parent: Option<&DelegationParent>,
+    ) -> Result<Option<ChatKey>> {
+        let parent_owner = match parent {
+            Some(parent) => match self.sessions.get(&parent.sid) {
+                Some(session) => Some(session.owner.clone()),
+                None if self.is_external_node(&parent.sid) => None,
+                None => {
+                    return Err(anyhow!(
+                        "delegation parent `{}` is no longer live; refusing child spawn",
+                        parent.sid
+                    ));
+                }
+            },
+            None => None,
+        };
+        Ok(self.tenant_project_owner(project).or(parent_owner))
+    }
+
     /// Emit a multi-per-row [`SendMessage::button_rows`] message (TG-GATE-V2
     /// W5) — e.g. a `cmd:?<cmd>` confirmation's `[✅ Да][❌ Отмена]` row,
     /// where the two buttons must render side by side rather than one per
@@ -8895,6 +8921,13 @@ impl Gateway {
             return ConfirmationResolution::Stale;
         }
         if pending.chat != *chat {
+            self.pending_command_confirmations.remove(token);
+            tracing::warn!(
+                sid = ?pending.command.split_whitespace().nth(1),
+                expected_chat = %pending.chat.identity(),
+                actual_chat = %chat.identity(),
+                "command confirmation ignored for foreign tapper"
+            );
             return ConfirmationResolution::Foreign;
         }
         self.pending_command_confirmations.remove(token);
@@ -11847,13 +11880,10 @@ impl Gateway {
         )
         .await?;
         let host = host_target.host.clone();
-        // DELIVERY only — ownership comes from `plan_new_session` (the project
-        // principal). A delegated spawn has no frontend of its own (its caller
-        // is an agent, not a human chat), so a tenant project's answers must
-        // land in THAT tenant's web console rather than the caller's.
         let reply_to = self
             .tenant_project_owner_reply_target(&project)
             .unwrap_or_else(|| ChatKey::new("web", &owner_id, &owner_id));
+        let inherited_owner = self.delegated_owner(&project, parent.as_ref())?;
         let handle = role.clone();
         let mut plan = self.plan_new_session(
             reply_to,
@@ -11865,6 +11895,9 @@ impl Gateway {
             protocol,
             tuning,
         )?;
+        if let Some(owner) = inherited_owner {
+            plan.owner = owner;
+        }
         plan.remote = host_target.remote;
         plan.parent_sid = parent_sid.clone();
         plan.spawned_by_role = spawned_by_role;
@@ -12021,6 +12054,7 @@ impl Gateway {
             let reply_to = guard
                 .tenant_project_owner_reply_target(&project)
                 .unwrap_or_else(|| ChatKey::new("web", &owner_id, &owner_id));
+            let inherited_owner = guard.delegated_owner(&project, parent.as_ref())?;
             let handle = role.clone();
             let mut plan = guard.plan_new_session(
                 reply_to,
@@ -12032,6 +12066,9 @@ impl Gateway {
                 protocol,
                 tuning,
             )?;
+            if let Some(owner) = inherited_owner {
+                plan.owner = owner;
+            }
             plan.remote = host_target.remote;
             plan.parent_sid = parent_sid.clone();
             plan.spawned_by_role = spawned_by_role;
@@ -21020,6 +21057,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delegated_spawn_refuses_stopped_managed_parent_before_planning() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway
+            .handle_text("telegram", "665337735", "Maxim_0s", "/new claude")
+            .await
+            .unwrap();
+        let parent = gateway
+            .session_views()
+            .into_iter()
+            .next()
+            .expect("managed parent")
+            .sid;
+        gateway.stop_session(&parent).await.unwrap();
+
+        let error = gateway
+            .create_delegated_session(
+                "alpha".into(),
+                "worker".into(),
+                AgentVendor::Codex,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning::default(),
+                Some(DelegationParent {
+                    sid: parent,
+                    depth: 0,
+                    role: "claude".into(),
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no longer live"),
+            "stopped parent must refuse the delegated spawn, got: {error}"
+        );
+        assert!(
+            gateway.session_views().is_empty(),
+            "a stopped managed parent must not mint a fallback user:web-api child"
+        );
+    }
+
     /// THE REPORTED BUG (2026-07-30, real machine) — a tenant's IM `/status`
     /// rendered NO `👥 直接子会话` block and under-counted "本项目其他 N 个会话"
     /// while that tenant's WEB team page listed the very same children. The
@@ -23279,7 +23361,7 @@ mod tests {
     /// Confirmation tokens bind the rendered prompt to the tapper, including
     /// in a group chat where the shared chat id cannot identify that person.
     #[tokio::test]
-    async fn cmd_confirmation_ignores_a_different_tapper() {
+    async fn cmd_confirmation_foreign_tap_spends_the_token() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
@@ -23336,10 +23418,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            owner,
-            vec!["✅ /status", "Нет сессий — создайте через /new"]
-        );
+        assert_eq!(owner, vec!["Подтверждение устарело"]);
     }
 
     /// A cancellation token spends only its matching confirmation.
