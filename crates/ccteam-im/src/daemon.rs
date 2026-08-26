@@ -60,6 +60,7 @@ const MIN_DRAFT_KEEPALIVE: Duration = Duration::from_secs(2);
 const MAX_DRAFT_KEEPALIVE: Duration = Duration::from_secs(25);
 const DRAFT_BREAKER_RETRY_TICKS: u8 = 3;
 const DRAFT_FINALIZATION_GRACE: Duration = Duration::from_millis(100);
+const DRAFT_FINALIZATION_TTL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone)]
 struct DraftRoute {
@@ -2557,6 +2558,8 @@ fn schedule_draft_finalization(
         .entry(completion.sid.clone())
         .or_default()
         .push_back(state.clone());
+    let sid = completion.sid.clone();
+    let finalizations = finalizations.clone();
     tokio::spawn(async move {
         tokio::time::sleep(DRAFT_FINALIZATION_GRACE).await;
         loop {
@@ -2582,6 +2585,12 @@ fn schedule_draft_finalization(
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         );
+                        let cleanup_state = state.clone();
+                        let cleanup_finalizations = finalizations.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(DRAFT_FINALIZATION_TTL).await;
+                            remove_finalization(&cleanup_finalizations, &sid, &cleanup_state);
+                        });
                     }
                     return;
                 }
