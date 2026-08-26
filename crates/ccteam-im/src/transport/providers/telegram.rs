@@ -9,6 +9,7 @@
 //! the Bot API documented at <https://core.telegram.org/bots/api>;
 //! end-to-end verification ships post-token-paste.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,7 @@ pub struct TelegramChannel {
     rejected_senders: RejectedSenderNotifier,
     http: reqwest::Client,
     last_offset: Arc<Mutex<i64>>,
+    bot_identity: Mutex<Option<BotIdentity>>,
     name: String,
     /// TG-GATE-V2 W1 — reason kinds (`"http_400"`, `"network_error"`, …)
     /// already logged for a rich→classic fallback, so a noisy failure mode
@@ -105,6 +107,7 @@ impl TelegramChannel {
                 .build()
                 .expect("reqwest client"),
             last_offset: Arc::new(Mutex::new(0)),
+            bot_identity: Mutex::new(None),
             name: "telegram".to_string(),
             rich_fallback_logged: Mutex::new(std::collections::HashSet::new()),
             rich_failures: std::sync::atomic::AtomicU32::new(0),
@@ -139,6 +142,26 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!("{}/bot{}/{}", self.api_base, self.bot_token, method)
+    }
+
+    async fn bot_identity(&self) -> BotIdentity {
+        let mut cached = self.bot_identity.lock().await;
+        if let Some(identity) = cached.as_ref() {
+            return identity.clone();
+        }
+
+        let identity = match self.http.get(self.api_url("getMe")).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<GetMeResp>().await {
+                Ok(body) if body.ok => BotIdentity {
+                    username: body.result.and_then(|user| user.username),
+                    healthy: true,
+                },
+                _ => BotIdentity::default(),
+            },
+            _ => BotIdentity::default(),
+        };
+        *cached = Some(identity.clone());
+        identity
     }
 
     /// Whether a chat is permitted. An empty allowlist means whatever this
@@ -712,6 +735,25 @@ struct GetUpdatesResp {
     ok: bool,
     #[serde(default)]
     result: Vec<TgUpdate>,
+}
+
+#[derive(Clone, Default)]
+struct BotIdentity {
+    username: Option<String>,
+    healthy: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetMeResp {
+    ok: bool,
+    #[serde(default)]
+    result: Option<TgBotUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgBotUser {
+    #[serde(default)]
+    username: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1313,6 +1355,12 @@ impl Channel for TelegramChannel {
                         .clone()
                         .or_else(|| m.caption.clone())
                         .unwrap_or_default();
+                    let content = if content.starts_with('/') && !content.contains(['\r', '\n']) {
+                        let identity = self.bot_identity().await;
+                        strip_bot_mention(&content, identity.username.as_deref()).into_owned()
+                    } else {
+                        content
+                    };
                     let mut attachments = Vec::new();
                     let mut rejected_notice: Option<String> = None;
                     if let Some(pending) = pick_attachment(&m) {
@@ -1380,11 +1428,7 @@ impl Channel for TelegramChannel {
     }
 
     async fn health_check(&self) -> bool {
-        let url = self.api_url("getMe");
-        match self.http.get(&url).send().await {
-            Ok(r) => r.status().is_success(),
-            Err(_) => false,
-        }
+        self.bot_identity().await.healthy
     }
 
     fn max_message_len(&self) -> Option<usize> {
@@ -1513,6 +1557,27 @@ fn set_my_commands_body(
     body
 }
 
+fn strip_bot_mention<'a>(text: &'a str, own_username: Option<&str>) -> Cow<'a, str> {
+    if !text.starts_with('/') || text.contains(['\r', '\n']) {
+        return Cow::Borrowed(text);
+    }
+    let first_end = text.find(char::is_whitespace).unwrap_or(text.len());
+    let (command, mention) = match text[..first_end].split_once('@') {
+        Some(parts) => parts,
+        None => return Cow::Borrowed(text),
+    };
+    if mention.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let matches_bot = own_username
+        .map(|username| mention.eq_ignore_ascii_case(username))
+        .unwrap_or_else(|| mention.to_ascii_lowercase().ends_with("bot"));
+    if !matches_bot {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(format!("{command}{}", &text[first_end..]))
+}
+
 /// Parse a Telegram message id for `setMessageReaction`, tolerating ccteam's
 /// `tg-<n>` inbound-id namespacing (the gateway carries IM message ids as
 /// `tg-<n>`, but the Bot API needs the BARE numeric `<n>`). Without the strip,
@@ -1568,6 +1633,38 @@ mod tests {
         let ch = TelegramChannel::new("ABC".into(), vec![]);
         let url = ch.api_url("getMe");
         assert_eq!(url, "https://api.telegram.org/botABC/getMe");
+    }
+
+    #[test]
+    fn strip_bot_mention_only_rewrites_the_first_command_token() {
+        assert_eq!(
+            strip_bot_mention("/projects@codexcoder1bot", Some("CodexCoder1Bot")),
+            "/projects"
+        );
+        assert_eq!(
+            strip_bot_mention("/new codex@CodexCoder1Bot", Some("codexcoder1bot")),
+            "/new codex@CodexCoder1Bot"
+        );
+        assert_eq!(
+            strip_bot_mention("/projects@otherbot", Some("codexcoder1bot")),
+            "/projects@otherbot"
+        );
+        assert_eq!(
+            strip_bot_mention("/projects@codexcoder1bot", None),
+            "/projects"
+        );
+        assert_eq!(
+            strip_bot_mention("/projects@codexcoder1bot arg1 arg2", Some("codexcoder1bot")),
+            "/projects arg1 arg2"
+        );
+        assert_eq!(
+            strip_bot_mention("/projects@codexcoder1bot\nnext", Some("codexcoder1bot")),
+            "/projects@codexcoder1bot\nnext"
+        );
+        assert_eq!(
+            strip_bot_mention("plain text", Some("codexcoder1bot")),
+            "plain text"
+        );
     }
 
     #[test]
