@@ -1896,6 +1896,12 @@ async fn send_gateway_outbound(
     // defeat that — every part would carry the same (also unsplit)
     // `rich_markdown`, duplicating it across messages.
     let parts = match channel.max_message_len() {
+        Some(_) if message.attachments.is_empty() && message.rich_markdown.is_some() => {
+            crate::sanitize::split_rich_markdown_numbered(
+                message.rich_markdown.as_deref().expect("checked above"),
+                30_000,
+            )
+        }
         Some(limit) if message.attachments.is_empty() && message.rich_markdown.is_none() => {
             crate::sanitize::split_for_channel_numbered(&message.content, limit)
         }
@@ -1960,9 +1966,9 @@ async fn queue_and_send_durable_part(
 /// Queue every part of a split as its OWN durable `Queued` row, id =
 /// `{id_prefix}-{part_idx}` — before anything is sent. Only the LAST
 /// part keeps `button_rows`/`options`/`reply_keyboard` (a tapper acting from a
-/// middle part would be acting on an incomplete reply); `rich_markdown` is
-/// cleared on every part (each part is a plain/HTML classic send, never
-/// itself a Rich Message).
+/// middle part would be acting on an incomplete reply). Rich parts retain
+/// their own independently valid Markdown; a later classic degradation still
+/// enters [`finish_durable_outbound_send`]'s ordinary plain splitter.
 ///
 /// Queuing ALL parts up front — rather than one-at-a-time right before
 /// each send — matters for crash-safe replay: [`finish_durable_outbound_send`]'s
@@ -1996,7 +2002,9 @@ fn queue_split_parts(
         let id = format!("{id_prefix}-{part_idx}");
         let mut part_msg = message.clone();
         part_msg.content = part;
-        part_msg.rich_markdown = None;
+        if message.rich_markdown.is_some() {
+            part_msg.rich_markdown = Some(part_msg.content.clone());
+        }
         if part_idx != last_idx {
             part_msg.button_rows.clear();
             part_msg.options.clear();
@@ -2177,13 +2185,15 @@ async fn finish_durable_outbound_send(
                 .downcast_ref::<TelegramRichFallbackNeedsSplit>()
                 .is_some()
             {
-                let mut split_message = message.clone();
-                split_message.rich_markdown = None;
+                let split_message = message.clone();
                 let limit = channel
                     .max_message_len()
                     .unwrap_or(split_message.content.encode_utf16().count().max(1));
-                let parts =
-                    crate::sanitize::split_for_channel_numbered(&split_message.content, limit);
+                let parts = if let Some(markdown) = split_message.rich_markdown.as_deref() {
+                    crate::sanitize::split_rich_markdown_numbered(markdown, limit.min(30_000))
+                } else {
+                    crate::sanitize::split_for_channel_numbered(&split_message.content, limit)
+                };
                 // Append propagates (`?` inside `queue_split_parts`): if
                 // durably queuing the parts fails, we must NOT mark this
                 // parent row terminal — that would claim the parts exist
@@ -2867,7 +2877,9 @@ mod tests {
                 self.inner.max_message_len()
             }
             async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
-                if message.rich_markdown.is_some() {
+                if message.rich_markdown.is_some()
+                    && message.content.len() > self.inner.max_message_len().unwrap_or(usize::MAX)
+                {
                     return Err(TelegramRichFallbackNeedsSplit.into());
                 }
                 if message.content == self.fail_once_content
@@ -2897,7 +2909,7 @@ mod tests {
         let block = |c: char| c.to_string().repeat(30);
         let content = format!("{}\n\n{}\n\n{}", block('A'), block('B'), block('C'));
         let limit = 40usize;
-        let parts = crate::sanitize::split_for_channel_numbered(&content, limit);
+        let parts = crate::sanitize::split_rich_markdown_numbered(&content, limit);
         assert_eq!(
             parts.len(),
             3,
@@ -2932,8 +2944,11 @@ mod tests {
 
         let delivered = inner_handle.outbox().await;
         assert!(
-            delivered.iter().all(|m| m.rich_markdown.is_none()),
-            "every delivered part goes out via the plain (non-rich) path: {delivered:?}"
+            delivered
+                .iter()
+                .filter(|m| !m.content.starts_with('⚠'))
+                .all(|m| m.rich_markdown.as_deref() == Some(m.content.as_str())),
+            "every delivered rich part retains matching classic fallback content: {delivered:?}"
         );
         assert!(
             delivered.iter().any(|m| m.content == parts[0]),

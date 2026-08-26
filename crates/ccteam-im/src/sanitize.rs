@@ -201,6 +201,56 @@ pub fn split_for_channel_numbered(text: &str, limit: usize) -> Vec<String> {
         .collect()
 }
 
+/// Split Rich Message Markdown into independently valid numbered parts.
+/// Fenced blocks are the only block type that may be split; each fragment is
+/// closed and re-opened with the original info string.
+pub fn split_rich_markdown_numbered(markdown: &str, limit: usize) -> Vec<String> {
+    if markdown.len() <= limit {
+        return vec![markdown.to_string()];
+    }
+    let budget = limit.saturating_sub(24).max(1);
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut fence: Option<String> = None;
+    for line in markdown.split_inclusive('\n') {
+        let bare = line.trim_end_matches('\n');
+        let fence_line = bare.trim_start().starts_with("```");
+        let closes_fence = fence_line && fence.is_some();
+        if fence_line && fence.is_none() {
+            fence = Some(bare.trim_start()[3..].trim().to_string());
+        }
+        if current.len() + line.len() > budget && !current.trim().is_empty() {
+            if let Some(info) = &fence {
+                if !current.ends_with('\n') {
+                    current.push('\n');
+                }
+                current.push_str("```");
+                parts.push(current);
+                current = format!("```{info}\n");
+            } else {
+                parts.push(current);
+                current = String::new();
+            }
+        }
+        current.push_str(line);
+        if closes_fence {
+            fence = None;
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    if parts.len() == 1 {
+        return parts;
+    }
+    let total = parts.len();
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, part)| format!("{}\n\n({}/{total})", part.trim_end(), i + 1))
+        .collect()
+}
+
 /// Greedy length-budgeted split that preserves every byte (no fence
 /// awareness). Each returned chunk is `<= budget` UTF-16 units except a
 /// pathological lone char wider than `budget`, which is emitted whole to
@@ -578,6 +628,30 @@ mod tests {
                 "part {i} missing correctly-widened suffix: {part:?}"
             );
             assert!(utf16_len(part) <= limit, "part over budget: {part:?}");
+        }
+    }
+
+    #[test]
+    fn rich_split_keeps_each_part_valid_and_numbered() {
+        let markdown = format!(
+            "# One\n\n{}\n\n```rust\n{}\n```\n\n- last",
+            "first ".repeat(20),
+            "code();\n".repeat(30)
+        );
+        let parts = split_rich_markdown_numbered(&markdown, 180);
+        assert!(parts.len() > 1);
+        let total = parts.len();
+        for (i, part) in parts.iter().enumerate() {
+            assert!(part.len() <= 180, "{part:?}");
+            assert!(part.ends_with(&format!("({}/{total})", i + 1)));
+            assert_eq!(
+                part.lines()
+                    .filter(|line| line.trim_start().starts_with("```"))
+                    .count()
+                    % 2,
+                0,
+                "{part:?}"
+            );
         }
     }
 }
