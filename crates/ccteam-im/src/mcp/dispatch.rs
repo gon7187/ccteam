@@ -854,6 +854,7 @@ fn build_send_file_event(
     })?;
     Ok(crate::gateway::GatewayEvent {
         id: format!("chat-send-file-{slug}-{role}-{seq}"),
+        cid: None,
         channel,
         chat_id,
         thread_ts: None,
@@ -1047,6 +1048,7 @@ async fn execute_interaction_ask(
     if sink
         .send(GatewayEvent {
             id: format!("interaction-{token}"),
+            cid: None,
             channel,
             chat_id,
             thread_ts: None,
@@ -1278,6 +1280,7 @@ async fn execute_permission_ask(
     if sink
         .send(GatewayEvent {
             id: format!("permission-{token}"),
+            cid: None,
             channel,
             chat_id,
             thread_ts: None,
@@ -1849,73 +1852,67 @@ async fn run_session_tool(
 /// 3. **Never** for a tenant (`User`): their `_caller_*` args are stripped
 ///    upstream, and a declaration must not smuggle identity back in.
 async fn resolve_call_origin(
+    tool: &str,
     caller: &McpCaller,
     args: &Value,
+    project: &str,
     gateway: Option<&std::sync::Arc<tokio::sync::Mutex<crate::gateway::Gateway>>>,
     deadline: Option<crate::gateway::GatewayDeadline>,
 ) -> Result<Option<crate::gateway::DelegationParent>, String> {
-    match caller {
-        McpCaller::Ambient => {
-            let caller_sid = args
-                .get("_caller_sid")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if caller_sid.is_empty() {
-                return Ok(None);
-            }
-            Ok(Some(crate::gateway::DelegationParent {
-                sid: caller_sid,
-                depth: args
-                    .get("_caller_depth")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32,
-                role: args
-                    .get("_caller_role")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            }))
-        }
+    let declared = match caller {
+        McpCaller::Ambient => args
+            .get("_caller_sid")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|sid| !sid.is_empty()),
         McpCaller::Admin => {
-            let Some(declared) = args
+            let declared = args
                 .get("parent_sid")
                 .and_then(|v| v.as_str())
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
-            else {
-                // Nothing declared → a root spawn, as before: the admin front
-                // door IS rootless when a human drives it.
-                return Ok(None);
-            };
-            let Some(gateway) = gateway else {
-                return Err(format!(
-                    "session_spawn: parent_sid `{declared}` cannot be validated (no live gateway)"
-                ));
-            };
-            let view = {
-                let gw = match deadline {
-                    Some(deadline) => deadline
-                        .lock(gateway)
-                        .await
-                        .map_err(|error| mcp_gateway_error("session_spawn", &error))?,
-                    None => crate::latency::gateway_lock(gateway, "mcp.spawn.resolve").await,
-                };
-                gw.session_views().into_iter().find(|v| v.sid == declared)
-            };
-            let Some(view) = view else {
-                return Err(format!(
-                    "session_spawn: parent_sid `{declared}` is not a live session — run session_list to find your own sid, or omit parent_sid for a root spawn"
-                ));
-            };
-            Ok(Some(crate::gateway::DelegationParent {
-                sid: view.sid,
-                depth: view.delegation_depth,
-                role: view.role,
-            }))
+                .filter(|sid| !sid.is_empty());
+            // Nothing declared → a root spawn/dispatch, as before: the admin
+            // front door is rootless when a human drives it.
+            declared
         }
-        McpCaller::User { .. } => Ok(None),
+        McpCaller::User { .. } => None,
+    };
+    let Some(declared) = declared else {
+        return Ok(None);
+    };
+    let Some(gateway) = gateway else {
+        return Err(format!(
+            "{tool}: parent_sid `{declared}` cannot be validated (no live gateway)"
+        ));
+    };
+    let view = {
+        let gw = match deadline {
+            Some(deadline) => deadline
+                .lock(gateway)
+                .await
+                .map_err(|error| mcp_gateway_error(tool, &error))?,
+            None => crate::latency::gateway_lock(gateway, "mcp.spawn.resolve").await,
+        };
+        gw.session_views()
+            .into_iter()
+            .find(|view| view.sid == declared)
+    };
+    let Some(view) = view else {
+        return Err(format!(
+            "{tool}: parent_sid `{declared}` is not a live session — run session_list to find your own sid, or omit parent_sid for a root spawn"
+        ));
+    };
+    if view.project != project {
+        return Err(format!(
+            "{tool}: parent_sid `{}` belongs to project `{}`, not target project `{project}`",
+            view.sid, view.project
+        ));
     }
+    Ok(Some(crate::gateway::DelegationParent {
+        sid: view.sid,
+        depth: view.delegation_depth,
+        role: view.role,
+    }))
 }
 
 async fn run_session_spawn_at(
@@ -2017,9 +2014,9 @@ async fn run_session_spawn_at(
     let requested_wait_seconds = requested_inline_wait_seconds(args);
     let effective_wait_seconds = effective_inline_wait_seconds(requested_wait_seconds);
     let notify = parse_notify_mode("session_spawn", args)?;
-    // Operator/unowned projects retain the caller-derived pool. Tenant-owned
-    // projects ignore this fallback in the gateway and make every
-    // session_spawn inherit the tenant principal.
+    // Root spawns and enrolled/external parents in operator/unowned projects
+    // retain this caller-derived fallback. A managed parent overrides it in
+    // the gateway with its own owner; tenant projects keep their principal.
     let fallback_owner_id = match &caller {
         McpCaller::User { user_id } => user_id.clone(),
         McpCaller::Ambient | McpCaller::Admin => "web-api".to_string(),
@@ -2037,7 +2034,15 @@ async fn run_session_spawn_at(
     // from CallerCtx — never caller-supplied). Admin (the local mcp.sock
     // admin-token tier) = a human/root spawn unless it declares a `parent_sid`.
     // Guardrails apply only when a real parent is present.
-    let parent = resolve_call_origin(&caller, args, Some(gateway), Some(deadline)).await?;
+    let parent = resolve_call_origin(
+        "session_spawn",
+        &caller,
+        args,
+        &project,
+        Some(gateway),
+        Some(deadline),
+    )
+    .await?;
     // The dispatcher identity for an optional first `task` (captured before
     // `parent` moves into the create call).
     let parent_sid_for_task = parent.as_ref().map(|p| p.sid.clone());
@@ -2461,6 +2466,25 @@ async fn run_session_dispatch(
     )
     .await?;
 
+    let target_project = {
+        let gw = deadline
+            .lock(gateway)
+            .await
+            .map_err(|error| mcp_gateway_error("session_dispatch", &error))?;
+        gw.session_vendor_host_slug(&sid)
+            .map(|(_, _, project)| project)
+            .ok_or_else(|| format!("session_dispatch: unknown session `{sid}`"))?
+    };
+    let parent = resolve_call_origin(
+        "session_dispatch",
+        &caller,
+        args,
+        &target_project,
+        Some(gateway),
+        Some(deadline),
+    )
+    .await?;
+
     let requested_wait_seconds = requested_inline_wait_seconds(args);
     let effective_wait_seconds = effective_inline_wait_seconds(requested_wait_seconds);
     let notify = parse_notify_mode("session_dispatch", args)?;
@@ -2484,22 +2508,15 @@ async fn run_session_dispatch(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from);
-    // The dispatcher's server-resolved principal (Ambient only; injected in
-    // `execute_session_tool`). A delegation is armed only for an agent caller.
-    let caller_sid = match &caller {
-        McpCaller::Ambient => args
-            .get("_caller_sid")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        McpCaller::Admin | McpCaller::User { .. } => String::new(),
-    };
-    let caller_slug = args
-        .get("_caller_slug")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let is_delegation = !caller_sid.is_empty();
+    // The common resolver verifies every parent against the live origin and
+    // target project. Admin can declare the same origin explicitly; tenants
+    // remain root-only because their caller fields were stripped upstream.
+    let caller_sid = parent
+        .as_ref()
+        .map(|parent| parent.sid.clone())
+        .unwrap_or_default();
+    let caller_slug = target_project;
+    let is_delegation = parent.is_some();
 
     // ---- Scope 1: idempotent replay + cycle guard (fast, no submit) ----
     {
@@ -5168,6 +5185,159 @@ mod session_tool_tests {
 
         assert_eq!(meta.owner, "user:ualice");
         assert_eq!(meta.parent_sid.as_deref(), Some(alice_sid.as_str()));
+    }
+
+    #[tokio::test]
+    async fn admin_delegation_rejects_cross_project_parent_for_spawn_and_dispatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, alice_sid, bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+
+        for (tool, arguments) in [
+            (
+                "session_spawn",
+                json!({
+                    "project": "bob",
+                    "vendor": "claude",
+                    "parent_sid": alice_sid,
+                }),
+            ),
+            (
+                "session_dispatch",
+                json!({
+                    "sid": bob_sid,
+                    "task": "cross-project delegation",
+                    "parent_sid": alice_sid,
+                }),
+            ),
+        ] {
+            let response = execute_session_tool_with_paths(
+                &call(tool, arguments),
+                Some(&gateway),
+                McpCaller::Admin,
+                &paths,
+            )
+            .await;
+            assert_eq!(response["result"]["isError"], true, "{tool}: {response}");
+            let text = response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                text.contains("parent_sid")
+                    && text.contains("project `alice`")
+                    && text.contains("project `bob`"),
+                "{tool}: expected a readable cross-project parent error, got: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ambient_child_of_telegram_parent_inherits_owner_and_is_stoppable_from_telegram() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let alpha_dir = seed_owned_project(&paths, "alpha", "telegram:665337735");
+        let factory: std::sync::Arc<
+            dyn Fn(
+                    ccteam_harness::AgentVendor,
+                    ccteam_harness::SessionProtocol,
+                )
+                    -> std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+                + Send
+                + Sync,
+        > = std::sync::Arc::new(move |_, _| {
+            std::sync::Arc::new(StubAdapter::default())
+                as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+        });
+        let mut gateway = Gateway::new_with_factory(factory, "alpha", alpha_dir);
+        mark_stub_vendors_installed(&mut gateway);
+        gateway.enable_project_creation(paths.clone());
+        gateway
+            .handle_text("telegram", "665337735", "Maxim_0s", "/new claude")
+            .await
+            .unwrap();
+        let parent = gateway
+            .session_views()
+            .into_iter()
+            .next()
+            .expect("Telegram parent spawned")
+            .sid;
+        let gateway = std::sync::Arc::new(tokio::sync::Mutex::new(gateway));
+
+        let child = parse(
+            &run_session_spawn_at(
+                &ambient(&parent, "alpha", json!({ "vendor": "codex" })),
+                &gateway,
+                McpCaller::Ambient,
+                Some(&paths),
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .expect("MCP spawn sid")
+            .to_string();
+        gateway
+            .lock()
+            .await
+            .bind_operator_allowlist("telegram", ["operator-chat".to_string()]);
+        let meta = ccteam_harness::execution::session_meta::read_session_meta(
+            &paths.projects_root.join("alpha"),
+            &child,
+        )
+        .unwrap();
+
+        let menu = gateway
+            .lock()
+            .await
+            .handle_message_rich(
+                "telegram",
+                "665337735",
+                "Maxim_0s",
+                "",
+                "/sessions all",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let reply = gateway
+            .lock()
+            .await
+            .handle_text(
+                "telegram",
+                "665337735",
+                "Maxim_0s",
+                &format!("/stop {child}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.len(), 1, "{reply:?}");
+        assert!(
+            reply[0].starts_with(&format!("Сессия {child} остановлена")),
+            "{reply:?}"
+        );
+        assert!(
+            !gateway
+                .lock()
+                .await
+                .session_views()
+                .iter()
+                .any(|view| view.sid == child),
+            "the Telegram /stop must actually remove {child}"
+        );
+
+        assert_eq!(meta.owner, "telegram:665337735");
+        assert_eq!(meta.parent_sid.as_deref(), Some(parent.as_str()));
+        assert!(
+            menu[0]
+                .markdown
+                .contains(&format!("data=\"cmd:?/stop {child}\"")),
+            "{menu:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

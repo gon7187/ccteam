@@ -124,6 +124,20 @@ pub fn platform_of(channel: &str) -> &str {
     channel.split('@').next().unwrap_or(channel)
 }
 
+/// Stable log correlation without exposing opaque gateway/event ids.
+pub(crate) fn safe_correlation_id(id: &str) -> String {
+    let telegram_suffix = id.strip_prefix("tg-cb-").or_else(|| id.strip_prefix("tg-"));
+    if telegram_suffix.is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    }) {
+        return id.to_string();
+    }
+    let hash = id.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("id-{:08x}", hash as u32)
+}
+
 /// Whether a channel name belongs to a per-tenant bot (`"<platform>@<tenant>"`)
 /// rather than the global/admin bot (`"telegram"`/`"lark"`/…) or web (`"web"`).
 pub fn is_tenant_bot_channel(channel: &str) -> bool {
@@ -930,6 +944,16 @@ mod tests {
         assert!(!is_tenant_bot_channel("web"));
         assert!(is_tenant_bot_channel("telegram@uabc"));
         assert!(is_tenant_bot_channel("lark@u123"));
+    }
+
+    #[test]
+    fn safe_correlation_id_keeps_telegram_cids_and_hashes_opaque_ids() {
+        assert_eq!(safe_correlation_id("tg-42"), "tg-42");
+        assert_eq!(safe_correlation_id("tg-cb-99"), "tg-cb-99");
+        assert_eq!(
+            safe_correlation_id("gateway-ephemeral-confirm-1-secret"),
+            "id-cc2d0f13"
+        );
     }
 
     #[test]

@@ -316,7 +316,7 @@ impl TelegramChannel {
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
         cb: TgCallbackQuery,
     ) {
-        let Some(data) = cb.data.as_ref().cloned() else {
+        let Some(data) = cb.data.as_ref().map(|data| decode_tg_button_entities(data)) else {
             let _ = self.answer_callback(&cb.id).await;
             return;
         };
@@ -1733,6 +1733,67 @@ fn escape_tg_button_attr(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Telegram Rich Message callbacks preserve `&#33;`, `&#036;`, `&#39;`,
+/// `&amp;`, `&lt;`, `&gt;`, and `&quot;` literally. `&apos;` is decoded
+/// defensively as a standard HTML entity, although it was not observed live.
+/// Malformed, unknown, and control-code entities remain byte-for-byte intact.
+fn decode_tg_button_entities(s: &str) -> String {
+    let mut decoded = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(offset) = rest.find('&') {
+        decoded.push_str(&rest[..offset]);
+        rest = &rest[offset..];
+        if let Some((ch, consumed)) = decode_tg_button_entity(rest) {
+            decoded.push(ch);
+            rest = &rest[consumed..];
+        } else {
+            decoded.push('&');
+            rest = &rest[1..];
+        }
+    }
+    decoded.push_str(rest);
+    decoded
+}
+
+fn decode_tg_button_entity(s: &str) -> Option<(char, usize)> {
+    for (entity, ch) in [
+        ("&amp;", '&'),
+        ("&lt;", '<'),
+        ("&gt;", '>'),
+        ("&quot;", '"'),
+        ("&apos;", '\''),
+    ] {
+        if s.starts_with(entity) {
+            return Some((ch, entity.len()));
+        }
+    }
+
+    let digits = s.strip_prefix("&#")?;
+    let (radix, digits, radix_prefix_len) = match digits
+        .strip_prefix('x')
+        .or_else(|| digits.strip_prefix('X'))
+    {
+        Some(hex) => (16, hex, 1),
+        None => (10, digits, 0),
+    };
+    let end = digits.find(';')?;
+    let digits = &digits[..end];
+    let valid_digits = match radix {
+        10 => digits.bytes().all(|byte| byte.is_ascii_digit()),
+        16 => digits.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        _ => unreachable!("numeric entities use decimal or hexadecimal"),
+    };
+    if digits.is_empty() || !valid_digits {
+        return None;
+    }
+    let value = u32::from_str_radix(digits, radix).ok()?;
+    let ch = char::from_u32(value)?;
+    if ch.is_control() {
+        return None;
+    }
+    Some((ch, 2 + radix_prefix_len + end + 1))
+}
+
 /// `SendMessage::button_rows` ⊕ `SendMessage::options` — button rows first,
 /// then one row per choice-reply option (`options` stays a one-per-row
 /// concept; see [`MessageOption`] docs). Shared by the Rich Message
@@ -3054,6 +3115,103 @@ mod tests {
             .is_none());
         assert_eq!(seen.lock().unwrap().len(), 1);
         assert!(seen.lock().unwrap()[0].0.contains("answerCallbackQuery"));
+    }
+
+    fn callback_query_json(id: &str, data: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "from": {"id": 7},
+            "data": data,
+            "message": {
+                "message_id": 1,
+                "date": 0,
+                "chat": {"id": 7, "type": "private"}
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn callback_query_decodes_rich_button_entities() {
+        let cases = [
+            ("cmd:&#33;abc", "cmd:!abc"),
+            ("&#036;", "$"),
+            ("a&amp;b", "a&b"),
+            ("a&quot;b", "a\"b"),
+            ("&#39;", "'"),
+            ("a&lt;b&gt;", "a<b>"),
+            ("&apos;", "'"),
+            ("&#x41;", "A"),
+            ("a&b", "a&b"),
+            ("&#;", "&#;"),
+            ("&#xZZ;", "&#xZZ;"),
+            ("&#99999999999;", "&#99999999999;"),
+            ("&#xD800;", "&#xD800;"),
+            ("&#0;", "&#0;"),
+            ("&amp", "&amp"),
+            ("&#3", "&#3"),
+            ("&amp;amp;", "&amp;"),
+            ("middle&bare", "middle&bare"),
+        ];
+        let (base, _) = spawn_sequential_http(&[r#"{"ok":true,"result":true}"#; 17]);
+        let channel = TelegramChannel::new("t".into(), vec![]).with_api_base(base);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(cases.len());
+
+        for (idx, (data, expected)) in cases.iter().enumerate() {
+            channel
+                .handle_callback_query(
+                    &tx,
+                    serde_json::from_value(callback_query_json(&format!("cb-{idx}"), data))
+                        .unwrap(),
+                )
+                .await;
+            let forwarded = rx.recv().await.expect("callback forwarded");
+            assert_eq!(forwarded.selection.expect("selection").data, *expected);
+        }
+    }
+
+    fn simulate_telegram_rich_button_encoding(attribute: &str) -> String {
+        let decoded = attribute
+            .replace("&quot;", "\"")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&");
+        let mut encoded = String::new();
+        for ch in decoded.chars() {
+            encoded.push_str(match ch {
+                '!' => "&#33;",
+                '$' => "&#036;",
+                '\'' => "&#39;",
+                '&' => "&amp;",
+                '<' => "&lt;",
+                '>' => "&gt;",
+                '\"' => "&quot;",
+                _ => {
+                    encoded.push(ch);
+                    continue;
+                }
+            });
+        }
+        encoded
+    }
+
+    #[tokio::test]
+    async fn rich_button_attribute_escape_round_trips_through_callback_ingress() {
+        let original = "!$'&<>\"";
+        let attribute = escape_tg_button_attr(original);
+        let data = simulate_telegram_rich_button_encoding(&attribute);
+        let (base, _) = spawn_sequential_http(&[r#"{"ok":true,"result":true}"#]);
+        let channel = TelegramChannel::new("t".into(), vec![]).with_api_base(base);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        channel
+            .handle_callback_query(
+                &tx,
+                serde_json::from_value(callback_query_json("cb-round-trip", &data)).unwrap(),
+            )
+            .await;
+
+        let forwarded = rx.recv().await.expect("callback forwarded");
+        assert_eq!(forwarded.selection.expect("selection").data, original);
     }
 
     #[tokio::test]

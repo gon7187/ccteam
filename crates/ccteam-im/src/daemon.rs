@@ -1607,12 +1607,13 @@ fn spawn_inbound_consumer(
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             let cid = msg.id.clone();
+            let log_cid = crate::transport::safe_correlation_id(&cid);
             let route_t0 = std::time::Instant::now();
             tracing::info!(
                 event = "latency",
                 stage = "imd.route.begin",
-                cid = %cid,
-                channel = %msg.channel,
+                cid = %log_cid,
+                channel = crate::transport::platform_of(&msg.channel),
                 "latency imd.route.begin"
             );
             // Clone the channel out under the read lock, then DROP the guard
@@ -1665,7 +1666,7 @@ fn spawn_inbound_consumer(
             let Some(mut clean_payload) = sec_gate_payload(outcome.clone(), has_nontext_payload)
             else {
                 tracing::warn!(
-                    cid = %cid,
+                    cid = %log_cid,
                     outcome = ?outcome,
                     "ccteam-im: gateway inbound rejected by security layer"
                 );
@@ -1696,8 +1697,13 @@ fn spawn_inbound_consumer(
                     if channel.supports_rich_messages() {
                         partial = partial.with_rich_markdown(route.content);
                     }
-                    if let Err(error) = channel.send(&partial).await {
-                        tracing::warn!(cid = %cid, error = %error, "ccteam-im: failed to preserve stopped draft");
+                    if channel.send(&partial).await.is_err() {
+                        tracing::info!(
+                            cid = %log_cid,
+                            channel = crate::transport::platform_of(&msg.channel),
+                            error_kind = "channel_send",
+                            "ccteam-im: failed to preserve stopped draft"
+                        );
                     }
                 }
                 clean_payload = format!("/stop {}", route.sid);
@@ -1836,6 +1842,7 @@ async fn deliver_gateway_replies(
     channel: &(dyn Channel + Send + Sync),
     replies: Result<Vec<RichReply>>,
 ) {
+    let log_cid = crate::transport::safe_correlation_id(cid);
     match replies {
         Ok(replies) => {
             for (seq, reply) in replies.into_iter().enumerate() {
@@ -1859,12 +1866,12 @@ async fn deliver_gateway_replies(
                 if let Some(reply_keyboard) = reply_keyboard {
                     out = out.with_reply_keyboard(reply_keyboard);
                 }
-                send_gateway_outbound(cid, seq, &msg.channel, channel, out).await;
+                send_gateway_outbound(cid, &log_cid, seq, &msg.channel, channel, out).await;
             }
             tracing::info!(
                 event = "latency",
                 stage = "imd.gateway.done",
-                cid = %cid,
+                cid = %log_cid,
                 elapsed_ms = route_t0.elapsed().as_millis() as u64,
                 "latency imd.gateway.done"
             );
@@ -1872,13 +1879,13 @@ async fn deliver_gateway_replies(
         Err(err) => {
             let out = SendMessage::new(format_gateway_user_error(&err), msg.reply_target.clone())
                 .in_thread(msg.thread_ts.clone());
-            send_gateway_outbound(cid, 0, &msg.channel, channel, out).await;
-            tracing::warn!(
+            send_gateway_outbound(cid, &log_cid, 0, &msg.channel, channel, out).await;
+            tracing::info!(
                 event = "latency",
                 stage = "imd.gateway.err",
-                cid = %cid,
+                cid = %log_cid,
                 elapsed_ms = route_t0.elapsed().as_millis() as u64,
-                error = %err,
+                error_kind = "gateway_error",
                 "latency imd.gateway.err"
             );
         }
@@ -1929,6 +1936,10 @@ fn spawn_gateway_event_consumer(
         // logged + swallowed, NEVER propagated, so it can't affect delivery.
         let mut reaction_handles: HashMap<String, Option<String>> = HashMap::new();
         while let Some(evt) = rx.recv().await {
+            let log_cid = evt
+                .cid
+                .clone()
+                .unwrap_or_else(|| crate::transport::safe_correlation_id(&evt.id));
             // v0.9.0 W4 (F4) — a delegation lifecycle event is broadcast-only
             // (the team view's global SSE); it has no IM channel representation
             // and no bound `evt.channel` to resolve, so skip it BEFORE the
@@ -1949,9 +1960,9 @@ fn spawn_gateway_event_consumer(
                 g.get(&evt.channel).cloned()
             };
             let Some(channel) = channel else {
-                tracing::warn!(
-                    channel = %evt.channel,
-                    event_id = %evt.id,
+                tracing::info!(
+                    cid = %log_cid,
+                    channel = crate::transport::platform_of(&evt.channel),
                     "ccteam-im: gateway event dropped because channel is not configured"
                 );
                 continue;
@@ -1985,9 +1996,15 @@ fn spawn_gateway_event_consumer(
                             Ordering::Acquire,
                         );
                     }
-                    let sent =
-                        send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out)
-                            .await;
+                    let sent = send_gateway_outbound(
+                        &evt.id,
+                        &log_cid,
+                        0,
+                        &evt.channel,
+                        channel.as_ref(),
+                        out,
+                    )
+                    .await;
                     if let Some(sid) = evt.sid.as_deref() {
                         if sent {
                             if let Some((status_key, state)) = finalization {
@@ -2061,21 +2078,41 @@ fn spawn_gateway_event_consumer(
                 // back to the pre-W8 behavior: send the resolution as a
                 // new message, so it is never silently dropped.
                 GatewayEventKind::EditMessage { message_id } => {
-                    if let Err(err) = channel
+                    match channel
                         .edit_message(&evt.chat_id, &message_id, &evt.content, &evt.button_rows)
                         .await
                     {
-                        tracing::warn!(
-                            channel = %evt.channel,
-                            message_id = %message_id,
-                            error = %err,
-                            "ccteam-im: confirmation edit failed, falling back to a new message"
-                        );
-                        let out = SendMessage::new(evt.content, evt.chat_id)
-                            .in_thread(evt.thread_ts)
-                            .with_button_rows(evt.button_rows);
-                        send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out)
+                        Ok(_) => tracing::info!(
+                            cid = %log_cid,
+                            channel = crate::transport::platform_of(&evt.channel),
+                            outcome = "ok",
+                            kind = "edit",
+                            len = evt.content.len(),
+                            "ccteam-im: confirmation edit delivered"
+                        ),
+                        Err(_) => {
+                            tracing::info!(
+                                cid = %log_cid,
+                                channel = crate::transport::platform_of(&evt.channel),
+                                outcome = "err",
+                                error_kind = "channel_edit",
+                                kind = "edit",
+                                len = evt.content.len(),
+                                "ccteam-im: confirmation edit failed, falling back to a new message"
+                            );
+                            let out = SendMessage::new(evt.content, evt.chat_id)
+                                .in_thread(evt.thread_ts)
+                                .with_button_rows(evt.button_rows);
+                            send_gateway_outbound(
+                                &evt.id,
+                                &log_cid,
+                                0,
+                                &evt.channel,
+                                channel.as_ref(),
+                                out,
+                            )
                             .await;
+                        }
                     }
                 }
                 GatewayEventKind::EphemeralAnswer {
@@ -2092,14 +2129,33 @@ fn spawn_gateway_event_consumer(
                             )
                             .await
                         {
-                            EphemeralDelivery::Delivered(_) => {}
-                            EphemeralDelivery::Unknown(err) => tracing::warn!(
-                                channel = %evt.channel,
-                                error = %err,
+                            EphemeralDelivery::Delivered(_) => tracing::info!(
+                                cid = %log_cid,
+                                channel = crate::transport::platform_of(&evt.channel),
+                                outcome = "ok",
+                                kind = "ephemeral_edit",
+                                len = evt.content.len(),
+                                "ccteam-im: ephemeral edit delivered"
+                            ),
+                            EphemeralDelivery::Unknown(_) => tracing::info!(
+                                cid = %log_cid,
+                                channel = crate::transport::platform_of(&evt.channel),
+                                outcome = "err",
+                                error_kind = "unknown",
+                                kind = "ephemeral_edit",
+                                len = evt.content.len(),
                                 "ccteam-im: ephemeral edit outcome unknown; suppressing duplicate fallback"
                             ),
-                            EphemeralDelivery::Rejected(err) => {
-                                tracing::warn!(channel = %evt.channel, error = %err, "ccteam-im: ephemeral edit rejected; retrying as a new ephemeral message");
+                            EphemeralDelivery::Rejected(_) => {
+                                tracing::info!(
+                                    cid = %log_cid,
+                                    channel = crate::transport::platform_of(&evt.channel),
+                                    outcome = "err",
+                                    error_kind = "rejected",
+                                    kind = "ephemeral_edit",
+                                    len = evt.content.len(),
+                                    "ccteam-im: ephemeral edit rejected; retrying as a new ephemeral message"
+                                );
                                 let mut retry = callback.clone();
                                 retry.replace_callback_query_message = false;
                                 let mut out =
@@ -2108,14 +2164,35 @@ fn spawn_gateway_event_consumer(
                                         .with_button_rows(evt.button_rows.clone());
                                 out.callback_ephemeral = Some(retry);
                                 match channel.send_ephemeral(&out).await {
-                                    EphemeralDelivery::Delivered(_) => {}
-                                    EphemeralDelivery::Unknown(err) => tracing::warn!(
-                                        channel = %evt.channel,
-                                        error = %err,
+                                    EphemeralDelivery::Delivered(_) => {
+                                        tracing::info!(
+                                            cid = %log_cid,
+                                            channel = crate::transport::platform_of(&evt.channel),
+                                            outcome = "ok",
+                                            kind = "ephemeral_retry",
+                                            len = evt.content.len(),
+                                            "ccteam-im: ephemeral retry delivered"
+                                        )
+                                    }
+                                    EphemeralDelivery::Unknown(_) => tracing::info!(
+                                        cid = %log_cid,
+                                        channel = crate::transport::platform_of(&evt.channel),
+                                        outcome = "err",
+                                        error_kind = "unknown",
+                                        kind = "ephemeral_retry",
+                                        len = evt.content.len(),
                                         "ccteam-im: ephemeral retry outcome unknown; suppressing plain fallback"
                                     ),
-                                    EphemeralDelivery::Rejected(err) => {
-                                        tracing::warn!(channel = %evt.channel, error = %err, "ccteam-im: ephemeral retry rejected; falling back to a plain message");
+                                    EphemeralDelivery::Rejected(_) => {
+                                        tracing::info!(
+                                            cid = %log_cid,
+                                            channel = crate::transport::platform_of(&evt.channel),
+                                            outcome = "err",
+                                            error_kind = "rejected",
+                                            kind = "ephemeral_retry",
+                                            len = evt.content.len(),
+                                            "ccteam-im: ephemeral retry rejected; falling back to a plain message"
+                                        );
                                         let out = SendMessage::new(
                                             evt.content.clone(),
                                             evt.chat_id.clone(),
@@ -2124,6 +2201,7 @@ fn spawn_gateway_event_consumer(
                                         .with_button_rows(evt.button_rows.clone());
                                         send_gateway_outbound(
                                             &evt.id,
+                                            &log_cid,
                                             0,
                                             &evt.channel,
                                             channel.as_ref(),
@@ -2147,16 +2225,35 @@ fn spawn_gateway_event_consumer(
                         out = out.with_rich_markdown(evt.content.clone());
                     }
                     match channel.send_ephemeral(&out).await {
-                        EphemeralDelivery::Delivered(_) => {}
-                        EphemeralDelivery::Unknown(err) => tracing::warn!(
-                            channel = %evt.channel,
-                            error = %err,
+                        EphemeralDelivery::Delivered(_) => tracing::info!(
+                            cid = %log_cid,
+                            channel = crate::transport::platform_of(&evt.channel),
+                            outcome = "ok",
+                            kind = "ephemeral",
+                            len = evt.content.len(),
+                            "ccteam-im: ephemeral response delivered"
+                        ),
+                        EphemeralDelivery::Unknown(_) => tracing::info!(
+                            cid = %log_cid,
+                            channel = crate::transport::platform_of(&evt.channel),
+                            outcome = "err",
+                            error_kind = "unknown",
+                            kind = "ephemeral",
+                            len = evt.content.len(),
                             "ccteam-im: ephemeral send outcome unknown; suppressing duplicate fallback"
                         ),
-                        EphemeralDelivery::Rejected(err) => {
-                            tracing::warn!(channel = %evt.channel, error = %err, "ccteam-im: ephemeral callback response rejected; using prior delivery path");
+                        EphemeralDelivery::Rejected(_) => {
+                            tracing::info!(
+                                cid = %log_cid,
+                                channel = crate::transport::platform_of(&evt.channel),
+                                outcome = "err",
+                                error_kind = "rejected",
+                                kind = "ephemeral",
+                                len = evt.content.len(),
+                                "ccteam-im: ephemeral callback response rejected; using prior delivery path"
+                            );
                             if let Some(message_id) = fallback_edit_message_id {
-                                if let Err(edit_err) = channel
+                                if channel
                                     .edit_message(
                                         &evt.chat_id,
                                         &message_id,
@@ -2164,14 +2261,24 @@ fn spawn_gateway_event_consumer(
                                         &evt.button_rows,
                                     )
                                     .await
+                                    .is_err()
                                 {
-                                    tracing::warn!(channel = %evt.channel, message_id, error = %edit_err, "ccteam-im: confirmation edit failed, falling back to a new message");
+                                    tracing::info!(
+                                        cid = %log_cid,
+                                        channel = crate::transport::platform_of(&evt.channel),
+                                        outcome = "err",
+                                        error_kind = "channel_edit",
+                                        kind = "edit",
+                                        len = evt.content.len(),
+                                        "ccteam-im: confirmation edit failed, falling back to a new message"
+                                    );
                                     let out =
                                         SendMessage::new(evt.content.clone(), evt.chat_id.clone())
                                             .in_thread(evt.thread_ts.clone())
                                             .with_button_rows(evt.button_rows.clone());
                                     send_gateway_outbound(
                                         &evt.id,
+                                        &log_cid,
                                         0,
                                         &evt.channel,
                                         channel.as_ref(),
@@ -2186,6 +2293,7 @@ fn spawn_gateway_event_consumer(
                                         .with_button_rows(evt.button_rows.clone());
                                 send_gateway_outbound(
                                     &evt.id,
+                                    &log_cid,
                                     0,
                                     &evt.channel,
                                     channel.as_ref(),
@@ -2627,8 +2735,12 @@ async fn send_stopped_draft_not_found(
     cid: &str,
 ) {
     let notice = SendMessage::new("сессия не найдена, /sessions", recipient).in_thread(thread_ts);
-    if let Err(error) = channel.send(&notice).await {
-        tracing::warn!(cid = %cid, error = %error, "ccteam-im: failed to report missing stopped draft");
+    if channel.send(&notice).await.is_err() {
+        tracing::info!(
+            cid = %crate::transport::safe_correlation_id(cid),
+            error_kind = "channel_send",
+            "ccteam-im: failed to report missing stopped draft"
+        );
     }
 }
 
@@ -2869,6 +2981,7 @@ fn durable_outbox_path() -> PathBuf {
 
 async fn send_gateway_outbound(
     inbound_id: &str,
+    cid: &str,
     seq: usize,
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
@@ -2920,13 +3033,14 @@ async fn send_gateway_outbound(
     if parts.len() <= 1 {
         // Unchanged single-message path: id = `{inbound_id}-{seq}`.
         let id = format!("{inbound_id}-{seq}");
-        return queue_and_send_durable_part(id, inbound_id, channel_name, channel, message).await;
+        return queue_and_send_durable_part(id, inbound_id, cid, channel_name, channel, message)
+            .await;
     }
 
     // Multi-part: id prefix = `{inbound_id}-{seq}`, one durable row per
     // part. The complete partition is queued before the first send.
     let id_prefix = format!("{inbound_id}-{seq}");
-    send_split_parts(&id_prefix, inbound_id, channel_name, channel, parts).await
+    send_split_parts(&id_prefix, inbound_id, cid, channel_name, channel, parts).await
 }
 
 /// Queue a single durable outbound row, then attempt delivery. Returns
@@ -2935,6 +3049,7 @@ async fn send_gateway_outbound(
 async fn queue_and_send_durable_part(
     id: String,
     inbound_id: &str,
+    cid: &str,
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     message: SendMessage,
@@ -2949,7 +3064,7 @@ async fn queue_and_send_durable_part(
         platform_message_id: None,
         error: None,
     });
-    finish_durable_outbound_send(id, inbound_id, channel_name, channel, message).await
+    finish_durable_outbound_send(id, inbound_id, cid, channel_name, channel, message).await
 }
 
 /// Queue every part of a split as its OWN durable `Queued` row, id =
@@ -3004,6 +3119,7 @@ fn queue_split_parts(
 /// ledger) naming only the failed parts.
 async fn send_queued_parts(
     inbound_id: &str,
+    cid: &str,
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     queued: Vec<(String, SendMessage)>,
@@ -3013,7 +3129,8 @@ async fn send_queued_parts(
     let mut failed_parts: Vec<usize> = Vec::new();
     for (part_idx, (id, part_msg)) in queued.into_iter().enumerate() {
         let sent =
-            finish_durable_outbound_send(id, inbound_id, channel_name, channel, part_msg).await;
+            finish_durable_outbound_send(id, inbound_id, cid, channel_name, channel, part_msg)
+                .await;
         if !sent {
             failed_parts.push(part_idx + 1); // 1-based for the user notice
         }
@@ -3033,11 +3150,11 @@ async fn send_queued_parts(
         };
         let notice =
             SendMessage::new(body, message.recipient.clone()).in_thread(message.thread_ts.clone());
-        if let Err(err) = channel.send(&notice).await {
-            tracing::warn!(
-                inbound_id,
-                channel = %channel_name,
-                error = %err,
+        if channel.send(&notice).await.is_err() {
+            tracing::info!(
+                cid = %cid,
+                channel = crate::transport::platform_of(channel_name),
+                error_kind = "channel_send",
                 "ccteam-im: failed to deliver split-failure notice"
             );
         }
@@ -3049,17 +3166,18 @@ async fn send_queued_parts(
 async fn send_split_parts(
     id_prefix: &str,
     inbound_id: &str,
+    cid: &str,
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     parts: Vec<SendMessage>,
 ) -> bool {
     let queued = match queue_split_parts(id_prefix, inbound_id, channel_name, parts) {
         Ok(queued) => queued,
-        Err(err) => {
-            tracing::warn!(
-                inbound_id,
-                channel = %channel_name,
-                error = %err,
+        Err(_) => {
+            tracing::info!(
+                cid = %cid,
+                channel = crate::transport::platform_of(channel_name),
+                error_kind = "durable_queue",
                 "ccteam-im: failed to durably queue split parts; dropping this send"
             );
             return false;
@@ -3069,7 +3187,7 @@ async fn send_split_parts(
         .first()
         .map(|(_, message)| message.clone())
         .expect("split partition must contain a row");
-    send_queued_parts(inbound_id, channel_name, channel, queued, &message).await
+    send_queued_parts(inbound_id, cid, channel_name, channel, queued, &message).await
 }
 
 /// Send a single already-queued durable row and append its terminal
@@ -3077,12 +3195,21 @@ async fn send_split_parts(
 async fn finish_durable_outbound_send(
     id: String,
     inbound_id: &str,
+    cid: &str,
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     message: SendMessage,
 ) -> bool {
     match channel.send(&message).await {
         Ok(platform_message_id) => {
+            tracing::info!(
+                cid = %cid,
+                channel = crate::transport::platform_of(channel_name),
+                outcome = "ok",
+                kind = "outbound",
+                len = message.content.len(),
+                "ccteam-im: gateway outbound delivered"
+            );
             append_durable_outbound(DurableOutboundRow {
                 ts_ms: now_unix_ms_u64(),
                 id,
@@ -3096,6 +3223,7 @@ async fn finish_durable_outbound_send(
             true
         }
         Err(err) => {
+            let len = message.content.len();
             append_durable_outbound(DurableOutboundRow {
                 ts_ms: now_unix_ms_u64(),
                 id,
@@ -3106,10 +3234,13 @@ async fn finish_durable_outbound_send(
                 platform_message_id: None,
                 error: Some(err.to_string()),
             });
-            tracing::warn!(
-                inbound_id,
-                channel = %channel_name,
-                error = %err,
+            tracing::info!(
+                cid = %cid,
+                channel = crate::transport::platform_of(channel_name),
+                outcome = "err",
+                error_kind = "channel_send",
+                kind = "outbound",
+                len,
                 "ccteam-im: gateway outbound send failed"
             );
             false
@@ -3164,6 +3295,7 @@ async fn replay_durable_outbox(channels: &ChannelMap) {
         finish_durable_outbound_send(
             row.id,
             &row.inbound_id,
+            &crate::transport::safe_correlation_id(&row.inbound_id),
             &row.channel,
             channel.as_ref(),
             row.message,
@@ -3456,6 +3588,7 @@ mod tests {
 
         tx.send(GatewayEvent {
             id: "progress-keepalive".to_string(),
+            cid: None,
             channel: "telegram".to_string(),
             chat_id: "123".to_string(),
             thread_ts: None,
@@ -3520,6 +3653,7 @@ mod tests {
         let consumer = spawn_gateway_event_consumer(rx, channels, routes);
         let event = |done: bool| GatewayEvent {
             id: format!("progress-final-{done}"),
+            cid: None,
             channel: "telegram".to_string(),
             chat_id: "123".to_string(),
             thread_ts: None,
@@ -3704,6 +3838,7 @@ mod tests {
 
         let reaction_event = |on: bool| GatewayEvent {
             id: format!("gateway-reaction-{on}"),
+            cid: None,
             channel: "telegram".to_string(),
             chat_id: "chat-7".to_string(),
             thread_ts: None,
@@ -3825,6 +3960,7 @@ mod tests {
 
         tx.send(GatewayEvent {
             id: "ephemeral-fallback".to_string(),
+            cid: None,
             channel: "telegram".to_string(),
             chat_id: "-100".to_string(),
             thread_ts: None,
@@ -3927,6 +4063,7 @@ mod tests {
 
         tx.send(GatewayEvent {
             id: "stale-ephemeral".to_string(),
+            cid: None,
             channel: "telegram".to_string(),
             chat_id: "-100".to_string(),
             thread_ts: None,
@@ -4138,6 +4275,7 @@ mod tests {
 
         tx.send(GatewayEvent {
             id: "unknown-ephemeral".to_string(),
+            cid: None,
             channel: "telegram".to_string(),
             chat_id: "-100".to_string(),
             thread_ts: None,
@@ -4192,6 +4330,7 @@ mod tests {
 
         let answer = |channel: &str| GatewayEvent {
             id: format!("answer-{channel}"),
+            cid: None,
             channel: channel.to_string(),
             chat_id: "chat-1".to_string(),
             thread_ts: None,
@@ -4472,7 +4611,7 @@ mod tests {
         let channel = TelegramChannel::new("token".into(), vec![]).with_api_base(base);
         let plain = "😀".repeat(2000);
         let message = SendMessage::new(plain.clone(), "chat-1").with_rich_markdown("**rich**");
-        send_gateway_outbound("in-1", 0, "telegram", &channel, message).await;
+        send_gateway_outbound("in-1", "id-test", 0, "telegram", &channel, message).await;
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 3, "one rich rejection and two classic sends");
@@ -4694,6 +4833,7 @@ mod tests {
 
         let ev = |on: bool| GatewayEvent {
             id: format!("r-{on}"),
+            cid: None,
             channel: "telegram".to_string(),
             chat_id: "chat-7".to_string(),
             thread_ts: None,
