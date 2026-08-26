@@ -812,6 +812,10 @@ struct TgUpdate {
     // v0.8.5 D3 — inline-keyboard button clicks.
     #[serde(default)]
     callback_query: Option<TgCallbackQuery>,
+    // Bot API 10.3 edits are acknowledged by advancing the offset, but are
+    // not re-dispatched: the gateway has no edit/reconciliation contract.
+    #[serde(default)]
+    edited_message: Option<TgMessage>,
 }
 
 /// An inline-keyboard button click (v0.8.5 D3).
@@ -1729,6 +1733,16 @@ impl Channel for TelegramChannel {
                 }
                 if let Some(cb) = upd.callback_query {
                     self.handle_callback_query(&tx, cb).await;
+                    continue;
+                }
+                if let Some(edited) = upd.edited_message {
+                    tracing::debug!(
+                        message_id = edited.message_id,
+                        chat_id = edited.chat.id,
+                        "telegram edited_message ignored"
+                    );
+                    // Edits are intentionally not re-dispatched: the gateway
+                    // has no update-in-place or duplicate-turn contract.
                     continue;
                 }
                 if let Some(m) = upd.message {
@@ -3046,4 +3060,14 @@ mod tests {
         assert_eq!(message_content(&caption, Some("mybot")).0, "/go");
     }
 
+    #[test]
+    fn edited_message_update_deserializes_without_being_a_message_update() {
+        let update: TgUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 7,
+            "edited_message": {"message_id": 8, "date": 9, "chat": {"id": 10}, "text": "edit"}
+        }))
+        .expect("edited_message is a valid update variant");
+        assert!(update.message.is_none());
+        assert!(update.edited_message.is_some());
+    }
 }
