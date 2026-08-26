@@ -81,7 +81,9 @@ struct DraftKeepaliveState {
     recipient: String,
     draft_id: i64,
     markdown: StdMutex<String>,
+    content: StdMutex<String>,
     last_sent: StdMutex<tokio::time::Instant>,
+    send_lock: tokio::sync::Mutex<()>,
     failed: AtomicBool,
     stopped: AtomicBool,
 }
@@ -197,6 +199,7 @@ fn stop_keepalive(keepalives: &mut HashMap<String, DraftKeepalive>, status_key: 
 async fn draft_keepalive_loop(
     state: std::sync::Weak<DraftKeepaliveState>,
     channel: Arc<dyn Channel + Send + Sync>,
+    draft_routes: DraftRoutes,
     interval: Duration,
     channel_name: String,
     sid: String,
@@ -212,6 +215,7 @@ async fn draft_keepalive_loop(
         if state.stopped.load(Ordering::Acquire) {
             return;
         }
+        let _send_lock = state.send_lock.lock().await;
         let now = tokio::time::Instant::now();
         let last_sent = *state.last_sent.lock().unwrap();
         if now.duration_since(last_sent) < DRAFT_SEND_FLOOR {
@@ -222,7 +226,18 @@ async fn draft_keepalive_loop(
             .send_draft(&state.recipient, state.draft_id, &markdown)
             .await
         {
-            Ok(()) => *state.last_sent.lock().unwrap() = now,
+            Ok(()) => {
+                *state.last_sent.lock().unwrap() = now;
+                let content = state.content.lock().unwrap().clone();
+                set_draft_route(
+                    &draft_routes,
+                    &channel_name,
+                    &state.recipient,
+                    state.draft_id,
+                    &sid,
+                    &content,
+                );
+            }
             Err(error) => {
                 state.failed.store(true, Ordering::Release);
                 tracing::warn!(
@@ -241,6 +256,7 @@ fn ensure_draft_keepalive(
     keepalives: &mut HashMap<String, DraftKeepalive>,
     status_key: &str,
     channel: Arc<dyn Channel + Send + Sync>,
+    draft_routes: DraftRoutes,
     channel_name: &str,
     sid: &str,
     interval: Duration,
@@ -257,6 +273,7 @@ fn ensure_draft_keepalive(
     keepalive.task = Some(tokio::spawn(draft_keepalive_loop(
         state,
         channel,
+        draft_routes,
         interval,
         channel_name,
         sid,
@@ -1976,6 +1993,7 @@ fn spawn_gateway_event_consumer(
                             &mut draft_keepalives,
                             &keepalive_key,
                             channel.clone(),
+                            draft_routes.clone(),
                             &evt.channel,
                             sid,
                             draft_keepalive_interval,
@@ -2104,45 +2122,21 @@ async fn deliver_progress(
             }
 
             if let (Some(sid), Some(draft_id)) = (draft_sid, handle.draft_id) {
-                let state_failed = draft_keepalives
+                let state = draft_keepalives
                     .get(&status_key)
-                    .map(|keepalive| keepalive.state.failed.load(Ordering::Acquire))
-                    .unwrap_or(false);
-                if state_failed {
-                    draft_failed(draft_failures, sid);
-                } else {
-                    let markdown = crate::progress::draft_markdown(&content);
-                    if let Some(keepalive) = draft_keepalives.get(&status_key) {
-                        *keepalive.state.markdown.lock().unwrap() = markdown.clone();
-                    }
-                    let now = tokio::time::Instant::now();
-                    let due = draft_keepalives
-                        .get(&status_key)
-                        .map(|keepalive| {
-                            now.duration_since(*keepalive.state.last_sent.lock().unwrap())
-                                >= DRAFT_SEND_FLOOR
-                        })
-                        .unwrap_or(true);
-                    if !due {
-                        set_draft_route(
-                            draft_routes,
-                            channel_name,
-                            &handle.recipient,
-                            draft_id,
-                            sid,
-                            &content,
-                        );
-                        return None;
-                    }
-                    match channel
-                        .send_draft(&handle.recipient, draft_id, &markdown)
-                        .await
-                    {
-                        Ok(()) => {
-                            if let Some(keepalive) = draft_keepalives.get(&status_key) {
-                                *keepalive.state.last_sent.lock().unwrap() = now;
-                            }
-                            draft_succeeded(draft_failures, sid);
+                    .map(|keepalive| keepalive.state.clone());
+                if let Some(state) = state {
+                    let _send_lock = state.send_lock.lock().await;
+                    if state.failed.load(Ordering::Acquire) {
+                        draft_failed(draft_failures, sid);
+                    } else {
+                        let markdown = crate::progress::draft_markdown(&content);
+                        *state.markdown.lock().unwrap() = markdown.clone();
+                        *state.content.lock().unwrap() = content.clone();
+                        let now = tokio::time::Instant::now();
+                        let due = now.duration_since(*state.last_sent.lock().unwrap())
+                            >= DRAFT_SEND_FLOOR;
+                        if !due {
                             set_draft_route(
                                 draft_routes,
                                 channel_name,
@@ -2153,17 +2147,38 @@ async fn deliver_progress(
                             );
                             return None;
                         }
-                        Err(err) => {
-                            draft_failed(draft_failures, sid);
-                            tracing::warn!(
-                                channel = %channel_name,
-                                status_key = %status_key,
-                                sid = %sid,
-                                error = %err,
-                                "ccteam-im: progress draft failed; falling back to edit"
-                            );
+                        match channel
+                            .send_draft(&handle.recipient, draft_id, &markdown)
+                            .await
+                        {
+                            Ok(()) => {
+                                *state.last_sent.lock().unwrap() = now;
+                                draft_succeeded(draft_failures, sid);
+                                set_draft_route(
+                                    draft_routes,
+                                    channel_name,
+                                    &handle.recipient,
+                                    draft_id,
+                                    sid,
+                                    &content,
+                                );
+                                return None;
+                            }
+                            Err(err) => {
+                                state.failed.store(true, Ordering::Release);
+                                draft_failed(draft_failures, sid);
+                                tracing::warn!(
+                                    channel = %channel_name,
+                                    status_key = %status_key,
+                                    sid = %sid,
+                                    error = %err,
+                                    "ccteam-im: progress draft failed; falling back to edit"
+                                );
+                            }
                         }
                     }
+                } else {
+                    draft_failed(draft_failures, sid);
                 }
             }
             if let Some(draft_id) = handle.draft_id {
@@ -2218,7 +2233,9 @@ async fn deliver_progress(
                                     recipient: chat_id.clone(),
                                     draft_id,
                                     markdown: StdMutex::new(markdown),
+                                    content: StdMutex::new(content.clone()),
                                     last_sent: StdMutex::new(now),
+                                    send_lock: tokio::sync::Mutex::new(()),
                                     failed: AtomicBool::new(false),
                                     stopped: AtomicBool::new(false),
                                 }),
@@ -2356,7 +2373,9 @@ async fn deliver_progress(
                                 recipient: chat_id.clone(),
                                 draft_id,
                                 markdown: StdMutex::new(markdown),
+                                content: StdMutex::new(content.clone()),
                                 last_sent: StdMutex::new(now),
+                                send_lock: tokio::sync::Mutex::new(()),
                                 failed: AtomicBool::new(false),
                                 stopped: AtomicBool::new(false),
                             }),
