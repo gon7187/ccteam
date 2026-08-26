@@ -69,6 +69,12 @@ struct DraftRoute {
 }
 
 type DraftRoutes = Arc<StdMutex<HashMap<DraftRouteKey, DraftRoute>>>;
+type DraftFinalizations = Arc<StdMutex<HashMap<String, Arc<AtomicU8>>>>;
+
+const FINAL_PENDING: u8 = 0;
+const FINALIZING: u8 = 1;
+const FINAL_SENT: u8 = 2;
+const FINAL_CANCELLED: u8 = 3;
 
 struct DraftKeepaliveState {
     recipient: String,
@@ -1862,7 +1868,7 @@ fn spawn_gateway_event_consumer(
         let mut status_messages: HashMap<String, StatusHandle> = HashMap::new();
         let mut draft_failures: HashMap<String, DraftBreaker> = HashMap::new();
         let mut draft_keepalives: HashMap<String, DraftKeepalive> = HashMap::new();
-        let mut draft_finalizations: HashMap<String, Arc<AtomicU8>> = HashMap::new();
+        let draft_finalizations: DraftFinalizations = Arc::new(StdMutex::new(HashMap::new()));
         let draft_keepalive_interval = draft_keepalive_interval();
         // 👀 ack reaction handle map (v0.8.19). Keyed `"{channel}:{message_id}"`;
         // the value is the provider's reaction handle (`Some(reaction_id)` for
@@ -1921,18 +1927,18 @@ fn spawn_gateway_event_consumer(
                     let finalization = evt
                         .sid
                         .as_deref()
-                        .and_then(|sid| draft_finalizations.get(sid).cloned());
+                        .and_then(|sid| draft_finalizations.lock().unwrap().get(sid).cloned());
                     let sent =
                         send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out)
                             .await;
                     if let Some(sid) = evt.sid.as_deref() {
                         if sent {
-                            draft_finalizations.remove(sid);
+                            draft_finalizations.lock().unwrap().remove(sid);
                             if let Some(state) = finalization {
-                                state.store(2, Ordering::Release);
+                                state.store(FINAL_SENT, Ordering::Release);
                             }
                         } else if let Some(state) = finalization {
-                            state.store(0, Ordering::Release);
+                            state.store(FINAL_PENDING, Ordering::Release);
                         }
                     }
                 }
@@ -1967,7 +1973,7 @@ fn spawn_gateway_event_consumer(
                         );
                     }
                     if let Some(completion) = completion {
-                        schedule_draft_finalization(&mut draft_finalizations, completion, channel);
+                        schedule_draft_finalization(&draft_finalizations, completion, channel);
                     }
                 }
                 // v0.8.19 — structured per-step activity is WEB-ONLY. IM's
@@ -2467,25 +2473,40 @@ fn take_stopped_draft_route(
 }
 
 fn schedule_draft_finalization(
-    finalizations: &mut HashMap<String, Arc<AtomicU8>>,
+    finalizations: &DraftFinalizations,
     completion: DraftCompletion,
     channel: Arc<dyn Channel + Send + Sync>,
 ) {
-    if let Some(previous) = finalizations.insert(completion.sid.clone(), Arc::new(AtomicU8::new(0)))
+    let state = Arc::new(AtomicU8::new(FINAL_PENDING));
+    if let Some(previous) = finalizations
+        .lock()
+        .unwrap()
+        .insert(completion.sid.clone(), state.clone())
     {
-        previous.store(2, Ordering::Release);
+        previous.store(FINAL_CANCELLED, Ordering::Release);
     }
-    let state = finalizations
-        .get(&completion.sid)
-        .expect("just inserted draft finalization")
-        .clone();
+    let sid = completion.sid.clone();
+    let finalizations = finalizations.clone();
     tokio::spawn(async move {
         tokio::time::sleep(DRAFT_FINALIZATION_GRACE).await;
         if state
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                FINAL_PENDING,
+                FINALIZING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
         {
             send_completed_draft(channel, completion).await;
+            state.store(FINAL_SENT, Ordering::Release);
+            let mut entries = finalizations.lock().unwrap();
+            if entries
+                .get(&sid)
+                .is_some_and(|current| Arc::ptr_eq(current, &state))
+            {
+                entries.remove(&sid);
+            }
         }
     });
 }
@@ -3070,6 +3091,7 @@ mod tests {
         assert!(routes.lock().unwrap().is_empty());
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(start_paused = true)]
     async fn draft_keepalive_refreshes_silent_session() {
         let _g = env_lock();
