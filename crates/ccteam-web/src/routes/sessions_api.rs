@@ -1462,6 +1462,7 @@ fn synthetic_approval_event(sid: &str, prompt: &ChoicePrompt) -> GatewayEvent {
     use ccteam_im::gateway::GatewayEventKind;
     GatewayEvent {
         id: format!("permission-{}", prompt.token),
+        cid: None,
         channel: String::new(),
         chat_id: String::new(),
         thread_ts: None,
