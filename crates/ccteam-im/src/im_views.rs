@@ -11,6 +11,9 @@ pub struct RichReply {
     pub plain: String,
     /// Telegram button rows, with at most eight buttons per row.
     pub button_rows: Vec<Vec<MessageOption>>,
+    /// The markdown already contains the button rows; classic fallback still
+    /// uses `button_rows` as its reply markup.
+    pub inline_buttons: bool,
     /// Persistent Telegram reply keyboard request.
     pub reply_keyboard: Option<ReplyKeyboard>,
 }
@@ -23,6 +26,7 @@ impl RichReply {
             markdown: plain.clone(),
             plain,
             button_rows: Vec::new(),
+            inline_buttons: false,
             reply_keyboard: None,
         }
     }
@@ -61,8 +65,17 @@ pub struct StatusView {
     pub cost_24h: String,
     /// Vendor resume UUID, or an honest placeholder.
     pub resume: String,
-    /// Direct children eligible for one-tap confirmed stopping.
-    pub child_stop_sids: Vec<String>,
+    /// Direct children and the detail line that describes each one.
+    pub children: Vec<StatusChild>,
+}
+
+/// A direct child rendered in the status detail section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusChild {
+    /// Stable ccteam session id.
+    pub sid: String,
+    /// Index into [`StatusView::detail_lines`].
+    pub detail_line_index: usize,
 }
 
 /// One compact session-list row.
@@ -146,11 +159,29 @@ pub fn render_status(view: &StatusView) -> RichReply {
     details.push(view.cost_24h.clone());
     details.push(String::new());
     details.push(format!("🔁 resume {}", view.resume));
-    let markdown_details = details
-        .iter()
-        .map(|line| escape_status_markdown(line))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut markdown_detail_lines = Vec::with_capacity(details.len() * 2);
+    let mut inline_rows = Vec::new();
+    for (index, line) in details.iter().enumerate() {
+        markdown_detail_lines.push(escape_status_markdown(line));
+        if let Some(child) = view
+            .children
+            .iter()
+            .find(|child| child.detail_line_index == index)
+        {
+            if let Some(stop) = command_button_styled(
+                &format!("⛔ {}", child.sid),
+                format!("?/stop {}", child.sid),
+                Some(ButtonStyle::Danger),
+            ) {
+                let row = vec![stop];
+                if let Some(rendered) = inline_button_row(row.iter().cloned().map(Some)) {
+                    markdown_detail_lines.push(rendered);
+                }
+                inline_rows.push(row);
+            }
+        }
+    }
+    let markdown_details = markdown_detail_lines.join("\n");
     let mut markdown_lines = vec![
         format!(
             "🧭 {} · {} · {}",
@@ -172,7 +203,7 @@ pub fn render_status(view: &StatusView) -> RichReply {
     }
     markdown_lines.push(String::new());
     markdown_lines.push(markdown_details);
-    let markdown = markdown_lines.join("\n");
+    let mut markdown = markdown_lines.join("\n");
     let mut plain_lines = vec![
         format!("🧭 {} · {} · {}", view.sid, view.project, view.vendor),
         format!(
@@ -200,19 +231,8 @@ pub fn render_status(view: &StatusView) -> RichReply {
         ]),
         command_row([command_button("✏️ Новая", "?/new"), stop]),
     ];
-    let child_stops = view
-        .child_stop_sids
-        .iter()
-        .filter_map(|sid| {
-            command_button_styled(
-                &format!("⛔ {sid}"),
-                format!("?/stop {sid}"),
-                Some(ButtonStyle::Danger),
-            )
-        })
-        .collect::<Vec<_>>();
-    button_rows.extend(child_stops.chunks(8).map(|row| row.to_vec()));
-    if !view.child_stop_sids.is_empty() {
+    let mut trailing_rows = Vec::new();
+    if !view.children.is_empty() {
         // `/stop children` (NOT `/stop all`, which stops every session
         // visible to this chat, including the parent itself) — direct
         // children of the CURRENT session only.
@@ -221,32 +241,46 @@ pub fn render_status(view: &StatusView) -> RichReply {
             "?/stop children",
             Some(ButtonStyle::Danger),
         ) {
-            button_rows.push(vec![stop_all]);
+            trailing_rows.push(vec![stop_all]);
         }
+    }
+    let global_rows = button_rows.clone();
+    let inline_buttons = !inline_rows.is_empty();
+    button_rows = inline_rows;
+    button_rows.extend(global_rows.clone());
+    button_rows.extend(trailing_rows.clone());
+    if inline_buttons {
+        let mut all_trailing = global_rows;
+        all_trailing.extend(trailing_rows);
+        append_inline_rows(&mut markdown, &all_trailing);
     }
     RichReply {
         markdown,
         plain,
         button_rows,
+        inline_buttons,
         reply_keyboard: None,
     }
 }
 
-/// Render the compact session table and its switch buttons.
+/// Render compact session cards and their switch buttons.
 pub fn render_sessions(view: &SessionsView) -> RichReply {
     let shown = view.sessions.iter().take(10).collect::<Vec<_>>();
     let hidden = view.sessions.iter().skip(10).collect::<Vec<_>>();
-    let mut markdown = format!(
-        "**Сессии** · `{}`\n\n| sid | vendor.model | статус | ctx |\n| --- | --- | --- | --- |",
-        escape_code(&view.project)
-    );
-    let mut plain = format!(
-        "Сессии · {}\nsid | vendor.model | статус | ctx",
-        view.project
-    );
+    let mut markdown = format!("**Сессии** · `{}`", escape_code(&view.project));
+    let mut plain = format!("Сессии · {}", view.project);
+    let mut button_rows = Vec::new();
     for session in &shown {
-        markdown.push_str(&markdown_session_row(session));
-        plain.push_str(&plain_session_row(session));
+        markdown.push_str("\n\n");
+        markdown.push_str(&markdown_session_line(session));
+        let row = session_button_options(session);
+        if let Some(inline) = inline_button_row(row.iter().cloned().map(Some)) {
+            markdown.push('\n');
+            markdown.push_str(&inline);
+            button_rows.push(row);
+        }
+        plain.push_str("\n\n");
+        plain.push_str(&plain_session_line(session));
     }
     let mut tail = hidden
         .iter()
@@ -265,36 +299,11 @@ pub fn render_sessions(view: &SessionsView) -> RichReply {
         plain.push_str("\nПодробнее:\n");
         plain.push_str(&tail.join("\n"));
     }
-    let mut button_rows = shown
-        .iter()
-        .filter_map(|session| {
-            let vendor = session
-                .vendor_model
-                .split('.')
-                .next()
-                .unwrap_or(session.vendor_model.as_str());
-            let title = session
-                .title
-                .as_deref()
-                .map(truncate_button_title)
-                .filter(|title| !title.is_empty())
-                .map(|title| format!(" · {title}"))
-                .unwrap_or_default();
-            command_button(
-                &format!(
-                    "{}{} {}{}",
-                    if session.current { "▶ " } else { "" },
-                    session.sid,
-                    vendor,
-                    title
-                ),
-                format!("/use {}", session.sid),
-            )
-        })
-        .collect::<Vec<_>>()
-        .chunks(8)
-        .map(|row| row.to_vec())
-        .collect::<Vec<_>>();
+    let global_rows = vec![command_row([
+        command_button("🔄 Обновить", "/sessions"),
+        command_button("✏️ Новая", "?/new"),
+    ])];
+    let mut trailing_rows = global_rows.clone();
     if view.elsewhere > 0 {
         let footer = format!("ещё {} в других проектах → /sessions all", view.elsewhere);
         markdown.push_str(&format!("\n\n{footer}"));
@@ -303,13 +312,19 @@ pub fn render_sessions(view: &SessionsView) -> RichReply {
             &format!("Ещё {} → /sessions all", view.elsewhere),
             "/sessions all",
         ) {
-            button_rows.push(vec![button]);
+            trailing_rows.push(vec![button]);
         }
+    }
+    button_rows.extend(trailing_rows.iter().cloned());
+    let inline_buttons = !button_rows.is_empty() && !shown.is_empty();
+    if inline_buttons {
+        append_inline_rows(&mut markdown, &trailing_rows);
     }
     RichReply {
         markdown,
         plain,
         button_rows,
+        inline_buttons,
         reply_keyboard: None,
     }
 }
@@ -343,6 +358,7 @@ pub fn render_projects(view: &ProjectsView) -> RichReply {
         markdown,
         plain,
         button_rows: buttons.chunks(8).map(|row| row.to_vec()).collect(),
+        inline_buttons: false,
         reply_keyboard: None,
     }
 }
@@ -388,6 +404,7 @@ pub fn render_help(commands: &[CommandView]) -> RichReply {
         markdown,
         plain,
         button_rows: Vec::new(),
+        inline_buttons: false,
         reply_keyboard: None,
     }
 }
@@ -414,27 +431,39 @@ fn command_button_styled(
     })
 }
 
-fn markdown_session_row(session: &SessionRow) -> String {
+fn markdown_session_line(session: &SessionRow) -> String {
+    let sid = session_display_sid(session);
+    let vendor_model = session_vendor_model_compact(session);
+    let state = session_state(session);
+    let prefix = format!("{sid} · {vendor_model} · {state}");
     format!(
-        "\n| **{}** | {} | {} | {} |",
-        escape_markdown(&session_display_sid(session)),
-        escape_markdown(&session_vendor_model(session)),
-        escape_markdown(&session.status),
-        escape_markdown(&session.context),
+        "**{}** · {} · {}{}",
+        escape_markdown(&sid),
+        escape_markdown(&vendor_model),
+        escape_markdown(&state),
+        session_title_suffix(&session_title(session), prefix.chars().count()),
     )
 }
 
-fn plain_session_row(session: &SessionRow) -> String {
-    format!("\n{}", plain_session_line(session))
-}
-
 fn plain_session_line(session: &SessionRow) -> String {
+    let title = session_title(session);
+    let title_or_context = if title == "—" {
+        session.context.clone()
+    } else {
+        let prefix = format!(
+            "{} | {} | {} | ",
+            session_display_sid(session),
+            session_vendor_model(session),
+            session.status
+        );
+        truncate_session_title_to(&title, 60usize.saturating_sub(prefix.chars().count()))
+    };
     format!(
         "{} | {} | {} | {}",
         session_display_sid(session),
         session_vendor_model(session),
         session.status,
-        session.context
+        title_or_context,
     )
 }
 
@@ -453,13 +482,116 @@ fn session_vendor_model(session: &SessionRow) -> String {
     }
 }
 
-fn truncate_button_title(title: &str) -> String {
-    const MAX: usize = 12;
+fn session_vendor_model_compact(session: &SessionRow) -> String {
+    let vendor_model = session_vendor_model(session);
+    vendor_model
+        .split_once('.')
+        .map(|(vendor, model)| format!("{vendor}/{model}"))
+        .unwrap_or(vendor_model)
+}
+
+fn session_title(session: &SessionRow) -> String {
+    session
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .map(truncate_session_title)
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn session_state(session: &SessionRow) -> String {
+    if session.context == "—" {
+        session.status.clone()
+    } else {
+        format!("{} · ctx {}", session.status, session.context)
+    }
+}
+
+fn truncate_session_title(title: &str) -> String {
+    truncate_session_title_to(title, 20)
+}
+
+fn truncate_session_title_to(title: &str, max: usize) -> String {
     let title = title.trim();
-    if title.chars().count() <= MAX {
+    if title.chars().count() <= max {
         return title.to_string();
     }
-    format!("{}…", title.chars().take(MAX - 1).collect::<String>())
+    if max == 0 {
+        return String::new();
+    }
+    format!("{}…", title.chars().take(max - 1).collect::<String>())
+}
+
+fn session_button_options(session: &SessionRow) -> Vec<MessageOption> {
+    command_row([
+        command_button_styled(
+            "⛔ Стоп",
+            format!("?/stop {}", session.sid),
+            Some(ButtonStyle::Danger),
+        ),
+        command_button("💬 Переключиться", format!("/use {}", session.sid)),
+    ])
+}
+
+fn session_title_suffix(title: &str, prefix_len: usize) -> String {
+    if title == "—" {
+        String::new()
+    } else {
+        let max = 60usize.saturating_sub(prefix_len + 3).min(20);
+        let title = truncate_session_title_to(title, max);
+        if title.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", escape_markdown(&title))
+        }
+    }
+}
+
+fn append_inline_rows(markdown: &mut String, rows: &[Vec<MessageOption>]) {
+    for row in rows {
+        if let Some(rendered) = inline_button_row(row.iter().cloned().map(Some)) {
+            markdown.push_str("\n\n");
+            markdown.push_str(&rendered);
+        }
+    }
+}
+
+fn inline_button_row<I>(buttons: I) -> Option<String>
+where
+    I: IntoIterator<Item = Option<MessageOption>>,
+{
+    let buttons = buttons.into_iter().flatten().collect::<Vec<_>>();
+    if buttons.is_empty() {
+        return None;
+    }
+    let mut row = String::from("<tg-button-row>");
+    for button in buttons {
+        row.push_str("<tg-button type=\"callback_data\" data=\"");
+        row.push_str(&escape_button_attribute(&button.data));
+        row.push('"');
+        if let Some(style) = button.style {
+            row.push_str(" style=\"");
+            row.push_str(match style {
+                ButtonStyle::Primary => "primary",
+                ButtonStyle::Success => "success",
+                ButtonStyle::Danger => "danger",
+            });
+            row.push('"');
+        }
+        row.push('>');
+        row.push_str(&escape_button_attribute(&button.label));
+        row.push_str("</tg-button>");
+    }
+    row.push_str("</tg-button-row>");
+    Some(row)
+}
+
+fn escape_button_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn command_usage(command: &CommandView) -> String {
@@ -502,7 +634,8 @@ mod tests {
 
     use super::{
         render_help, render_projects, render_sessions, render_status, CommandView,
-        DetachedSessionRow, ProjectRow, ProjectsView, SessionRow, SessionsView, StatusView,
+        DetachedSessionRow, ProjectRow, ProjectsView, SessionRow, SessionsView, StatusChild,
+        StatusView,
     };
 
     #[test]
@@ -533,37 +666,32 @@ mod tests {
             ],
             cost_24h: "💰 Расход проекта 24ч: $1.23".into(),
             resume: "123e4567-e89b-12d3-a456-426614174000".into(),
-            child_stop_sids: vec![
-                "s56".into(),
-                "s78".into(),
-                "s79".into(),
-                "s80".into(),
-                "s81".into(),
-                "s82".into(),
-                "s83".into(),
-                "s84".into(),
-                "s85".into(),
-            ],
+            children: vec![StatusChild {
+                sid: "s56".into(),
+                detail_line_index: 6,
+            }],
         });
 
         assert_eq!(
             reply.markdown,
-            "🧭 s42 · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 /root/projects/ccteam\n\nЗапущено: ожидает · Роль: reviewer\n\n⚡️ Использование:\nCC: 5h 17% (19:00) · неделя 78% (06/29) · max\n\n👥 Дочерние (2):\n  • s56 · codex · gpt-5.6-terra · 🟡 работает · title\n\n  • s57 · codex · gpt-5.6-luna · 🟢 ожидание · other\n\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\n\n💰 Расход проекта 24ч: $1.23\n\n🔁 resume 123e4567-e89b-12d3-a456-426614174000"
+            "🧭 s42 · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 /root/projects/ccteam\n\nЗапущено: ожидает · Роль: reviewer\n\n⚡️ Использование:\nCC: 5h 17% (19:00) · неделя 78% (06/29) · max\n\n👥 Дочерние (2):\n  • s56 · codex · gpt-5.6-terra · 🟡 работает · title\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop s56\" style=\"danger\">⛔ s56</tg-button></tg-button-row>\n\n  • s57 · codex · gpt-5.6-luna · 🟢 ожидание · other\n\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\n\n💰 Расход проекта 24ч: $1.23\n\n🔁 resume 123e4567-e89b-12d3-a456-426614174000\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:/sessions\">📋 Сессии</tg-button><tg-button type=\"callback_data\" data=\"cmd:/projects\">📁 Проекты</tg-button><tg-button type=\"callback_data\" data=\"cmd:/status\">🔄 Обновить</tg-button></tg-button-row>\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/new\">✏️ Новая</tg-button><tg-button type=\"callback_data\" data=\"cmd:?/stop s42\" style=\"danger\">⛔ Стоп</tg-button></tg-button-row>\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop children\" style=\"danger\">⛔ Остановить все дочерние</tg-button></tg-button-row>"
         );
         assert_eq!(reply.plain.lines().next(), Some("🧭 s42 · ccteam · claude"));
         assert!(reply
             .plain
             .contains("🔁 resume 123e4567-e89b-12d3-a456-426614174000"));
-        assert_eq!(reply.button_rows[1][0].data, "cmd:?/new");
-        assert_eq!(reply.button_rows[1][1].data, "cmd:?/stop s42");
-        assert_eq!(reply.button_rows[2][0].label, "⛔ s56");
-        assert_eq!(reply.button_rows[2][0].data, "cmd:?/stop s56");
-        assert_eq!(reply.button_rows[2][0].style, Some(ButtonStyle::Danger));
-        assert_eq!(reply.button_rows[2].len(), 8);
-        assert_eq!(reply.button_rows[3][0].label, "⛔ s85");
-        assert_eq!(reply.button_rows[4][0].label, "⛔ Остановить все дочерние");
-        assert_eq!(reply.button_rows[4][0].data, "cmd:?/stop children");
-        assert_eq!(reply.button_rows[4][0].style, Some(ButtonStyle::Danger));
+        assert_eq!(reply.button_rows[2][0].data, "cmd:?/new");
+        assert_eq!(reply.button_rows[2][1].data, "cmd:?/stop s42");
+        assert!(reply.markdown.contains("<tg-button-row>"));
+        assert!(
+            reply.markdown.find("s56").unwrap()
+                < reply.markdown.find("data=\"cmd:?/stop s56\"").unwrap()
+        );
+        assert!(reply.plain.contains("s56"));
+        assert!(!reply.plain.contains("<tg-button-row>"));
+        assert_eq!(reply.button_rows[3][0].label, "⛔ Остановить все дочерние");
+        assert_eq!(reply.button_rows[3][0].data, "cmd:?/stop children");
+        assert_eq!(reply.button_rows[3][0].style, Some(ButtonStyle::Danger));
         assert!(reply.button_rows.iter().all(|row| row.len() <= 8));
         assert!(reply
             .button_rows
@@ -588,7 +716,7 @@ mod tests {
             detail_lines: vec!["  • s79 · x</blockquote><tg-button-row>".into()],
             cost_24h: "💰 Расход проекта 24ч: $0.00".into(),
             resume: "—".into(),
-            child_stop_sids: Vec::new(),
+            children: Vec::new(),
         });
 
         assert!(!reply.markdown.contains("<blockquote"));
@@ -615,7 +743,7 @@ mod tests {
             detail_lines: vec!["Запущено: ожидание · Роль: —".into()],
             cost_24h: "💰 Расход проекта 24ч: $0.00".into(),
             resume: "—".into(),
-            child_stop_sids: Vec::new(),
+            children: Vec::new(),
         });
 
         assert!(reply.markdown.contains("🖥 host: edge"));
@@ -651,22 +779,29 @@ mod tests {
             }],
         });
 
+        assert!(!reply.markdown.contains("| sid |"));
         assert!(reply
             .markdown
-            .contains("| **s1** | claude.opus | ⏳ ожидание | 38% |"));
+            .contains("**s1** · claude/opus · ⏳ ожидание · ctx 38% — active work"));
+        assert!(reply.markdown.contains("data=\"cmd:?/stop s1\""));
+        assert!(reply.markdown.contains("data=\"cmd:/use s1\""));
         assert!(reply.markdown.contains("<blockquote expandable>"));
         assert!(reply
             .markdown
-            .contains("s11 | claude.opus | 🟢 ожидание | 38%"));
-        assert!(reply.markdown.contains("| **└─ s2** | claude.opus @edge |"));
+            .contains("**s10** · claude/opus · 🟢 ожидание · ctx 38%"));
+        assert!(reply
+            .markdown
+            .contains("**└─ s2** · claude/opus @edge · 🟢 ожидание · ctx 38%"));
         assert!(reply.markdown.contains("pid 4242"));
         assert!(reply
             .markdown
             .contains("сообщения встанут в очередь; /stop s77 завершит"));
-        assert_eq!(reply.button_rows[0][0].label, "▶ s1 claude · active work");
+        assert_eq!(reply.button_rows[10][0].data, "cmd:/sessions");
+        assert_eq!(reply.button_rows[10][1].data, "cmd:?/new");
         assert!(reply
             .plain
             .contains("ещё 2 в других проектах → /sessions all"));
+        assert!(!reply.plain.contains("<tg-button-row>"));
         assert!(reply.button_rows.iter().all(|row| row.len() <= 8));
         assert!(reply
             .button_rows
@@ -675,12 +810,56 @@ mod tests {
             .all(|button| button.data.len() <= 64));
     }
 
+    #[test]
+    fn sessions_render_exact_inline_cards_and_one_global_row() {
+        let reply = render_sessions(&SessionsView {
+            project: "ccteam".into(),
+            sessions: vec![
+                SessionRow {
+                    sid: "s1".into(),
+                    vendor_model: "claude.opus-4-8".into(),
+                    status: "🟢 ожидание".into(),
+                    context: "38%".into(),
+                    title: Some("active work".into()),
+                    current: true,
+                    tree_depth: 0,
+                    host: None,
+                },
+                SessionRow {
+                    sid: "s2".into(),
+                    vendor_model: "codex.gpt-5.6-terra".into(),
+                    status: "🔵 работает".into(),
+                    context: "—".into(),
+                    title: None,
+                    current: false,
+                    tree_depth: 0,
+                    host: None,
+                },
+            ],
+            elsewhere: 0,
+            detached: Vec::new(),
+        });
+
+        assert_eq!(
+            reply.markdown,
+            concat!(
+                "**Сессии** · `ccteam`\n\n",
+                "**s1** · claude/opus-4-8 · 🟢 ожидание · ctx 38% — active work\n",
+                "<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop s1\" style=\"danger\">⛔ Стоп</tg-button><tg-button type=\"callback_data\" data=\"cmd:/use s1\">💬 Переключиться</tg-button></tg-button-row>\n\n",
+                "**s2** · codex/gpt-5.6-terra · 🔵 работает\n",
+                "<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop s2\" style=\"danger\">⛔ Стоп</tg-button><tg-button type=\"callback_data\" data=\"cmd:/use s2\">💬 Переключиться</tg-button></tg-button-row>\n\n",
+                "<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:/sessions\">🔄 Обновить</tg-button><tg-button type=\"callback_data\" data=\"cmd:?/new\">✏️ Новая</tg-button></tg-button-row>"
+            )
+        );
+        assert!(!reply.plain.contains("<tg-button-row>"));
+    }
+
     /// TG-FMT-1 review round 1 — bold lives ONLY in `.markdown` (the Telegram
     /// Rich Messages field); `.plain` is the universal fallback every
     /// channel (Lark, Slack, the classic Telegram send) reads verbatim and
     /// must stay unformatted. `render_markdown` (the Telegram classic-path
-    /// HTML converter) must keep the table inside a plain `<pre>` while
-    /// escaping HTML-special characters riding along in another cell.
+    /// HTML converter) must strip rich-only button tags while escaping
+    /// HTML-special characters riding along in the card.
     #[test]
     fn sessions_markdown_bold_sid_survives_html_special_chars_in_other_cells() {
         let sessions = vec![SessionRow {
@@ -705,20 +884,10 @@ mod tests {
             reply.plain
         );
         let html = crate::telegram_html::render_markdown(&reply.markdown).html;
-        let table = html
-            .split_once("<pre>")
-            .and_then(|(_, rest)| rest.split_once("</pre>").map(|(body, _)| body))
-            .expect("sessions table must be rendered inside <pre>");
+        assert!(html.contains("<b>s1</b>"), "sid must stay bold: {html}");
+        assert!(!html.contains("tg-button"), "rich controls leaked: {html}");
         assert!(
-            table.contains("s1"),
-            "sid must remain plain table text: {html}"
-        );
-        assert!(
-            !table.contains("<b>"),
-            "table cells must stay unformatted: {html}"
-        );
-        assert!(
-            html.contains("claude.&lt;script&gt;&amp;\""),
+            html.contains("claude/&lt;script&gt;&amp;\""),
             "special chars must be escaped, not left raw: {html}"
         );
         assert!(!html.contains("<script>"), "unescaped tag leaked: {html}");
