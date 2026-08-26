@@ -609,18 +609,9 @@ impl TelegramChannel {
 
     /// The classic `sendMessage` path (HTML → plain retry), extended with
     /// [`SendMessage::button_rows`] ⊕ [`SendMessage::options`] as an
-    /// `inline_keyboard`. TG-GATE-V2 W9 — this ONLY ever sends a single
-    /// message now: splitting an over-long message is the daemon's job (it
-    /// owns the durable per-part outbox — see [`RichFallbackNeedsSplit`] and
-    /// `daemon.rs`'s `finish_durable_outbound_send`), never this channel's.
-    /// `content` reaching here already fits [`MAX_MESSAGE_UTF16`] in every
-    /// production path: the daemon pre-splits a non-rich message at
-    /// [`Channel::max_message_len`] before calling [`Channel::send`], and
-    /// [`Channel::send`]'s rich-fallback branch returns
-    /// [`RichFallbackNeedsSplit`] instead of calling this when `content`
-    /// doesn't fit. An over-long `content` reaching here anyway (e.g. a
-    /// direct caller that bypasses both) degrades to a single truncated
-    /// message via [`text_payload`]'s existing safety net rather than a 400.
+    /// `inline_keyboard`. A rich row that degrades to classic is split here
+    /// when its plain fallback exceeds [`MAX_MESSAGE_UTF16`]; all sub-sends
+    /// finish before this call returns.
     async fn send_classic(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         self.send_classic_part(message, &message.content, true)
             .await
@@ -1288,6 +1279,9 @@ impl Channel for TelegramChannel {
                         self.log_rich_fallback_once(&reason).await;
                     }
                 }
+            }
+            if message.content.encode_utf16().count() > MAX_MESSAGE_UTF16 {
+                return self.send_classic_split(message).await;
             }
             // Rich failed (or the breaker skipped it) — fall back to the
             // classic HTML path fed with `markdown` (review round 1:
@@ -2494,6 +2488,38 @@ mod tests {
             !classic_body["text"].as_str().unwrap().ends_with('…'),
             "content must not be truncated: {classic_body}"
         );
+    }
+
+    #[tokio::test]
+    async fn rich_fallback_sends_long_plain_as_sequential_classic_messages() {
+        let (base, seen) = spawn_sequential_http(&[
+            r#"{"ok":false,"description":"rich messages unsupported"}"#,
+            r#"{"ok":true,"result":{"message_id":1}}"#,
+            r#"{"ok":true,"result":{"message_id":2}}"#,
+        ]);
+        let mut ch = TelegramChannel::new("t".into(), vec![]);
+        ch.api_base = base;
+        let message = SendMessage::new("😀".repeat(2000), "42").with_rich_markdown("**rich**");
+
+        let id = ch.send(&message).await.unwrap();
+        assert_eq!(id.as_deref(), Some("2"));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            3,
+            "rich rejection plus two classic sends: {seen:?}"
+        );
+        assert!(seen[0].0.contains("sendRichMessage"));
+        for (_, body) in seen.iter().skip(1) {
+            let body: serde_json::Value = serde_json::from_str(body).unwrap();
+            let text = body["text"].as_str().unwrap();
+            assert!(text.encode_utf16().count() <= MAX_MESSAGE_UTF16);
+            assert!(
+                !text.contains("(1/2)"),
+                "transport must not add nested numbering"
+            );
+        }
     }
 
     /// TG-GATE-V2 W9 (N6) — `body_reports_failure` now gates BOTH the
