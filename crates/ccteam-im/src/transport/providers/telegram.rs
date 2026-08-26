@@ -1257,55 +1257,67 @@ fn normalize_inbound_text<'a>(
     entities: &[TgEntity],
     own_username: Option<&str>,
 ) -> Cow<'a, str> {
+    normalize_inbound_text_with_heuristic(text, entities, own_username).0
+}
+
+fn normalize_inbound_text_with_heuristic<'a>(
+    text: &'a str,
+    entities: &[TgEntity],
+    own_username: Option<&str>,
+) -> (Cow<'a, str>, bool) {
     if entities.is_empty() {
-        return strip_bot_mention(text, own_username);
+        let normalized = strip_bot_mention(text, own_username);
+        let used_heuristic = own_username.is_none() && normalized.as_ref() != text;
+        return (normalized, used_heuristic);
     }
     let Some(entity) = entities
         .iter()
         .find(|entity| entity.kind == "bot_command" && entity.offset == 0)
     else {
-        return Cow::Borrowed(text);
+        return (Cow::Borrowed(text), false);
     };
     let Some(start) = utf16_offset_to_byte(text, entity.offset) else {
-        return Cow::Borrowed(text);
+        return (Cow::Borrowed(text), false);
     };
     let Some(end_units) = entity.offset.checked_add(entity.length) else {
-        return Cow::Borrowed(text);
+        return (Cow::Borrowed(text), false);
     };
     let Some(end) = utf16_offset_to_byte(text, end_units) else {
-        return Cow::Borrowed(text);
+        return (Cow::Borrowed(text), false);
     };
     let token = &text[start..end];
     let Some((command, mention)) = token.split_once('@') else {
-        return Cow::Borrowed(text);
+        return (Cow::Borrowed(text), false);
     };
     if !command.starts_with('/') || mention.is_empty() {
-        return Cow::Borrowed(text);
+        return (Cow::Borrowed(text), false);
     }
+    let used_heuristic = own_username.is_none();
     let matches_bot = own_username
         .map(|username| mention.eq_ignore_ascii_case(username))
         .unwrap_or_else(|| mention.to_ascii_lowercase().ends_with("bot"));
     if !matches_bot {
-        return Cow::Borrowed(text);
+        return (Cow::Borrowed(text), false);
     }
-    Cow::Owned(format!("{}{}{}", &text[..start], command, &text[end..]))
+    (
+        Cow::Owned(format!("{}{}{}", &text[..start], command, &text[end..])),
+        used_heuristic,
+    )
 }
 
 fn message_content<'a>(message: &'a TgMessage, own_username: Option<&str>) -> (Cow<'a, str>, bool) {
     if let Some(text) = message.text.as_deref().filter(|text| !text.is_empty()) {
-        return (
-            normalize_inbound_text(text, &message.entities, own_username),
-            message.entities.is_empty(),
-        );
+        return normalize_inbound_text_with_heuristic(text, &message.entities, own_username);
     }
     if let Some(caption) = message
         .caption
         .as_deref()
         .filter(|caption| !caption.is_empty())
     {
-        return (
-            normalize_inbound_text(caption, &message.caption_entities, own_username),
-            message.caption_entities.is_empty(),
+        return normalize_inbound_text_with_heuristic(
+            caption,
+            &message.caption_entities,
+            own_username,
         );
     }
     let rich = message
@@ -1313,10 +1325,9 @@ fn message_content<'a>(message: &'a TgMessage, own_username: Option<&str>) -> (C
         .as_ref()
         .map(rich_message_to_text)
         .unwrap_or_default();
-    (
-        Cow::Owned(normalize_inbound_text(&rich, &[], own_username).into_owned()),
-        false,
-    )
+    let (normalized, used_heuristic) =
+        normalize_inbound_text_with_heuristic(&rich, &[], own_username);
+    (Cow::Owned(normalized.into_owned()), used_heuristic)
 }
 
 /// One size of an inbound photo (Telegram sends an ascending-size array;
@@ -3171,6 +3182,20 @@ mod tests {
             normalize_inbound_text("/go@MyBot", &[], Some("mybot")),
             "/go"
         );
+    }
+
+    #[test]
+    fn entity_command_path_reports_when_heuristic_fired() {
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "date": 0,
+            "chat": {"id": 5},
+            "text": "/go@mybot",
+            "entities": [{"type": "bot_command", "offset": 0, "length": 9}]
+        }))
+        .expect("entity command update is valid");
+
+        assert!(message_content(&message, None).1);
     }
 
     #[test]
