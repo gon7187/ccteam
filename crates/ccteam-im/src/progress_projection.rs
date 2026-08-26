@@ -119,6 +119,10 @@ pub struct ProjectProjectionSnapshot {
     pub cost: CostSummary,
     /// Per-session incremental accumulators.
     pub sessions: HashMap<String, SessionProjection>,
+    /// Raw input+output tokens in the trailing 24-hour window.
+    pub tokens_24h: u64,
+    /// Whether at least one 24-hour row has a trustworthy USD amount.
+    pub cost_24h_priced: bool,
     /// Delegation lifecycle and rolling counters.
     pub delegations: DelegationProjection,
     /// Low-frequency workflow facts needed by the legacy workflow summary.
@@ -188,7 +192,39 @@ impl ProjectProjectionSnapshot {
 struct CostBucket {
     total: f64,
     count: u32,
+    priced: u32,
+    tokens: u64,
     by_vendor: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnSource {
+    ChatTurnCompleted,
+    AgentDone,
+}
+
+impl TurnSource {
+    fn priority(self) -> u8 {
+        match self {
+            Self::ChatTurnCompleted => 1,
+            Self::AgentDone => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TurnIdentity {
+    sid: String,
+    turn_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct FoldedTurn {
+    source: TurnSource,
+    cost_usd: Option<f64>,
+    vendor: Option<String>,
+    tokens: u64,
+    event_minute: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -208,6 +244,7 @@ struct SlugState {
     lifetime_cost: f64,
     lifetime_by_vendor: BTreeMap<String, f64>,
     minute_cost: BTreeMap<i64, CostBucket>,
+    folded_turns: HashMap<TurnIdentity, FoldedTurn>,
     sessions: HashMap<String, SessionProjection>,
     delegations: DelegationProjection,
     minute_delegations: BTreeMap<i64, DelegationBucket>,
@@ -557,7 +594,9 @@ fn fold_event(state: &mut SlugState, event: Value, now: DateTime<Utc>) {
     ) {
         state.workflow_events.push(event.clone());
     }
-    if let Some(cost) = progress_bridge::progress_cost_contribution(&event) {
+    if let Some(source) = turn_source(kind) {
+        fold_turn(state, &event, source, now);
+    } else if let Some(cost) = progress_bridge::progress_cost_contribution(&event) {
         fold_cost(state, cost, &event, now);
     }
     if kind == CHAT_TURN_COMPLETED {
@@ -568,12 +607,125 @@ fn fold_event(state: &mut SlugState, event: Value, now: DateTime<Utc>) {
     fold_delegation(state, kind, &event, now);
 }
 
+fn turn_source(kind: &str) -> Option<TurnSource> {
+    match kind {
+        CHAT_TURN_COMPLETED => Some(TurnSource::ChatTurnCompleted),
+        AGENT_DONE => Some(TurnSource::AgentDone),
+        _ => None,
+    }
+}
+
+// Invariant: codex is today the only adapter emitting priced `agent_done`;
+// a new vendor bridging `agent_done` must also be excluded from pricing
+// `chat_turn_completed`, or its cost double-counts.
+fn turn_identity(event: &Value) -> Option<TurnIdentity> {
+    let sid = ccteam_core::progress::event_sid(event)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)?;
+    let turn_id = event
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)?;
+    Some(TurnIdentity { sid, turn_id })
+}
+
+fn event_tokens(event: &Value) -> u64 {
+    event
+        .get("usage")
+        .and_then(|usage| {
+            serde_json::from_value::<ccteam_cost::UnifiedTokenUsage>(usage.clone()).ok()
+        })
+        .map(|usage| usage.input_tokens.saturating_add(usage.output_tokens))
+        .unwrap_or(0)
+}
+
+fn recent_event_minute(event: &Value, now: DateTime<Utc>) -> Option<i64> {
+    let now_minute = minute(now);
+    let oldest = now_minute.saturating_sub(MINUTES_24H);
+    let event_minute = bucket_minute(event, now).min(now_minute);
+    (event_minute >= oldest).then_some(event_minute)
+}
+
+fn fold_turn(state: &mut SlugState, event: &Value, source: TurnSource, now: DateTime<Utc>) {
+    let cost = progress_bridge::progress_cost_contribution(event);
+    let tokens = event_tokens(event);
+    let Some(identity) = turn_identity(event) else {
+        if let Some(cost) = cost {
+            fold_cost(state, cost, event, now);
+        }
+        if tokens > 0 {
+            fold_tokens(state, tokens, recent_event_minute(event, now), now);
+        }
+        return;
+    };
+
+    if let Some(previous) = state.folded_turns.get(&identity).cloned() {
+        if previous.source.priority() >= source.priority() {
+            return;
+        }
+        unfold_turn(state, &previous);
+    }
+
+    let folded = FoldedTurn {
+        source,
+        cost_usd: cost
+            .as_ref()
+            .filter(|value| value.is_priced)
+            .map(|value| value.cost_usd),
+        vendor: cost
+            .as_ref()
+            .and_then(|value| value.vendor.map(str::to_string)),
+        tokens,
+        event_minute: recent_event_minute(event, now),
+    };
+    if let Some(cost) = cost.filter(|value| value.is_priced) {
+        fold_cost(state, cost, event, now);
+    }
+    if tokens > 0 {
+        fold_tokens(state, tokens, folded.event_minute, now);
+    }
+    state.folded_turns.insert(identity, folded);
+}
+
+fn unfold_turn(state: &mut SlugState, turn: &FoldedTurn) {
+    if let Some(cost) = turn.cost_usd {
+        state.lifetime_cost -= cost;
+        if let Some(vendor) = turn.vendor.as_deref() {
+            *state
+                .lifetime_by_vendor
+                .entry(vendor.to_string())
+                .or_insert(0.0) -= cost;
+        }
+        if let Some(event_minute) = turn.event_minute {
+            if let Some(bucket) = state.minute_cost.get_mut(&event_minute) {
+                bucket.total -= cost;
+                bucket.count = bucket.count.saturating_sub(1);
+                bucket.priced = bucket.priced.saturating_sub(1);
+                if let Some(vendor) = turn.vendor.as_deref() {
+                    *bucket.by_vendor.entry(vendor.to_string()).or_insert(0.0) -= cost;
+                }
+            }
+        }
+    }
+    if turn.tokens > 0 {
+        if let Some(event_minute) = turn.event_minute {
+            if let Some(bucket) = state.minute_cost.get_mut(&event_minute) {
+                bucket.tokens = bucket.tokens.saturating_sub(turn.tokens);
+            }
+        }
+    }
+}
+
 fn fold_cost(
     state: &mut SlugState,
     contribution: ProgressCostContribution<'_>,
     event: &Value,
     now: DateTime<Utc>,
 ) {
+    if !contribution.is_priced {
+        return;
+    }
     let cost = contribution.cost_usd;
     state.lifetime_cost += cost;
     let vendor = contribution.vendor;
@@ -594,8 +746,18 @@ fn fold_cost(
     let bucket = state.minute_cost.entry(event_minute).or_default();
     bucket.total += cost;
     bucket.count = bucket.count.saturating_add(1);
+    bucket.priced = bucket.priced.saturating_add(1);
     if let Some(vendor) = vendor {
         *bucket.by_vendor.entry(vendor.to_string()).or_insert(0.0) += cost;
+    }
+}
+
+fn fold_tokens(state: &mut SlugState, tokens: u64, event_minute: Option<i64>, now: DateTime<Utc>) {
+    let oldest = minute(now).saturating_sub(MINUTES_24H);
+    state.minute_cost.retain(|minute, _| *minute >= oldest);
+    if let Some(event_minute) = event_minute {
+        let bucket = state.minute_cost.entry(event_minute).or_default();
+        bucket.tokens = bucket.tokens.saturating_add(tokens);
     }
 }
 
@@ -702,6 +864,15 @@ fn snapshot(state: &SlugState, now: DateTime<Utc>) -> ProjectProjectionSnapshot 
         tail: state.tail.iter().cloned().collect(),
         cost,
         sessions: state.sessions.clone(),
+        tokens_24h: state
+            .minute_cost
+            .range(oldest..)
+            .map(|(_, bucket)| bucket.tokens)
+            .sum(),
+        cost_24h_priced: state
+            .minute_cost
+            .range(oldest..)
+            .any(|(_, bucket)| bucket.priced > 0),
         delegations,
         workflow_events: state.workflow_events.clone(),
         last_unscoped: state.last_unscoped.clone(),
@@ -797,6 +968,99 @@ mod tests {
             "cost_usd": cost,
             "ts": ts.to_rfc3339(),
         })
+    }
+
+    #[test]
+    fn chat_turn_completed_rows_feed_project_24h_cost() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        let now = fixed_now();
+        write_lines(
+            &paths.progress_jsonl("chat-cost"),
+            &[json!({
+                "event": CHAT_TURN_COMPLETED,
+                "sid": "s1",
+                "vendor": "claude",
+                "model": "claude-sonnet-4-6",
+                "usage": {"output_tokens": 1_000_000},
+                "ts": now.to_rfc3339(),
+            })],
+        );
+
+        let projection = projection(paths);
+        projection.hydrate_now(&["chat-cost".to_string()]).unwrap();
+        let snapshot = projection.project_snapshot("chat-cost");
+
+        assert!((snapshot.cost.cost_24h_usd - 15.0).abs() < 1e-9);
+        assert_eq!(snapshot.cost.cost_24h_by_vendor["claude"], 15.0);
+        assert_eq!(snapshot.sessions["s1"].tokens_total, Some(1_000_000));
+        assert_eq!(snapshot.tokens_24h, 1_000_000);
+    }
+
+    #[test]
+    fn duplicate_turn_rows_prefer_agent_done_cost_and_tokens() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        let now = fixed_now();
+        write_lines(
+            &paths.progress_jsonl("dedupe"),
+            &[
+                json!({
+                    "event": CHAT_TURN_COMPLETED,
+                    "sid": "s1",
+                    "turn_id": "turn-1",
+                    "vendor": "claude",
+                    "model": "claude-sonnet-4-6",
+                    "usage": {"output_tokens": 1_000_000},
+                    "ts": now.to_rfc3339(),
+                }),
+                json!({
+                    "event": AGENT_DONE,
+                    "session_id": "s1",
+                    "turn_id": "turn-1",
+                    "vendor": "claude",
+                    "cost_usd": 7.0,
+                    "usage": {"output_tokens": 1_000_000},
+                    "ts": now.to_rfc3339(),
+                }),
+            ],
+        );
+
+        let projection = projection(paths);
+        projection.hydrate_now(&["dedupe".to_string()]).unwrap();
+        let snapshot = projection.project_snapshot("dedupe");
+
+        assert_eq!(snapshot.cost.cost_24h_usd, 7.0);
+        assert_eq!(snapshot.cost.session_count_24h, 1);
+        assert_eq!(snapshot.cost.cost_24h_by_vendor["claude"], 7.0);
+        assert_eq!(snapshot.tokens_24h, 1_000_000);
+    }
+
+    #[test]
+    fn codex_agent_done_is_counted_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        let now = fixed_now();
+        write_lines(
+            &paths.progress_jsonl("codex-cost"),
+            &[json!({
+                "event": AGENT_DONE,
+                "session_id": "s1",
+                "turn_id": "turn-1",
+                "vendor": "codex",
+                "cost_usd": 30.0,
+                "usage": {"output_tokens": 1_000_000},
+                "ts": now.to_rfc3339(),
+            })],
+        );
+
+        let projection = projection(paths);
+        projection.hydrate_now(&["codex-cost".to_string()]).unwrap();
+        let snapshot = projection.project_snapshot("codex-cost");
+
+        assert_eq!(snapshot.cost.cost_24h_usd, 30.0);
+        assert_eq!(snapshot.cost.session_count_24h, 1);
+        assert_eq!(snapshot.tokens_24h, 1_000_000);
     }
 
     #[test]
