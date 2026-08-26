@@ -17516,6 +17516,7 @@ mod tests {
         /// v0.9 T2 — `close_thread` call count (stop path + discarded zombie
         /// resume both close).
         closes: AtomicUsize,
+        closes_notify: tokio::sync::Notify,
         close_failures_remaining: Arc<AtomicUsize>,
     }
 
@@ -17569,6 +17570,7 @@ mod tests {
                 title_surface: false,
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
+                closes_notify: tokio::sync::Notify::new(),
                 close_failures_remaining: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -17627,6 +17629,20 @@ mod tests {
         fn with_close_failures(self, count: usize) -> Self {
             self.close_failures_remaining.store(count, Ordering::SeqCst);
             self
+        }
+
+        async fn wait_for_closes(&self, expected: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let notified = self.closes_notify.notified();
+                    if self.closes.load(Ordering::SeqCst) >= expected {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("expected vendor close");
         }
     }
 
@@ -17854,6 +17870,7 @@ mod tests {
 
         async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
             self.closes.fetch_add(1, Ordering::SeqCst);
+            self.closes_notify.notify_waiters();
             let mut remaining = self.close_failures_remaining.load(Ordering::SeqCst);
             while remaining > 0 {
                 match self.close_failures_remaining.compare_exchange(
@@ -19215,6 +19232,7 @@ mod tests {
         assert_eq!(current.generation, newer_generation);
         assert_eq!(current.thread.identity, "newer-live-thread");
         drop(guard);
+        fake.wait_for_closes(1).await;
         assert!(
             fake.closes.load(Ordering::SeqCst) >= 1,
             "the discarded vendor result must be closed, got {} closes",
@@ -28520,7 +28538,11 @@ mod tests {
     async fn delegation_watch_is_spent_by_the_dispatched_task_boundary() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().to_path_buf();
-        let gateway = delegation_gateway(&project_dir).await;
+        // This test drives delivery synchronously below. Starting the async
+        // notifier would race its startup reconcile against that manual path,
+        // an interleaving production never permits (the notifier reconciles
+        // before it starts draining live signals).
+        let gateway = delegation_gateway_without_notifier(&project_dir).await;
 
         let (parent_sid, child_sid) = {
             let mut gw = gateway.lock().await;

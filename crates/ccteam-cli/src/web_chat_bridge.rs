@@ -149,7 +149,11 @@ fn to_im_message(message: WebChannelMessage) -> ChannelMessage {
         // attachments — so there are none to carry here.
         attachments: Vec::new(),
         // v0.8.5 D3: a chip click carries its opaque "{token}:{idx}".
-        selection: message.selection.map(|data| ChoiceReply { data }),
+        selection: message.selection.map(|data| ChoiceReply {
+            data,
+            // Web chips are never Telegram callbacks — no ephemeral context.
+            callback_ephemeral: None,
+        }),
     }
 }
 
@@ -240,7 +244,8 @@ mod tests {
         assert_eq!(
             clicked.selection,
             Some(ChoiceReply {
-                data: "tok:2".into()
+                data: "tok:2".into(),
+                callback_ephemeral: None,
             })
         );
         assert!(clicked.attachments.is_empty());
