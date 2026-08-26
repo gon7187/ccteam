@@ -22854,6 +22854,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:/use s1".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
