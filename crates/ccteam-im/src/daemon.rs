@@ -1702,6 +1702,35 @@ fn spawn_gateway_event_consumer(
                     callback,
                     fallback_edit_message_id,
                 } => {
+                    if callback.ephemeral_message_id.is_some() {
+                        if channel
+                            .edit_ephemeral_message(
+                                &evt.chat_id,
+                                &callback,
+                                &evt.content,
+                                &evt.button_rows,
+                            )
+                            .await
+                            .is_ok()
+                        {
+                            continue;
+                        }
+                        let mut retry = callback.clone();
+                        retry.replace_callback_query_message = false;
+                        let mut out = SendMessage::new(evt.content.clone(), evt.chat_id.clone())
+                            .in_thread(evt.thread_ts.clone())
+                            .with_button_rows(evt.button_rows.clone());
+                        out.callback_ephemeral = Some(retry);
+                        if channel.send(&out).await.is_ok() {
+                            continue;
+                        }
+                        let out = SendMessage::new(evt.content, evt.chat_id)
+                            .in_thread(evt.thread_ts)
+                            .with_button_rows(evt.button_rows);
+                        send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out)
+                            .await;
+                        continue;
+                    }
                     let mut out = SendMessage::new(evt.content.clone(), evt.chat_id.clone())
                         .in_thread(evt.thread_ts.clone())
                         .with_button_rows(evt.button_rows.clone())
@@ -2459,6 +2488,123 @@ mod tests {
             Some("rid-123"),
             "the add handle must be replayed to remove"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ephemeral_answer_falls_back_to_new_ephemeral_then_plain_message() {
+        struct FailingEphemeralChannel {
+            sends: Arc<StdMutex<Vec<SendMessage>>>,
+            ephemeral_edits: Arc<StdMutex<Vec<i64>>>,
+            ordinary_edits: Arc<StdMutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for FailingEphemeralChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                self.sends.lock().unwrap().push(message.clone());
+                if message.callback_ephemeral.is_some() {
+                    anyhow::bail!("ephemeral send failed")
+                }
+                Ok(Some("plain-message".to_string()))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn edit_ephemeral_message(
+                &self,
+                _chat_id: &str,
+                callback: &crate::transport::CallbackEphemeral,
+                _content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> anyhow::Result<()> {
+                self.ephemeral_edits
+                    .lock()
+                    .unwrap()
+                    .push(callback.ephemeral_message_id.unwrap());
+                anyhow::bail!("ephemeral edit failed")
+            }
+
+            async fn edit_message(
+                &self,
+                _recipient: &str,
+                message_id: &str,
+                _content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> anyhow::Result<Option<String>> {
+                self.ordinary_edits
+                    .lock()
+                    .unwrap()
+                    .push(message_id.to_string());
+                anyhow::bail!("ordinary edit must not target an ephemeral message")
+            }
+        }
+
+        let channel = Arc::new(FailingEphemeralChannel {
+            sends: Arc::new(StdMutex::new(Vec::new())),
+            ephemeral_edits: Arc::new(StdMutex::new(Vec::new())),
+            ordinary_edits: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), channel.clone());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let consumer = spawn_gateway_event_consumer(rx, Arc::new(RwLock::new(channels)));
+
+        tx.send(GatewayEvent {
+            id: "ephemeral-fallback".to_string(),
+            channel: "telegram".to_string(),
+            chat_id: "-100".to_string(),
+            thread_ts: None,
+            content: "cancelled".to_string(),
+            kind: GatewayEventKind::EphemeralAnswer {
+                callback: crate::transport::CallbackEphemeral {
+                    callback_query_id: "cb-1".to_string(),
+                    receiver_user_id: 7,
+                    replace_callback_query_message: false,
+                    ephemeral_message_id: Some(99),
+                },
+                fallback_edit_message_id: Some("ordinary-1".to_string()),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: None,
+            slug: None,
+        })
+        .unwrap();
+
+        for _ in 0..200 {
+            if channel.sends.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        consumer.abort();
+
+        assert_eq!(*channel.ephemeral_edits.lock().unwrap(), vec![99]);
+        assert!(channel.ordinary_edits.lock().unwrap().is_empty());
+        let sends = channel.sends.lock().unwrap();
+        assert_eq!(
+            sends.len(),
+            2,
+            "failed ephemeral retry must still reach plain fallback"
+        );
+        assert_eq!(
+            sends[0]
+                .callback_ephemeral
+                .as_ref()
+                .map(|callback| callback.replace_callback_query_message),
+            Some(false)
+        );
+        assert!(sends[1].callback_ephemeral.is_none());
     }
 
     /// TG-GATE-V2 W7a — a rich-capable channel's `Answer` event gets

@@ -23029,6 +23029,7 @@ mod tests {
                         callback_query_id: "cb-42".to_string(),
                         receiver_user_id: 7,
                         replace_callback_query_message: true,
+                        ephemeral_message_id: None,
                     }),
                 }),
             )

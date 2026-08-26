@@ -315,21 +315,18 @@ impl TelegramChannel {
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
         cb: TgCallbackQuery,
     ) {
-        let _ = self
-            .http
-            .post(self.api_url("answerCallbackQuery"))
-            .json(&serde_json::json!({ "callback_query_id": cb.id }))
-            .send()
-            .await;
-        let Some(data) = cb.data else {
+        let Some(data) = cb.data.as_ref().cloned() else {
+            self.answer_callback_query(&cb.id).await;
             return;
         };
-        let Some(msg) = cb.message else {
+        let Some(msg) = cb.message.as_ref() else {
+            self.answer_callback_query(&cb.id).await;
             return;
         };
         let chat_id = msg.chat.id.to_string();
         if !self.chat_allowed(&chat_id) {
             self.reject_chat(&chat_id, msg.message_id, msg.date).await;
+            self.answer_callback_query(&cb.id).await;
             return;
         }
         let sender = cb
@@ -338,18 +335,7 @@ impl TelegramChannel {
             .and_then(|u| u.username.clone())
             .or_else(|| cb.from.as_ref().map(|u| u.id.to_string()))
             .unwrap_or_else(|| "anonymous".to_string());
-        let callback_ephemeral = (msg.chat.kind.as_deref() == Some("group")
-            || msg.chat.kind.as_deref() == Some("supergroup"))
-        .then(|| {
-            cb.from
-                .as_ref()
-                .map(|user| crate::transport::CallbackEphemeral {
-                    callback_query_id: cb.id.clone(),
-                    receiver_user_id: user.id,
-                    replace_callback_query_message: msg.ephemeral_message_id.is_none(),
-                })
-        })
-        .flatten();
+        let callback_ephemeral = callback_ephemeral_context(&cb, msg);
         let payload = ChannelMessage {
             id: callback_message_id(msg.message_id),
             sender,
@@ -365,6 +351,19 @@ impl TelegramChannel {
             }),
         };
         let _ = tx.send(payload).await;
+        // The callback id authorizes the ephemeral send queued above. Bot API
+        // does not promise it remains valid after answering; owner will verify
+        // this ordering against a live group before rollout.
+        self.answer_callback_query(&cb.id).await;
+    }
+
+    async fn answer_callback_query(&self, callback_query_id: &str) {
+        let _ = self
+            .http
+            .post(self.api_url("answerCallbackQuery"))
+            .json(&serde_json::json!({ "callback_query_id": callback_query_id }))
+            .send()
+            .await;
     }
 
     /// POST a `setMessageReaction` body (the shared transport for both
@@ -615,6 +614,9 @@ impl TelegramChannel {
             return Err(format!("http_{}", status.as_u16()));
         }
         if body_reports_failure(&text) {
+            if message.callback_ephemeral.is_some() {
+                self.log_ephemeral_fallback_once("ok_false").await;
+            }
             return Err("ok_false".to_string());
         }
         Ok(extract_message_id(&text))
@@ -708,6 +710,10 @@ impl TelegramChannel {
         }
         let send_http_ms = t0.elapsed().as_millis() as u64;
         if !status.is_success() {
+            if message.callback_ephemeral.is_some() {
+                self.log_ephemeral_fallback_once(&format!("http_{}", status.as_u16()))
+                    .await;
+            }
             tracing::warn!(
                 event = "latency",
                 stage = "tg.egress",
@@ -914,6 +920,25 @@ struct TgUser {
     id: i64,
     #[serde(default)]
     username: Option<String>,
+}
+
+fn callback_ephemeral_context(
+    callback: &TgCallbackQuery,
+    message: &TgMessage,
+) -> Option<crate::transport::CallbackEphemeral> {
+    matches!(message.chat.kind.as_deref(), Some("group" | "supergroup"))
+        .then(|| {
+            callback
+                .from
+                .as_ref()
+                .map(|user| crate::transport::CallbackEphemeral {
+                    callback_query_id: callback.id.clone(),
+                    receiver_user_id: user.id,
+                    replace_callback_query_message: message.ephemeral_message_id.is_none(),
+                    ephemeral_message_id: message.ephemeral_message_id,
+                })
+        })
+        .flatten()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1702,6 +1727,19 @@ fn build_rich_send_body(message: &SendMessage, markdown: &str) -> serde_json::Va
     body
 }
 
+fn build_ephemeral_edit_body(
+    chat_id: &str,
+    callback: &crate::transport::CallbackEphemeral,
+    content: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "chat_id": chat_id,
+        "receiver_user_id": callback.receiver_user_id,
+        "ephemeral_message_id": callback.ephemeral_message_id,
+        "text": content,
+    })
+}
+
 /// Build the `editMessageText` request body using `rich_message` (Bot API
 /// 10.3) instead of `text`. TG-GATE-V2 W5 — `button_rows` (e.g. the live
 /// progress edit's `[⛔ Прервать]`) rides the same trailing
@@ -1855,6 +1893,36 @@ impl Channel for TelegramChannel {
             return self.send_classic_split(message).await;
         }
         self.send_classic(message).await
+    }
+
+    async fn edit_ephemeral_message(
+        &self,
+        chat_id: &str,
+        callback: &crate::transport::CallbackEphemeral,
+        content: &str,
+        _button_rows: &[Vec<MessageOption>],
+    ) -> anyhow::Result<()> {
+        let Some(_) = callback.ephemeral_message_id else {
+            anyhow::bail!("telegram ephemeral edit missing ephemeral_message_id");
+        };
+        let response = self
+            .http
+            .post(self.api_url("editEphemeralMessageText"))
+            .json(&build_ephemeral_edit_body(chat_id, callback, content))
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() || body_reports_failure(&text) {
+            let reason = if status.is_success() {
+                "edit_ok_false".to_string()
+            } else {
+                format!("edit_http_{}", status.as_u16())
+            };
+            self.log_ephemeral_fallback_once(&reason).await;
+            anyhow::bail!("telegram editEphemeralMessageText {chat_id} → {status}: {text}");
+        }
+        Ok(())
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -2669,6 +2737,57 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_edit_body_targets_the_ephemeral_id_space() {
+        let callback = crate::transport::CallbackEphemeral {
+            callback_query_id: "cb-42".to_string(),
+            receiver_user_id: 7,
+            replace_callback_query_message: false,
+            ephemeral_message_id: Some(99),
+        };
+        assert_eq!(
+            build_ephemeral_edit_body("-100", &callback, "done"),
+            serde_json::json!({
+                "chat_id": "-100",
+                "receiver_user_id": 7,
+                "ephemeral_message_id": 99,
+                "text": "done",
+            })
+        );
+    }
+
+    #[test]
+    fn private_callback_has_no_ephemeral_context() {
+        let callback: TgCallbackQuery = serde_json::from_value(serde_json::json!({
+            "id": "cb-1", "from": {"id": 7}
+        }))
+        .unwrap();
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1, "date": 0, "chat": {"id": 7, "type": "private"}
+        }))
+        .unwrap();
+        assert!(callback_ephemeral_context(&callback, &message).is_none());
+    }
+
+    #[test]
+    fn ephemeral_callback_keeps_its_separate_message_id() {
+        let callback: TgCallbackQuery = serde_json::from_value(serde_json::json!({
+            "id": "cb-1", "from": {"id": 7}
+        }))
+        .unwrap();
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "ephemeral_message_id": 99,
+            "date": 0,
+            "chat": {"id": -100, "type": "supergroup"}
+        }))
+        .unwrap();
+
+        let context = callback_ephemeral_context(&callback, &message).unwrap();
+        assert_eq!(context.ephemeral_message_id, Some(99));
+        assert!(!context.replace_callback_query_message);
+    }
+
+    #[test]
     fn rich_markdown_budget_includes_button_block() {
         let plain = SendMessage::new("hello", "42");
         assert_eq!(rich_markdown_budget(&plain), MAX_RICH_MARKDOWN_BYTES);
@@ -3046,6 +3165,36 @@ mod tests {
         assert!(
             classic_body.contains(r#""parse_mode":"HTML""#),
             "classic body must ask Telegram to parse the HTML: {classic_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_ephemeral_message_uses_its_own_endpoint_and_identifier() {
+        let (base, seen) = spawn_sequential_http(&[r#"{"ok":true,"result":true}"#]);
+        let mut ch = TelegramChannel::new("t".into(), vec![]);
+        ch.api_base = base;
+        let callback = crate::transport::CallbackEphemeral {
+            callback_query_id: "cb-42".to_string(),
+            receiver_user_id: 7,
+            replace_callback_query_message: false,
+            ephemeral_message_id: Some(99),
+        };
+
+        ch.edit_ephemeral_message("-100", &callback, "done", &[])
+            .await
+            .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].0.contains("editEphemeralMessageText"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&seen[0].1).unwrap(),
+            serde_json::json!({
+                "chat_id": "-100",
+                "receiver_user_id": 7,
+                "ephemeral_message_id": 99,
+                "text": "done",
+            })
         );
     }
 

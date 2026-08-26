@@ -530,6 +530,8 @@ pub struct CallbackEphemeral {
     pub receiver_user_id: i64,
     /// Whether Telegram may replace the callback's source message.
     pub replace_callback_query_message: bool,
+    /// Source ephemeral message, when this callback came from one.
+    pub ephemeral_message_id: Option<i64>,
 }
 
 /// Message to send through a channel.
@@ -642,6 +644,7 @@ impl SendMessage {
             callback_query_id: callback_query_id.into(),
             receiver_user_id,
             replace_callback_query_message: true,
+            ephemeral_message_id: None,
         });
         self
     }
@@ -686,6 +689,18 @@ pub trait Channel: Send + Sync {
     /// when available (Slack `ts`, Discord message id, …) for echo
     /// suppression in the outbound tailer.
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>>;
+
+    /// Edit a Telegram ephemeral message. Other transports deliberately do
+    /// not implement this separate identifier space.
+    async fn edit_ephemeral_message(
+        &self,
+        _chat_id: &str,
+        _callback: &CallbackEphemeral,
+        _content: &str,
+        _button_rows: &[Vec<MessageOption>],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("ephemeral message edits are unsupported")
+    }
 
     /// Long-running inbound listener (see trait-level docs).
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
