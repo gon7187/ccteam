@@ -19778,8 +19778,9 @@ mod tests {
     /// enqueue→resume→drain path (same end state: turn lands, sid stable).
     #[tokio::test]
     async fn gateway_resumes_dead_session_on_next_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
 
         let sid = gateway
             .create_session_api(
