@@ -59,6 +59,8 @@ pub struct StatusView {
     pub detail_lines: Vec<String>,
     /// Project-scoped trailing 24-hour cost from the progress ledger.
     pub cost_24h: String,
+    /// Vendor resume UUID, or an honest placeholder.
+    pub resume: String,
     /// Direct children eligible for one-tap confirmed stopping.
     pub child_stop_sids: Vec<String>,
 }
@@ -146,7 +148,11 @@ pub fn render_status(view: &StatusView) -> RichReply {
         .map(|line| escape_markdown(line))
         .collect::<Vec<_>>()
         .join("\n");
-    let plain_details = details.join("\n");
+    let markdown_details = format!(
+        "{markdown_details}\n🔁 resume `{}`",
+        escape_code(&view.resume)
+    );
+    let plain_details = format!("{}\n🔁 resume {}", details.join("\n"), view.resume);
     let markdown = format!(
         "🧭 **{}** · {} · {}\n{} · {} · {} · ctx {}\n📁 `{}`\n🖥 host: {}\n<blockquote expandable>{}</blockquote>",
         escape_markdown(&view.sid),
@@ -498,17 +504,16 @@ mod tests {
             path: "/root/projects/ccteam".into(),
             host: "local".into(),
             detail_lines: vec![
-                "Запущено: ожидает".into(),
-                "Роль: reviewer".into(),
-                "resume 123e4567-e89b-12d3-a456-426614174000".into(),
+                "Запущено: ожидает · Роль: reviewer".into(),
                 "🤖 Выполняется: workflow (1)".into(),
                 "⚡ Использование: 5h 17% (→19:00)".into(),
-                "👥 Прямые дочерние сессии: s56 · codex · gpt-5.6-terra · 🟡 работает · title"
-                    .into(),
+                "👥 Дочерние (1):".into(),
+                "  • s56 · codex · gpt-5.6-terra · 🟡 работает · title".into(),
                 "↓ Другие сессии проекта: 2 → /sessions".into(),
                 "↓ Все проекты: 3 → /projects".into(),
             ],
-            cost_24h: "Расход проекта 24ч: $1.23".into(),
+            cost_24h: "💰 Расход проекта 24ч: $1.23".into(),
+            resume: "123e4567-e89b-12d3-a456-426614174000".into(),
             child_stop_sids: vec![
                 "s56".into(),
                 "s78".into(),
@@ -524,9 +529,12 @@ mod tests {
 
         assert_eq!(
             reply.markdown,
-            "🧭 **s42** · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 `/root/projects/ccteam`\n🖥 host: local\n<blockquote expandable>Запущено: ожидает\nРоль: reviewer\nresume 123e4567-e89b-12d3-a456-426614174000\n🤖 Выполняется: workflow (1)\n⚡ Использование: 5h 17% (→19:00)\n👥 Прямые дочерние сессии: s56 · codex · gpt-5.6-terra · 🟡 работает · title\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\nРасход проекта 24ч: $1.23</blockquote>"
+            "🧭 **s42** · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 `/root/projects/ccteam`\n🖥 host: local\n<blockquote expandable>Запущено: ожидает · Роль: reviewer\n🤖 Выполняется: workflow (1)\n⚡ Использование: 5h 17% (→19:00)\n👥 Дочерние (1):\n  • s56 · codex · gpt-5.6-terra · 🟡 работает · title\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\n💰 Расход проекта 24ч: $1.23\n🔁 resume `123e4567-e89b-12d3-a456-426614174000`</blockquote>"
         );
         assert_eq!(reply.plain.lines().next(), Some("🧭 s42 · ccteam · claude"));
+        assert!(reply
+            .plain
+            .contains("🔁 resume 123e4567-e89b-12d3-a456-426614174000"));
         assert_eq!(reply.button_rows[1][0].data, "cmd:?/new");
         assert_eq!(reply.button_rows[1][1].data, "cmd:?/stop s42");
         assert_eq!(reply.button_rows[2][0].label, "⛔ s56");
