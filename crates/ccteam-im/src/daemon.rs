@@ -2566,6 +2566,79 @@ mod tests {
         assert_eq!(statuses["status"].replacement_fallbacks, 2);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn progress_message_not_modified_does_not_send_replacement() {
+        struct NotModifiedEditChannel {
+            sends: Arc<StdMutex<Vec<SendMessage>>>,
+            edits: Arc<StdMutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for NotModifiedEditChannel {
+            fn name(&self) -> &str {
+                "progress-test"
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                let mut sends = self.sends.lock().unwrap();
+                sends.push(message.clone());
+                Ok(Some(format!("message-{}", sends.len())))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn edit_message(
+                &self,
+                _recipient: &str,
+                message_id: &str,
+                _content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> anyhow::Result<Option<String>> {
+                self.edits.lock().unwrap().push(message_id.to_string());
+                anyhow::bail!("message is not modified")
+            }
+        }
+
+        let channel = NotModifiedEditChannel {
+            sends: Arc::new(StdMutex::new(Vec::new())),
+            edits: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let mut statuses = HashMap::new();
+        deliver_progress(
+            &channel,
+            &mut statuses,
+            "status".to_string(),
+            false,
+            "progress-test",
+            "chat-1".to_string(),
+            None,
+            "seed".to_string(),
+            Vec::new(),
+        )
+        .await;
+        deliver_progress(
+            &channel,
+            &mut statuses,
+            "status".to_string(),
+            false,
+            "progress-test",
+            "chat-1".to_string(),
+            None,
+            "unchanged".to_string(),
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(channel.sends.lock().unwrap().len(), 1, "seed only");
+        assert_eq!(channel.edits.lock().unwrap().len(), 1);
+        assert_eq!(statuses["status"].replacement_fallbacks, 0);
+    }
+
     /// Persistent rich rejection must stay inside the transport contract:
     /// the daemon has one already-partitioned row, while the transport may
     /// emit several classic messages without creating nested ledger rows.
