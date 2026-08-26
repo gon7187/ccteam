@@ -33,16 +33,15 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
         let raw_line = lines[index];
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
 
-        if is_fence_line(line) {
-            let fence_len = fence_length(line).expect("checked by is_fence_line");
-            let language = fence_language(line, fence_len);
+        if let Some(opening) = fence_marker(line) {
+            let language = fence_language(line, opening);
             let mut body = String::new();
             let mut closing = None;
             let mut cursor = index + 1;
             while cursor < lines.len() {
                 let candidate = lines[cursor];
                 let candidate_line = candidate.strip_suffix('\n').unwrap_or(candidate);
-                if is_fence_closer(candidate_line, fence_len) {
+                if is_fence_closer(candidate_line, opening) {
                     closing = Some(candidate.ends_with('\n'));
                     break;
                 }
@@ -380,15 +379,38 @@ fn utf16_len(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }
 
-/// TG-GATE-V2 W7a — `pub(crate)` so the rich-fallback split (telegram.rs)
-/// can be tested against the exact fence-line predicate it must never
-/// corrupt by appending a `(i/n)` suffix onto the same line.
-pub(crate) fn is_fence_line(line: &str) -> bool {
-    line.trim_start().starts_with("```")
+/// Common fence identity shared by the Markdown renderer and all splitters.
+/// The closing run must use the same marker and be at least as long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FenceMarker {
+    pub(crate) marker: u8,
+    pub(crate) len: usize,
 }
 
-fn fence_language(line: &str, fence_len: usize) -> Option<&str> {
-    let info = line.trim_start().get(fence_len..)?.trim();
+pub(crate) fn fence_marker(line: &str) -> Option<FenceMarker> {
+    let trimmed = line.trim_start();
+    let marker = *trimmed.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let len = trimmed.bytes().take_while(|byte| *byte == marker).count();
+    if len < 3 {
+        return None;
+    }
+    // CommonMark does not allow backticks in a backtick fence's info string.
+    if marker == b'`' && trimmed[len..].contains('`') {
+        return None;
+    }
+    Some(FenceMarker { marker, len })
+}
+
+/// `pub(crate)` keeps the splitter and renderer on the same fence predicate.
+pub(crate) fn is_fence_line(line: &str) -> bool {
+    fence_marker(line).is_some()
+}
+
+fn fence_language(line: &str, marker: FenceMarker) -> Option<&str> {
+    let info = line.trim_start().get(marker.len..)?.trim();
     let language = info.split_whitespace().next()?;
     if language
         .chars()
@@ -417,16 +439,14 @@ fn strip_html_blockquote_open(line: &str) -> Option<(bool, &str)> {
     }
 }
 
-fn fence_length(line: &str) -> Option<usize> {
+pub(crate) fn is_fence_closer(line: &str, opening: FenceMarker) -> bool {
     let trimmed = line.trim_start();
-    let length = trimmed.bytes().take_while(|byte| *byte == b'`').count();
-    (length >= 3).then_some(length)
-}
-
-fn is_fence_closer(line: &str, opening_len: usize) -> bool {
-    let trimmed = line.trim_start();
-    let length = fence_length(line).unwrap_or(0);
-    length >= opening_len && trimmed[length..].trim().is_empty()
+    let Some(candidate) = fence_marker(line) else {
+        return false;
+    };
+    candidate.marker == opening.marker
+        && candidate.len >= opening.len
+        && trimmed[candidate.len..].trim().is_empty()
 }
 
 fn strip_blockquote(line: &str) -> Option<&str> {
