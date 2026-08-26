@@ -59,6 +59,8 @@ pub struct StatusView {
     pub detail_lines: Vec<String>,
     /// Project-scoped trailing 24-hour cost from the progress ledger.
     pub cost_24h: String,
+    /// Vendor resume UUID, or an honest placeholder.
+    pub resume: String,
     /// Direct children eligible for one-tap confirmed stopping.
     pub child_stop_sids: Vec<String>,
 }
@@ -143,21 +145,25 @@ pub fn render_status(view: &StatusView) -> RichReply {
     details.push(view.cost_24h.clone());
     let markdown_details = details
         .iter()
-        .map(|line| escape_markdown(line))
+        .map(|line| escape_status_markdown(line))
         .collect::<Vec<_>>()
         .join("\n");
-    let plain_details = details.join("\n");
+    let markdown_details = format!(
+        "{markdown_details}\n🔁 resume `{}`",
+        escape_code(&view.resume)
+    );
+    let plain_details = format!("{}\n🔁 resume {}", details.join("\n"), view.resume);
     let markdown = format!(
         "🧭 **{}** · {} · {}\n{} · {} · {} · ctx {}\n📁 `{}`\n🖥 host: {}\n<blockquote expandable>{}</blockquote>",
-        escape_markdown(&view.sid),
-        escape_markdown(&view.project),
-        escape_markdown(&view.vendor),
-        escape_markdown(&view.state),
-        escape_markdown(&view.model),
-        escape_markdown(&view.effort),
-        escape_markdown(&view.context),
-        escape_code(&view.path),
-        escape_markdown(&view.host),
+        escape_status_markdown(&view.sid),
+        escape_status_markdown(&view.project),
+        escape_status_markdown(&view.vendor),
+        escape_status_markdown(&view.state),
+        escape_status_markdown(&view.model),
+        escape_status_markdown(&view.effort),
+        escape_status_markdown(&view.context),
+        escape_status_code(&view.path),
+        escape_status_markdown(&view.host),
         markdown_details,
     );
     let plain = format!(
@@ -461,6 +467,16 @@ fn escape_code(value: &str) -> String {
     value.replace('`', "\\`").replace(['\r', '\n'], " ")
 }
 
+fn escape_status_code(value: &str) -> String {
+    escape_code(value).replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn escape_status_markdown(value: &str) -> String {
+    escape_markdown(value)
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn escape_markdown(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -498,17 +514,16 @@ mod tests {
             path: "/root/projects/ccteam".into(),
             host: "local".into(),
             detail_lines: vec![
-                "Запущено: ожидает".into(),
-                "Роль: reviewer".into(),
-                "resume 123e4567-e89b-12d3-a456-426614174000".into(),
+                "Запущено: ожидает · Роль: reviewer".into(),
                 "🤖 Выполняется: workflow (1)".into(),
                 "⚡ Использование: 5h 17% (→19:00)".into(),
-                "👥 Прямые дочерние сессии: s56 · codex · gpt-5.6-terra · 🟡 работает · title"
-                    .into(),
+                "👥 Дочерние (1):".into(),
+                "  • s56 · codex · gpt-5.6-terra · 🟡 работает · title".into(),
                 "↓ Другие сессии проекта: 2 → /sessions".into(),
                 "↓ Все проекты: 3 → /projects".into(),
             ],
-            cost_24h: "Расход проекта 24ч: $1.23".into(),
+            cost_24h: "💰 Расход проекта 24ч: $1.23".into(),
+            resume: "123e4567-e89b-12d3-a456-426614174000".into(),
             child_stop_sids: vec![
                 "s56".into(),
                 "s78".into(),
@@ -524,9 +539,12 @@ mod tests {
 
         assert_eq!(
             reply.markdown,
-            "🧭 **s42** · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 `/root/projects/ccteam`\n🖥 host: local\n<blockquote expandable>Запущено: ожидает\nРоль: reviewer\nresume 123e4567-e89b-12d3-a456-426614174000\n🤖 Выполняется: workflow (1)\n⚡ Использование: 5h 17% (→19:00)\n👥 Прямые дочерние сессии: s56 · codex · gpt-5.6-terra · 🟡 работает · title\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\nРасход проекта 24ч: $1.23</blockquote>"
+            "🧭 **s42** · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 `/root/projects/ccteam`\n🖥 host: local\n<blockquote expandable>Запущено: ожидает · Роль: reviewer\n🤖 Выполняется: workflow (1)\n⚡ Использование: 5h 17% (→19:00)\n👥 Дочерние (1):\n  • s56 · codex · gpt-5.6-terra · 🟡 работает · title\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\n💰 Расход проекта 24ч: $1.23\n🔁 resume `123e4567-e89b-12d3-a456-426614174000`</blockquote>"
         );
         assert_eq!(reply.plain.lines().next(), Some("🧭 s42 · ccteam · claude"));
+        assert!(reply
+            .plain
+            .contains("🔁 resume 123e4567-e89b-12d3-a456-426614174000"));
         assert_eq!(reply.button_rows[1][0].data, "cmd:?/new");
         assert_eq!(reply.button_rows[1][1].data, "cmd:?/stop s42");
         assert_eq!(reply.button_rows[2][0].label, "⛔ s56");
@@ -544,6 +562,31 @@ mod tests {
             .flatten()
             .all(|button| button.data.len() <= 64));
         assert_eq!(super::escape_markdown("x*y"), "x\\*y");
+    }
+
+    #[test]
+    fn status_escapes_html_tags_in_child_titles() {
+        let reply = render_status(&StatusView {
+            sid: "s78".into(),
+            project: "ccteam".into(),
+            vendor: "codex".into(),
+            state: "🟢 ожидание".into(),
+            model: "gpt-5.6-terra".into(),
+            effort: "—".into(),
+            context: "—".into(),
+            path: "/tmp/ccteam".into(),
+            host: "local".into(),
+            detail_lines: vec!["  • s79 · x</blockquote><tg-button-row>".into()],
+            cost_24h: "💰 Расход проекта 24ч: $0.00".into(),
+            resume: "—".into(),
+            child_stop_sids: Vec::new(),
+        });
+
+        assert_eq!(reply.markdown.matches("</blockquote>").count(), 1);
+        assert!(!reply.markdown.contains("<tg-button-row>"));
+        assert!(reply
+            .markdown
+            .contains("&lt;/blockquote&gt;&lt;tg-button-row&gt;"));
     }
 
     #[test]

@@ -9901,14 +9901,8 @@ impl Gateway {
             })
             .collect::<Vec<_>>();
         let role = if s.role.is_empty() { "—" } else { &s.role };
-        let resume = thread_vendor_uuid(&s.thread)
-            .map(|uuid| format!("resume {uuid}"))
-            .unwrap_or_else(|| "resume —".to_string());
-        let mut detail_lines = vec![
-            format!("Запущено: {detail}"),
-            format!("Роль: {role}"),
-            resume,
-        ];
+        let resume = thread_vendor_uuid(&s.thread).unwrap_or_else(|| "—".to_string());
+        let mut detail_lines = vec![format!("Запущено: {detail} · Роль: {role}")];
         detail_lines.extend(
             format_running_tasks(&running)
                 .lines()
@@ -9935,10 +9929,12 @@ impl Gateway {
             }
         }
         if !child_summary.is_empty() {
-            detail_lines.push(format!(
-                "👥 Прямые дочерние сессии: {}",
-                child_summary.join(", ")
-            ));
+            detail_lines.push(format!("👥 Дочерние ({}):", child_summary.len()));
+            detail_lines.extend(
+                child_summary
+                    .into_iter()
+                    .map(|child| format!("  • {child}")),
+            );
         }
         let same_project_sessions = visible
             .iter()
@@ -9957,8 +9953,8 @@ impl Gateway {
             .progress_projection
             .as_ref()
             .map(|projection| projection.project_snapshot(&s.project).cost.cost_24h_usd)
-            .map(|cost| format!("Расход проекта 24ч: ${cost:.2}"))
-            .unwrap_or_else(|| "Расход проекта 24ч: нет данных".to_string());
+            .map(|cost| format!("💰 Расход проекта 24ч: ${cost:.2}"))
+            .unwrap_or_else(|| "💰 Расход проекта 24ч: нет данных".to_string());
         im_views::render_status(&StatusView {
             sid: s.id.clone(),
             project: s.project.clone(),
@@ -9975,6 +9971,7 @@ impl Gateway {
             },
             detail_lines,
             cost_24h,
+            resume,
             child_stop_sids: direct_children
                 .iter()
                 .map(|child| child.id.clone())
@@ -23672,7 +23669,7 @@ mod tests {
             .unwrap();
         assert!(
             out[0].contains(
-                "Прямые дочерние сессии: s2 · claude · gpt-5.6-terra · 🟡 работает · delegated investigation"
+                "👥 Дочерние (1):\n  • s2 · claude · gpt-5.6-terra · 🟡 работает · delegated investigation"
             ),
             "working child is visible from its root status: {out:?}"
         );
@@ -23811,7 +23808,7 @@ mod tests {
         assert!(out[0].contains("Роль: reviewer"), "role missing: {out:?}");
         assert!(out[0].contains("resume —"), "resume fact missing: {out:?}");
         assert!(
-            out[0].contains("Расход проекта 24ч: нет данных"),
+            out[0].contains("💰 Расход проекта 24ч: нет данных"),
             "honest missing ledger state missing: {out:?}"
         );
     }
@@ -23844,7 +23841,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("Расход проекта 24ч: $1.25"),
+            out[0].contains("💰 Расход проекта 24ч: $1.25"),
             "project ledger cost missing: {out:?}"
         );
     }

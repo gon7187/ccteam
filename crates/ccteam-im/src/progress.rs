@@ -427,7 +427,7 @@ impl ProgressFold {
         let mut lines = vec![format!("▶️ {sid} работает · {elapsed}")];
         let summary = self.counts_summary();
         if !self.recent.is_empty() {
-            lines.push("```text".to_string());
+            lines.push("```Terminal".to_string());
             lines.extend(self.recent.iter().map(|line| terminal_line(line)));
             lines.push("```".to_string());
         }
@@ -591,7 +591,7 @@ mod tests {
         // adds only the `🔧 Bash(…)` wrapper + indent, so it stays far
         // below the untruncated 500.
         let detail = r
-            .split("```text\n")
+            .split("```Terminal\n")
             .nth(1)
             .and_then(|body| body.lines().next())
             .expect("output detail");
@@ -871,7 +871,7 @@ mod tests {
         }
         let rendered = f.render("s42");
         let block = rendered
-            .split("```text\n")
+            .split("```Terminal\n")
             .nth(1)
             .and_then(|body| body.split("\n```").next())
             .expect("fenced output block");
@@ -894,11 +894,11 @@ mod tests {
             rendered.starts_with("▶️ s42 работает · "),
             "got: {rendered}"
         );
-        assert!(rendered.contains("```text\n"), "got: {rendered}");
+        assert!(rendered.contains("```Terminal\n"), "got: {rendered}");
         assert!(!rendered.contains('\u{1b}'), "ANSI leaked: {rendered:?}");
 
         let block = rendered
-            .split("```text\n")
+            .split("```Terminal\n")
             .nth(1)
             .and_then(|body| body.split("\n```").next())
             .expect("fenced output block");
@@ -911,7 +911,7 @@ mod tests {
 
         let html = crate::telegram_html::render_markdown(&rendered).html;
         assert!(
-            html.contains("<pre><code class=\"language-text\">"),
+            html.contains("<pre><code class=\"language-Terminal\">"),
             "got: {html}"
         );
     }
