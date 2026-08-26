@@ -151,17 +151,22 @@ impl TelegramChannel {
         }
 
         let identity = match self.http.get(self.api_url("getMe")).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json::<GetMeResp>().await {
-                Ok(body) if body.ok => BotIdentity {
-                    username: body.result.and_then(|user| user.username),
-                    healthy: true,
-                },
-                _ => BotIdentity::default(),
-            },
-            _ => BotIdentity::default(),
+            Ok(resp) => {
+                let status_ok = resp.status().is_success();
+                let body = if status_ok {
+                    resp.json::<GetMeResp>().await.ok()
+                } else {
+                    None
+                };
+                identity_from_response(status_ok, body)
+            }
+            Err(_) => None,
         };
-        *cached = Some(identity.clone());
-        identity
+        if let Some(identity) = identity {
+            *cached = Some(identity.clone());
+            return identity;
+        }
+        BotIdentity::default()
     }
 
     /// Whether a chat is permitted. An empty allowlist means whatever this
@@ -754,6 +759,14 @@ struct GetMeResp {
 struct TgBotUser {
     #[serde(default)]
     username: Option<String>,
+}
+
+fn identity_from_response(status_ok: bool, body: Option<GetMeResp>) -> Option<BotIdentity> {
+    let body = body.filter(|body| status_ok && body.ok)?;
+    Some(BotIdentity {
+        username: body.result.and_then(|user| user.username),
+        healthy: true,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1665,6 +1678,32 @@ mod tests {
             strip_bot_mention("plain text", Some("codexcoder1bot")),
             "plain text"
         );
+    }
+
+    #[test]
+    fn identity_from_response_caches_only_successful_get_me() {
+        let success = identity_from_response(
+            true,
+            Some(GetMeResp {
+                ok: true,
+                result: Some(TgBotUser {
+                    username: Some("codexcoder1bot".into()),
+                }),
+            }),
+        )
+        .expect("successful getMe is cacheable");
+        assert_eq!(success.username.as_deref(), Some("codexcoder1bot"));
+        assert!(success.healthy);
+
+        assert!(identity_from_response(false, None).is_none());
+        assert!(identity_from_response(
+            true,
+            Some(GetMeResp {
+                ok: false,
+                result: None,
+            }),
+        )
+        .is_none());
     }
 
     #[test]
