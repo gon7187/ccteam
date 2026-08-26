@@ -17540,7 +17540,7 @@ mod tests {
                 }
             }
             // Wake any pump task that is waiting in `events()` for new work.
-            self.events_notify.notify_one();
+            self.events_notify.notify_waiters();
             Ok(TurnId::new(turn_id))
         }
 
@@ -20463,7 +20463,7 @@ mod tests {
             .unwrap();
         let im_ev = recv_answer(&mut im_events).await;
         assert!(
-            im_ev.content.ends_with("\n\n→ alpha/s1"),
+            im_ev.content.contains("\n\n→ alpha/s1") && !im_ev.content.contains("\n\n→ alpha/s1 ("),
             "roleless echo carries no (role) parens: {:?}",
             im_ev.content
         );
@@ -27548,6 +27548,7 @@ mod tests {
     async fn delegation_gateway_with_factory(
         project_dir: &std::path::Path,
         factory: crate::daemon::AdapterFactory,
+        start_notifier: bool,
     ) -> Arc<tokio::sync::Mutex<Gateway>> {
         let mut gw = Gateway::new_with_factory(factory, "alpha", project_dir);
         gw.register_project("alpha", project_dir);
@@ -27557,12 +27558,10 @@ mod tests {
         gw.set_event_sink(etx);
         tokio::spawn(async move { while erx.recv().await.is_some() {} });
         let gateway = Arc::new(tokio::sync::Mutex::new(gw));
-        // Production runs reconciliation before draining live signals. Finish
-        // that empty-project startup phase before returning the fixture too,
-        // so a newly-created watch cannot race a historical replay.
-        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
-        let notifier_gateway = Arc::clone(&gateway);
-        tokio::spawn(Gateway::run_delegation_notifier(notifier_gateway, drx));
+        if start_notifier {
+            let notifier_gateway = Arc::clone(&gateway);
+            tokio::spawn(Gateway::run_delegation_notifier(notifier_gateway, drx));
+        }
         gateway
     }
 
@@ -27577,7 +27576,17 @@ mod tests {
             Arc::new(FakeAdapter::new(vendor).with_turn_boundary())
                 as Arc<dyn HarnessAdapter + Send + Sync>
         });
-        delegation_gateway_with_factory(project_dir, factory).await
+        delegation_gateway_with_factory(project_dir, factory, true).await
+    }
+
+    async fn delegation_gateway_without_notifier(
+        project_dir: &std::path::Path,
+    ) -> Arc<tokio::sync::Mutex<Gateway>> {
+        let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
+            Arc::new(FakeAdapter::new(vendor).with_turn_boundary())
+                as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        delegation_gateway_with_factory(project_dir, factory, false).await
     }
 
     /// e2e: an Ambient spawn records the parent lineage + trigger + title; a
@@ -27655,8 +27664,8 @@ mod tests {
         for _ in 0..200 {
             let turns = read_all_turns(&project_dir, &parent_sid).unwrap_or_default();
             if turns.iter().any(|t| {
-                t.user.contains("[ccteam] delegated session")
-                    || t.assistant.contains("[ccteam] delegated session")
+                t.user.contains("[ccteam] делегированная сессия")
+                    || t.assistant.contains("[ccteam] делегированная сессия")
             }) {
                 notified = true;
                 break;
@@ -27696,7 +27705,7 @@ mod tests {
         ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
             .unwrap_or_default()
             .into_iter()
-            .filter(|t| t.user.contains("[ccteam] delegated session"))
+            .filter(|t| t.user.contains("[ccteam] делегированная сессия"))
             .collect()
     }
 
@@ -27713,7 +27722,7 @@ mod tests {
             };
             Arc::new(fake) as Arc<dyn HarnessAdapter + Send + Sync>
         });
-        let gateway = delegation_gateway_with_factory(&project_dir, factory).await;
+        let gateway = delegation_gateway_with_factory(&project_dir, factory, true).await;
 
         let (parent_sid, child_sid) = {
             let mut gw = gateway.lock().await;
@@ -28026,7 +28035,7 @@ mod tests {
     async fn delegation_all_and_off_modes() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().to_path_buf();
-        let gateway = delegation_gateway(&project_dir).await;
+        let gateway = delegation_gateway_without_notifier(&project_dir).await;
 
         let (parent_sid, child_sid) = {
             let mut gw = gateway.lock().await;
@@ -28330,7 +28339,7 @@ mod tests {
         use ccteam_harness::execution::turns_mirror::{append_turn, read_all_turns, TurnRecord};
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().to_path_buf();
-        let gateway = delegation_gateway(&project_dir).await;
+        let gateway = delegation_gateway_without_notifier(&project_dir).await;
 
         // A live parent to receive the notification.
         let parent_sid = {
@@ -28388,7 +28397,7 @@ mod tests {
             read_all_turns(dir, psid)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| t.user.contains("[ccteam] delegated session"))
+                .filter(|t| t.user.contains("[ccteam] делегированная сессия"))
                 .count()
         };
         let mut delivered = 0;
@@ -28423,7 +28432,7 @@ mod tests {
         use ccteam_harness::execution::turns_mirror::{append_turn, read_all_turns, TurnRecord};
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().to_path_buf();
-        let gateway = delegation_gateway(&project_dir).await;
+        let gateway = delegation_gateway_without_notifier(&project_dir).await;
 
         let parent_sid = {
             let mut gw = gateway.lock().await;
@@ -28476,7 +28485,7 @@ mod tests {
             read_all_turns(dir, psid)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| t.user.contains("[ccteam] delegated session"))
+                .filter(|t| t.user.contains("[ccteam] делегированная сессия"))
                 .collect::<Vec<_>>()
         };
         let mut got: Vec<TurnRecord> = vec![];

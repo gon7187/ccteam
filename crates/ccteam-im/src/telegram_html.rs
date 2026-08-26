@@ -4,6 +4,8 @@
 //! this deliberately renders the useful Markdown shapes and escapes every
 //! other character as text. It is not a general Markdown parser.
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 /// Rendered Telegram HTML plus the visible UTF-16 length after entity parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedMarkdown {
@@ -25,6 +27,22 @@ struct Fragment {
 
 /// Render the supported Markdown subset as Telegram HTML.
 pub fn render_markdown(input: &str) -> RenderedMarkdown {
+    render_markdown_at_depth(input, 0)
+}
+
+const MAX_RENDER_DEPTH: usize = 16;
+
+fn render_markdown_at_depth(input: &str, depth: usize) -> RenderedMarkdown {
+    if depth > MAX_RENDER_DEPTH {
+        let mut out = Fragment::default();
+        append_escaped_text(&mut out, input);
+        return RenderedMarkdown {
+            html: out.html,
+            text_utf16_len: out.text_utf16_len,
+            has_non_whitespace: out.has_non_whitespace,
+        };
+    }
+
     let lines: Vec<&str> = input.split_inclusive('\n').collect();
     let mut out = Fragment::default();
     let mut index = 0;
@@ -34,7 +52,7 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
 
         if is_fence_line(line) {
-            let fence_len = fence_length(line).expect("checked by is_fence_line");
+            let (fence_char, fence_len) = fence_marker(line).expect("checked by is_fence_line");
             let language = fence_language(line, fence_len);
             let mut body = String::new();
             let mut closing = None;
@@ -42,7 +60,7 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
             while cursor < lines.len() {
                 let candidate = lines[cursor];
                 let candidate_line = candidate.strip_suffix('\n').unwrap_or(candidate);
-                if is_fence_closer(candidate_line, fence_len) {
+                if is_fence_closer(candidate_line, fence_char, fence_len) {
                     closing = Some(candidate.ends_with('\n'));
                     break;
                 }
@@ -58,6 +76,15 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
             } else {
                 index = lines.len();
             }
+            continue;
+        }
+
+        if let Some((table, next_index, has_newline)) = render_table(&lines, index) {
+            append_fragment(&mut out, table);
+            if has_newline {
+                append_escaped_text(&mut out, "\n");
+            }
+            index = next_index;
             continue;
         }
 
@@ -115,7 +142,7 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
         }
 
         if is_blockquote_line(line) {
-            let mut quote = Fragment::default();
+            let mut quote_source = String::new();
             let mut cursor = index;
             while cursor < lines.len() {
                 let raw_quote = lines[cursor];
@@ -123,17 +150,59 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
                 let Some(content) = strip_blockquote(quote_line) else {
                     break;
                 };
-                // Telegram disallows pre in blockquotes, but inline code and
-                // links are valid there.
-                append_fragment(&mut quote, render_inline(content, true, true));
+                quote_source.push_str(content);
                 if raw_quote.ends_with('\n') {
-                    append_escaped_text(&mut quote, "\n");
+                    quote_source.push('\n');
                 }
                 cursor += 1;
             }
-            append_fragment(&mut out, wrap("blockquote", quote));
+            for part in render_blockquote_parts(&quote_source) {
+                append_fragment(&mut out, part);
+            }
             index = cursor;
             continue;
+        }
+
+        if let Some((indent, content)) = unordered_item(line) {
+            if fence_marker(content).is_some() {
+                let (code, next_index, has_newline) =
+                    render_list_fence(&lines, index, indent.len() + 2, content, depth)
+                        .expect("fence marker checked above");
+                let mut item = Fragment::default();
+                append_escaped_text(&mut item, indent);
+                append_escaped_text(&mut item, "• ");
+                append_fragment(&mut item, code);
+                if has_newline {
+                    append_escaped_text(&mut item, "\n");
+                }
+                append_fragment(&mut out, item);
+                index = next_index;
+                continue;
+            }
+        }
+
+        if let Some((indent, number, content)) = ordered_item(line) {
+            if fence_marker(content).is_some() {
+                let (code, next_index, has_newline) = render_list_fence(
+                    &lines,
+                    index,
+                    indent.len() + number.len() + 2,
+                    content,
+                    depth,
+                )
+                .expect("fence marker checked above");
+                let mut item = Fragment::default();
+                append_escaped_text(&mut item, indent);
+                append_escaped_text(&mut item, number);
+                append_escaped_text(&mut item, ". ");
+                append_fragment(&mut item, code);
+                if has_newline {
+                    append_escaped_text(&mut item, "\n");
+                }
+                append_fragment(&mut out, item);
+                index = next_index;
+                continue;
+            }
         }
 
         let line_fragment = if let Some(content) = heading_content(line) {
@@ -190,6 +259,161 @@ fn render_code_block(body: &str, language: Option<&str>) -> Fragment {
         has_non_whitespace: body.chars().any(|ch| !ch.is_whitespace()),
         contains_code: true,
     }
+}
+
+fn render_table(lines: &[&str], start: usize) -> Option<(Fragment, usize, bool)> {
+    let header = table_row(lines.get(start)?.strip_suffix('\n').unwrap_or(lines[start]))?;
+    let separator = table_row(
+        lines
+            .get(start + 1)?
+            .strip_suffix('\n')
+            .unwrap_or(lines[start + 1]),
+    )?;
+    if header.len() != separator.len()
+        || header.is_empty()
+        || !separator.iter().all(|cell| is_table_separator_cell(cell))
+    {
+        return None;
+    }
+
+    let mut rows = vec![header];
+    let mut index = start + 2;
+    while let Some(raw_line) = lines.get(index) {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let Some(row) = table_row(line) else {
+            break;
+        };
+        if row.len() != rows[0].len() {
+            break;
+        }
+        rows.push(row);
+        index += 1;
+    }
+
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| table_cell_text(cell)).collect())
+        .collect();
+    let widths: Vec<usize> = (0..cells[0].len())
+        .map(|column| {
+            cells
+                .iter()
+                .map(|row| row[column].width())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+
+    let mut body = String::new();
+    append_table_row(&mut body, &cells[0], &widths);
+    trim_table_row_end(&mut body);
+    body.push('\n');
+    for (column, width) in widths.iter().enumerate() {
+        if column > 0 {
+            body.push_str("-+-");
+        }
+        body.extend(std::iter::repeat_n('-', *width));
+    }
+    for row in &cells[1..] {
+        body.push('\n');
+        append_table_row(&mut body, row, &widths);
+        trim_table_row_end(&mut body);
+    }
+
+    let fragment = Fragment {
+        html: format!("<pre>{}</pre>", escape_html(&body)),
+        text_utf16_len: utf16_len(&body),
+        has_non_whitespace: body.chars().any(|ch| !ch.is_whitespace()),
+        contains_code: true,
+    };
+    let has_newline = lines[index - 1].ends_with('\n');
+    Some((fragment, index, has_newline))
+}
+
+fn append_table_row(body: &mut String, row: &[String], widths: &[usize]) {
+    for (column, cell) in row.iter().enumerate() {
+        if column > 0 {
+            body.push_str(" | ");
+        }
+        body.push_str(cell);
+        body.extend(std::iter::repeat_n(' ', widths[column] - cell.width()));
+    }
+}
+
+fn trim_table_row_end(body: &mut String) {
+    let trimmed_len = body.trim_end_matches(' ').len();
+    body.truncate(trimmed_len);
+}
+
+fn table_row(line: &str) -> Option<Vec<&str>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let trimmed = trimmed
+        .strip_prefix('|')
+        .unwrap_or(trimmed)
+        .strip_suffix('|')
+        .unwrap_or_else(|| trimmed.strip_prefix('|').unwrap_or(trimmed));
+    Some(trimmed.split('|').map(str::trim).collect())
+}
+
+fn is_table_separator_cell(cell: &str) -> bool {
+    let cell = cell.trim();
+    let without_left = cell.strip_prefix(':').unwrap_or(cell);
+    let without_edges = without_left.strip_suffix(':').unwrap_or(without_left);
+    without_edges.len() >= 3 && without_edges.chars().all(|ch| ch == '-')
+}
+
+fn table_cell_text(cell: &str) -> String {
+    let rendered = render_inline(cell, true, true);
+    let mut plain = strip_rendered_tags(&rendered.html);
+    if plain.width() > 24 {
+        let mut truncated = String::new();
+        let mut width = 0;
+        for character in plain.chars() {
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if width + character_width > 23 {
+                break;
+            }
+            truncated.push(character);
+            width += character_width;
+        }
+        truncated.push('…');
+        plain = truncated;
+    }
+    plain
+}
+
+fn strip_rendered_tags(input: &str) -> String {
+    let mut out = String::new();
+    let mut index = 0;
+    while index < input.len() {
+        let tail = &input[index..];
+        if tail.starts_with('<') {
+            if let Some(end) = tail.find('>') {
+                index += end + 1;
+                continue;
+            }
+        }
+        if let Some((entity, character)) = [
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+            ("&amp;", '&'),
+            ("&quot;", '"'),
+        ]
+        .into_iter()
+        .find(|(entity, _)| tail.starts_with(entity))
+        {
+            out.push(character);
+            index += entity.len();
+            continue;
+        }
+        let ch = tail.chars().next().expect("valid char boundary");
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
 }
 
 fn render_inline(input: &str, allow_code: bool, allow_links: bool) -> Fragment {
@@ -384,7 +608,7 @@ fn utf16_len(text: &str) -> usize {
 /// can be tested against the exact fence-line predicate it must never
 /// corrupt by appending a `(i/n)` suffix onto the same line.
 pub(crate) fn is_fence_line(line: &str) -> bool {
-    line.trim_start().starts_with("```")
+    fence_marker(line).is_some()
 }
 
 fn fence_language(line: &str, fence_len: usize) -> Option<&str> {
@@ -417,16 +641,141 @@ fn strip_html_blockquote_open(line: &str) -> Option<(bool, &str)> {
     }
 }
 
-fn fence_length(line: &str) -> Option<usize> {
+fn fence_marker(line: &str) -> Option<(u8, usize)> {
     let trimmed = line.trim_start();
-    let length = trimmed.bytes().take_while(|byte| *byte == b'`').count();
-    (length >= 3).then_some(length)
+    let marker = *trimmed.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let length = trimmed.bytes().take_while(|byte| *byte == marker).count();
+    (length >= 3).then_some((marker, length))
 }
 
-fn is_fence_closer(line: &str, opening_len: usize) -> bool {
+fn is_fence_closer(line: &str, opening_char: u8, opening_len: usize) -> bool {
     let trimmed = line.trim_start();
-    let length = fence_length(line).unwrap_or(0);
-    length >= opening_len && trimmed[length..].trim().is_empty()
+    let Some((marker, length)) = fence_marker(line) else {
+        return false;
+    };
+    marker == opening_char && length >= opening_len && trimmed[length..].trim().is_empty()
+}
+
+fn render_list_fence(
+    lines: &[&str],
+    start: usize,
+    marker_width: usize,
+    content: &str,
+    depth: usize,
+) -> Option<(Fragment, usize, bool)> {
+    let (opening_char, opening_len) = fence_marker(content)?;
+    let mut source = content.to_owned();
+    if lines[start].ends_with('\n') {
+        source.push('\n');
+    }
+
+    let mut cursor = start + 1;
+    let mut closed = false;
+    while let Some(raw_line) = lines.get(cursor) {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let is_indented = line.len() >= marker_width
+            && line.as_bytes()[..marker_width]
+                .iter()
+                .all(|byte| *byte == b' ');
+        let candidate = if is_indented {
+            &line[marker_width..]
+        } else if line.trim().is_empty() {
+            ""
+        } else if fence_marker(line).is_some() {
+            line.trim_start()
+        } else {
+            break;
+        };
+        if is_fence_closer(candidate, opening_char, opening_len) {
+            cursor += 1;
+            closed = true;
+            break;
+        }
+        source.push_str(candidate);
+        if raw_line.ends_with('\n') {
+            source.push('\n');
+        }
+        cursor += 1;
+    }
+
+    let rendered = render_markdown_at_depth(&source, depth + 1);
+    let contains_code = rendered.html.contains("<pre>") || rendered.html.contains("<code>");
+    Some((
+        Fragment {
+            html: rendered.html,
+            text_utf16_len: rendered.text_utf16_len,
+            has_non_whitespace: rendered.has_non_whitespace,
+            contains_code,
+        },
+        cursor,
+        closed && lines[cursor - 1].ends_with('\n'),
+    ))
+}
+
+fn render_blockquote_parts(source: &str) -> Vec<Fragment> {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mut parts = Vec::new();
+    let mut quote = Fragment::default();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let raw_line = lines[index];
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        if let Some((fence_char, fence_len)) = fence_marker(line) {
+            if !quote.html.is_empty() {
+                parts.push(wrap("blockquote", std::mem::take(&mut quote)));
+            }
+            let language = fence_language(line, fence_len);
+            let mut body = String::new();
+            let mut closing = None;
+            let mut cursor = index + 1;
+            while cursor < lines.len() {
+                let candidate = lines[cursor];
+                let candidate_line = candidate.strip_suffix('\n').unwrap_or(candidate);
+                if is_fence_closer(candidate_line, fence_char, fence_len) {
+                    closing = Some(candidate.ends_with('\n'));
+                    break;
+                }
+                body.push_str(candidate);
+                cursor += 1;
+            }
+            let mut code = render_code_block(&body, language);
+            if closing == Some(true) {
+                append_escaped_text(&mut code, "\n");
+            }
+            parts.push(code);
+            index = closing.map_or(lines.len(), |_| cursor + 1);
+            continue;
+        }
+
+        if let Some((table, next_index, has_newline)) = render_table(&lines, index) {
+            if !quote.html.is_empty() {
+                parts.push(wrap("blockquote", std::mem::take(&mut quote)));
+            }
+            parts.push(table);
+            if has_newline {
+                let mut newline = Fragment::default();
+                append_escaped_text(&mut newline, "\n");
+                parts.push(newline);
+            }
+            index = next_index;
+            continue;
+        }
+
+        append_fragment(&mut quote, render_inline(line, true, true));
+        if raw_line.ends_with('\n') {
+            append_escaped_text(&mut quote, "\n");
+        }
+        index += 1;
+    }
+
+    if !quote.html.is_empty() {
+        parts.push(wrap("blockquote", quote));
+    }
+    parts
 }
 
 fn strip_blockquote(line: &str) -> Option<&str> {
@@ -645,7 +994,7 @@ fn parse_link(input: &str, start: usize) -> Option<(usize, usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::render_markdown;
+    use super::{render_markdown, render_markdown_at_depth, MAX_RENDER_DEPTH};
 
     #[test]
     fn escapes_html_text() {
@@ -818,5 +1167,98 @@ mod tests {
                 rendered.html.matches("</code>").count()
             );
         }
+    }
+
+    #[test]
+    fn renders_gfm_tables_as_padded_plain_text_pre() {
+        let rendered = render_markdown(
+            "| Name | Status |\n| :--- | ---: |\n| **Alice** | [ok](https://e.test?a=1&b=2) |\n| Bob | `pending` |\n",
+        );
+        assert_eq!(
+            rendered.html,
+            "<pre>Name  | Status\n------+--------\nAlice | ok\nBob   | pending</pre>\n"
+        );
+        assert!(!rendered.html.contains("<a "));
+        assert!(!rendered.html.contains("<b>"));
+    }
+
+    #[test]
+    fn caps_gfm_table_cells_without_emitting_markup() {
+        let rendered = render_markdown(
+            "| Long | Value |\n| --- | --- |\n| abcdefghijklmnopqrstuvwxyz | <tag> |\n",
+        );
+        assert_eq!(
+            rendered.html,
+            "<pre>Long                     | Value\n-------------------------+------\nabcdefghijklmnopqrstuvw… | &lt;tag&gt;</pre>\n"
+        );
+    }
+
+    #[test]
+    fn renders_tilde_fences_and_closes_unterminated_fences_at_eof() {
+        assert_eq!(
+            render_markdown("~~~~rust\n```\nvalue < 1\n~~~~").html,
+            "<pre><code class=\"language-rust\">```\nvalue &lt; 1\n</code></pre>"
+        );
+        assert_eq!(
+            render_markdown("~~~\nvalue < 1").html,
+            "<pre><code>value &lt; 1</code></pre>"
+        );
+    }
+
+    #[test]
+    fn renders_fences_inside_blockquotes_and_list_items() {
+        assert_eq!(
+            render_markdown("> ````\n> ```\n> quoted < 1\n> ````").html,
+            "<pre><code>```\nquoted &lt; 1\n</code></pre>"
+        );
+        assert_eq!(
+            render_markdown("- ~~~rust\n  list < 1\n  ~~~").html,
+            "• <pre><code class=\"language-rust\">list &lt; 1\n</code></pre>"
+        );
+    }
+
+    #[test]
+    fn does_not_nest_blockquotes_for_literal_nested_markers() {
+        assert_eq!(
+            render_markdown("> > nested\n").html,
+            "<blockquote>&gt; nested\n</blockquote>"
+        );
+    }
+
+    #[test]
+    fn bounds_render_recursion_and_handles_deep_quote_input() {
+        let input = format!("{}x", "> ".repeat(20_000));
+        let rendered = render_markdown(&input);
+        assert_eq!(rendered.html.matches("<blockquote>").count(), 1);
+        assert_eq!(rendered.html.matches("</blockquote>").count(), 1);
+        assert_eq!(
+            render_markdown_at_depth("**literal**", MAX_RENDER_DEPTH + 1).html,
+            "**literal**"
+        );
+    }
+
+    #[test]
+    fn keeps_fenced_code_outside_blockquote_tags() {
+        assert_eq!(
+            render_markdown("> before\n> ```\n> code\n> ```\n> after\n").html,
+            "<blockquote>before\n</blockquote><pre><code>code\n</code></pre>\n<blockquote>after\n</blockquote>"
+        );
+    }
+
+    #[test]
+    fn pads_table_columns_by_display_width() {
+        assert_eq!(
+            render_markdown("| 名称 | Значение |\n| --- | --- |\n| 😀😀 | x |\n| 甲 | long |\n")
+                .html,
+            "<pre>名称 | Значение\n-----+---------\n😀😀 | x\n甲   | long</pre>\n"
+        );
+    }
+
+    #[test]
+    fn removes_the_full_ordered_list_marker_before_code() {
+        assert_eq!(
+            render_markdown("1. ```\n   code\n   ```").html,
+            "1. <pre><code>code\n</code></pre>"
+        );
     }
 }
