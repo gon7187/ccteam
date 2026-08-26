@@ -1619,17 +1619,7 @@ fn spawn_inbound_consumer(
                 continue;
             };
 
-            let stop_payload = if stopped_marker
-                || clean_payload.starts_with(crate::transport::STOPPED_DRAFT_PREFIX)
-            {
-                Some(if stopped_marker {
-                    msg.content.as_str()
-                } else {
-                    clean_payload.as_str()
-                })
-            } else {
-                None
-            };
+            let stop_payload = stopped_marker_payload(&msg.content, &clean_payload);
             if let Some(stop_payload) = stop_payload {
                 let Some(route) = take_stopped_draft_route(
                     &msg.channel,
@@ -1637,12 +1627,13 @@ fn spawn_inbound_consumer(
                     stop_payload,
                     &draft_routes,
                 ) else {
-                    let notice =
-                        SendMessage::new("сессия не найдена, /sessions", msg.reply_target.clone())
-                            .in_thread(msg.thread_ts.clone());
-                    if let Err(error) = channel.send(&notice).await {
-                        tracing::warn!(cid = %cid, error = %error, "ccteam-im: failed to report missing stopped draft");
-                    }
+                    send_stopped_draft_not_found(
+                        channel.as_ref(),
+                        &msg.reply_target,
+                        msg.thread_ts.clone(),
+                        &cid,
+                    )
+                    .await;
                     continue;
                 };
                 if !route.content.is_empty() {
@@ -2424,6 +2415,28 @@ fn is_private_telegram_chat(channel_name: &str, chat_id: &str) -> bool {
         && chat_id.parse::<i64>().map(|id| id > 0).unwrap_or(false)
 }
 
+fn stopped_marker_payload<'a>(raw: &'a str, gated: &'a str) -> Option<&'a str> {
+    if raw.starts_with(crate::transport::STOPPED_DRAFT_PREFIX) {
+        Some(raw)
+    } else if gated.starts_with(crate::transport::STOPPED_DRAFT_PREFIX) {
+        Some(gated)
+    } else {
+        None
+    }
+}
+
+async fn send_stopped_draft_not_found(
+    channel: &(dyn Channel + Send + Sync),
+    recipient: &str,
+    thread_ts: Option<String>,
+    cid: &str,
+) {
+    let notice = SendMessage::new("сессия не найдена, /sessions", recipient).in_thread(thread_ts);
+    if let Err(error) = channel.send(&notice).await {
+        tracing::warn!(cid = %cid, error = %error, "ccteam-im: failed to report missing stopped draft");
+    }
+}
+
 fn stopped_draft_command(
     channel: &str,
     chat_id: &str,
@@ -3010,6 +3023,20 @@ mod tests {
             stopped_draft_command("telegram", "999", &payload, &routes),
             None
         );
+        assert_eq!(
+            stopped_marker_payload(&payload, "security-layer-rewrote-marker"),
+            Some(payload.as_str()),
+            "stop routing must use the raw provider marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_draft_without_route_reports_sessions() {
+        let channel = crate::transport::providers::mock::MockChannel::new();
+        send_stopped_draft_not_found(&channel, "123", None, "stop-missing").await;
+        let outbox = channel.outbox().await;
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].content, "сессия не найдена, /sessions");
     }
 
     #[tokio::test(start_paused = true)]
