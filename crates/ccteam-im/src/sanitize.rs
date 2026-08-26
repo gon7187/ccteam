@@ -402,7 +402,7 @@ fn split_rich_fence(block: &str, budget: usize) -> Vec<String> {
     };
     let close_line = fence_close_line(&opening);
     if open_line.len() + close_line.len() + 1 > budget {
-        return raw_split(block, budget);
+        return raw_split_bytes(block, budget);
     }
     let mut parts = Vec::new();
     let mut current = open_line.clone();
