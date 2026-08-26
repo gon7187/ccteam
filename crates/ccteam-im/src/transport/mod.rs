@@ -515,6 +515,37 @@ pub enum ReplyKeyboard {
 pub struct ChoiceReply {
     /// The clicked option's opaque callback payload (`"{token}:{idx}"`).
     pub data: String,
+    /// Telegram callback context for a one-shot ephemeral reply. `None` for
+    /// ordinary button systems and Telegram private chats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_ephemeral: Option<CallbackEphemeral>,
+}
+
+/// Callback facts required by Telegram's one-shot ephemeral reply API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CallbackEphemeral {
+    /// Telegram callback query that triggered the response.
+    pub callback_query_id: String,
+    /// Telegram user who alone receives the response.
+    pub receiver_user_id: i64,
+    /// Whether Telegram may replace the callback's source message.
+    pub replace_callback_query_message: bool,
+    /// Source ephemeral message, when this callback came from one.
+    pub ephemeral_message_id: Option<i64>,
+}
+
+/// Outcome of a Telegram callback-bound ephemeral operation.
+///
+/// `Unknown` means the request may have reached Telegram despite the missing
+/// response, so retrying would duplicate user-visible output.
+#[derive(Debug)]
+pub enum EphemeralDelivery {
+    /// Telegram accepted the operation.
+    Delivered(Option<String>),
+    /// Telegram explicitly rejected the operation; a fallback is safe.
+    Rejected(anyhow::Error),
+    /// The request may have applied, so no follow-up send is safe.
+    Unknown(anyhow::Error),
 }
 
 /// Message to send through a channel.
@@ -563,6 +594,9 @@ pub struct SendMessage {
     /// Telegram reply keyboard request; unsupported channels ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_keyboard: Option<ReplyKeyboard>,
+    /// Telegram-only response to a group callback. Other channels ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_ephemeral: Option<CallbackEphemeral>,
 }
 
 impl SendMessage {
@@ -579,6 +613,7 @@ impl SendMessage {
             button_rows: Vec::new(),
             inline_buttons: false,
             reply_keyboard: None,
+            callback_ephemeral: None,
         }
     }
 
@@ -623,6 +658,21 @@ impl SendMessage {
         self.reply_keyboard = Some(reply_keyboard);
         self
     }
+
+    /// Render this callback response only to the user who tapped the button.
+    pub fn with_callback_ephemeral(
+        mut self,
+        callback_query_id: impl Into<String>,
+        receiver_user_id: i64,
+    ) -> Self {
+        self.callback_ephemeral = Some(CallbackEphemeral {
+            callback_query_id: callback_query_id.into(),
+            receiver_user_id,
+            replace_callback_query_message: true,
+            ephemeral_message_id: None,
+        });
+        self
+    }
 }
 
 /// A gateway-owned command advertised in a channel's command menu
@@ -664,6 +714,33 @@ pub trait Channel: Send + Sync {
     /// when available (Slack `ts`, Discord message id, …) for echo
     /// suppression in the outbound tailer.
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>>;
+
+    /// Send a callback-bound ephemeral message. Providers without Telegram's
+    /// acknowledgement ambiguity treat a send error as an explicit rejection.
+    async fn send_ephemeral(&self, message: &SendMessage) -> EphemeralDelivery {
+        match self.send(message).await {
+            Ok(id) => EphemeralDelivery::Delivered(id),
+            Err(err) => EphemeralDelivery::Rejected(err),
+        }
+    }
+
+    /// Complete the client-side callback spinner. Telegram overrides this;
+    /// other channels have no equivalent operation.
+    async fn answer_callback(&self, _callback_query_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Edit a Telegram ephemeral message. Other transports deliberately do
+    /// not implement this separate identifier space.
+    async fn edit_ephemeral_message(
+        &self,
+        _chat_id: &str,
+        _callback: &CallbackEphemeral,
+        _content: &str,
+        _button_rows: &[Vec<MessageOption>],
+    ) -> EphemeralDelivery {
+        EphemeralDelivery::Rejected(anyhow::anyhow!("ephemeral message edits are unsupported"))
+    }
 
     /// Long-running inbound listener (see trait-level docs).
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
