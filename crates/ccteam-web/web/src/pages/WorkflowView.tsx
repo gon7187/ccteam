@@ -20,12 +20,12 @@ import MarketplaceView from "./MarketplaceView";
 
 type TabId = "skills" | "roles" | "market" | "mcp" | "evolution";
 
-const TABS: { id: TabId; label: string; labelKey?: string; subKey: string; icon: React.ReactNode }[] = [
-  { id: "skills", label: "Skills", subKey: "skillsSub", icon: <Package /> },
-  { id: "roles", label: "Roles", subKey: "rolesSub", icon: <User /> },
-  { id: "market", label: "Plugins", labelKey: "marketTab", subKey: "marketSub", icon: <ShoppingBag /> },
-  { id: "mcp", label: "MCP Servers", subKey: "mcpSub", icon: <Server /> },
-  { id: "evolution", label: "自进化", labelKey: "evolve", subKey: "evolveSub", icon: <Activity /> },
+const TABS: { id: TabId; labelKey: string; subKey: string; icon: React.ReactNode }[] = [
+  { id: "skills", labelKey: "workflowSkillsTitle", subKey: "skillsSub", icon: <Package /> },
+  { id: "roles", labelKey: "workflowRolesTitle", subKey: "rolesSub", icon: <User /> },
+  { id: "market", labelKey: "marketTab", subKey: "marketSub", icon: <ShoppingBag /> },
+  { id: "mcp", labelKey: "workflowMcpTitle", subKey: "mcpSub", icon: <Server /> },
+  { id: "evolution", labelKey: "evolve", subKey: "evolveSub", icon: <Activity /> },
 ];
 
 function isTab(v: string | undefined): v is TabId {
@@ -45,7 +45,6 @@ export default function WorkflowView({
 } = {}) {
   const lang = langProp ?? "zh";
   const t = makeT(lang);
-  const zh = lang !== "en";
   const [localTab, setLocalTab] = useState<TabId>("skills");
   const tab: TabId = isTab(routeTab) ? routeTab : localTab;
   const setTab = (next: TabId) => {
@@ -112,7 +111,7 @@ export default function WorkflowView({
     const command = mcpForm.command.trim();
     if (!slug || !name || (!url && !command)) {
       toastBus.handler?.error(
-        tr(lang, "填写 name + url(或 command)", "Fill name + url (or command)"),
+        tr(lang, "填写 name + url(或 command)", "Fill name + url (or command)", "Заполните name и url (или command)"),
       );
       return;
     }
@@ -127,7 +126,7 @@ export default function WorkflowView({
       setMcpForm({ name: "", url: "", command: "", args: "" });
       setMcp(await getMcpServers(slug));
       toastBus.handler?.info(
-        tr(lang, `已写入 .mcp.json:${name}(vendor 下次启动生效)`, `Wrote .mcp.json: ${name}`),
+        tr(lang, `已写入 .mcp.json:${name}(vendor 下次启动生效)`, `Wrote .mcp.json: ${name}`, `Записано в .mcp.json: ${name}`),
       );
     } catch (e) {
       toastBus.handler?.error(e instanceof Error ? e.message : String(e));
@@ -145,7 +144,7 @@ export default function WorkflowView({
         className="btn ghost"
         style={{ padding: "6px 10px", fontSize: 12.5 }}
       >
-        {projects.length === 0 ? <option value="">{tr(lang, "(无项目)", "(no projects)")}</option> : null}
+        {projects.length === 0 ? <option value="">{tr(lang, "(无项目)", "(no projects)", "(нет проектов)")}</option> : null}
         {projects.map((p) => (
           <option key={p} value={p}>
             {p}
@@ -187,7 +186,7 @@ export default function WorkflowView({
             onClick={() => setTab(it.id)}
           >
             {it.icon}
-            {it.labelKey ? t(it.labelKey) : it.label}
+            {t(it.labelKey)}
             <span className="sub">{t(it.subKey)}</span>
           </button>
         ))}
@@ -200,10 +199,15 @@ export default function WorkflowView({
           {tab === "skills" ? (
             <>
               {detailHeader(
-                "Skills",
-                zh ? (
+                t("workflowSkillsTitle"),
+                lang === "zh" ? (
                   <>
                     当前项目的技能库(<code>.claude/skills/</code>)—— 会话内按触发词自动调用;可从插件市场安装。
+                  </>
+                ) : lang === "ru" ? (
+                  <>
+                    Библиотека навыков текущего проекта (<code>.claude/skills/</code>) — навыки автоматически
+                    вызываются в сессиях; установить их можно из маркетплейса.
                   </>
                 ) : (
                   <>
@@ -214,9 +218,12 @@ export default function WorkflowView({
               )}
               {skills.length === 0 && !loading ? (
                 <p style={{ fontSize: 13, color: "var(--text-faint)" }}>
-                  {zh
-                    ? "暂无已装 skill(可从设置→插件市场安装)。"
-                    : "No installed skills (install from Settings → Marketplace)."}
+                  {tr(
+                    lang,
+                    "暂无已装 skill(可从设置→插件市场安装)。",
+                    "No installed skills (install from Settings → Marketplace).",
+                    "Установленных навыков нет (установите их в разделе «Настройки → Маркетплейс»).",
+                  )}
                 </p>
               ) : (
                 <div className="flow-rows">
@@ -251,11 +258,16 @@ export default function WorkflowView({
           {tab === "roles" ? (
             <>
               {detailHeader(
-                "Roles",
-                zh ? (
+                t("workflowRolesTitle"),
+                lang === "zh" ? (
                   <>
                     角色库(<code>.claude/agents/&lt;role&gt;.md</code>)—— spawn 时绑 <code>--agent</code>
                     ,会话内 <code>/role</code> 原地切换。
+                  </>
+                ) : lang === "ru" ? (
+                  <>
+                    Библиотека ролей (<code>.claude/agents/&lt;role&gt;.md</code>) — при spawn роль
+                    привязывается через <code>--agent</code>; в сессии её можно сменить командой <code>/role</code>.
                   </>
                 ) : (
                   <>
@@ -266,7 +278,7 @@ export default function WorkflowView({
               )}
               {roles.length === 0 && !loading ? (
                 <p style={{ fontSize: 13, color: "var(--text-faint)" }}>
-                  {zh ? "暂无 role 文件。" : "No role files."}
+                  {tr(lang, "暂无 role 文件。", "No role files.", "Файлов ролей нет.")}
                 </p>
               ) : (
                 <div className="flow-rows">
@@ -275,7 +287,7 @@ export default function WorkflowView({
                       r.role,
                       r.description || "",
                       r.role === "cto" ? (
-                        <span className="badge brand">built-in</span>
+                        <span className="badge brand">{t("workflowBuiltIn")}</span>
                       ) : (
                         <span className="badge ok">{t("installed")}</span>
                       ),
@@ -305,11 +317,17 @@ export default function WorkflowView({
           {tab === "mcp" ? (
             <>
               {detailHeader(
-                "MCP Servers",
-                zh ? (
+                t("workflowMcpTitle"),
+                lang === "zh" ? (
                   <>
                     注册进各 vendor 配置的工具服务器;ccteam 自身 = 8 个 <code>mcp__ccteam__*</code> 工具,默认
                     stream-json 会话经 curated mcp-config 注入。
+                  </>
+                ) : lang === "ru" ? (
+                  <>
+                    Серверы инструментов, зарегистрированные в конфигурациях vendor; сам ccteam предоставляет
+                    8 инструментов <code>mcp__ccteam__*</code>, которые добавляются в stream-json-сессии через
+                    curated mcp-config.
                   </>
                 ) : (
                   <>
@@ -322,14 +340,25 @@ export default function WorkflowView({
               <div className="flow-rows" data-testid="mcp-rows">
                 {flowRow(
                   "ccteam",
-                  zh
-                    ? "8 tools · status(+grok_claude_codex_kimi) / chat_send_file / session_* · doctor --verify-mcp 自检"
-                    : "8 tools · status(+grok_claude_codex_kimi) / chat_send_file / session_* · doctor --verify-mcp",
+                  tr(
+                    lang,
+                    "8 tools · status(+grok_claude_codex_kimi) / chat_send_file / session_* · doctor --verify-mcp 自检",
+                    "8 tools · status(+grok_claude_codex_kimi) / chat_send_file / session_* · doctor --verify-mcp",
+                    "8 инструментов · status(+grok_claude_codex_kimi) / chat_send_file / session_* · doctor --verify-mcp",
+                  ),
                   mcp?.ccteam_registered ? (
                     <span className="badge ok">{t("mcpOk")}</span>
                   ) : (
-                    <span className="badge" title={zh ? "默认 stream-json 会话经 curated mcp-config 注入,不依赖项目 .mcp.json" : "curated mcp-config injects it per session"}>
-                      {zh ? "随会话注入" : "per-session"}
+                    <span
+                      className="badge"
+                      title={tr(
+                        lang,
+                        "默认 stream-json 会话经 curated mcp-config 注入,不依赖项目 .mcp.json",
+                        "curated mcp-config injects it per session",
+                        "По умолчанию добавляется в каждую stream-json-сессию через curated mcp-config и не зависит от .mcp.json",
+                      )}
+                    >
+                      {tr(lang, "随会话注入", "per-session", "в каждой сессии")}
                     </span>
                   ),
                   "ccteam",
@@ -342,19 +371,22 @@ export default function WorkflowView({
                       sv.url
                         ? `${sv.kind} · ${sv.url}`
                         : `${sv.kind} · ${sv.command ?? ""} ${(sv.args ?? []).join(" ")}`.trim(),
-                      <span className="badge ok">{zh ? "已注册" : "registered"}</span>,
+                      <span className="badge ok">{tr(lang, "已注册", "registered", "зарегистрирован")}</span>,
                       sv.name,
                     ),
                   )}
               </div>
               <div className="form" data-testid="mcp-register-form">
                   <label style={{ fontSize: 13, fontWeight: 600 }}>
-                    {zh ? "注册第三方 MCP server" : "Register a third-party MCP server"}
+                    {tr(lang, "注册第三方 MCP server", "Register a third-party MCP server", "Зарегистрировать сторонний MCP-сервер")}
                   </label>
                   <p style={{ fontSize: 12.5, color: "var(--text-faint)", margin: 0 }}>
-                    {zh
-                      ? "幂等写入项目根 .mcp.json(vendor 原生配置,Claude Code 下次启动读取);ccteam 不下载、不执行任何内容。"
-                      : "Idempotently writes the project .mcp.json (vendor-native; Claude Code reads it on next start); ccteam downloads/executes nothing."}
+                    {tr(
+                      lang,
+                      "幂等写入项目根 .mcp.json(vendor 原生配置,Claude Code 下次启动读取);ccteam 不下载、不执行任何内容。",
+                      "Idempotently writes the project .mcp.json (vendor-native; Claude Code reads it on next start); ccteam downloads/executes nothing.",
+                      "Идемпотентно записывает .mcp.json в корень проекта (нативная конфигурация vendor; Claude Code прочитает её при следующем запуске); ccteam ничего не скачивает и не выполняет.",
+                    )}
                   </p>
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                     <input
@@ -368,7 +400,7 @@ export default function WorkflowView({
                     <input
                       type="text"
                       data-testid="mcp-url"
-                      placeholder={zh ? "url(http 型)" : "url (http)"}
+                      placeholder={tr(lang, "url(http 型)", "url (http)", "url (http)")}
                       value={mcpForm.url}
                       onChange={(e) => setMcpForm((f) => ({ ...f, url: e.target.value }))}
                       style={{ width: 240 }}
@@ -376,7 +408,7 @@ export default function WorkflowView({
                     <input
                       type="text"
                       data-testid="mcp-command"
-                      placeholder={zh ? "command(stdio 型)" : "command (stdio)"}
+                      placeholder={tr(lang, "command(stdio 型)", "command (stdio)", "command (stdio)")}
                       value={mcpForm.command}
                       onChange={(e) => setMcpForm((f) => ({ ...f, command: e.target.value }))}
                       style={{ width: 160 }}
@@ -396,12 +428,14 @@ export default function WorkflowView({
                       disabled={mcpBusy}
                       onClick={() => void onRegisterMcp()}
                     >
-                      {mcpBusy ? (zh ? "写入中…" : "Writing…") : zh ? "注册" : "Register"}
+                      {mcpBusy
+                        ? tr(lang, "写入中…", "Writing…", "Запись…")
+                        : tr(lang, "注册", "Register", "Зарегистрировать")}
                     </button>
                   </div>
                   <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                     <span style={{ fontSize: 12, color: "var(--text-faint)" }}>
-                      {zh ? "建议模板(仅填表,不执行):" : "Templates (prefill only):"}
+                      {tr(lang, "建议模板(仅填表,不执行):", "Templates (prefill only):", "Шаблоны (только заполнение, без запуска):")}
                     </span>
                     <button
                       type="button"
@@ -442,34 +476,37 @@ export default function WorkflowView({
             <>
               {detailHeader(
                 t("evolve"),
-                zh
-                  ? "v0.9 经验底座:每个 turn 落 turn record,role / skill 指纹随使用进化,后续 spawn 自动携带 —— 团队越用越懂你的项目。本版只读。"
-                  : "v0.9 experience substrate: every turn writes a turn record; role / skill fingerprints evolve with use. Read-only this version.",
+                tr(
+                  lang,
+                  "v0.9 经验底座:每个 turn 落 turn record,role / skill 指纹随使用进化,后续 spawn 自动携带 —— 团队越用越懂你的项目。本版只读。",
+                  "v0.9 experience substrate: every turn writes a turn record; role / skill fingerprints evolve with use. Read-only this version.",
+                  "Основа опыта v0.9: каждый turn сохраняется как запись, отпечатки ролей и навыков меняются с использованием, а следующие spawn получают их автоматически — команда всё лучше понимает ваш проект. В этой версии только чтение.",
+                ),
               )}
               {!evolution || evolution.empty ? (
                 !loading ? (
                   <p style={{ fontSize: 13, color: "var(--text-faint)" }} data-testid="evolution-empty">
-                    {zh ? "尚无 experience 数据(诚实空态)。" : "No experience data yet (honest empty state)."}
+                    {tr(lang, "尚无 experience 数据(诚实空态)。", "No experience data yet (honest empty state).", "Данных об опыте пока нет (честное пустое состояние).")}
                   </p>
                 ) : null
               ) : (
                 <>
                   <div className="stat-grid">
                     <div className="stat">
-                      <span className="k">turn records</span>
+                      <span className="k">{tr(lang, "turn records", "turn records", "записи ходов")}</span>
                       <span className="v">{evolution.turn_records}</span>
                       <span className="k" data-testid="evolution-7d">
-                        {zh ? "近 7 天" : "last 7 days"} +{evolution.turn_records_7d} ·{" "}
-                        {zh ? "verdicts" : "verdicts"} {evolution.verdict_records}
+                        {tr(lang, "近 7 天", "last 7 days", "за последние 7 дней")} +{evolution.turn_records_7d} ·{" "}
+                        {tr(lang, "verdicts", "verdicts", "вердиктов")} {evolution.verdict_records}
                       </span>
                     </div>
                     <div className="stat">
-                      <span className="k">role {zh ? "指纹" : "fingerprints"}</span>
+                      <span className="k">{tr(lang, "role 指纹", "role fingerprints", "отпечатки ролей")}</span>
                       <span className="v">{evolution.roles.length}</span>
                       <span className="k">{evolution.roles.map((b) => b.id).join(" · ") || "—"}</span>
                     </div>
                     <div className="stat">
-                      <span className="k">skill {zh ? "指纹" : "fingerprints"}</span>
+                      <span className="k">{tr(lang, "skill 指纹", "skill fingerprints", "отпечатки навыков")}</span>
                       <span className="v">{evolution.skills.length}</span>
                       <span className="k">{evolution.skills.map((b) => b.id).join(" · ") || "—"}</span>
                     </div>
@@ -479,7 +516,7 @@ export default function WorkflowView({
                       flowRow(
                         `${b.kind}:${b.id}`,
                         `turns=${b.turn_count}${b.sha ? ` · ${b.sha.slice(0, 10)}` : ""}`,
-                        <span className="badge ok">{zh ? "只读" : "read-only"}</span>,
+                        <span className="badge ok">{tr(lang, "只读", "read-only", "только чтение")}</span>,
                         `${b.kind}-${b.id}-${b.sha}`,
                       ),
                     )}

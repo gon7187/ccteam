@@ -202,19 +202,25 @@ describe("AdminPanel (管理员 · Admin — user management only)", () => {
 });
 
 describe("GeneralPanel (语言 + 主题 segs)", () => {
-  it("renders both segs with the active choice highlighted", () => {
+  it("renders all language segs with the Russian choice highlighted", () => {
     const html = renderToString(
-      <GeneralPanel lang="zh" theme="light" onLang={() => {}} onTheme={() => {}} />,
+      <GeneralPanel lang="ru" theme="light" onLang={() => {}} onTheme={() => {}} />,
     );
     expect(html).toContain('data-testid="lang-seg"');
     expect(html).toContain('data-testid="theme-seg"');
-    expect(html).toContain("中文");
+    expect(html).toContain("Русский");
+    expect(html).toContain("Язык интерфейса");
+    expect(html).toContain('data-testid="lang-ru"');
+    expect(html).toContain('data-testid="lang-zh"');
     expect(html).toContain("English");
-    expect(html).toContain("浅色");
-    expect(html).toContain("深色");
+    expect(html).toContain("Светлая");
+    expect(html).toContain("Тёмная");
     // light is active.
     const themeSeg = html.slice(html.indexOf('data-testid="theme-seg"'));
     expect(themeSeg.indexOf('class="active"')).toBeGreaterThan(-1);
+    const languageSeg = html.slice(html.indexOf('data-testid="lang-seg"'), html.indexOf('data-testid="theme-seg"'));
+    expect(languageSeg).toContain('data-testid="lang-ru"');
+    expect(languageSeg).toContain('data-testid="lang-ru" class="active"');
   });
 });
 

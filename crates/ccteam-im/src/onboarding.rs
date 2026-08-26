@@ -70,22 +70,22 @@ pub const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 pub enum OnboardingError {
     /// The underlying `reqwest` HTTP call (getMe / getUpdates) failed —
     /// DNS, TLS, connect, or read timeout.
-    #[error("HTTP request failed: {0}")]
+    #[error("Ошибка HTTP-запроса: {0}")]
     Http(#[from] reqwest::Error),
     /// Telegram returned a `200` with `ok: false`; the `String` names the
     /// API method that was rejected (e.g. an invalid bot token on `getMe`).
-    #[error("Telegram API returned `ok: false`: {0}")]
+    #[error("Telegram API вернул `ok: false`: {0}")]
     ApiNotOk(String),
     /// The long-poll window elapsed without the owner sending a message,
     /// so no `chat_id` could be captured.
-    #[error("polled {seconds}s with no incoming message — please DM the bot and retry")]
+    #[error("За {seconds} с не получено входящих сообщений — напишите боту в личные сообщения и повторите попытку")]
     NoIncomingMessage {
         /// The poll budget (seconds) that was exhausted.
         seconds: u64,
     },
     /// A Telegram response decoded but was missing a field the flow needs
     /// (e.g. `getMe.result`); the `String` describes what was absent.
-    #[error("malformed Telegram response: {0}")]
+    #[error("Некорректный ответ Telegram: {0}")]
     BadResponse(String),
 }
 

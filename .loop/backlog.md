@@ -15,6 +15,21 @@
 
 ## 当前卡
 
+### TG-KEYS-1 Telegram 常驻快捷键盘:web「快速开始」六模板落 IM(owner 直驱 2026-08-25)
+- **状态**:完成(ac20a585) · **冲突域**:`crates/ccteam-im/src(gateway + daemon + im_views + transport/providers/telegram)+ crates/ccteam-core/src/config.rs + docs/usage.md` · **建议入口**:规划亲自派工(coder terra/sonnet · review sol max · 二审 opus)
+- **背景**:owner Telegram 反馈:web 的六个 quick-start 模板(`web/src/lib/playbooks.ts` + `i18n.ts tpl*P`)在 IM 只能手打;要常驻 reply keyboard(非 inline、非 bot 菜单),且可配置。
+- **规格**:① `CcteamConfig.im.quick_templates: Vec<{label, prefix}>`(`serde(default)`,默认 = 六模板英文 prefix,label 短),hot reload 生效;② Telegram `send` 新增 `reply_keyboard` 携带(`SendMessage` 加可选字段,provider 渲染 `reply_markup.keyboard` persistent + resize),`/help` 与 `/keys` 附带键盘,`/keys off` 收起(`remove_keyboard`);③ 点按 = 收到与 label 相等的文本 → per-chat pending prefix(`RoutingState` 新字段,持久化)+ 回执「模板 X 已选,发任务」;下一条普通文本 = `<prefix> <text>` 后走原 `wrap_inbound`/`submit_to_current`,一次性清除;再点另一键 = 覆盖;④ 非 Telegram 通道零影响;⑤ 不注入 system prompt(模板是用户自己选的用户 turn,与 web 同构)。
+- **DoD**:gateway 单测(点按→pending→下一条前缀→清除 / 覆盖 / off)+ telegram 渲染单测(keyboard JSON 形状);`make check` + `make test` 只增;fmt 干净;`docs/usage.md` Gateway Commands 段补 `/keys` + config 示例。
+- **验证**:2026-08-25 terra(codex gpt-5.6-terra)三轮交付,sol(max)两轮 + opus 二审均 MERGE:`7e54df50`→`d60c2506`→`ac20a585`,新测 15+(arm/consume/覆盖/off/legacy routing.json 默认/fresh-chat 走 shared spawn/Telegram-only/附件不消费/`@handle` 消费/rich 体 reply_markup 不重复 inline/split 仅末段带键盘/label trim);`/help` 不再挂键盘(仅 `/keys`);fmt 干净、clippy 0;合并树 `make test` 红 17 ⊂ origin/dev 基线红 53(cli 集成族,零新增)。
+- **偏差**:opus 提「六模板与 web i18n 双家」→ owner 要求开箱即用,默认留 core,记为已知重复;sol 提「非 Telegram `/keys` 不应拦截」→ 保留「Telegram only」回复。
+
+### TG-FMT-1 Telegram 渲染两处:formatting 丢失 + 工具行原始名(owner 直驱 2026-08-25)
+- **状态**:完成(567288fc) · **冲突域**:`crates/ccteam-im/src(progress + im_views + telegram_html + transport/providers/telegram)` · **建议入口**:规划派工(sonnet · review sol)
+- **背景**:owner 见 `/sessions` 等消息无粗体;进度消息工具行为 `🔧 Bash(ls …)` 原始名,而页脚已本地化「команда ×4」。
+- **规格**:病根层修一次:出站单一路径统一 `parse_mode`(HTML 或 MarkdownV2 二选一,配转义 helper,渲染器统一用同一标记);工具行 label 复用页脚同一本地化映射,输入截断。
+- **DoD**:转义单测(含用户文本里 `<`/`_`/`*`)+ 渲染单测;`make check`/`make test` 只增;fmt 干净。
+- **验证**:2026-08-25 sonnet 三轮 + sol(max)两轮 MERGE:`0408ad3e`→`c94b90da`→`567288fc`。病根不在渲染器:HTML 渲染早已存在,但 Telegram classic 回落(rich `sendRichMessage` 失败/断路器开 = owner 实况)吃 `.content` 而非 `.markdown`;修在传输层:回落阶梯 rich → markdown(渲染后 UTF-16 长度合限)→ `.content`;`.plain` 保持纯文本(Lark/Slack 不受影响);`markdown_session_row`/项目行 sid/slug 改 `**bold**`;`<blockquote expandable>` 仅精确包装被识别为标签,其余原样转义;progress 工具行用类别标签(`🔧 команда: …`),未知工具 label 与 footer 桶同源;HTTP 桩测试真跑 `send` 回落体。
+
 ### RESTART-1 一 sid 一 body:daemon 重启后孤儿体识别 / 跟踪 / 回收,杜绝同 sid 双进程(owner 直驱 2026-08-19)
 - **状态**:完成(905e4a9) · **冲突域**:`crates/ccteam-harness/src/execution(session_body 新 + claude_stream_json + acp/transport + pi_rpc + adapter.rs + progress_bridge)+ crates/ccteam-im/src(gateway + daemon + mcp/dispatch)+ crates/ccteam-web(sessions_api + web lifecycle)+ crates/ccteam-cli/src(main 停机 + daemon_cli 文案)+ crates/ccteam-core/src(progress re-export + daemon 指纹委托)+ docs` · **建议入口**:规划(控制)会话亲自(owner「从 ccteam 代码本身解决,需要一个完善的方案,之后执行」)
 - **背景**:2026-08-19 本机实锤(分析留痕 `docs-local/bugs/2026-08-19-daemon-restart-duplicate-session-bodies.md`):`ccteam stop`(02:09:23)优雅停机把 agent 子进程「left running intentionally」,`ccteam start`(02:09:28)的启动恢复却假设「every child died」,对 live-set 22 个 sid 逐个 `--resume` 重生;忙碌的 stream-json 真身(s989,stdin EOF 后把手头 turn 跑完才退出,本机实测 claude 行为)与影子同时写 `wt/MM-154` → 双写;孤儿体不可观测 / 不可停 / 不计容量。两层假设互相矛盾 = 病根;补在症状点(kill 名单、单个 vendor)= 债。

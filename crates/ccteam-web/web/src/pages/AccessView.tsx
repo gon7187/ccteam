@@ -24,7 +24,7 @@ import {
   type EnrollCredentialView,
   type MintedEnrollment,
 } from "../lib/enrollApi";
-import { makeT, type Lang } from "../lib/i18n";
+import { makeT, tr, type Lang } from "../lib/i18n";
 import { getToken } from "../lib/token";
 import { getUserLink, listUsers, type TenantView } from "../lib/usersApi";
 import { useMe } from "../hooks/useMe";
@@ -51,10 +51,10 @@ curl -sX POST ${origin}/api/v1/sessions/s42/turn \\
 curl -N ${origin}/api/v1/sessions/s42/events -H "Authorization: Bearer $TOKEN"`;
 }
 
-async function copyWithToast(value: string, success: string) {
+async function copyWithToast(value: string, success: string, lang: Lang) {
   const ok = await copyText(value);
   if (ok) toastBus.handler?.info(success);
-  else toastBus.handler?.error("复制失败 / Copy failed");
+  else toastBus.handler?.error(tr(lang, "复制失败", "Copy failed", "Не удалось скопировать"));
 }
 
 export default function AccessView({ lang }: { lang: Lang }) {
@@ -184,7 +184,7 @@ export default function AccessView({ lang }: { lang: Lang }) {
                 data-testid="access-api-base-copy"
                 variant="outline"
                 size="sm"
-                onClick={() => void copyWithToast(`${origin}/api/v1`, t("accessCopied"))}
+                onClick={() => void copyWithToast(`${origin}/api/v1`, t("accessCopied"), lang)}
               >
                 {t("accessCopyBaseUrl")}
               </Button>
@@ -197,7 +197,7 @@ export default function AccessView({ lang }: { lang: Lang }) {
               variant="outline"
               size="sm"
               className="self-start"
-              onClick={() => void copyWithToast(apiSnippet, t("accessCopied"))}
+              onClick={() => void copyWithToast(apiSnippet, t("accessCopied"), lang)}
             >
               {t("accessCopySnippet")}
             </Button>
@@ -356,6 +356,7 @@ export function ExternalAgentCard({ lang }: { lang: Lang }) {
                 styled trigger is the control), so it carries `ariaLabel`. */}
             <Label>{t("accessMcpScopeLabel")}</Label>
             <Combobox
+              lang={lang}
               data-testid="access-mcp-scope"
               name="enroll-scope"
               ariaLabel={t("accessMcpScopeLabel")}
@@ -418,7 +419,7 @@ export function ExternalAgentCard({ lang }: { lang: Lang }) {
                   size="sm"
                   onClick={() => {
                     setShown(s.vendor);
-                    void copyWithToast(s.body, t("accessCopied"));
+                    void copyWithToast(s.body, t("accessCopied"), lang);
                   }}
                 >
                   {s.vendor}
@@ -540,7 +541,7 @@ export function LoginLinksCard({ lang, className }: { lang: Lang; className?: st
       .then((res) => {
         const linkOrigin =
           typeof window !== "undefined" && window.location ? window.location.origin : "";
-        return copyWithToast(`${linkOrigin}${res.personal_link}`, t("accessCopied"));
+        return copyWithToast(`${linkOrigin}${res.personal_link}`, t("accessCopied"), lang);
       })
       .catch((e) => {
         if (!(e instanceof Error && e.message === "UNAUTHENTICATED")) {

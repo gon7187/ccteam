@@ -84,7 +84,7 @@ fn seed_role(project_dir: &std::path::Path, role: &str) {
 }
 
 fn created_session_receipt(sid: &str) -> String {
-    format!("created session {sid}\n↓ 查看状态 → /status")
+    format!("Создана сессия {sid}\n↓ Статус → /status")
 }
 
 // ----- stub adapter — records submit_turn -----------------------------
@@ -831,7 +831,15 @@ async fn daemon_splits_long_outbound_into_ordered_parts() {
     // than betting on whether that race won. `reconstructed` itself (not a
     // hand-computed guess) is then the source of truth for the outbox
     // cross-check below.
-    let reconstructed: String = echo_parts.iter().map(|(_, c)| c.as_str()).collect();
+    let total = echo_parts.len();
+    let reconstructed: String = echo_parts
+        .iter()
+        .map(|(idx, content)| {
+            content
+                .strip_suffix(&format!("\n\n({}/{total})", idx + 1))
+                .unwrap_or_else(|| panic!("part {idx} missing numbering suffix: {content:?}"))
+        })
+        .collect();
     assert!(
         reconstructed.starts_with(&echo),
         "ordered parts must concatenate to the echo (+ optional title tag): {reconstructed:?}"
@@ -839,15 +847,18 @@ async fn daemon_splits_long_outbound_into_ordered_parts() {
 
     // ---- the mock outbox carries the same ordered parts ------------
     let outbox = mock.outbox().await;
+    let expected_echo_parts: Vec<String> = echo_parts
+        .iter()
+        .map(|(_, content)| content.clone())
+        .collect();
     let echo_outbox: Vec<String> = outbox
         .into_iter()
         .map(|m| m.content)
-        .filter(|c| !c.is_empty() && c != &reconstructed && reconstructed.contains(c.as_str()))
+        .filter(|content| expected_echo_parts.contains(content))
         .collect();
     assert_eq!(
-        echo_outbox.concat(),
-        reconstructed,
-        "outbox echo parts must reconstruct"
+        echo_outbox, expected_echo_parts,
+        "outbox must preserve every numbered echo part in order"
     );
 }
 
@@ -1106,8 +1117,7 @@ async fn daemon_surfaces_start_failure_to_im_and_ledger() {
         .into_iter()
         .map(|message| message.content)
         .collect();
-    let expected =
-        "会话启动失败: simulated start failure。下一步: 请检查项目和角色后重试 /new；如果仍失败，重启 ccteam start 后再试。";
+    let expected = "Не удалось запустить сессию: simulated start failure. Проверьте проект и роль, затем повторите /new; если ошибка останется, перезапустите ccteam start.";
     assert_eq!(contents, vec![expected.to_string()]);
     assert!(!contents[0].contains("gateway error"));
     assert_eq!(adapter.starts.load(Ordering::SeqCst), 1);
@@ -1159,8 +1169,7 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
         .into_iter()
         .map(|message| message.content)
         .collect();
-    let expected =
-        "发送失败: simulated submit failure。下一步: 请重试；如果仍失败，发送 /sessions 确认会话还在，或重新 /new。";
+    let expected = "Не удалось отправить сообщение: simulated submit failure. Повторите попытку; если ошибка останется, проверьте сессию через /sessions или создайте её через /new.";
     assert_eq!(
         contents,
         vec![created_session_receipt("s1"), expected.to_string()]
@@ -1735,7 +1744,7 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
     // → Ok here) and notifies. v0.8.15: idle-based — this stub emits NO events
     // (stream::empty), so it idles out and the message reads "went silent".
     assert!(
-        contents[1].starts_with("⏱️ turn failing-stub-turn went silent for 50ms"),
+        contents[1].starts_with("⏱️ Запуск failing-stub-turn в сессии s1"),
         "unexpected timeout content: {:?}",
         contents[1]
     );
@@ -1743,7 +1752,8 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
     // turn (a long silent command like a benchmark is real work); it only flags
     // the silence + tells the user it did not touch the turn.
     assert!(
-        !contents[1].contains("interrupted it") && contents[1].contains("does NOT interrupt"),
+        contents[1].contains("не проявлял активности 50ms")
+            && contents[1].contains("watchdog не прерывает запуск"),
         "watchdog must be heads-up only (no interrupt): {:?}",
         contents[1]
     );
@@ -1754,7 +1764,7 @@ async fn daemon_surfaces_turn_timeout_to_im_and_ledger() {
         row["state"] == "sent"
             && row["message"]["content"]
                 .as_str()
-                .is_some_and(|s| s.starts_with("⏱️ turn failing-stub-turn went silent for 50ms"))
+                .is_some_and(|s| s.starts_with("⏱️ Запуск failing-stub-turn в сессии s1"))
     }));
 
     let paths = ccteam_core::CcteamPaths {
@@ -2918,6 +2928,7 @@ async fn daemon_delivers_gateway_event_attachment_to_channel() {
             kind: OutboundFileKind::Photo,
         }],
         options: Vec::new(),
+        button_rows: Vec::new(),
         sid: None,
         slug: None,
     })

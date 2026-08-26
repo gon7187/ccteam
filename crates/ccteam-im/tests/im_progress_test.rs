@@ -220,7 +220,7 @@ fn agent_delta(id: &str, text: &str) -> ThreadEvent {
 }
 
 fn is_status(text: &str) -> bool {
-    ["⏳", "💭", "✍️", "✅"].iter().any(|p| text.starts_with(p))
+    ["▶️", "✅"].iter().any(|p| text.starts_with(p))
 }
 
 /// Run the daemon over one `/new` + one trigger message with `script` as
@@ -302,6 +302,12 @@ async fn progress_edits_one_status_message_not_spam() {
         status_sends, 1,
         "expected exactly one status seed in outbox, got: {outbox:?}"
     );
+    let status = outbox
+        .iter()
+        .find(|content| content.starts_with("▶️"))
+        .expect("terminal progress seed");
+    assert!(status.contains("работает · "), "status: {status}");
+    assert!(status.contains("```Terminal\n"), "status: {status}");
     // The answer is its own (new) message. It carries the v0.8.23 review
     // §3.2-5 context echo suffix on a focused answer, so match on a prefix.
     assert!(
@@ -324,16 +330,53 @@ async fn progress_edits_one_status_message_not_spam() {
     // The status was edited (≥1 edit), and finalized to a ✅ summary.
     assert!(!edits.is_empty(), "status message was never edited");
     assert!(
-        edits.iter().any(|(_, c)| c.starts_with("✅ done")),
+        edits.iter().any(|(_, c, _)| c.starts_with("✅ готово · ")),
         "status was not finalized, edits: {edits:?}"
     );
     // A tool count surfaced in some status text.
     assert!(
         outbox
             .iter()
-            .chain(edits.iter().map(|(_, c)| c))
-            .any(|c| c.contains("bash ×1")),
+            .chain(edits.iter().map(|(_, c, _)| c))
+            .any(|c| c.contains("команда ×1")),
         "no folded tool count appeared"
+    );
+    std::env::remove_var("CCTEAM_IM_PROGRESS");
+    std::env::remove_var("CCTEAM_IM_PROGRESS_THROTTLE_MS");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn progress_terminal_output_cannot_close_its_fence() {
+    let _g = env_lock();
+    std::env::set_var("CCTEAM_IM_PROGRESS", "on");
+    std::env::set_var("CCTEAM_IM_PROGRESS_THROTTLE_MS", "0");
+
+    let mock = run_scripted(vec![
+        tool_started("t1", "Bash", serde_json::json!({"command": "printf ```"})),
+        answer("a1", "done"),
+    ])
+    .await;
+    let rendered = mock
+        .outbox()
+        .await
+        .into_iter()
+        .map(|message| message.content)
+        .chain(
+            mock.edits()
+                .await
+                .into_iter()
+                .map(|(_, content, _)| content),
+        )
+        .collect::<Vec<_>>();
+
+    assert!(
+        rendered.iter().any(|text| text.contains("ˋˋˋ")),
+        "literal fence was not neutralized: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().all(|text| !text.contains("printf ```")),
+        "tool output can terminate the wrapper fence: {rendered:?}"
     );
     std::env::remove_var("CCTEAM_IM_PROGRESS");
     std::env::remove_var("CCTEAM_IM_PROGRESS_THROTTLE_MS");

@@ -77,7 +77,7 @@ impl CommandRunner for SystemRunner {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .with_context(|| format!("spawn {program}"))?;
+            .with_context(|| format!("запустить {program}"))?;
         Ok(status.success())
     }
 }
@@ -196,17 +196,17 @@ pub fn run_takeover(
         match runner.run("systemctl", &["--user", "disable", "--now", "ccteam"]) {
             Ok(true) => actions.push("systemctl --user disable --now ccteam".to_string()),
             Ok(false) => actions.push(
-                "systemctl --user disable --now ccteam (non-zero exit — unit may not have been \
-                 active)"
+                "systemctl --user disable --now ccteam (ненулевой код выхода — unit мог быть \
+                 неактивен)"
                     .to_string(),
             ),
             Err(err) => actions.push(format!(
-                "systemctl not runnable ({err}); unit file removed anyway"
+                "systemctl не запускается ({err}); файл unit всё равно удалён"
             )),
         }
         std::fs::remove_file(&paths.systemd_unit)
-            .with_context(|| format!("remove {}", paths.systemd_unit.display()))?;
-        actions.push(format!("removed {}", paths.systemd_unit.display()));
+            .with_context(|| format!("удалить {}", paths.systemd_unit.display()))?;
+        actions.push(format!("удалён {}", paths.systemd_unit.display()));
         if matches!(
             runner.run("systemctl", &["--user", "daemon-reload"]),
             Ok(true)
@@ -231,15 +231,15 @@ pub fn run_takeover(
         match runner.run("launchctl", &["bootout", &service]) {
             Ok(true) => actions.push(format!("launchctl bootout {service}")),
             Ok(false) => actions.push(format!(
-                "launchctl bootout {service} (non-zero exit — agent may not have been loaded)"
+                "launchctl bootout {service} (ненулевой код выхода — агент мог не быть загружен)"
             )),
             Err(err) => actions.push(format!(
-                "launchctl not runnable ({err}); plist removed anyway"
+                "launchctl не запускается ({err}); plist всё равно удалён"
             )),
         }
         std::fs::remove_file(&paths.launchd_plist)
-            .with_context(|| format!("remove {}", paths.launchd_plist.display()))?;
-        actions.push(format!("removed {}", paths.launchd_plist.display()));
+            .with_context(|| format!("удалить {}", paths.launchd_plist.display()))?;
+        actions.push(format!("удалён {}", paths.launchd_plist.display()));
         return Ok(TakeoverOutcome::Migrated {
             unit: paths.launchd_plist.clone(),
             actions,
@@ -404,7 +404,7 @@ mod tests {
                 assert_eq!(unit, paths.systemd_unit);
                 assert_eq!(actions.len(), 3, "disable + remove + reload: {actions:?}");
                 assert!(actions[0].contains("disable --now"));
-                assert!(actions[1].contains("removed"));
+                assert!(actions[1].contains("удалён"));
             }
             other => panic!("expected Migrated, got {other:?}"),
         }

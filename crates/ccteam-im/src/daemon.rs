@@ -29,8 +29,10 @@ use tokio::sync::Mutex;
 use crate::acl::AclPolicy;
 use crate::credentials::{self, Credentials};
 use crate::gateway::{Gateway, GatewayEvent, GatewayEventKind};
+use crate::im_views::RichReply;
 use crate::latency::now_unix_ms;
 use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
+#[cfg(feature = "telegram")]
 use crate::transport::providers::telegram::TelegramChannel;
 use crate::transport::{Channel, ChannelMessage, SendMessage};
 use crate::{list_bots, BotRegistration};
@@ -192,21 +194,21 @@ fn format_gateway_user_error(err: &anyhow::Error) -> String {
     let raw = err.to_string();
     if let Some(rest) = raw.strip_prefix("spawn failed: ") {
         return format!(
-            "会话启动失败: {rest}。下一步: 请检查项目和角色后重试 /new；如果仍失败，重启 ccteam start 后再试。"
+            "Не удалось запустить сессию: {rest}. Проверьте проект и роль, затем повторите /new; если ошибка останется, перезапустите ccteam start."
         );
     }
     if let Some(rest) = raw.strip_prefix("submit failed: ") {
         return format!(
-            "发送失败: {rest}。下一步: 请重试；如果仍失败，发送 /sessions 确认会话还在，或重新 /new。"
+            "Не удалось отправить сообщение: {rest}. Повторите попытку; если ошибка останется, проверьте сессию через /sessions или создайте её через /new."
         );
     }
     if let Some(project) = raw.strip_prefix("unknown project: ") {
         return format!(
-            "项目不存在: {project}。下一步: 发送 /projects 查看可用项目，或先运行 ccteam init 注册项目。"
+            "Проект не найден: {project}. Посмотрите доступные через /projects или сначала зарегистрируйте проект командой ccteam init."
         );
     }
     format!(
-        "操作失败: {raw}。下一步: 请重试；如果仍失败，发送 /projects 检查项目，或重启 ccteam start。"
+        "Операция не выполнена: {raw}. Повторите попытку; если ошибка останется, проверьте проект через /projects или перезапустите ccteam start."
     )
 }
 
@@ -1231,15 +1233,24 @@ pub fn build_gateway_for_daemon(
 ///
 /// [`menu_command_specs`]: crate::gateway::menu_command_specs
 pub async fn refresh_telegram_command_menu(credentials_path: Option<&Path>) -> Result<()> {
-    let creds = credentials::load(credentials_path)?;
-    let Some(tg) = creds.telegram.as_ref() else {
-        return Ok(()); // no Telegram configured → nothing to refresh
-    };
-    let specs = crate::gateway::menu_command_specs();
-    // The allowlist is irrelevant to setMyCommands (it gates inbound reads,
-    // not this outbound publish), so an empty list keeps the channel minimal.
-    let channel = TelegramChannel::new(tg.bot_token.clone(), Vec::new());
-    channel.register_commands(&specs).await
+    #[cfg(not(feature = "telegram"))]
+    {
+        let _ = credentials_path;
+        return Ok(());
+    }
+
+    #[cfg(feature = "telegram")]
+    {
+        let creds = credentials::load(credentials_path)?;
+        let Some(tg) = creds.telegram.as_ref() else {
+            return Ok(()); // no Telegram configured → nothing to refresh
+        };
+        let specs = crate::gateway::menu_command_specs();
+        // The allowlist is irrelevant to setMyCommands (it gates inbound reads,
+        // not this outbound publish), so an empty list keeps the channel minimal.
+        let channel = TelegramChannel::new(tg.bot_token.clone(), Vec::new());
+        channel.register_commands(&specs).await
+    }
 }
 
 /// Surface `ccteam-chat-*` processes that outlived a prior daemon but are not
@@ -1399,7 +1410,7 @@ fn spawn_inbound_consumer(
                     let replies = gateway
                         .lock()
                         .await
-                        .handle_message(
+                        .handle_message_rich(
                             &msg.channel,
                             &msg.reply_target,
                             &msg.sender,
@@ -1454,6 +1465,7 @@ fn spawn_inbound_consumer(
                     &msg.sender,
                     &clean_payload,
                     msg.selection.is_some(),
+                    !msg.attachments.is_empty(),
                 )
             };
             if may_spawn {
@@ -1481,7 +1493,7 @@ fn spawn_inbound_consumer(
             let replies = gateway
                 .lock()
                 .await
-                .handle_message(
+                .handle_message_rich(
                     &msg.channel,
                     &msg.reply_target,
                     &msg.sender,
@@ -1506,13 +1518,27 @@ async fn deliver_gateway_replies(
     route_t0: std::time::Instant,
     msg: &ChannelMessage,
     channel: &(dyn Channel + Send + Sync),
-    replies: Result<Vec<String>>,
+    replies: Result<Vec<RichReply>>,
 ) {
     match replies {
         Ok(replies) => {
             for (seq, reply) in replies.into_iter().enumerate() {
-                let out = SendMessage::new(reply, msg.reply_target.clone())
+                let button_rows = reply.button_rows.clone();
+                let reply_keyboard = reply.reply_keyboard.clone();
+                let mut out = SendMessage::new(reply.plain, msg.reply_target.clone())
                     .in_thread(msg.thread_ts.clone());
+                // TG-GATE-V2 W7a — `rich_markdown` only for a channel that can
+                // render it; every other channel keeps today's plain-`content`
+                // split + durable per-part ledger behavior unchanged.
+                if channel.supports_rich_messages() {
+                    out = out.with_rich_markdown(reply.markdown);
+                }
+                if !button_rows.is_empty() {
+                    out = out.with_button_rows(button_rows);
+                }
+                if let Some(reply_keyboard) = reply_keyboard {
+                    out = out.with_reply_keyboard(reply_keyboard);
+                }
                 send_gateway_outbound(cid, seq, &msg.channel, channel, out).await;
             }
             tracing::info!(
@@ -1546,6 +1572,7 @@ async fn deliver_gateway_replies(
 struct StatusHandle {
     message_id: String,
     recipient: String,
+    replacement_fallbacks: u8,
 }
 
 fn spawn_gateway_event_consumer(
@@ -1596,10 +1623,21 @@ fn spawn_gateway_event_consumer(
             };
             match evt.kind {
                 GatewayEventKind::Answer => {
-                    let out = SendMessage::new(evt.content, evt.chat_id)
+                    // TG-GATE-V2 W7a — carry the agent's answer as
+                    // `rich_markdown` too (the SAME text as `content`, which
+                    // is already the markdown answer), but only for a
+                    // rich-capable channel; every other channel is unchanged.
+                    let rich_markdown = channel
+                        .supports_rich_messages()
+                        .then(|| evt.content.clone());
+                    let mut out = SendMessage::new(evt.content, evt.chat_id)
                         .in_thread(evt.thread_ts)
                         .with_attachments(evt.attachments)
-                        .with_options(evt.options);
+                        .with_options(evt.options)
+                        .with_button_rows(evt.button_rows);
+                    if let Some(markdown) = rich_markdown {
+                        out = out.with_rich_markdown(markdown);
+                    }
                     send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out).await;
                 }
                 GatewayEventKind::Progress { status_key, done } => {
@@ -1612,6 +1650,7 @@ fn spawn_gateway_event_consumer(
                         evt.chat_id,
                         evt.thread_ts,
                         evt.content,
+                        evt.button_rows,
                     )
                     .await;
                 }
@@ -1627,6 +1666,29 @@ fn spawn_gateway_event_consumer(
                 GatewayEventKind::Delegation { .. } => {}
                 GatewayEventKind::SessionLifecycle { .. } => {}
                 GatewayEventKind::ScheduledChanged => {}
+                // TG-GATE-V2 W8 — edit an arbitrary already-sent message
+                // (the `cmd:` confirmation prompt) in place by its
+                // platform id. A failed edit (message gone/too old) falls
+                // back to the pre-W8 behavior: send the resolution as a
+                // new message, so it is never silently dropped.
+                GatewayEventKind::EditMessage { message_id } => {
+                    if let Err(err) = channel
+                        .edit_message(&evt.chat_id, &message_id, &evt.content, &evt.button_rows)
+                        .await
+                    {
+                        tracing::warn!(
+                            channel = %evt.channel,
+                            message_id = %message_id,
+                            error = %err,
+                            "ccteam-im: confirmation edit failed, falling back to a new message"
+                        );
+                        let out = SendMessage::new(evt.content, evt.chat_id)
+                            .in_thread(evt.thread_ts)
+                            .with_button_rows(evt.button_rows);
+                        send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out)
+                            .await;
+                    }
+                }
                 // v0.8.19 — the 👀 ack reaction (IM-only; web/discord/slack keep
                 // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
                 // Activity arm's discipline: ALL fire-and-forget — log + swallow,
@@ -1682,18 +1744,79 @@ async fn deliver_progress(
     chat_id: String,
     thread_ts: Option<String>,
     content: String,
+    button_rows: Vec<Vec<crate::transport::MessageOption>>,
 ) {
     if let Some(handle) = status_messages.get(&status_key).cloned() {
-        if let Err(err) = channel
-            .edit_message(&handle.recipient, &handle.message_id, &content)
+        match channel
+            .edit_message(
+                &handle.recipient,
+                &handle.message_id,
+                &content,
+                &button_rows,
+            )
             .await
         {
-            tracing::warn!(
-                channel = %channel_name,
-                status_key = %status_key,
-                error = %err,
-                "ccteam-im: progress edit failed"
-            );
+            Ok(message_id) => {
+                if !done {
+                    status_messages.insert(
+                        status_key.clone(),
+                        StatusHandle {
+                            message_id: message_id.unwrap_or(handle.message_id),
+                            recipient: handle.recipient,
+                            replacement_fallbacks: 0,
+                        },
+                    );
+                }
+            }
+            Err(err) if !err.to_string().contains("message is not modified") => {
+                if handle.replacement_fallbacks >= 2 {
+                    tracing::warn!(
+                        channel = %channel_name,
+                        status_key = %status_key,
+                        error = %err,
+                        "ccteam-im: progress edit failed; replacement cap reached"
+                    );
+                } else {
+                    let replacement_fallbacks = handle.replacement_fallbacks + 1;
+                    if !done {
+                        status_messages.insert(
+                            status_key.clone(),
+                            StatusHandle {
+                                replacement_fallbacks,
+                                ..handle.clone()
+                            },
+                        );
+                    }
+                    if replacement_fallbacks == 1 {
+                        tracing::warn!(
+                            channel = %channel_name,
+                            status_key = %status_key,
+                            error = %err,
+                            "ccteam-im: progress edit failed; sending replacement"
+                        );
+                    }
+                    let replacement = SendMessage::new(content, handle.recipient.clone())
+                        .in_thread(thread_ts)
+                        .with_button_rows(button_rows);
+                    match channel.send(&replacement).await {
+                        Ok(Some(message_id)) if !done => {
+                            status_messages.insert(
+                                status_key.clone(),
+                                StatusHandle {
+                                    message_id,
+                                    recipient: handle.recipient,
+                                    replacement_fallbacks,
+                                },
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(send_err) => {
+                            tracing::warn!(channel = %channel_name, status_key = %status_key, error = %send_err, "ccteam-im: progress replacement send failed")
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
         }
         if done {
             status_messages.remove(&status_key);
@@ -1701,7 +1824,9 @@ async fn deliver_progress(
         return;
     }
     // First progress for this turn — send a new status message (the seed).
-    let seed = SendMessage::new(content, chat_id.clone()).in_thread(thread_ts.clone());
+    let seed = SendMessage::new(content, chat_id.clone())
+        .in_thread(thread_ts.clone())
+        .with_button_rows(button_rows);
     match channel.send(&seed).await {
         Ok(Some(message_id)) if !done => {
             status_messages.insert(
@@ -1709,6 +1834,7 @@ async fn deliver_progress(
                 StatusHandle {
                     message_id,
                     recipient: chat_id,
+                    replacement_fallbacks: 0,
                 },
             );
         }
@@ -1744,7 +1870,18 @@ enum DurableOutboundState {
     Failed,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_OUTBOX_PATH: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 fn durable_outbox_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_OUTBOX_PATH.with(|path| path.borrow().clone()) {
+        return path;
+    }
     crate::default_ccteam_root_public()
         .join("state")
         .join("im")
@@ -1765,11 +1902,40 @@ async fn send_gateway_outbound(
     // `4096`/`"telegram"` branch lives here.
     // Attachment-bearing messages never split — the files + caption are
     // one logical send (splitting would duplicate the files across parts).
+    // Rich Markdown is partitioned once at the 30,000-byte Rich Message
+    // ceiling. Each row carries the matching plain fallback; Telegram may
+    // split that fallback internally if the row degrades to classic.
     let parts = match channel.max_message_len() {
-        Some(limit) if message.attachments.is_empty() => {
-            crate::sanitize::split_for_channel(&message.content, limit)
+        Some(_limit) if message.attachments.is_empty() && message.rich_markdown.is_some() => {
+            #[cfg(feature = "telegram")]
+            let rich_limit = crate::transport::providers::telegram::rich_markdown_budget(&message);
+            #[cfg(not(feature = "telegram"))]
+            let rich_limit = _limit;
+            crate::sanitize::split_rich_markdown_with_plain(
+                message.rich_markdown.as_deref().expect("checked above"),
+                &message.content,
+                rich_limit,
+            )
+            .into_iter()
+            .map(|(rich, plain)| {
+                let mut part = message.clone();
+                part.content = plain;
+                part.rich_markdown = Some(rich);
+                part
+            })
+            .collect()
         }
-        _ => vec![message.content.clone()],
+        Some(limit) if message.attachments.is_empty() && message.rich_markdown.is_none() => {
+            crate::sanitize::split_for_channel_numbered(&message.content, limit)
+                .into_iter()
+                .map(|content| {
+                    let mut part = message.clone();
+                    part.content = content;
+                    part
+                })
+                .collect()
+        }
+        _ => vec![message.clone()],
     };
 
     if parts.len() <= 1 {
@@ -1779,48 +1945,15 @@ async fn send_gateway_outbound(
         return;
     }
 
-    // Multi-part: each part is its own durable row, id =
-    // `{inbound_id}-{seq}-{part}`, sent in order (same logical message ⇒
-    // serial). The ledger keeps one Queued+Sent/Failed pair per part.
-    let total = parts.len();
-    let mut failed_parts: Vec<usize> = Vec::new();
-    for (part_idx, part) in parts.into_iter().enumerate() {
-        let id = format!("{inbound_id}-{seq}-{part_idx}");
-        let mut part_msg = message.clone();
-        part_msg.content = part;
-        let sent =
-            queue_and_send_durable_part(id, inbound_id, channel_name, channel, part_msg).await;
-        if !sent {
-            failed_parts.push(part_idx + 1); // 1-based for the user notice
-        }
-    }
-
-    // Failure visible: a partial split (some parts delivered, some not) is
-    // confusing silence today — surface one line back to the chat. Sent
-    // directly (not split / not laddered through the ledger) since it is a
-    // best-effort UX notice.
-    if !failed_parts.is_empty() {
-        let body = if failed_parts.len() == 1 {
-            format!("⚠️ 部分消息发送失败 (part {}/{total})", failed_parts[0])
-        } else {
-            format!("⚠️ 部分消息发送失败 ({}/{total} parts)", failed_parts.len())
-        };
-        let notice =
-            SendMessage::new(body, message.recipient.clone()).in_thread(message.thread_ts.clone());
-        if let Err(err) = channel.send(&notice).await {
-            tracing::warn!(
-                inbound_id,
-                channel = %channel_name,
-                error = %err,
-                "ccteam-im: failed to deliver split-failure notice"
-            );
-        }
-    }
+    // Multi-part: id prefix = `{inbound_id}-{seq}`, one durable row per
+    // part. The complete partition is queued before the first send.
+    let id_prefix = format!("{inbound_id}-{seq}");
+    send_split_parts(&id_prefix, inbound_id, channel_name, channel, parts).await;
 }
 
 /// Queue a single durable outbound row, then attempt delivery. Returns
-/// `true` when the send succeeded. Shared by the single- and multi-part
-/// branches of [`send_gateway_outbound`].
+/// `true` when the send succeeded. Used by the single-message (unsplit)
+/// path of [`send_gateway_outbound`].
 async fn queue_and_send_durable_part(
     id: String,
     inbound_id: &str,
@@ -1839,6 +1972,125 @@ async fn queue_and_send_durable_part(
         error: None,
     });
     finish_durable_outbound_send(id, inbound_id, channel_name, channel, message).await
+}
+
+/// Queue every part of a split as its OWN durable `Queued` row, id =
+/// `{id_prefix}-{part_idx}` — before anything is sent. Only the LAST
+/// part keeps `button_rows`/`options`/`reply_keyboard` (a tapper acting from a
+/// middle part would be acting on an incomplete reply). Rich parts retain
+/// their own independently valid Markdown and plain fallback.
+///
+/// A single ledger write makes the partition visible to replay before any
+/// provider call can happen.
+fn queue_split_parts(
+    id_prefix: &str,
+    inbound_id: &str,
+    channel_name: &str,
+    parts: Vec<SendMessage>,
+) -> Result<Vec<(String, SendMessage)>> {
+    let total = parts.len();
+    let last_idx = total.saturating_sub(1);
+    let mut queued = Vec::with_capacity(total);
+    let mut rows = Vec::with_capacity(total);
+    for (part_idx, mut part_msg) in parts.into_iter().enumerate() {
+        let id = format!("{id_prefix}-{part_idx}");
+        if part_idx != last_idx {
+            part_msg.button_rows.clear();
+            part_msg.options.clear();
+            part_msg.reply_keyboard = None;
+        }
+        let row = DurableOutboundRow {
+            ts_ms: now_unix_ms_u64(),
+            id: id.clone(),
+            inbound_id: inbound_id.to_string(),
+            channel: channel_name.to_string(),
+            state: DurableOutboundState::Queued,
+            message: part_msg.clone(),
+            platform_message_id: None,
+            error: None,
+        };
+        rows.push(row);
+        queued.push((id, part_msg));
+    }
+    append_durable_outbound_batch_inner(&rows)?;
+    Ok(queued)
+}
+
+/// Send already-`Queued` parts (from [`queue_split_parts`]) in order
+/// (same logical message ⇒ serial send), appending each one's own
+/// terminal (`Sent`/`Failed`) row. A late part's failure does not abort
+/// the loop — every part gets its own delivery attempt, so a later
+/// replay only re-sends the parts that actually failed, never the ones
+/// that already landed. A partial failure surfaces one best-effort
+/// notice (sent directly, not itself split or laddered through the
+/// ledger) naming only the failed parts.
+async fn send_queued_parts(
+    inbound_id: &str,
+    channel_name: &str,
+    channel: &(dyn Channel + Send + Sync),
+    queued: Vec<(String, SendMessage)>,
+    message: &SendMessage,
+) {
+    let total = queued.len();
+    let mut failed_parts: Vec<usize> = Vec::new();
+    for (part_idx, (id, part_msg)) in queued.into_iter().enumerate() {
+        let sent =
+            finish_durable_outbound_send(id, inbound_id, channel_name, channel, part_msg).await;
+        if !sent {
+            failed_parts.push(part_idx + 1); // 1-based for the user notice
+        }
+    }
+
+    if !failed_parts.is_empty() {
+        let body = if failed_parts.len() == 1 {
+            format!(
+                "⚠️ Не удалось отправить часть сообщения (часть {}/{total})",
+                failed_parts[0]
+            )
+        } else {
+            format!(
+                "⚠️ Не удалось отправить части сообщения ({}/{total} шт.)",
+                failed_parts.len()
+            )
+        };
+        let notice =
+            SendMessage::new(body, message.recipient.clone()).in_thread(message.thread_ts.clone());
+        if let Err(err) = channel.send(&notice).await {
+            tracing::warn!(
+                inbound_id,
+                channel = %channel_name,
+                error = %err,
+                "ccteam-im: failed to deliver split-failure notice"
+            );
+        }
+    }
+}
+
+/// Queue the complete partition, then send its rows serially.
+async fn send_split_parts(
+    id_prefix: &str,
+    inbound_id: &str,
+    channel_name: &str,
+    channel: &(dyn Channel + Send + Sync),
+    parts: Vec<SendMessage>,
+) {
+    let queued = match queue_split_parts(id_prefix, inbound_id, channel_name, parts) {
+        Ok(queued) => queued,
+        Err(err) => {
+            tracing::warn!(
+                inbound_id,
+                channel = %channel_name,
+                error = %err,
+                "ccteam-im: failed to durably queue split parts; dropping this send"
+            );
+            return;
+        }
+    };
+    let message = queued
+        .first()
+        .map(|(_, message)| message.clone())
+        .expect("split partition must contain a row");
+    send_queued_parts(inbound_id, channel_name, channel, queued, &message).await;
 }
 
 /// Send a single already-queued durable row and append its terminal
@@ -1892,28 +2144,31 @@ async fn replay_durable_outbox(channels: &ChannelMap) {
         return;
     };
     let mut latest: HashMap<String, DurableOutboundRow> = HashMap::new();
+    let mut order = Vec::new();
     for (line_idx, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         match serde_json::from_str::<DurableOutboundRow>(line) {
             Ok(row) => {
+                if !latest.contains_key(&row.id) {
+                    order.push(row.id.clone());
+                }
                 latest.insert(row.id.clone(), row);
             }
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    line = line_idx + 1,
-                    error = %err,
-                    "ccteam-im: ignoring malformed durable outbound row"
-                );
-            }
+            Err(err) => tracing::warn!(
+                path = %path.display(),
+                line = line_idx + 1,
+                error = %err,
+                "ccteam-im: ignoring malformed durable outbound row"
+            ),
         }
     }
-    for row in latest
-        .into_values()
-        .filter(|row| row.state != DurableOutboundState::Sent)
-    {
+
+    for row in order.into_iter().filter_map(|id| latest.remove(&id)) {
+        if row.state == DurableOutboundState::Sent {
+            continue;
+        }
         let Some(channel) = channels.get(&row.channel) else {
             append_durable_outbound(DurableOutboundRow {
                 ts_ms: now_unix_ms_u64(),
@@ -1950,6 +2205,10 @@ fn append_durable_outbound(row: DurableOutboundRow) {
 }
 
 fn append_durable_outbound_inner(row: &DurableOutboundRow) -> Result<()> {
+    append_durable_outbound_batch_inner(std::slice::from_ref(row))
+}
+
+fn append_durable_outbound_batch_inner(rows: &[DurableOutboundRow]) -> Result<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     let _guard = LOCK
         .get_or_init(|| std::sync::Mutex::new(()))
@@ -1959,12 +2218,16 @@ fn append_durable_outbound_inner(row: &DurableOutboundRow) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let mut encoded = Vec::new();
+    for row in rows {
+        serde_json::to_writer(&mut encoded, row)?;
+        encoded.push(b'\n');
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)?;
-    serde_json::to_writer(&mut file, row)?;
-    file.write_all(b"\n")?;
+    file.write_all(&encoded)?;
     Ok(())
 }
 
@@ -2097,6 +2360,7 @@ mod tests {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some("s1".to_string()),
             slug: None,
         };
@@ -2131,6 +2395,489 @@ mod tests {
         );
     }
 
+    /// TG-GATE-V2 W7a — a rich-capable channel's `Answer` event gets
+    /// `rich_markdown` set to the SAME text as `content` (the agent's
+    /// markdown answer); a non-rich channel's `Answer` gets no
+    /// `rich_markdown` at all — zero behavior change for every channel that
+    /// isn't Telegram.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_event_carries_rich_markdown_only_for_rich_channels() {
+        use crate::transport::providers::mock::MockChannel;
+
+        let rich = MockChannel::new().with_name("rich").with_rich_support();
+        let plain = MockChannel::new().with_name("plain");
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("rich".to_string(), Arc::new(rich.clone()));
+        channels.insert("plain".to_string(), Arc::new(plain.clone()));
+        let channels = Arc::new(RwLock::new(channels));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        let consumer = spawn_gateway_event_consumer(rx, channels);
+
+        let answer = |channel: &str| GatewayEvent {
+            id: format!("answer-{channel}"),
+            channel: channel.to_string(),
+            chat_id: "chat-1".to_string(),
+            thread_ts: None,
+            content: "**bold** answer".to_string(),
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: None,
+            slug: None,
+        };
+        tx.send(answer("rich")).unwrap();
+        tx.send(answer("plain")).unwrap();
+
+        let mut rich_out = Vec::new();
+        let mut plain_out = Vec::new();
+        for _ in 0..200 {
+            rich_out = rich.outbox().await;
+            plain_out = plain.outbox().await;
+            if !rich_out.is_empty() && !plain_out.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        consumer.abort();
+
+        assert_eq!(rich_out.len(), 1);
+        assert_eq!(
+            rich_out[0].rich_markdown.as_deref(),
+            Some("**bold** answer"),
+            "a rich-capable channel's answer carries rich_markdown"
+        );
+        assert_eq!(plain_out.len(), 1);
+        assert_eq!(
+            plain_out[0].rich_markdown, None,
+            "a non-rich channel's answer never carries rich_markdown"
+        );
+        // Both channels get the same plain `content` either way.
+        assert_eq!(rich_out[0].content, "**bold** answer");
+        assert_eq!(plain_out[0].content, "**bold** answer");
+    }
+
+    /// TG-GATE-V2 W7a — `deliver_gateway_replies` (the command-reply path)
+    /// applies the same rich-gate: `rich_markdown` only rides a reply to a
+    /// channel that `supports_rich_messages`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn command_reply_carries_rich_markdown_only_for_rich_channels() {
+        use crate::transport::providers::mock::MockChannel;
+
+        let rich_msg = ChannelMessage {
+            id: "in-1".into(),
+            sender: "u1".into(),
+            reply_target: "chat-1".into(),
+            content: "/status".into(),
+            channel: "rich".into(),
+            timestamp: 0,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+        };
+        let reply = RichReply {
+            markdown: "**status**".into(),
+            plain: "status".into(),
+            button_rows: Vec::new(),
+            reply_keyboard: None,
+        };
+        let rich = MockChannel::new().with_name("rich").with_rich_support();
+        deliver_gateway_replies(
+            "cid-1",
+            std::time::Instant::now(),
+            &rich_msg,
+            &rich,
+            Ok(vec![reply]),
+        )
+        .await;
+        let out = rich.outbox().await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rich_markdown.as_deref(), Some("**status**"));
+        assert_eq!(out[0].content, "status");
+
+        let plain_msg = ChannelMessage {
+            channel: "plain".into(),
+            ..rich_msg
+        };
+        let reply = RichReply {
+            markdown: "**status**".into(),
+            plain: "status".into(),
+            button_rows: Vec::new(),
+            reply_keyboard: None,
+        };
+        let plain = MockChannel::new().with_name("plain");
+        deliver_gateway_replies(
+            "cid-2",
+            std::time::Instant::now(),
+            &plain_msg,
+            &plain,
+            Ok(vec![reply]),
+        )
+        .await;
+        let out = plain.outbox().await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].rich_markdown, None,
+            "a non-rich channel's command reply never carries rich_markdown"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn progress_stops_replacing_after_two_consecutive_edit_fallbacks() {
+        struct AlwaysFailingEditChannel {
+            sends: Arc<StdMutex<Vec<SendMessage>>>,
+            edits: Arc<StdMutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for AlwaysFailingEditChannel {
+            fn name(&self) -> &str {
+                "progress-test"
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                let mut sends = self.sends.lock().unwrap();
+                sends.push(message.clone());
+                Ok(Some(format!("message-{}", sends.len())))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn edit_message(
+                &self,
+                _recipient: &str,
+                message_id: &str,
+                _content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> anyhow::Result<Option<String>> {
+                self.edits.lock().unwrap().push(message_id.to_string());
+                anyhow::bail!("edit failed")
+            }
+        }
+
+        let channel = AlwaysFailingEditChannel {
+            sends: Arc::new(StdMutex::new(Vec::new())),
+            edits: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let mut statuses = HashMap::new();
+        for content in ["seed", "one", "two", "three"] {
+            deliver_progress(
+                &channel,
+                &mut statuses,
+                "status".to_string(),
+                false,
+                "progress-test",
+                "chat-1".to_string(),
+                None,
+                content.to_string(),
+                Vec::new(),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            channel.sends.lock().unwrap().len(),
+            3,
+            "seed + two replacements"
+        );
+        assert_eq!(channel.edits.lock().unwrap().len(), 3);
+        assert_eq!(statuses["status"].replacement_fallbacks, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn progress_message_not_modified_does_not_send_replacement() {
+        struct NotModifiedEditChannel {
+            sends: Arc<StdMutex<Vec<SendMessage>>>,
+            edits: Arc<StdMutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for NotModifiedEditChannel {
+            fn name(&self) -> &str {
+                "progress-test"
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                let mut sends = self.sends.lock().unwrap();
+                sends.push(message.clone());
+                Ok(Some(format!("message-{}", sends.len())))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn edit_message(
+                &self,
+                _recipient: &str,
+                message_id: &str,
+                _content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> anyhow::Result<Option<String>> {
+                self.edits.lock().unwrap().push(message_id.to_string());
+                anyhow::bail!("message is not modified")
+            }
+        }
+
+        let channel = NotModifiedEditChannel {
+            sends: Arc::new(StdMutex::new(Vec::new())),
+            edits: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let mut statuses = HashMap::new();
+        deliver_progress(
+            &channel,
+            &mut statuses,
+            "status".to_string(),
+            false,
+            "progress-test",
+            "chat-1".to_string(),
+            None,
+            "seed".to_string(),
+            Vec::new(),
+        )
+        .await;
+        deliver_progress(
+            &channel,
+            &mut statuses,
+            "status".to_string(),
+            false,
+            "progress-test",
+            "chat-1".to_string(),
+            None,
+            "unchanged".to_string(),
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(channel.sends.lock().unwrap().len(), 1, "seed only");
+        assert_eq!(channel.edits.lock().unwrap().len(), 1);
+        assert_eq!(statuses["status"].replacement_fallbacks, 0);
+    }
+
+    /// Persistent rich rejection must stay inside the Telegram transport:
+    /// one durable row may emit several classic HTTP messages, but the ledger
+    /// must still contain one logical id and one terminal Sent row.
+    #[cfg(feature = "telegram")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn rich_fallback_needs_split_is_handled_inside_telegram_without_new_rows() {
+        let tmp = TempDir::new().unwrap();
+        let _outbox = isolate_outbox(&tmp);
+
+        let (base, seen) = spawn_persistent_rich_reject_http();
+        let channel = TelegramChannel::new("token".into(), vec![]).with_api_base(base);
+        let plain = "😀".repeat(2000);
+        let message = SendMessage::new(plain.clone(), "chat-1").with_rich_markdown("**rich**");
+        send_gateway_outbound("in-1", 0, "telegram", &channel, message).await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "one rich rejection and two classic sends");
+        assert!(seen[0].0.contains("sendRichMessage"));
+        let classic = seen
+            .iter()
+            .filter(|(request, _)| request.contains("sendMessage"))
+            .collect::<Vec<_>>();
+        assert_eq!(classic.len(), 2, "plain fallback is sent in two chunks");
+        let classic_text = classic
+            .iter()
+            .map(|(_, body)| {
+                serde_json::from_str::<serde_json::Value>(body).unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(classic_text
+            .iter()
+            .all(|text| text.encode_utf16().count() <= 3900));
+        assert_eq!(classic_text.concat(), plain);
+
+        let rows = std::fs::read_to_string(durable_outbox_path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<DurableOutboundRow>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "queued row plus one terminal row");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1,
+            "classic chunks must not create nested outbox ids"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.state == DurableOutboundState::Sent)
+                .count(),
+            1,
+            "the logical row is marked sent exactly once"
+        );
+    }
+
+    #[cfg(feature = "telegram")]
+    type SeenRequests = Arc<StdMutex<Vec<(String, String)>>>;
+
+    #[cfg(feature = "telegram")]
+    fn spawn_persistent_rich_reject_http() -> (String, SeenRequests) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_thread = seen.clone();
+        std::thread::spawn(move || {
+            for classic_id in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let mut header_end = None;
+                let mut content_length = 0;
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            request.extend_from_slice(&buffer[..read]);
+                            if header_end.is_none() {
+                                if let Some(position) =
+                                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                                {
+                                    let end = position + 4;
+                                    header_end = Some(end);
+                                    let headers = String::from_utf8_lossy(&request[..end]);
+                                    content_length = headers
+                                        .lines()
+                                        .find_map(|line| {
+                                            let (name, value) = line.split_once(':')?;
+                                            name.eq_ignore_ascii_case("content-length")
+                                                .then(|| value.trim().parse::<usize>().ok())
+                                                .flatten()
+                                        })
+                                        .unwrap_or(0);
+                                }
+                            }
+                            if let Some(end) = header_end {
+                                if request.len().saturating_sub(end) >= content_length {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let end = header_end.unwrap_or(request.len());
+                let request_line = String::from_utf8_lossy(&request[..end])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let body = String::from_utf8_lossy(&request[end..]).to_string();
+                seen_thread
+                    .lock()
+                    .unwrap()
+                    .push((request_line.clone(), body));
+                let rich = request_line.contains("sendRichMessage");
+                let response_body = if rich {
+                    r#"{"ok":false,"description":"rich messages unsupported"}"#.to_string()
+                } else {
+                    format!(
+                        r#"{{"ok":true,"result":{{"message_id":{}}}}}"#,
+                        classic_id + 1
+                    )
+                };
+                let status = if rich { "400 Bad Request" } else { "200 OK" };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn crash_after_partition_write_replays_all_parts_in_order() {
+        use crate::transport::providers::mock::MockChannel;
+
+        let tmp = TempDir::new().unwrap();
+        let _outbox = isolate_outbox(&tmp);
+
+        let parts = vec![
+            SendMessage::new("part one", "chat-1"),
+            SendMessage::new("part two", "chat-1"),
+            SendMessage::new("part three", "chat-1"),
+        ];
+        let queued = queue_split_parts("row-1", "in-1", "telegram", parts).unwrap();
+        assert_eq!(queued.len(), 3);
+        let raw = std::fs::read_to_string(durable_outbox_path()).unwrap();
+        let expected_ids = ["row-1-0", "row-1-1", "row-1-2"];
+        let queued_ids: std::collections::HashSet<String> = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<DurableOutboundRow>(line).ok())
+            .filter(|row| expected_ids.contains(&row.id.as_str()))
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(
+            queued_ids,
+            expected_ids.into_iter().map(String::from).collect(),
+            "the whole partition is visible in the ledger before any send"
+        );
+
+        let mock = MockChannel::new().with_name("telegram");
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), Arc::new(mock.clone()));
+        replay_durable_outbox(&channels).await;
+
+        let delivered = mock.outbox().await;
+        let delivered_parts: Vec<_> = delivered
+            .iter()
+            .filter(|message| message.content.starts_with("part "))
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(delivered_parts, vec!["part one", "part two", "part three"],);
+        replay_durable_outbox(&channels).await;
+        assert_eq!(
+            mock.outbox()
+                .await
+                .iter()
+                .filter(|message| message.content.starts_with("part "))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn queue_split_parts_keeps_plain_and_rich_payloads_per_row() {
+        let tmp = TempDir::new().unwrap();
+        let _outbox = isolate_outbox(&tmp);
+
+        let parts = vec![
+            SendMessage::new("plain one", "chat-1").with_rich_markdown("**rich one**"),
+            SendMessage::new("plain two", "chat-1").with_rich_markdown("**rich two**"),
+        ];
+        let queued = queue_split_parts("row-1", "in-1", "telegram", parts).unwrap();
+        assert_eq!(queued[0].1.content, "plain one");
+        assert_eq!(queued[0].1.rich_markdown.as_deref(), Some("**rich one**"));
+        assert_eq!(queued[1].1.content, "plain two");
+        assert_eq!(queued[1].1.rich_markdown.as_deref(), Some("**rich two**"));
+        let raw = std::fs::read_to_string(durable_outbox_path()).unwrap();
+        assert_eq!(raw.lines().count(), 2);
+    }
+
     /// v0.8.19 — the stateless (Telegram) shape: `add_reaction` returns `None`,
     /// so the egress stores `None` and `remove_reaction` is called with `None`
     /// (Telegram clears by message_id alone). The handle map still round-trips
@@ -2160,6 +2907,7 @@ mod tests {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: None,
             slug: None,
         };
@@ -2285,6 +3033,29 @@ mod tests {
         LOCK.get_or_init(|| StdMutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct OutboxScope {
+        previous: Option<PathBuf>,
+    }
+
+    impl Drop for OutboxScope {
+        fn drop(&mut self) {
+            TEST_OUTBOX_PATH.with(|path| {
+                path.replace(self.previous.take());
+            });
+        }
+    }
+
+    fn isolate_outbox(tmp: &TempDir) -> OutboxScope {
+        let path = tmp
+            .path()
+            .join(".ccteam")
+            .join("state")
+            .join("im")
+            .join("outbound.jsonl");
+        let previous = TEST_OUTBOX_PATH.with(|slot| slot.replace(Some(path)));
+        OutboxScope { previous }
     }
 
     fn restore_env(key: &str, value: Option<std::ffi::OsString>) {

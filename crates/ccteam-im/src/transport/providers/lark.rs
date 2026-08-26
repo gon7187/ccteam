@@ -847,7 +847,7 @@ impl LarkChannel {
                             Ok(None) => {
                                 let mb = LARK_MAX_ATTACHMENT_BYTES / (1024 * 1024);
                                 let _ = self.send(&SendMessage::new(
-                                    format!("⚠️ 附件 {} 超过 {mb}MB 上限,已拒收", p.file_name),
+                                    format!("⚠️ Вложение {} превышает лимит {mb} МБ и отклонено", p.file_name),
                                     channel_msg.reply_target.clone(),
                                 )).await;
                                 if channel_msg.content.is_empty() { continue; }
@@ -855,7 +855,7 @@ impl LarkChannel {
                             Err(e) => {
                                 tracing::warn!(message_id = %raw_message_id, error = %e, "Lark: attachment download failed");
                                 let _ = self.send(&SendMessage::new(
-                                    format!("⚠️ 附件 {} 下载失败", p.file_name),
+                                    format!("⚠️ Не удалось скачать вложение {}", p.file_name),
                                     channel_msg.reply_target.clone(),
                                 )).await;
                                 if channel_msg.content.is_empty() { continue; }
@@ -1271,10 +1271,12 @@ impl Channel for LarkChannel {
         if !message.attachments.is_empty() {
             return self.send_with_attachments(message).await;
         }
-        // Picker options → an interactive card with one button per option
-        // (symmetric to telegram's inline keyboard). The numbered-text
-        // fallback already lives in `content`, so the card body carries it
-        // too — a client that can't render buttons still sees the list.
+        // TG-GATE-V2 W7a — Lark has no button-ROW concept (its card is one
+        // button per `action` element, vertically stacked) and `button_rows`
+        // is a multi-per-row command/navigation affordance, not a picker —
+        // rendering it as a numbered dead list is worse than showing
+        // nothing, so it is dropped entirely here. Only `options` (the
+        // picker) keeps the numbered-fold-into-a-card treatment below.
         if !message.options.is_empty() {
             let card = build_option_card(&message.content, &message.options);
             return self
@@ -1322,10 +1324,13 @@ impl Channel for LarkChannel {
         _recipient: &str,
         message_id: &str,
         content: &str,
+        _button_rows: &[Vec<MessageOption>],
     ) -> anyhow::Result<Option<String>> {
         // Lark addresses the edit by `message_id` in the URL path, not by
         // recipient, so `recipient` is unused here.
         let url = format!("{}/im/v1/messages/{message_id}", self.api_base());
+        // TG-GATE-V2 W7a — `button_rows` is dropped entirely on Lark (see
+        // `send`'s comment): no numbered dead list on a plain text edit.
         // Same Feishu quirk as `send`: the inner value is stringified JSON.
         let inner = serde_json::json!({ "text": content }).to_string();
         let body = serde_json::json!({

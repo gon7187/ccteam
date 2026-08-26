@@ -26,7 +26,7 @@ import { useVendorCatalog } from "../hooks/useVendorCatalog";
 import type { TurnAttachment } from "../lib/attachmentsApi";
 import { VendorChip } from "../components/VendorChip";
 import { toastBus } from "../lib/toastBus";
-import { makeT, tRemoteProjectPath, type Lang } from "../lib/i18n";
+import { makeT, tr, tRemoteProjectPath, type Lang } from "../lib/i18n";
 import {
   defaultDraft,
   effortSwitchFor,
@@ -352,7 +352,7 @@ export default function HomeView({
     if (pending) return false;
     if (!project && !isNewProject) {
       toastBus.handler?.error(
-        lang === "en" ? "Pick a project first (＋ New project…)" : "先选一个项目(＋ 新建项目…)",
+        tr(lang, "先选一个项目(＋ 新建项目…)", "Pick a project first (＋ New project…)", "Сначала выберите проект (＋ Новый проект…)") ,
       );
       return false;
     }
@@ -365,7 +365,7 @@ export default function HomeView({
         }
         const derived = slugFromPath(newProjectPath);
         if (!derived) {
-          throw new Error(lang === "en" ? "invalid project path" : "项目路径无效");
+          throw new Error(tr(lang, "项目路径无效", "invalid project path", "некорректный путь проекта"));
         }
         const created = await apiCreateProject(derived, newProjectPath.trim(), { host: effectiveHost });
         slug = created.slug;
@@ -397,7 +397,7 @@ export default function HomeView({
         setPending(false);
         if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
         toastBus.handler?.error(
-          `${lang === "en" ? "Launch failed" : "启动失败"}: ${e instanceof Error ? e.message : "unknown"}`,
+          `${tr(lang, "启动失败", "Launch failed", "Не удалось запустить")}: ${e instanceof Error ? e.message : "unknown"}`,
         );
       });
     return true;

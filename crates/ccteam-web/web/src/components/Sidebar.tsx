@@ -118,6 +118,7 @@ export function RemoveProjectDialog({
   const t = makeT(lang);
   return (
     <Dialog
+      lang={lang}
       open
       onClose={onCancel}
       title={`${t("projectRemoveTitle")} · ${project}`}

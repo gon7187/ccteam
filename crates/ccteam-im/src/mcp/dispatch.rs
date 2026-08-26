@@ -867,6 +867,7 @@ fn build_send_file_event(
             kind,
         }],
         options: Vec::new(),
+        button_rows: Vec::new(),
         // Web staging replaces this with the server-resolved caller sid so
         // the current per-session SSE can render the reference live. IM-only
         // delivery keeps the historical `None`.
@@ -1023,6 +1024,7 @@ async fn execute_interaction_ask(
             // "allow"/"deny") so the web SSE consumer can resolve by
             // {token, selection=id} through the same pending machinery.
             id: opt.id.clone(),
+            style: None,
         })
         .collect();
 
@@ -1052,6 +1054,7 @@ async fn execute_interaction_ask(
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: message_options,
+            button_rows: Vec::new(),
             // The D6 `interaction/ask` hook prompt has no gateway session.
             sid: None,
             slug: if slug.is_empty() {
@@ -1244,6 +1247,7 @@ async fn execute_permission_ask(
             // "allow"/"deny") so the web SSE consumer can resolve by
             // {token, selection=id} through the same pending machinery.
             id: opt.id.clone(),
+            style: None,
         })
         .collect();
 
@@ -1281,6 +1285,7 @@ async fn execute_permission_ask(
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: message_options,
+            button_rows: Vec::new(),
             // sid set so a per-session web UI stream can show the approval
             // (None would route to IM fine but be filtered out of SSE).
             sid: sid_label.clone(),
@@ -6635,7 +6640,7 @@ mod session_tool_tests {
         assert_eq!(result.chars().count(), INLINE_RESULT_MAX_CHARS);
         assert!(result.starts_with("echo: HEAD"));
         assert!(result.ends_with("TAIL"));
-        assert!(result.contains("truncated"));
+        assert!(result.contains("сокращено"));
         assert!(result.contains("session_collect{sid:"));
     }
 
@@ -6926,7 +6931,7 @@ mod session_tool_tests {
         assert_eq!(result.chars().count(), INLINE_RESULT_MAX_CHARS);
         assert!(result.starts_with("echo: HEAD"));
         assert!(result.ends_with("TAIL"));
-        assert!(result.contains("truncated"));
+        assert!(result.contains("сокращено"));
 
         // timeout pending (child's answer is delayed past the wait).
         let tmp2 = tempfile::TempDir::new().unwrap();
@@ -7050,7 +7055,7 @@ mod session_tool_tests {
                 ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &principal)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|t| t.user.contains("[ccteam] delegated session"))
+                    .filter(|t| t.user.contains("[ccteam] делегированная сессия"))
                     .collect();
             if !notes.is_empty() {
                 break;
@@ -7058,9 +7063,15 @@ mod session_tool_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(notes.len(), 1, "one boundary notification, no flood");
-        assert!(notes[0].user.contains("is now IDLE"), "{}", notes[0].user);
         assert!(
-            notes[0].user.contains("1 interim note(s)"),
+            notes[0].user.contains("ожидает следующую задачу"),
+            "{}",
+            notes[0].user
+        );
+        assert!(
+            notes[0]
+                .user
+                .contains("1 промежуточное сообщение этого запуска осталось в журнале"),
             "pump folds the narration count: {}",
             notes[0].user
         );

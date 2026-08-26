@@ -2,14 +2,20 @@
 //
 // Modeled on the prototype's `I18N` object (ui-prototype.html): one zh/en
 // table + `t(lang, key)`, plus parameterized helpers for count/sid phrases.
-// The older `tr(lang, zh, en)` inline helper and `navLabel` stay for the
+// The older `tr(lang, zh, en, ru)` inline helper and `navLabel` stay for the
 // long-tail of embedded panels that still carry their strings inline.
 
-export type Lang = "zh" | "en";
+export type Lang = "ru" | "zh" | "en";
+
+export const WEB_LOCALE: Record<Lang, string> = {
+  ru: "ru-RU",
+  zh: "zh-CN",
+  en: "en-US",
+};
 
 /** Pick the right string for the current language (`zh` is the default). */
-export function tr(lang: Lang, zh: string, en: string): string {
-  return lang === "en" ? en : zh;
+export function tr(lang: Lang, zh: string, en: string, ru: string): string {
+  return lang === "ru" ? ru : lang === "en" ? en : zh;
 }
 
 /** Whole-shell dictionary — keys follow the prototype's `I18N` object. */
@@ -84,6 +90,10 @@ export const I18N: Record<Lang, Record<string, string>> = {
     flowTitle: "工作流",
     skillsSub: "技能库",
     rolesSub: "角色库",
+    workflowSkillsTitle: "Skills",
+    workflowRolesTitle: "Roles",
+    workflowMcpTitle: "MCP Servers",
+    workflowBuiltIn: "built-in",
     marketSub: "扩展库",
     marketTab: "插件市场",
     mcpSub: "工具",
@@ -162,6 +172,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     probing: "探测中…",
     registerMcp: "注册 MCP",
     registerDshPlugin: "注册 DSH 插件",
+    dshPluginOk: "插件已注册",
     registeringMcp: "注册中…",
     mcpOk: "MCP 已注册",
     notInstalled: "未安装",
@@ -315,6 +326,200 @@ export const I18N: Record<Lang, Record<string, string>> = {
     parentSession: "父会话",
     noParent: "根会话(无父)",
   },
+  ru: {
+search: "Поиск сессий",
+  newSession: "Новая сессия",
+  workflow: "Рабочие процессы",
+  workspaces: "Рабочие пространства",
+  newWorkspace: "Новое рабочее пространство",
+  settings: "Настройки",
+  home: "Главная",
+  collapse: "Свернуть",
+  expand: "Развернуть",
+  homeTitle: "За работу!",
+  homeSub: "Выберите проект и машину, затем пишите — сессия создастся с первым сообщением.",
+  inputPh: "Введите сообщение",
+  convPh: "Введите сообщение (Enter — отправить, Shift+Enter — новая строка)",
+  approve: "Запросить одобрение",
+  quickStart: "Быстрый старт",
+  terminal: "Терминал",
+  chatTab: "Чат",
+  project: "Проект",
+  host: "Хост",
+  branch: "Ветка",
+  role: "Роль",
+  cancel: "Отмена",
+  offline: "офлайн",
+  noRole: "без роли",
+  protocol: "Протокол",
+  noSessions: "Нет сессий",
+  noMatch: "Подходящих сессий нет",
+  connLost: "Соединение потеряно",
+  hitlOn: "Чувствительные операции потребуют одобрения (--permission-mode default)",
+  hitlOff: "Одобрения пропускаются (--dangerously-skip-permissions)",
+  flowTitle: "Рабочие процессы",
+  skillsSub: "навыки",
+  rolesSub: "роли",
+  workflowSkillsTitle: "Навыки",
+  workflowRolesTitle: "Роли",
+  workflowMcpTitle: "MCP-серверы",
+  workflowBuiltIn: "встроенная",
+  marketSub: "расширения",
+  marketTab: "Плагины",
+  mcpSub: "инструменты",
+  evolve: "Саморазвитие",
+  setOps: "Операции и хосты",
+  setAccess: "Доступ",
+  setHosts: "Хосты",
+  setMarket: "Маркетплейс",
+  setGeneral: "Общие",
+  setAccount: "Учётная запись",
+  setAdmin: "Администратор",
+  accessDesc: "Подключайте внешних агентов, спутники, IM-каналы и вход для пользователей.",
+  accessPeopleGroup: "Люди",
+  accessProgramsGroup: "Программы",
+  accessMachinesGroup: "Машины",
+  accessConfigError: "Не удалось загрузить учётные данные IM",
+  accessResetCredentials: "Сбросить",
+  accessMcpTitle: "Внешний доступ агентов (MCP)",
+  accessMcpScopeLabel: "Область",
+  accessMcpMint: "Создать конфигурацию",
+  accessMcpMinting: "Создание…",
+  accessMcpMintFailed: "Не удалось создать",
+  accessMcpEndpoint: "Конечная точка MCP",
+  accessMcpExisting: "Выданные учётные данные",
+  accessMcpRevoke: "Отозвать",
+  accessMcpScopeAll: "Все проекты",
+  accessApiTitle: "API разработчика (REST)",
+  accessCopyBaseUrl: "Копировать URL",
+  accessCopySnippet: "Копировать полный пример",
+  accessApiReference: "Справочник API Scalar",
+  accessSatelliteTitle: "Спутниковые узлы",
+  accessImTitle: "Учётные данные IM",
+  accessLinksTitle: "Ссылки входа пользователей",
+  accessCopyConfig: "Копировать конфигурацию",
+  accessCopyLink: "Копировать ссылку входа",
+  accessCopied: "Скопировано",
+  reprobe: "Проверить снова",
+  nothingToDo: "Ничего делать не нужно",
+  importProject: "Подключить",
+  importingProject: "Подключение…",
+  importProjectFailed: "Не удалось подключить проект",
+  unknownError: "Неизвестная ошибка",
+  probing: "Проверка…",
+  registerMcp: "Зарегистрировать MCP",
+  registerDshPlugin: "Зарегистрировать плагин DSH",
+  registeringMcp: "Регистрация…",
+  notInstalled: "не установлен",
+  updateVendor: "Обновить",
+  installingVendor: "Установка…",
+  installFailed: "Установка не удалась",
+  joinTitle: "Подключить новый хост (спутник)",
+  joinTokenGen: "Создать join token",
+  joinTokenGenBusy: "Создание…",
+  joinTokenCopy: "Копировать команду",
+  joinTokenCopied: "Скопировано",
+  mcpNotRegistered: "MCP не зарегистрирован",
+  hostSatProjects: "Проекты от спутника",
+  wsMenu: "Меню проекта",
+  wsMenuCopyPath: "Копировать путь к проекту",
+  wsMenuRemove: "Удалить из ccteam…",
+  projectRemoveTitle: "Удалить проект",
+  projectRemoveBusy: "Удаление…",
+  projectRemoveConfirm: "Подтвердить удаление",
+  pathCopied: "Путь скопирован",
+  copyFailed: "Не удалось скопировать",
+  install: "Установить",
+  installed: "Установлено",
+  statusDesc: "Состояние daemon · сессии · сегодняшние расходы / бюджет.",
+  running: "работает",
+  sessionsK: "Сессии",
+  todayCost: "Сегодняшние расходы",
+  total: "всего",
+  save: "Сохранить",
+  language: "Язык интерфейса",
+  theme: "Тема",
+  light: "Светлая",
+  dark: "Тёмная",
+  accAvatar: "Аватар / имя",
+  logout: "Выйти (очистит token этого браузера)",
+  goMarket: "Установить",
+  sendTip: "Отправить (Enter)",
+  scheduleToggle: "Отложенная отправка",
+  scheduleDateTime: "Локальное время",
+  scheduleTimezone: "часовой пояс daemon",
+  scheduleMinutes: "мин",
+  scheduleHours: "ч",
+  scheduleSend: "Запланировать сообщение",
+  scheduleQueue: "Запланировано",
+  scheduleCancel: "Отменить запланированное сообщение",
+  stopTurnTip: "Остановить текущий ход (сессия сохранится)",
+  attachTip: "Прикрепить файлы / навыки",
+  attachFiles: "Загрузить файлы или фото",
+  attachSkillGroup: "Прикрепить навык",
+  attachSkillGlobal: "Глобальная библиотека",
+  loading: "Загрузка…",
+  starting: "Создание сессии…",
+  dshStart: "Запустить",
+  dshStop: "Остановить",
+  dshRestart: "Перезапустить",
+  dshOpenNative: "Открыть нативное окно",
+  dshAttached: "Подключён",
+  dshHomeManaged: "Изолированное пространство",
+  dshStoppedTitle: "DSH не запущен",
+  dshStartingHint: "Запускается экземпляр DSH web…",
+  dshDisabledTitle: "Меню DSH выключено",
+  dshRetry: "Повторить",
+  team: "Команда",
+  teamEmpty: "Сессий пока нет — создайте одну, чтобы начать делегирование.",
+  teamSelectHint: "Нажмите участника, чтобы увидеть детали",
+  teamOpenChat: "Открыть чат",
+  teamTicker: "Последние поручения",
+  teamActivity: "Текущая активность",
+  teamRecentTurns: "Последние ходы",
+  teamIdle: "Простаивает",
+  teamTabTopology: "Топология",
+  teamTabCharter: "Устав",
+  charterTitle: "Устав разделения труда",
+  charterEdit: "Редактировать",
+  charterPreview: "Предпросмотр",
+  charterSaving: "Сохранение…",
+  charterUnsaved: "не сохранено",
+  charterNoProjects: "Нет видимых проектов",
+  charterLoadFailed: "Не удалось загрузить устав",
+  playbookLaunch: "Запустить",
+  rosterStatusReady: "готов",
+  rosterStatusNeedsConfig: "нужна настройка",
+  rosterHostOnline: "онлайн",
+  rosterHostOffline: "офлайн",
+  rosterRemove: "Удалить",
+  rosterRemoveConfirm: "Подтвердить?",
+  vendor: "Поставщик",
+  model: "Модель",
+  cost: "Стоимость",
+  depth: "Глубина делегирования",
+  parentSession: "Родительская сессия",
+  noParent: "Корневая сессия (без родителя)",
+  newWsToast: "Новое рабочее пространство: запустите ccteam init в новом каталоге.",
+  tplCommanderT: "Командир и команды",
+  tplCommanderD: "claude планирует и принимает; codex разрабатывает, grok исследует — отчёты возвращаются",
+  tplCommanderP: "Сначала проверьте через status доступных в проекте vendor, затем разбейте задачу и делегируйте через session_spawn / session_dispatch: разработку — codex, исследование — grok. Вы отвечаете за планирование, приёмку и итог. Задача:",
+  tplAdvisorT: "Исполнитель и советник", tplAdvisorD: "Основной исполнитель ведёт работу; при затруднениях советуется с claude в том же репозитории", tplAdvisorP: "Двигайте задачу сами. При затруднениях создайте через session_spawn сессию советника claude в том же проекте, передайте контекст и сами выполните рекомендацию. Задача:",
+  tplCrossreviewT: "Перекрёстное ревью", tplCrossreviewD: "Один vendor пишет, другой независимо проверяет diff", tplCrossreviewP: "Передайте требование сессии codex; после завершения дайте diff другому vendor для независимого ревью корректности, безопасности и рисков регрессий. Требование:",
+  tplBakeoffT: "Параллельный конкурс", tplBakeoffD: "Решите сложную задачу у 2–3 vendor параллельно и выберите лучшее", tplBakeoffP: "Отправьте задачу 2–3 новым сессиям разных vendor для независимого решения, затем сравните подходы и объедините лучший ответ. Задача:",
+  tplTriangulateT: "Треугольник исследования", tplTriangulateD: "grok изучает X, claude — веб, codex — исходники", tplTriangulateP: "Исследуйте тему: через session_spawn поручите grok изучить X, claude — веб-обзор, codex — исходники. Сверьте результаты и подготовьте вывод с источниками. Тема:",
+  tplPyramidT: "Пирамидальная команда", tplPyramidD: "Недорогие vendor делают механическую работу; сложное эскалируется сильной модели", tplPyramidP: "Поручите механические задачи через session_spawn недорогим vendor (kimi / opencode), а сложные решения передавайте сильной модели. Список задач:",
+  localTag: "локальный", newProjLabel: "Путь к новому проекту", newProjRemotePath: "Абсолютный путь на {host}", newProjPathRequired: "Укажите путь к проекту", newProject: "＋ Новый проект…", connectHost: "＋ Подключить хост…", installFromMarket: "Установить из маркетплейса…", offlineNoPick: "офлайн, недоступно", ctoSub: "главный помощник", effort: "Усилие", emptyInput: "Сначала введите сообщение", stopTip: "Остановить (состояние сохранится, можно продолжить)", renameTip: "Переименовать", renameHint: "Enter — сохранить, Esc — отменить", renameFailed: "Не удалось переименовать", newInWs: "Новая сессия в этом рабочем пространстве",
+  piHitlTradeoff: "Строгий HITL Pi отключает пользовательские расширения. Навыки, контекстные файлы и шаблоны подсказок не затрагиваются.", evolveSub: "v0.9", setStatus: "Статус",
+  accessMcpDesc: "Создайте конфигурацию MCP с отдельными учётными данными и вставьте её в agent на любой машине (Claude / Codex / Grok / OpenCode / Kimi), чтобы дать ему инструменты ccteam.", accessMcpFooter: "Любые учётные данные можно отозвать, не затрагивая остальные. У вручную запущенного pi нет инструментов ccteam.", accessMcpScopeUser: "Пользователь машины (все мои проекты)", accessMcpScopeUserHint: "Проект не закрепляется: его нужно указывать в каждом вызове", accessMcpScopeProjectHint: "Доступно только это рабочее пространство", accessMcpNoProjects: "Проектов пока нет — создайте один или выберите область пользователя машины.", accessMcpLabelLabel: "Метка (необязательно)", accessMcpLabelPh: "например, ноутбук rob или CI runner", accessMcpWarn: "Эта конфигурация содержит учётные данные: любой, у кого они есть, может использовать ccteam от этого имени. При утечке отзовите их ниже.", accessMcpWarnPlainHttp: "Это HTTP без TLS к не-loopback хосту: учётные данные передаются открытым текстом. Используйте доверенную сеть или HTTPS.", accessMcpExistingEmpty: "Учётные данные ещё не выдавались.", accessMcpRevokeFailed: "Не удалось отозвать", accessMcpSnippetFor: "Вставить в",
+  accessApiDesc: "Вызывайте REST API из внешних программ: создавайте сессии, отправляйте сообщения и получайте ответы с тем же bearer token, что и веб-приложение.", accessApiBaseUrl: "Базовый URL", accessApiOpenApi: "OpenAPI 3.x", accessApiFooter: "Этот token совпадает с веб-входом; сбросьте его в разделе «Учётная запись».", accessApiStepCreate: "создать сессию", accessApiStepSend: "отправить сообщение", accessApiStepStream: "потоково получать ответы и прогресс", accessLinksDesc: "Скопируйте личную ссылку входа для каждого пользователя.", accessLinksEmpty: "Пользователей пока нет; добавьте их в разделе «Администратор».",
+  hostsDesc: "Управление хостами и harness: состояние установки, версии и регистрации MCP каждого vendor CLI на хосте; обзор парка находится на странице команды.", hostsTeamLink: "→ Обзор парка на странице команды", hostsAccessPointer: "Подключить хост → Настройки · Доступ", dshPluginOk: "плагин зарегистрирован", mcpOk: "MCP зарегистрирован", npmMissingHint: "npm нет в PATH — установка в один клик недоступна", offlineRow: "Офлайн — невозможно проверить агентов.", joinDesc: "Установите ccteam на целевой машине и подключите её к этому daemon: спутник сам соединяется с этой машиной и не открывает собственные порты.", joinTokenCopyFailed: "Не удалось скопировать — скопируйте команду вручную.", joinTokenHint: "Любая машина с join token может зарегистрироваться как спутник — не передавайте его.", hostsUnit: "", hostCataloged: "подключён",
+  projectRemoveHint: "Удаляет только регистрацию в ccteam: сессии останавливаются, а каталог и код на диске остаются.", projectRemoveType: "Введите slug проекта для подтверждения:", marketDesc: "Роли, навыки, рабочие процессы и плагины из ccteam-hub с проверкой sha256.", accToken: "web token", accTokenHint: "Используется для авторизации /api/v1; личная ссылка ?token=… сохранила его в этом браузере.", browseMarket: "Открыть маркетплейс →", installMarket: "Установить из маркетплейса →", protoToast: "Протокол: ",
+  schedulePickTime: "Укажите минуты/часы или выберите локальное время", scheduleIn: "Через", scheduleOrAt: "или", schedulePreview: "Отправится примерно", scheduleTzNote: "Преобразуется в задержку по часам устройства (часовой пояс daemon не важен)", scheduleLocalTime: "ваше локальное время", scheduleFailed: "Не удалось запланировать отправку", scheduleCancelFailed: "Не удалось отменить",
+  noSkills: "В этом проекте нет установленных навыков (установите из маркетплейса)", noGlobalSkills: "Глобальная библиотека пуста (установите из маркетплейса)", skillInstallToLibrary: "Установить в библиотеку", skillInLibrary: "В библиотеке", skillUpdateLibrary: "Обновить версию в библиотеке", skillLibraryTarget: "Устанавливается в глобальную библиотеку (проект не изменяется)", skillInstalledToast: "Установлено в библиотеку", uploadingWait: "Вложения ещё загружаются — подождите", uploadFailed: "Загрузка не удалась", attachNeedProject: "Перед прикреплением файлов или навыков выберите проект", historySec: "история",
+  dsh: "DSH", dshDesc: "Встроенный DeepSeek Harness: откройте его — и готово ваше пространство DSH с собственными моделями, учётными данными и плагинами, на этой машине и под защитой входа ccteam.", dshAttachedHint: "Проксируется запущенный вами dsh web, а не запускается второй (у одного DSH_HOME не может быть двух записывающих процессов).", dshHomeOwn: "~/.dsh этой машины", dshDisabledHint: "Этот daemon запущен с --dsh-web-bind off. Чтобы включить его, задайте порт спутника DSH при перезапуске:", dshErrorTitle: "Не удалось прочитать состояние DSH",
+  teamDesc: "Живая топология делегирования и устав разделения труда между harness и хостами: кто работает, кто кому делегировал и как распределена работа.", teamOpenLink: "Открыть ↗", teamKpiLive: "live-сессии", teamKpiWorking: "в работе", teamKpiDispatches: "активные поручения", teamKpiCost: "общая стоимость", teamColTurns: "Ходы", teamColModel: "Модель · усилие", charterRoster: "Состав vendor", charterCopyDraft: "Скопировать в черновик", charterBlankDraft: "Начать с пустого", charterGlobalFallback: "Показан глобальный fallback (только чтение) — сохранение создаст собственный routing.md этого проекта", charterNone: "У этого проекта пока нет устава", charterHonesty: "Агенты запрашивают этот файл по требованию через инструмент MCP status (только рекомендация, без инъекции); после ~4k символов status отдаёт отрывок и указатель на полный файл.", playbookSection: "Сценарии формирования команды", playbookHonesty: "Сценарий заполняет только состав vendor и начальный заголовок — оркестрация выполняется внутри сессии (после spawn сессия командира делегирует работу через инструменты session_*).", rosterPickHint: "Показать сессии этого vendor в топологии", rosterStaleHint: "рекомендуется удалить",
+  },
   en: {
     search: "Search sessions",
     newSession: "New session",
@@ -385,6 +590,10 @@ export const I18N: Record<Lang, Record<string, string>> = {
     flowTitle: "Workflows",
     skillsSub: "skills",
     rolesSub: "roles",
+    workflowSkillsTitle: "Skills",
+    workflowRolesTitle: "Roles",
+    workflowMcpTitle: "MCP Servers",
+    workflowBuiltIn: "built-in",
     marketSub: "extensions",
     marketTab: "Plugins",
     mcpSub: "tools",
@@ -463,6 +672,7 @@ export const I18N: Record<Lang, Record<string, string>> = {
     probing: "Probing…",
     registerMcp: "Register MCP",
     registerDshPlugin: "Register DSH plugin",
+    dshPluginOk: "plugin registered",
     registeringMcp: "Registering…",
     mcpOk: "MCP registered",
     notInstalled: "not installed",
@@ -618,6 +828,8 @@ export const I18N: Record<Lang, Record<string, string>> = {
   },
 };
 
+
+
 /** Dictionary lookup; falls back zh → key so a missing entry is visible, not
  *  a crash. */
 export function t(lang: Lang, key: string): string {
@@ -631,14 +843,22 @@ export function makeT(lang: Lang): (key: string) => string {
 
 /** Parameterized phrases (the prototype's function-valued entries). */
 export function tShowMore(lang: Lang, n: number): string {
+  if (lang === "ru") return `Показать ещё (${n})`;
   return lang === "en" ? `Show more (${n} more)` : `展开显示(还有 ${n} 个)`;
 }
 /** Workspace-header badge when a project's live sessions span several
  *  execution hosts (per-row badges carry the specifics). */
 export function tHostsCount(lang: Lang, n: number): string {
+  if (lang === "ru") {
+    const mod10 = n % 10;
+    const mod100 = n % 100;
+    const suffix = mod10 === 1 && mod100 !== 11 ? "" : mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14) ? "а" : "ов";
+    return `${n} хост${suffix}`;
+  }
   return lang === "en" ? `${n} hosts` : `${n} 台主机`;
 }
 export function tStopped(lang: Lang, sid: string): string {
+  if (lang === "ru") return `Сессия ${sid} остановлена (состояние сохранено, можно продолжить)`;
   return lang === "en"
     ? `Stopped ${sid} (state kept, resume anytime)`
     : `已停止 ${sid}(状态保留,随时 resume)`;
@@ -649,6 +869,7 @@ export function tRemoteProjectPath(lang: Lang, host: string): string {
 /** Roster host-group age line: how long an offline satellite has been out of
  *  touch (`n` + unit come from `lib/charterRoster.ts::offlineAge`). */
 export function tRosterOfflineFor(lang: Lang, n: number, unit: "hours" | "days"): string {
+  if (lang === "ru") return unit === "days" ? `офлайн ${n} дн.` : `офлайн ${n} ч.`;
   if (lang === "en") {
     const word = unit === "days" ? "day" : "hour";
     return `offline for ${n} ${word}${n === 1 ? "" : "s"}`;
@@ -659,34 +880,35 @@ export function tRosterOfflineFor(lang: Lang, n: number, unit: "hours" | "days")
  *  reports installed (`lib/vendorLatest.ts`). Only ever rendered when the
  *  comparison actually resolved — silence, not "unknown", otherwise. */
 export function tRosterUpdateAvailable(lang: Lang, latest: string): string {
+  if (lang === "ru") return `↑ доступна ${latest}`;
   return lang === "en" ? `↑ ${latest} available` : `↑ ${latest} 可更新`;
 }
 
 /** Shell / nav labels, keyed by route or shell surface (pre-dictionary seam;
  *  kept for panels that still call it). */
-export const NAV_LABELS: Record<string, { zh: string; en: string }> = {
-  marketplace: { zh: "插件市场", en: "Plugins" },
-  status: { zh: "Status", en: "Status" },
-  hosts: { zh: "主机", en: "Hosts" },
-  settings: { zh: "设置", en: "Settings" },
-  workflow: { zh: "工作流", en: "Workflow" },
-  home: { zh: "开工吧!", en: "Let's go!" },
-  newSession: { zh: "新建会话", en: "New session" },
-  search: { zh: "搜索会话 / 项目", en: "Search sessions / projects" },
-  collapse: { zh: "折叠侧栏", en: "Collapse sidebar" },
-  expand: { zh: "展开侧栏", en: "Expand sidebar" },
-  general: { zh: "通用", en: "General" },
-  account: { zh: "账号", en: "Account" },
-  admin: { zh: "管理员", en: "Admin" },
-  theme: { zh: "主题", en: "Theme" },
-  language: { zh: "界面语言", en: "Language" },
-  light: { zh: "浅色", en: "Light" },
-  dark: { zh: "深色", en: "Dark" },
+export const NAV_LABELS: Record<string, Record<Lang, string>> = {
+  marketplace: { ru: "Плагины", zh: "插件市场", en: "Plugins" },
+  status: { ru: "Статус", zh: "Status", en: "Status" },
+  hosts: { ru: "Хосты", zh: "主机", en: "Hosts" },
+  settings: { ru: "Настройки", zh: "设置", en: "Settings" },
+  workflow: { ru: "Рабочие процессы", zh: "工作流", en: "Workflow" },
+  home: { ru: "За работу!", zh: "开工吧!", en: "Let's go!" },
+  newSession: { ru: "Новая сессия", zh: "新建会话", en: "New session" },
+  search: { ru: "Поиск сессий / проектов", zh: "搜索会话 / 项目", en: "Search sessions / projects" },
+  collapse: { ru: "Свернуть боковую панель", zh: "折叠侧栏", en: "Collapse sidebar" },
+  expand: { ru: "Развернуть боковую панель", zh: "展开侧栏", en: "Expand sidebar" },
+  general: { ru: "Общие", zh: "通用", en: "General" },
+  account: { ru: "Учётная запись", zh: "账号", en: "Account" },
+  admin: { ru: "Администратор", zh: "管理员", en: "Admin" },
+  theme: { ru: "Тема", zh: "主题", en: "Theme" },
+  language: { ru: "Язык интерфейса", zh: "界面语言", en: "Language" },
+  light: { ru: "Светлая", zh: "浅色", en: "Light" },
+  dark: { ru: "Тёмная", zh: "深色", en: "Dark" },
 };
 
 /** Resolve a nav label for the active language. Falls back to the key. */
 export function navLabel(key: string, lang: Lang): string {
   const entry = NAV_LABELS[key];
   if (!entry) return key;
-  return lang === "en" ? entry.en : entry.zh;
+  return entry[lang];
 }

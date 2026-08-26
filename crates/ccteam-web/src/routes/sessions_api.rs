@@ -1476,8 +1476,10 @@ fn synthetic_approval_event(sid: &str, prompt: &ChoicePrompt) -> GatewayEvent {
                 data: format!("{}:{i}", prompt.token),
                 label: opt.label.clone(),
                 id: opt.id.clone(),
+                style: None,
             })
             .collect(),
+        button_rows: Vec::new(),
         sid: Some(sid.to_string()),
         // Not resolvable from a bare `(sid, prompt)` pair; the reseed just
         // won't ACL-filter into the team view's global SSE for a tenant
@@ -2056,6 +2058,11 @@ pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
         GatewayEventKind::Delegation { .. } => ("delegation", false),
         GatewayEventKind::SessionLifecycle { .. } => ("session_lifecycle", false),
         GatewayEventKind::ScheduledChanged => ("scheduled_changed", false),
+        // TG-GATE-V2 W8 — an IM-only edit-in-place (e.g. resolving a `cmd:`
+        // confirmation tap); `is_im_only_event` filters it out before this
+        // serializer ever runs, same as `Reaction` above — the arm exists
+        // only for match exhaustiveness.
+        GatewayEventKind::EditMessage { .. } => ("edit_message", false),
     };
     let mut payload = json!({
         "id": ev.id,
@@ -2403,6 +2410,7 @@ mod tests {
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: sid.map(str::to_string),
             slug: None,
         }
@@ -2587,11 +2595,13 @@ mod tests {
                 data: "pcafef00d:0".into(),
                 label: "✅ Approve".into(),
                 id: "allow".into(),
+                style: None,
             },
             MessageOption {
                 data: "pcafef00d:1".into(),
                 label: "⛔ Deny".into(),
                 id: "deny".into(),
+                style: None,
             },
         ];
         let payload = session_event_payload(&ev);
@@ -2613,6 +2623,7 @@ mod tests {
             data: "ptok:0".into(),
             label: "x".into(),
             id: "allow".into(),
+            style: None,
         }];
         assert_eq!(approval_token(&ev).as_deref(), Some("ptok"));
         // No options ⇒ None (the payload then omits the resolve affordance).
@@ -3294,6 +3305,7 @@ mod tests {
             kind: ccteam_im::gateway::GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: None,
         };

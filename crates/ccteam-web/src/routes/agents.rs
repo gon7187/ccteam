@@ -708,6 +708,7 @@ mod tests {
             kind: ccteam_im::gateway::GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: None,
             slug: None,
         };
@@ -743,6 +744,7 @@ mod tests {
             kind: ccteam_im::gateway::GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: None,
             slug: None,
         };
@@ -764,6 +766,7 @@ mod tests {
             kind: ccteam_im::gateway::GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: None,
             slug: Some("demo".to_string()),
         };

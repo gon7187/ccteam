@@ -37,6 +37,25 @@ pub enum InteractionOrigin {
         /// One-shot back to the waiting party (the blocked hook task).
         reply: tokio::sync::oneshot::Sender<ChoiceSelection>,
     },
+    /// Telegram bulk-stop confirmation. The snapshot is deliberately stored
+    /// in the same one-shot registry as every other button prompt.
+    BulkStop {
+        /// Delivery channel for the chat that requested the stop.
+        channel: String,
+        /// Chat identifier that owns the confirmation.
+        chat_id: String,
+        /// Sender identifier that owns the confirmation.
+        user_id: String,
+        /// Bulk-stop scope selected by the chat.
+        scope: String,
+        /// Project resolved when the preview was created, for `project` scope.
+        project: Option<String>,
+        /// Parent sid resolved when the preview was created, for `children`
+        /// scope (the chat's then-current session).
+        parent: Option<String>,
+        /// Candidate sids captured by the preview.
+        snapshot: Vec<String>,
+    },
 }
 
 /// One outstanding choice.

@@ -107,9 +107,8 @@ fn utf16_len(s: &str) -> usize {
 }
 
 /// Units reserved when a code fence straddles a split boundary, to hold
-/// the re-open (`` ```<info>\n ``) on the next part plus the close
-/// (`` \n``` ``) on this one. Comfortably covers info strings up to
-/// ~16 units (`typescript` = 10).
+/// the re-open (marker + info + newline) on the next part plus the close
+/// on this one. The final size is checked again after balancing.
 const FENCE_REOPEN_MARGIN: usize = 24;
 
 /// Split `text` into ordered chunks, each within `max_units` UTF-16 code
@@ -118,7 +117,7 @@ const FENCE_REOPEN_MARGIN: usize = 24;
 /// - **Lossless for plain text**: concatenating the parts reproduces the
 ///   original verbatim (no characters dropped, no separators consumed)
 ///   whenever no code fence crosses a boundary.
-/// - **Balanced fences**: a `` ``` `` block that crosses a split is
+/// - **Balanced fences**: a backtick or tilde fence block that crosses a split is
 ///   closed at the end of one part and re-opened (preserving the
 ///   language info string) at the start of the next, so every part is
 ///   valid Markdown on its own.
@@ -132,18 +131,349 @@ pub fn split_for_channel(text: &str, max_units: usize) -> Vec<String> {
     if utf16_len(text) <= max_units {
         return vec![text.to_string()];
     }
-    let has_fence = text.contains("```");
-    let budget = if has_fence {
-        max_units.saturating_sub(FENCE_REOPEN_MARGIN).max(1)
-    } else {
-        max_units
-    };
-    let raw = raw_split(text, budget);
-    if has_fence {
-        balance_fences(raw)
-    } else {
-        raw
+    if !text.lines().any(|line| fence_line(line).is_some()) {
+        return raw_split(text, max_units);
     }
+
+    let mut budget = max_units.saturating_sub(FENCE_REOPEN_MARGIN).max(1);
+    for _ in 0..32 {
+        let parts = balance_fences(raw_split(text, budget));
+        let over = parts
+            .iter()
+            .map(|part| utf16_len(part))
+            .max()
+            .unwrap_or_default()
+            .saturating_sub(max_units);
+        if over == 0 {
+            return parts;
+        }
+        let next = budget.saturating_sub(over.max(1));
+        if next == budget {
+            break;
+        }
+        budget = next;
+    }
+
+    // A pathological tiny ceiling can be smaller than the fence wrapper
+    // itself. The raw split still guarantees progress and the requested hard
+    // ceiling for every representable chunk.
+    raw_split(text, max_units)
+}
+
+/// [`split_for_channel`], plus a `(i/n)` numbering suffix on every part
+/// once a message actually needs more than one — the shared numbering
+/// contract both the pre-split classic path and the Telegram Rich
+/// Message fallback split follow (TG-GATE-V2).
+///
+/// The suffix is appended as `\n\n(i/n)` — a full blank line, then the
+/// marker on its own line — never glued onto the part's last content
+/// line. That matters because [`split_for_channel`] can hand back a part
+/// whose last line is a closing ` ``` ` fence (balanced by
+/// [`balance_fences`]); gluing `(i/n)` onto that line would corrupt the
+/// fence delimiter itself (`` ```(1/3) `` is not a valid fence). A blank
+/// line in between guarantees the marker always reads as its own
+/// trailing block, fence or no fence (see
+/// `telegram_html::is_fence_line`, which every part's last line is
+/// checked against in tests).
+///
+/// The suffix's own width must be reserved from `limit` BEFORE splitting
+/// — appending it after the fact could push a part back over the
+/// ceiling. But the suffix's width depends on `digits(n)`, and `n` isn't
+/// known until we've already split. Resolved by iterating: guess
+/// `digits`, reserve for it, split, check whether the actual part count
+/// still fits that many digits. Reserving more digits only shrinks the
+/// budget, which can only grow (never shrink) the part count, so
+/// `digits` is monotonically non-decreasing across iterations and the
+/// loop always converges (typically 1 iteration; 2 across a `9 → 10`
+/// part-count boundary).
+pub fn split_for_channel_numbered(text: &str, limit: usize) -> Vec<String> {
+    if utf16_len(text) <= limit {
+        return vec![text.to_string()];
+    }
+    let mut digits = 1usize;
+    let parts = loop {
+        // Width of `\n\n(i/n)` when both `i` and `n` have `digits` digits
+        // (the widest `i` can ever be, since `i <= n`): 2 newlines + 2
+        // parens + 1 slash + 2×`digits`.
+        let reserve = 2 * digits + 5;
+        let budget = limit.saturating_sub(reserve).max(1);
+        let candidate = split_for_channel(text, budget);
+        let needed = candidate.len().to_string().len();
+        if needed <= digits {
+            break candidate;
+        }
+        digits = needed;
+    };
+    if parts.len() <= 1 {
+        return parts;
+    }
+    let total = parts.len();
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(idx, part)| format!("{part}\n\n({}/{total})", idx + 1))
+        .collect()
+}
+
+/// Split Rich Message Markdown into independently valid numbered parts.
+/// Tables, quotes and details are atomic. If one of those exceeds the ceiling,
+/// it is cut only at line boundaries: the documented Rich Message ceiling wins.
+pub fn split_rich_markdown_numbered(markdown: &str, limit: usize) -> Vec<String> {
+    let limit = limit.max(1);
+    if markdown.len() <= limit {
+        return vec![markdown.to_string()];
+    }
+    let mut digits = 1usize;
+    let parts = loop {
+        let reserve = 2 * digits + 5;
+        let mut budget = limit.saturating_sub(reserve).max(1);
+        let candidate = loop {
+            let candidate = split_rich_raw(markdown, budget);
+            let total = candidate.len();
+            let over = candidate
+                .iter()
+                .enumerate()
+                .map(|(index, part)| {
+                    part.len()
+                        .saturating_add(if part.ends_with('\n') { 1 } else { 2 })
+                        .saturating_add((index + 1).to_string().len() + total.to_string().len() + 3)
+                })
+                .max()
+                .unwrap_or_default()
+                .saturating_sub(limit);
+            if over == 0 {
+                break candidate;
+            }
+            let next = budget.saturating_sub(over.max(1));
+            if next == budget {
+                break candidate;
+            }
+            budget = next;
+        };
+        if candidate.len().to_string().len() <= digits {
+            break candidate;
+        }
+        digits = candidate.len().to_string().len();
+    };
+    if parts.len() == 1 {
+        return parts;
+    }
+    let total = parts.len();
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let separator = if part.ends_with('\n') { "\n" } else { "\n\n" };
+            format!("{part}{separator}({}/{total})", i + 1)
+        })
+        .collect()
+}
+
+/// Split a rich message once and keep a separate plain fallback for each
+/// resulting row. The plain chunks use the same outer numbering and never
+/// copy the Markdown payload into `SendMessage::content`.
+pub fn split_rich_markdown_with_plain(
+    markdown: &str,
+    plain: &str,
+    limit: usize,
+) -> Vec<(String, String)> {
+    let rich_parts = split_rich_markdown_numbered(markdown, limit);
+    if rich_parts.len() == 1 {
+        return vec![(rich_parts[0].clone(), plain.to_string())];
+    }
+    let total = rich_parts.len();
+    split_plain_evenly(plain, total)
+        .into_iter()
+        .enumerate()
+        .zip(rich_parts)
+        .map(|((index, mut fallback), rich)| {
+            fallback.push_str(&format!("\n\n({}/{total})", index + 1));
+            (rich, fallback)
+        })
+        .collect()
+}
+
+fn split_rich_raw(markdown: &str, budget: usize) -> Vec<String> {
+    let lines: Vec<&str> = markdown.split_inclusive('\n').collect();
+    let mut blocks = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let bare = lines[i].trim_end_matches('\n');
+        let mut end = i + 1;
+        if let Some(opening) = fence_line(bare) {
+            while end < lines.len() {
+                let line = lines[end].trim_end_matches('\n');
+                end += 1;
+                if is_fence_close(line, &opening) {
+                    break;
+                }
+            }
+        } else if bare.trim_start().starts_with("<details") {
+            while end < lines.len() && !lines[end - 1].contains("</details>") {
+                end += 1;
+            }
+        } else if bare.trim_start().starts_with("<blockquote") {
+            while end < lines.len() && !lines[end - 1].contains("</blockquote>") {
+                end += 1;
+            }
+        } else if bare.trim_start().starts_with('>') {
+            while end < lines.len() && lines[end].trim_start().starts_with('>') {
+                end += 1;
+            }
+        } else if end < lines.len()
+            && bare.contains('|')
+            && is_table_separator(lines[end].trim_end_matches('\n'))
+        {
+            end += 1;
+            while end < lines.len() && lines[end].contains('|') {
+                end += 1;
+            }
+        }
+        blocks.push(lines[i..end].concat());
+        i = end;
+    }
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for block in blocks {
+        if block.len() > budget {
+            if !current.is_empty() {
+                parts.push(current);
+                current = String::new();
+            }
+            if fence_line(block.lines().next().unwrap_or_default()).is_some() {
+                parts.extend(split_rich_fence(&block, budget));
+            } else if block
+                .lines()
+                .next()
+                .is_some_and(|line| line.trim_start().starts_with("<details"))
+            {
+                parts.extend(split_rich_details(&block, budget));
+            } else {
+                parts.extend(split_rich_lines(&block, budget));
+            }
+        } else if current.len() + block.len() > budget && !current.is_empty() {
+            parts.push(current);
+            current = block;
+        } else {
+            current.push_str(&block);
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let cells: Vec<_> = line.trim().trim_matches('|').split('|').collect();
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let cell = cell.trim();
+            !cell.is_empty() && cell.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
+        })
+}
+
+fn split_rich_details(block: &str, budget: usize) -> Vec<String> {
+    let mut lines = block.split_inclusive('\n');
+    let opener = lines.next().unwrap_or_default();
+    let open_line = if opener.ends_with('\n') {
+        opener.to_string()
+    } else {
+        format!("{opener}\n")
+    };
+    let close_line = "</details>";
+    if open_line.len() + close_line.len() + 1 > budget {
+        return raw_split_bytes(block, budget);
+    }
+    let room = budget - open_line.len() - close_line.len() - 1;
+    let mut parts = Vec::new();
+    let mut current = open_line.clone();
+    for line in lines {
+        if line.trim().starts_with(close_line) {
+            continue;
+        }
+        for chunk in raw_split_bytes(line, room.max(1)) {
+            if current.len() + chunk.len() + close_line.len() + 1 > budget && current != open_line {
+                finish_details_part(&mut parts, &mut current, close_line);
+                current = open_line.clone();
+            }
+            current.push_str(&chunk);
+        }
+    }
+    finish_details_part(&mut parts, &mut current, close_line);
+    parts
+}
+
+fn finish_details_part(parts: &mut Vec<String>, current: &mut String, close_line: &str) {
+    if !current.ends_with('\n') {
+        current.push('\n');
+    }
+    current.push_str(close_line);
+    parts.push(std::mem::take(current));
+}
+
+fn split_rich_lines(block: &str, budget: usize) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for line in block.split_inclusive('\n') {
+        if line.len() > budget {
+            if !current.is_empty() {
+                parts.push(std::mem::take(&mut current));
+            }
+            parts.extend(raw_split_bytes(line, budget));
+        } else {
+            if current.len() + line.len() > budget && !current.is_empty() {
+                parts.push(std::mem::take(&mut current));
+            }
+            current.push_str(line);
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+fn split_rich_fence(block: &str, budget: usize) -> Vec<String> {
+    let mut lines = block.split_inclusive('\n');
+    let opener = lines.next().unwrap_or_default();
+    let Some(opening) = fence_line(opener.trim_end_matches('\n')) else {
+        return split_rich_lines(block, budget);
+    };
+    let open_line = if opener.ends_with('\n') {
+        opener.to_string()
+    } else {
+        format!("{opener}\n")
+    };
+    let close_line = fence_close_line(&opening);
+    if open_line.len() + close_line.len() + 1 > budget {
+        return raw_split_bytes(block, budget);
+    }
+    let mut parts = Vec::new();
+    let mut current = open_line.clone();
+    for line in lines {
+        if is_fence_close(line.trim_end_matches('\n'), &opening) {
+            continue;
+        }
+        let room = budget - open_line.len() - close_line.len() - 1;
+        for chunk in raw_split_bytes(line, room.max(1)) {
+            if current.len() + chunk.len() + close_line.len() + 1 > budget && current != open_line {
+                finish_fence_part(&mut parts, &mut current, &close_line);
+                current = open_line.clone();
+            }
+            current.push_str(&chunk);
+        }
+    }
+    finish_fence_part(&mut parts, &mut current, &close_line);
+    parts
+}
+
+fn finish_fence_part(parts: &mut Vec<String>, current: &mut String, close_line: &str) {
+    if !current.ends_with('\n') {
+        current.push('\n');
+    }
+    current.push_str(close_line);
+    parts.push(std::mem::take(current));
 }
 
 /// Greedy length-budgeted split that preserves every byte (no fence
@@ -163,6 +493,58 @@ fn raw_split(text: &str, budget: usize) -> Vec<String> {
         rest = &rest[cut..];
     }
     parts
+}
+
+/// Byte-budgeted counterpart used by Rich Message Markdown. Rich Telegram
+/// parts are capped in UTF-8 bytes, while classic Telegram parts use UTF-16.
+fn raw_split_bytes(text: &str, budget: usize) -> Vec<String> {
+    let budget = budget.max(1);
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.len() <= budget {
+            parts.push(rest.to_string());
+            break;
+        }
+        let cut = pick_byte_cut(rest, budget);
+        parts.push(rest[..cut].to_string());
+        rest = &rest[cut..];
+    }
+    parts
+}
+
+fn pick_byte_cut(s: &str, budget: usize) -> usize {
+    let min_fill = budget / 2;
+    let mut hard_cut = 0;
+    let mut first_char_end = 0;
+    let mut last_line = 0;
+    let mut last_ws = 0;
+    for (index, ch) in s.char_indices() {
+        let end = index + ch.len_utf8();
+        if first_char_end == 0 {
+            first_char_end = end;
+        }
+        if end > budget {
+            break;
+        }
+        hard_cut = end;
+        if end >= min_fill {
+            if ch == '\n' {
+                last_line = end;
+            } else if ch.is_whitespace() {
+                last_ws = end;
+            }
+        }
+    }
+    if last_line > 0 {
+        last_line
+    } else if last_ws > 0 {
+        last_ws
+    } else if hard_cut > 0 {
+        hard_cut
+    } else {
+        first_char_end
+    }
 }
 
 /// Byte index (always on a char boundary, always `> 0`) at which to cut
@@ -218,26 +600,24 @@ fn pick_cut(s: &str, budget: usize) -> usize {
 }
 
 /// Walk `parts` left-to-right; whenever a part ends inside an open code
-/// fence, append a closing `` ``` `` and re-open the fence (with its
-/// language info) at the head of the next part.
+/// fence, append a matching close and re-open it (with its language info)
+/// at the head of the next part.
 fn balance_fences(parts: Vec<String>) -> Vec<String> {
     let mut out = Vec::with_capacity(parts.len());
-    let mut carry: Option<String> = None;
+    let mut carry: Option<FenceState> = None;
     for part in parts {
         let mut s = String::new();
-        if let Some(info) = &carry {
-            s.push_str("```");
-            s.push_str(info);
+        if let Some(opening) = &carry {
+            s.push_str(&fence_open_line(opening));
             s.push('\n');
         }
         s.push_str(&part);
-        let (open, info) = fence_state(&s);
-        if open {
+        if let Some(opening) = fence_state(&s) {
             if !s.ends_with('\n') {
                 s.push('\n');
             }
-            s.push_str("```");
-            carry = Some(info);
+            s.push_str(&fence_close_line(&opening));
+            carry = Some(opening);
         } else {
             carry = None;
         }
@@ -246,25 +626,127 @@ fn balance_fences(parts: Vec<String>) -> Vec<String> {
     out
 }
 
-/// Whether `s` ends inside an open ```` ``` ```` fence, and (when open)
-/// the language info string of that fence. Only lines whose first
-/// non-whitespace run is ```` ``` ```` count as fence markers (standard
-/// Markdown), so inline back-ticks are ignored.
-fn fence_state(s: &str) -> (bool, String) {
-    let mut open = false;
-    let mut info = String::new();
-    for line in s.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("```") {
-            if open {
-                open = false;
-                info.clear();
-            } else {
-                open = true;
-                info = rest.trim().to_string();
+/// Whether `s` ends inside an open backtick or tilde fence, including a
+/// fence nested in a blockquote. Inline backticks are ignored.
+#[derive(Debug, Clone)]
+struct FenceState {
+    prefix: String,
+    quote_depth: usize,
+    marker: crate::telegram_html::FenceMarker,
+    info: String,
+}
+
+fn fence_line(line: &str) -> Option<FenceState> {
+    let mut offset = 0;
+    let mut quote_depth = 0;
+    loop {
+        while line[offset..].starts_with(' ') {
+            offset += 1;
+        }
+        if line[offset..].starts_with('>') {
+            quote_depth += 1;
+            offset += 1;
+            if line[offset..].starts_with(' ') {
+                offset += 1;
             }
+            continue;
+        }
+        break;
+    }
+    let marker = crate::telegram_html::fence_marker(&line[offset..])?;
+    let info = line[offset + marker.len..].trim().to_string();
+    Some(FenceState {
+        prefix: line[..offset].to_string(),
+        quote_depth,
+        marker,
+        info,
+    })
+}
+
+fn is_fence_close(line: &str, opening: &FenceState) -> bool {
+    let Some(candidate) = fence_line(line) else {
+        return false;
+    };
+    candidate.quote_depth == opening.quote_depth
+        && crate::telegram_html::is_fence_closer(
+            line[candidate.prefix.len()..].trim_end_matches('\n'),
+            opening.marker,
+        )
+}
+
+fn fence_open_line(opening: &FenceState) -> String {
+    format!(
+        "{}{}{}",
+        opening.prefix,
+        (opening.marker.marker as char)
+            .to_string()
+            .repeat(opening.marker.len),
+        if opening.info.is_empty() {
+            String::new()
+        } else {
+            opening.info.clone()
+        }
+    )
+}
+
+fn fence_close_line(opening: &FenceState) -> String {
+    format!(
+        "{}{}",
+        opening.prefix,
+        (opening.marker.marker as char)
+            .to_string()
+            .repeat(opening.marker.len)
+    )
+}
+
+fn fence_state(s: &str) -> Option<FenceState> {
+    let mut open: Option<FenceState> = None;
+    for line in s.lines() {
+        if let Some(opening) = open.as_ref() {
+            if is_fence_close(line, opening) {
+                open = None;
+            }
+        } else if let Some(opening) = fence_line(line) {
+            open = Some(opening);
         }
     }
-    (open, info)
+    open
+}
+
+fn split_plain_evenly(text: &str, count: usize) -> Vec<String> {
+    if count <= 1 {
+        return vec![text.to_string()];
+    }
+    let mut result = Vec::with_capacity(count);
+    let mut start = 0;
+    for index in 0..count {
+        if index + 1 == count {
+            result.push(text[start..].to_string());
+            break;
+        }
+        let remaining_parts = count - index;
+        let remaining = text.len() - start;
+        let target = start + remaining / remaining_parts;
+        let mut cut = target;
+        while cut > start && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if cut == start && target < text.len() {
+            cut = target + 1;
+            while cut < text.len() && !text.is_char_boundary(cut) {
+                cut += 1;
+            }
+        }
+        if cut == start && start < text.len() {
+            cut = start + text[start..].chars().next().unwrap().len_utf8();
+        }
+        result.push(text[start..cut].to_string());
+        start = cut;
+    }
+    while result.len() < count {
+        result.push(String::new());
+    }
+    result
 }
 
 #[cfg(test)]
@@ -432,10 +914,249 @@ mod tests {
     }
 
     #[test]
+    fn split_reopens_nested_fence_in_quote() {
+        let body = "> value\n".repeat(40);
+        let text = format!("> ```rust\n{body}> ```\n");
+        let parts = split_for_channel(&text, 120);
+        assert!(parts.len() > 1);
+        for part in &parts {
+            let fences = part
+                .lines()
+                .filter(|line| crate::telegram_html::is_fence_line(line.trim_start_matches("> ")))
+                .count();
+            assert_eq!(fences % 2, 0, "unbalanced quoted fence: {part:?}");
+            assert!(
+                part.lines().any(|line| line == "> ```rust"),
+                "reopened fence lost its quote or language: {part:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rich_tilde_fence_reopens_with_same_marker_and_language() {
+        let markdown = format!("~~~rust\n{}~~~\n", "value\n".repeat(80));
+        let parts = split_rich_markdown_numbered(&markdown, 180);
+        assert!(parts.len() > 1);
+        let total = parts.len();
+        for (index, part) in parts.iter().enumerate() {
+            assert!(part.len() <= 180, "part over ceiling: {part:?}");
+            assert!(
+                part.contains("~~~rust"),
+                "language was not reopened: {part:?}"
+            );
+            let fences = part
+                .lines()
+                .filter(|line| crate::telegram_html::is_fence_line(line))
+                .count();
+            assert_eq!(fences % 2, 0, "unbalanced tilde fence: {part:?}");
+            assert!(part.ends_with(&format!("({}/{total})", index + 1)));
+        }
+    }
+
+    #[test]
+    fn rich_split_reopens_nested_fence_in_quote() {
+        let markdown = format!("> ```rust\n{}>   ```\n", "> value\n".repeat(80));
+        let parts = split_rich_markdown_numbered(&markdown, 180);
+        assert!(parts.len() > 1);
+        for part in &parts {
+            let fences = part
+                .lines()
+                .filter_map(|line| line.strip_prefix("> "))
+                .filter(|line| crate::telegram_html::is_fence_line(line))
+                .count();
+            assert_eq!(fences % 2, 0, "unbalanced quoted rich fence: {part:?}");
+            assert!(
+                part.contains("> ```rust"),
+                "language was not reopened: {part:?}"
+            );
+        }
+    }
+
+    #[test]
     fn split_makes_progress_on_tiny_budget() {
         // Pathological: each emoji is 2 UTF-16 units, budget 1.
         let parts = split_for_channel("😀😀😀", 1);
         assert_eq!(parts.len(), 3);
         assert_eq!(parts.concat(), "😀😀😀");
+    }
+
+    #[test]
+    fn split_emoji_single_line_uses_utf16_ceiling() {
+        let text = "😀".repeat(2000); // exactly 4000 UTF-16 units
+        let parts = split_for_channel(&text, 3900);
+        assert!(parts.len() > 1);
+        assert_eq!(parts.concat(), text);
+        assert!(parts.iter().all(|part| utf16_len(part) <= 3900));
+    }
+
+    #[test]
+    fn rich_split_always_makes_progress() {
+        for text in ["", "x", "~~~\nbody\n~~~", &"x".repeat(400)] {
+            let parts = split_rich_markdown_numbered(text, 16);
+            assert!(!parts.is_empty());
+            if parts.len() > 1 {
+                assert!(parts.iter().all(|part| part.len() < text.len()));
+            }
+        }
+    }
+
+    #[test]
+    fn rich_split_keeps_plain_fallback_separate_per_part() {
+        let parts =
+            split_rich_markdown_with_plain(&"**rich** ".repeat(80), &"plain ".repeat(80), 100);
+        assert!(parts.len() > 1);
+        for (rich, plain) in parts {
+            assert_ne!(rich, plain);
+            assert!(plain.ends_with(')'));
+        }
+    }
+
+    // ----- split_for_channel_numbered (TG-GATE-V2 W10) --------------
+
+    #[test]
+    fn numbered_split_fits_returns_single_unsuffixed_part() {
+        let parts = split_for_channel_numbered("short message", 4096);
+        assert_eq!(parts, vec!["short message".to_string()]);
+    }
+
+    #[test]
+    fn numbered_split_appends_suffix_on_its_own_line_after_a_blank_line() {
+        let original = "lorem ipsum dolor sit amet ".repeat(400);
+        let parts = split_for_channel_numbered(&original, 1000);
+        assert!(parts.len() >= 2);
+        let total = parts.len();
+        for (i, part) in parts.iter().enumerate() {
+            let expected_suffix = format!("({}/{total})", i + 1);
+            assert!(
+                part.ends_with(&expected_suffix),
+                "part {i} missing suffix: {part:?}"
+            );
+            // Blank line then the marker on its own line — never glued
+            // onto the previous content line.
+            let mut lines: Vec<&str> = part.lines().collect();
+            let suffix_line = lines.pop().unwrap();
+            assert_eq!(suffix_line, expected_suffix);
+            let blank_line = lines.pop().unwrap_or("nonempty");
+            assert!(
+                blank_line.is_empty(),
+                "expected a blank separator line before the suffix, got {blank_line:?} in {part:?}"
+            );
+            // The suffix line is never itself mistaken for a fence line.
+            assert!(!crate::telegram_html::is_fence_line(suffix_line));
+            // Every part stays within the requested ceiling.
+            assert!(utf16_len(part) <= 1000, "part over budget: {part:?}");
+        }
+    }
+
+    #[test]
+    fn numbered_split_suffix_never_glues_onto_a_closing_fence_line() {
+        // A fence whose body overflows the budget, so a part's last
+        // content line before the suffix is a closing ` ``` ` — the
+        // exact shape the suffix must never merge onto.
+        let body = "let x = 1;\n".repeat(60);
+        let text = format!("intro line\n```rust\n{body}```\ntrailer");
+        let parts = split_for_channel_numbered(&text, 120);
+        assert!(parts.len() >= 2);
+        for part in &parts {
+            let lines: Vec<&str> = part.lines().collect();
+            for line in &lines {
+                // No line mixes fence markers with the numbering marker —
+                // each line is either a fence delimiter or the suffix,
+                // never both.
+                if crate::telegram_html::is_fence_line(line) {
+                    assert!(
+                        !line.contains('('),
+                        "suffix glued onto a fence line: {line:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numbered_split_reserves_extra_digit_width_across_the_9_to_10_boundary() {
+        // Craft input that needs exactly 10 parts once the `(i/n)`
+        // suffix width is reserved — the digit width of `n` grows from
+        // 1 to 2 mid-reservation (the case the iterative reserve loop
+        // exists for). Every part must still carry a correctly-widened
+        // 2-digit suffix, e.g. `(1/10)` not `(1/9)`.
+        let block = "x".repeat(28);
+        let text = std::iter::repeat_n(block, 40)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let limit = 32;
+        let parts = split_for_channel_numbered(&text, limit);
+        let total = parts.len();
+        assert!(total >= 10, "expected at least 10 parts, got {total}");
+        for (i, part) in parts.iter().enumerate() {
+            let expected_suffix = format!("({}/{total})", i + 1);
+            assert!(
+                part.ends_with(&expected_suffix),
+                "part {i} missing correctly-widened suffix: {part:?}"
+            );
+            assert!(utf16_len(part) <= limit, "part over budget: {part:?}");
+        }
+    }
+
+    #[test]
+    fn rich_split_keeps_each_part_valid_and_numbered() {
+        let markdown = format!(
+            "# One\n\n{}\n\n```rust\n{}\n```\n\n- last",
+            "first ".repeat(20),
+            "code();\n".repeat(30)
+        );
+        let parts = split_rich_markdown_numbered(&markdown, 180);
+        assert!(parts.len() > 1);
+        let total = parts.len();
+        for (i, part) in parts.iter().enumerate() {
+            assert!(part.len() <= 180, "{part:?}");
+            assert!(part.ends_with(&format!("({}/{total})", i + 1)));
+            assert_eq!(
+                part.lines()
+                    .filter(|line| line.trim_start().starts_with("```"))
+                    .count()
+                    % 2,
+                0,
+                "{part:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rich_split_keeps_tables_quotes_and_details_atomic() {
+        let table = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let quote = "> one\n> two\n";
+        let details = "<details>\n<summary>x</summary>\nbody\n</details>\n";
+        let markdown = format!(
+            "{}\n{}\n{}\n{}",
+            "before\n".repeat(10),
+            table,
+            quote,
+            details
+        );
+        let parts = split_rich_markdown_numbered(&markdown, 100);
+        for block in [table, quote, details] {
+            assert!(
+                parts.iter().any(|part| part.contains(block)),
+                "lost atomic block: {block:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rich_split_closes_and_reopens_unterminated_details() {
+        let markdown = format!("<details>\n{}", "body\n".repeat(80));
+        let parts = split_rich_markdown_numbered(&markdown, 180);
+        assert!(parts.len() > 1);
+        for part in &parts {
+            assert!(
+                part.contains("<details>"),
+                "details was not reopened: {part:?}"
+            );
+            assert!(
+                part.contains("</details>"),
+                "details was not closed: {part:?}"
+            );
+        }
     }
 }

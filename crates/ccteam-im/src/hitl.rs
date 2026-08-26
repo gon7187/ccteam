@@ -375,6 +375,7 @@ async fn ask_external_choice(
             data: format!("{token}:{index}"),
             label: option.label.clone(),
             id: option.id.clone(),
+            style: None,
         })
         .collect();
     let (reply, answer) = oneshot::channel::<ChoiceSelection>();
@@ -398,6 +399,7 @@ async fn ask_external_choice(
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: message_options,
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: None,
         })
@@ -549,7 +551,7 @@ impl CanUseToolResolver for GatewayCanUseToolResolver {
         };
         let Some(ctx) = ctx else {
             return ApprovalDecision::deny(
-                "HITL approval unavailable: session not tracked by the gateway (denied)",
+                "Подтверждение HITL недоступно: сессия не отслеживается gateway, вызов отклонён",
             );
         };
         match ask_permission(
@@ -564,13 +566,13 @@ impl CanUseToolResolver for GatewayCanUseToolResolver {
         {
             PermissionAnswer::Allow => ApprovalDecision::allow(),
             PermissionAnswer::Deny => {
-                ApprovalDecision::deny("用户未批准该工具调用。Tool call not approved by the user.")
+                ApprovalDecision::deny("Пользователь не одобрил вызов инструмента.")
             }
-            PermissionAnswer::Timeout => ApprovalDecision::deny(
-                "审批超时（未在时限内响应），已拒绝。Approval timed out — denied.",
-            ),
+            PermissionAnswer::Timeout => {
+                ApprovalDecision::deny("Время ожидания одобрения истекло, вызов отклонён.")
+            }
             PermissionAnswer::Unavailable => {
-                ApprovalDecision::deny("HITL approval channel unavailable — denied.")
+                ApprovalDecision::deny("Канал подтверждения HITL недоступен, вызов отклонён.")
             }
         }
     }
@@ -595,7 +597,7 @@ impl PiInteractionResolver for GatewayCanUseToolResolver {
             .unwrap_or(serde_json::Value::Null);
         if tool_name.is_empty() {
             return PiApprovalDecision::Deny(
-                "Pi approval request omitted its tool identity".to_string(),
+                "В запросе подтверждения Pi не указан инструмент".to_string(),
             );
         }
         let ctx = {
@@ -604,17 +606,19 @@ impl PiInteractionResolver for GatewayCanUseToolResolver {
         };
         let Some(ctx) = ctx else {
             return PiApprovalDecision::Deny(
-                "HITL approval unavailable: session not tracked by the gateway".to_string(),
+                "Подтверждение HITL недоступно: сессия не отслеживается gateway".to_string(),
             );
         };
         match ask_permission(&self.sink, &self.pending, &ctx, sid, tool_name, &input).await {
             PermissionAnswer::Allow => PiApprovalDecision::Allow,
             PermissionAnswer::Deny => {
-                PiApprovalDecision::Deny("Tool call not approved by the user".to_string())
+                PiApprovalDecision::Deny("Пользователь не одобрил вызов инструмента".to_string())
             }
-            PermissionAnswer::Timeout => PiApprovalDecision::Deny("Approval timed out".to_string()),
+            PermissionAnswer::Timeout => {
+                PiApprovalDecision::Deny("Время ожидания одобрения истекло".to_string())
+            }
             PermissionAnswer::Unavailable => {
-                PiApprovalDecision::Deny("HITL approval channel unavailable".to_string())
+                PiApprovalDecision::Deny("Канал подтверждения HITL недоступен".to_string())
             }
         }
     }

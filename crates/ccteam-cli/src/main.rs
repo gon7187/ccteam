@@ -49,10 +49,10 @@ const VERSION: &str = concat!(
 #[command(
     name = "ccteam",
     version = VERSION,
-    about = "Multi-harness agent team bridge and governance layer"
+    about = "Командный мост для агентных команд и уровень управления"
 )]
 struct Cli {
-    /// Override the ccteam home dir (default `~/.ccteam`); wins over `CCTEAM_HOME`.
+    /// Переопределить домашний каталог ccteam (по умолчанию `~/.ccteam`); приоритет над `CCTEAM_HOME`.
     #[arg(long, value_name = "DIR", global = true)]
     home: Option<PathBuf>,
     #[command(subcommand)]
@@ -61,287 +61,287 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Register a directory as a ccteam project and scaffold its `.ccteam/` state. Safe to re-run.
+    /// Зарегистрировать каталог как проект ccteam и создать состояние `.ccteam/`. Безопасно запускать повторно.
     Init {
-        /// Install in this directory instead of the cwd (created if absent).
+        /// Установить в этот каталог вместо cwd (создаётся при отсутствии).
         #[arg(long, value_name = "PATH")]
         r#in: Option<PathBuf>,
-        /// Registered project name (default: install-dir basename); does not move the install.
+        /// Имя зарегистрированного проекта (по умолчанию: имя каталога установки); установку не перемещает.
         #[arg(long, value_name = "NAME")]
         slug: Option<String>,
-        /// Overwrite ccteam-managed files (state.json, workflow.yaml); never touches `.claude/agents/`.
+        /// Перезаписать файлы под управлением ccteam (state.json, workflow.yaml); `.claude/agents/` не затрагивается.
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// Project owner identity (e.g. `user:alice`; a bare name maps to `user:<name>`).
+        /// Идентификатор владельца проекта (например, `user:alice`; простое имя становится `user:<name>`).
         #[arg(long, value_name = "OWNER")]
         owner: Option<String>,
     },
-    /// Run the gateway daemon in the foreground: IM gateway plus embedded web UI.
+    /// Запустить gateway-демон в foreground: IM-шлюз и встроенный web UI.
     Start {
-        /// Run without the embedded web UI (IM gateway only).
+        /// Запустить без встроенного web UI (только IM-шлюз).
         #[arg(long, default_value_t = false)]
         no_web: bool,
-        /// Run without the IM gateway (Telegram / Slack / Discord bridge); web only.
+        /// Запустить без IM-шлюза (моста Telegram / Slack / Discord); только web.
         #[arg(long, default_value_t = false)]
         no_imd: bool,
-        /// Web UI bind address; non-loopback binds auto-enable token auth.
+        /// Адрес привязки web UI; для не-loopback адресов токенная авторизация включается автоматически.
         #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
         web_bind: String,
-        /// DSH web companion proxy bind (default: web-bind port + 1; `off` disables).
+        /// Адрес привязки прокси DSH web companion (по умолчанию: порт web-bind + 1; `off` отключает).
         #[arg(long, value_name = "ADDR|off")]
         dsh_web_bind: Option<String>,
-        /// Disable web token auth. DANGEROUS on non-loopback binds.
+        /// Отключить токенную авторизацию web. ОПАСНО на не-loopback адресах.
         #[arg(long, default_value_t = false)]
         web_no_auth: bool,
-        /// Read the auth token from this file (default `~/.ccteam/web-token`).
+        /// Прочитать токен авторизации из файла (по умолчанию `~/.ccteam/web-token`).
         #[arg(long, value_name = "PATH")]
         web_token_file: Option<PathBuf>,
-        /// Do not copy the web auth token to the clipboard (for CI / headless runs).
+        /// Не копировать web-токен в буфер обмена (для CI / headless-запусков).
         #[arg(long, default_value_t = false)]
         no_clipboard: bool,
     },
-    /// One-screen health view: daemon, projects, sessions, web URL and token.
+    /// Краткий статус: демон, проекты, сессии, web URL и токен.
     Status,
-    /// Internal hook handlers and low-level utilities (not for daily use).
+    /// Внутренние обработчики хуков и низкоуровневые утилиты (не для ежедневного использования).
     #[command(hide = true)]
     Internal {
         #[command(subcommand)]
         cmd: InternalCommand,
     },
-    /// Stop the managed gateway daemon (alias for `daemon stop`); agent sessions keep running.
+    /// Остановить управляемый gateway-демон (псевдоним `daemon stop`); сессии агентов продолжают работать.
     Stop,
-    /// Manage the background daemon: start, stop, restart, status, logs.
+    /// Управлять фоновым демоном: start, stop, restart, status, logs.
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCommand,
     },
-    /// Update ccteam to the latest release and restart the daemon onto the new binary.
+    /// Обновить ccteam до последнего релиза и перезапустить демон с новым бинарником.
     Update {
-        /// Skip the in-flight drain and restart the daemon immediately.
+        /// Пропустить ожидание незавершённых задач и немедленно перезапустить демон.
         #[arg(long, default_value_t = false)]
         now: bool,
-        /// Swap the binary only; do not restart the running daemon.
+        /// Заменить только бинарник; работающий демон не перезапускать.
         #[arg(long, default_value_t = false)]
         no_restart: bool,
-        /// Emit one machine-readable JSON line on stdout.
+        /// Вывести одну машиночитаемую JSON-строку в stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// Reinstall even when already on the latest release (repair a corrupt install).
+        /// Переустановить даже на последнем релизе (восстановить повреждённую установку).
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// Manage registered projects: ls, show, new, stop, rm.
+    /// Управлять зарегистрированными проектами: ls, show, new, stop, rm.
     Project {
         #[command(subcommand)]
         cmd: ProjectCommand,
     },
-    /// List or attach to live sessions: ls, attach.
+    /// Вывести список или подключиться к активным сессиям: ls, attach.
     Session {
         #[command(subcommand)]
         cmd: SessionCommand,
     },
-    /// Browse and install agent plugins from the ccteam-hub marketplace.
+    /// Искать и устанавливать плагины агентов из каталога ccteam-hub.
     Role {
         #[command(subcommand)]
         cmd: RoleCommand,
     },
-    /// Manage the user-level skill library and project skill links.
+    /// Управлять пользовательской библиотекой skills и ссылками skills в проектах.
     Skill {
         #[command(subcommand)]
         cmd: SkillCommand,
     },
-    /// Multi-host operations: join a satellite, mint join tokens, deregister, list.
+    /// Операции с несколькими хостами: подключить satellite, выпустить join-токен, удалить, вывести список.
     Host {
         #[command(subcommand)]
         cmd: HostCommand,
     },
-    /// Check readiness: one row per agent vendor, plus ccteam/project advisories.
+    /// Проверить готовность: по строке на вендора агентов и рекомендации ccteam/проектов.
     Doctor {
-        /// CI check: assert the MCP tool surface is fully wired (exits 1 on any STUB).
+        /// Проверка CI: убедиться, что поверхность MCP-инструментов полностью подключена (код 1 при любом STUB).
         #[arg(long, default_value_t = false)]
         verify_mcp: bool,
-        /// Repair corrupt lines in progress journals (each file is backed up first).
+        /// Исправить повреждённые строки журналов progress (сначала создаётся резервная копия каждого файла).
         #[arg(long, default_value_t = false, conflicts_with = "verify_mcp")]
         repair_progress: bool,
-        /// Emit machine-readable JSON (only meaningful with `--verify-mcp`).
+        /// Вывести машиночитаемый JSON (имеет смысл только с `--verify-mcp`).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Set up ccteam (MCP registration, IM token) and view or set preferences.
+    /// Настроить ccteam (регистрация MCP, IM-токен), показать или задать предпочтения.
     Config {
-        /// Empty = interactive menu; `show`; `get <key>`; `<key> <value>` to set.
+        /// Пусто = интерактивное меню; `show`; `get <key>`; `<key> <value>` для установки.
         #[arg(value_name = "ARGS", num_args = 0..=2)]
         args: Vec<String>,
     },
 }
 
-/// `ccteam daemon` lifecycle group: detached spawn + pid-record ownership +
-/// versioned socket probe; the single mechanism on Linux / macOS / WSL.
+/// Управление жизненным циклом `ccteam daemon`: фоновый запуск, владение pid и
+/// проверка версии через сокет; единый механизм для Linux / macOS / WSL.
 #[derive(Subcommand)]
 enum DaemonCommand {
-    /// Start the daemon in the background and wait for readiness (idempotent).
+    /// Запустить демон в фоне и дождаться готовности (идемпотентно).
     Start {
-        /// Embedded web UI bind address, forwarded to the detached
+        /// Адрес привязки встроенного web UI, передаётся фоновому
         /// `ccteam start`.
         #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
         web_bind: String,
-        /// DSH web companion bind (default: web-bind port + 1; `off` disables).
+        /// Адрес привязки DSH web companion (по умолчанию порт web-bind + 1; `off` отключает).
         #[arg(long, value_name = "ADDR|off")]
         dsh_web_bind: Option<String>,
-        /// Emit one machine-readable JSON line on stdout.
+        /// Вывести одну машиночитаемую JSON-строку в stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Stop the managed daemon (SIGTERM + wait); a non-managed instance is refused.
+    /// Остановить управляемый демон (SIGTERM + ожидание); неуправляемый экземпляр будет отклонён.
     Stop {
-        /// Escalate to SIGKILL after the wait (daemon only; agent sessions untouched).
+        /// После ожидания перейти к SIGKILL (только демон; сессии агентов не затрагиваются).
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// Emit exactly one machine-readable JSON line on stdout.
+        /// Вывести ровно одну машиночитаемую JSON-строку в stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Restart the managed daemon (stop + start under one operation lock).
+    /// Перезапустить управляемый демон (остановка и запуск под одной блокировкой операции).
     Restart {
-        /// Embedded web UI bind address, forwarded to the detached
+        /// Адрес привязки встроенного web UI, передаётся фоновому
         /// `ccteam start`.
         #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
         web_bind: String,
-        /// DSH web companion bind (default: web-bind port + 1; `off` disables).
+        /// Адрес привязки DSH web companion (по умолчанию порт web-bind + 1; `off` отключает).
         #[arg(long, value_name = "ADDR|off")]
         dsh_web_bind: Option<String>,
-        /// Emit exactly one machine-readable JSON line on stdout.
+        /// Вывести ровно одну машиночитаемую JSON-строку в stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// If the running daemon is not managed, warn and exit successfully without restarting.
+        /// Если запущенный демон не управляется ccteam, предупредить и успешно завершиться без перезапуска.
         #[arg(long, default_value_t = false)]
         if_managed: bool,
     },
-    /// Show readiness, managed state, and running-vs-binary version.
+    /// Показать готовность, статус управления и версии запущенного демона и бинарника.
     Status {
-        /// Emit exactly one machine-readable JSON line on stdout.
+        /// Вывести ровно одну машиночитаемую JSON-строку в stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Print the tail of `~/.ccteam/daemon.log`.
+    /// Вывести конец `~/.ccteam/daemon.log`.
     Logs {
-        /// Number of trailing lines to print.
+        /// Число выводимых строк с конца.
         #[arg(short = 'n', long = "lines", default_value_t = 50)]
         n: usize,
-        /// Keep following appended output (like `tail -f`).
+        /// Продолжать вывод добавляемых строк (как `tail -f`).
         #[arg(short = 'f', long = "follow", default_value_t = false)]
         follow: bool,
-        /// Emit one JSON line (`{path, lines}`) instead of raw lines.
-        /// Not combinable with `--follow`.
+        /// Вывести JSON-строку (`{path, lines}`) вместо исходных строк.
+        /// Несовместимо с `--follow`.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
 }
 
-/// `ccteam session` verbs: read-only enumeration (`ls`) plus tmux attach (`attach`).
+/// Команды `ccteam session`: перечисление только для чтения (`ls`) и подключение tmux (`attach`).
 #[derive(Subcommand)]
 enum SessionCommand {
-    /// List live gateway chat sessions.
+    /// Вывести список активных чат-сессий gateway.
     Ls,
-    /// Attach to a live session's tmux pane (stream-json sessions have no pane).
+    /// Подключиться к tmux-панели активной сессии (у stream-json сессий панели нет).
     Attach {
         slug: String,
-        /// Chat session id; omit to auto-resolve a slug's single live session.
+        /// ID чат-сессии; не указывайте для автоматического выбора единственной активной сессии slug.
         sid: Option<String>,
     },
 }
 
-/// Mux backend utilities (`hook-emit`).
+/// Утилиты backend Mux (`hook-emit`).
 #[derive(Subcommand)]
 enum MuxCommand {
-    /// Forward a Claude Code hook firing to the daemon over `~/.ccteam/run/hook.sock`.
+    /// Передать срабатывание хука Claude Code демону через `~/.ccteam/run/hook.sock`.
     HookEmit {
-        /// Dispatch kind, e.g. `chat-progress`.
+        /// Тип диспетчеризации, например `chat-progress`.
         #[arg(long, value_name = "KIND")]
         kind: String,
-        /// Dispatch action (the event arg), e.g. `session-start`.
+        /// Действие диспетчеризации (аргумент события), например `session-start`.
         #[arg(long, value_name = "ACTION")]
         action: Option<String>,
-        /// Explicit session id (default: from `CCTEAM_CHAT_SLUG` / `CCTEAM_CHAT_ROLE`).
+        /// Явный ID сессии (по умолчанию из `CCTEAM_CHAT_SLUG` / `CCTEAM_CHAT_ROLE`).
         #[arg(long, value_name = "SID")]
         session: Option<String>,
-        /// Hook payload JSON inline; when absent, read from stdin (`-` also works).
+        /// JSON-полезная нагрузка хука inline; если отсутствует, читать stdin (`-` тоже работает).
         #[arg(long, value_name = "JSON")]
         json: Option<String>,
     },
 }
 
-/// `ccteam project` lifecycle verbs: `ls` / `show` inspect, `new` scaffolds,
-/// `stop` halts live sessions, `rm` un-registers (`--purge` deletes the footprint).
+/// Команды жизненного цикла `ccteam project`: `ls` / `show` просматривают, `new` создаёт,
+/// `stop` останавливает активные сессии, `rm` снимает регистрацию (`--purge` удаляет следы).
 #[derive(Subcommand)]
 enum ProjectCommand {
-    /// List all known projects.
+    /// Вывести список всех известных проектов.
     Ls {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// Show one project's state, recent events, and artifacts.
+    /// Показать состояние проекта, последние события и артефакты.
     Show {
         slug: Option<String>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// Scaffold a fresh project under `<projects_root>/<slug>/`.
+    /// Создать новый проект в `<projects_root>/<slug>/`.
     New {
-        /// Project slug. Becomes the dir name under `projects_root`.
+        /// Slug проекта. Станет именем каталога в `projects_root`.
         slug: String,
     },
-    /// Un-register a project; `--purge` also deletes ccteam's on-disk footprint.
+    /// Снять проект с регистрации; `--purge` также удаляет файлы ccteam.
     Rm {
-        /// Project slug (as listed by `ccteam project ls`).
+        /// Slug проекта (как в `ccteam project ls`).
         slug: String,
-        /// Also delete ccteam's footprint in the project (`.ccteam/`, hook settings section).
+        /// Также удалить следы ccteam в проекте (`.ccteam/`, секцию настроек хуков).
         #[arg(long, default_value_t = false)]
         purge: bool,
-        /// Print every planned change without touching anything.
+        /// Вывести все планируемые изменения без их применения.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
-        /// Skip the live-work refusal checks (tmux panes, background jobs, open spawns).
+        /// Пропустить проверки отказа при активной работе (tmux-панели, фоновые задачи, открытые запуски).
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// Stop a project's live sessions without removing it (resumable).
+    /// Остановить активные сессии проекта без его удаления (с продолжением позже).
     Stop {
-        /// Project slug to stop.
+        /// Slug останавливаемого проекта.
         slug: String,
     },
 }
 
-/// `ccteam role` marketplace verbs. Distinct from a live session's role
-/// switch: these are one-shot project-file install operations.
+/// Команды marketplace `ccteam role`. В отличие от переключения роли живой
+/// сессии, это разовые операции установки файлов проекта.
 #[derive(Subcommand)]
 enum RoleCommand {
-    /// Search the ccteam-hub marketplace (empty query lists everything).
+    /// Искать в marketplace ccteam-hub (пустой запрос выводит всё).
     Search {
-        /// Substring query. Omit (or pass "") to list everything.
+        /// Подстрока запроса. Не указывайте (или передайте ""), чтобы вывести всё.
         #[arg(default_value = "")]
         query: String,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// Install a hub agent/plugin into a project's `.claude/`.
+    /// Установить агента/плагин hub в `.claude/` проекта.
     Add {
-        /// Plugin id (as shown by `ccteam role search`).
+        /// ID плагина (как в `ccteam role search`).
         id: String,
-        /// Rename the installed plugin (file stem). Default: the plugin
-        /// `id`. Sanitized to `[a-z0-9_-]`.
+        /// Переименовать установленный плагин (основа имени файла). По умолчанию —
+        /// `id` плагина. Нормализуется в `[a-z0-9_-]`.
         #[arg(long = "as", value_name = "ROLE")]
         as_role: Option<String>,
-        /// Target project slug (default: current directory).
+        /// Slug целевого проекта (по умолчанию текущий каталог).
         #[arg(long, value_name = "SLUG")]
         project: Option<String>,
-        /// Overwrite an existing role file of the same name.
+        /// Перезаписать существующий файл роли с тем же именем.
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// List roles installed in a project's `.claude/agents/`.
+    /// Вывести роли, установленные в `.claude/agents/` проекта.
     List {
-        /// Target project slug. Default: the current working directory.
+        /// Slug целевого проекта. По умолчанию текущий рабочий каталог.
         #[arg(long, value_name = "SLUG")]
         project: Option<String>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -351,14 +351,14 @@ enum RoleCommand {
 
 #[derive(Subcommand)]
 enum SkillCommand {
-    /// Search skill entries in the curated ccteam-hub catalog.
+    /// Искать skill в отобранном каталоге ccteam-hub.
     Search {
         #[arg(default_value = "")]
         query: String,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// Install one hub skill into the user-level ccteam skill library.
+    /// Установить один skill hub в пользовательскую библиотеку ccteam.
     Add {
         id: String,
         #[arg(long = "as", value_name = "STEM")]
@@ -366,35 +366,35 @@ enum SkillCommand {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// List the user-level skill library recursively.
+    /// Рекурсивно вывести пользовательскую библиотеку skills.
     Ls {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Remove one skill, or a whole skill tree with explicit --force.
+    /// Удалить один skill или целое дерево skills с явным --force.
     Rm {
         id: String,
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// Refresh a hub-pinned skill whose catalog sha differs from disk.
+    /// Обновить закреплённый skill hub, если sha в каталоге отличается от диска.
     Update {
         #[arg(required_unless_present = "all", conflicts_with = "all")]
         id: Option<String>,
         #[arg(long, default_value_t = false)]
         all: bool,
     },
-    /// Register, update, list, or remove external skill sources.
+    /// Зарегистрировать, обновить, вывести или удалить внешние источники skills.
     Source {
         #[command(subcommand)]
         cmd: SkillSourceCommand,
     },
-    /// Ensure `.agents/skills` plus the Claude discovery symlink.
+    /// Обеспечить `.agents/skills` и символьную ссылку обнаружения Claude.
     EnsureProject {
         #[arg(long, value_name = "SLUG")]
         project: Option<String>,
     },
-    /// Move legacy project skills into `.agents/skills` and link Claude to it.
+    /// Переместить устаревшие skills проекта в `.agents/skills` и связать с Claude.
     MigrateProject {
         #[arg(long, value_name = "SLUG")]
         project: Option<String>,
@@ -403,7 +403,7 @@ enum SkillCommand {
 
 #[derive(Subcommand)]
 enum SkillSourceCommand {
-    /// Clone a git source or copy a local directory into the library once.
+    /// Один раз клонировать git-источник или скопировать локальный каталог в библиотеку.
     Add {
         origin: String,
         #[arg(long, value_name = "STEM")]
@@ -411,43 +411,43 @@ enum SkillSourceCommand {
         #[arg(long = "ref", value_name = "REV")]
         r#ref: Option<String>,
     },
-    /// Update one registered source or all sources.
+    /// Обновить один зарегистрированный источник или все источники.
     Update {
         #[arg(required_unless_present = "all", conflicts_with = "all")]
         stem: Option<String>,
         #[arg(long, default_value_t = false)]
         all: bool,
     },
-    /// List registered source metadata.
+    /// Вывести метаданные зарегистрированных источников.
     Ls {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Delete a registered source tree and deregister it.
+    /// Удалить дерево зарегистрированного источника и снять его с регистрации.
     Rm { stem: String },
 }
 
-/// `ccteam host` multi-host operations.
+/// Операции `ccteam host` с несколькими хостами.
 #[derive(Subcommand)]
 enum HostCommand {
-    /// Register this machine as a satellite of a main daemon.
+    /// Зарегистрировать эту машину как satellite основного демона.
     Join {
-        /// Main daemon base URL (e.g. `http://192.168.1.10:7331`).
+        /// Базовый URL основного демона (например, `http://192.168.1.10:7331`).
         #[arg(long)]
         daemon: String,
-        /// Join token minted by the main daemon admin.
+        /// Join-токен, выпущенный администратором основного демона.
         #[arg(long)]
         token: String,
-        /// Optional preferred host id (default = hostname slug).
+        /// Необязательный предпочтительный ID хоста (по умолчанию slug hostname).
         #[arg(long)]
         host_id: Option<String>,
     },
-    /// Mint a join token via the main daemon REST API (admin web-token).
+    /// Выпустить join-токен через REST API основного демона (admin web-token).
     MintToken {
-        /// Main daemon base URL.
+        /// Базовый URL основного демона.
         #[arg(long)]
         daemon: String,
-        /// Admin web token hex (or `ccteam:<hex>`). Env `CCTEAM_WEB_TOKEN` fallback.
+        /// Hex admin web-token (или `ccteam:<hex>`). Запасной источник — `CCTEAM_WEB_TOKEN`.
         #[arg(long)]
         web_token: Option<String>,
         #[arg(long)]
@@ -455,109 +455,109 @@ enum HostCommand {
         #[arg(long)]
         max_uses: Option<u32>,
     },
-    /// Deregister a satellite from the main daemon (refuses a live host unless `--force`).
+    /// Снять satellite с регистрации у основного демона (активный хост отклоняется без `--force`).
     Rm {
-        /// Main daemon base URL.
+        /// Базовый URL основного демона.
         #[arg(long)]
         daemon: String,
-        /// Admin web token hex (or `ccteam:<hex>`). Env `CCTEAM_WEB_TOKEN` fallback.
+        /// Hex admin web-token (или `ccteam:<hex>`). Запасной источник — `CCTEAM_WEB_TOKEN`.
         #[arg(long)]
         web_token: Option<String>,
-        /// Host id to deregister (see `ccteam host ls` or the web Team page).
+        /// ID снимаемого хоста (см. `ccteam host ls` или страницу Team в web).
         host_id: String,
-        /// Deregister even if the host is currently online.
+        /// Снять с регистрации, даже если хост сейчас онлайн.
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// Show the local satellite credentials (if joined).
+    /// Показать локальные учётные данные satellite (если подключён).
     Ls,
 }
 
-/// Subcommands hidden under `ccteam internal`: hook handlers, low-level
-/// session utilities (peek / progress / attach), mux hook-emit, web server.
+/// Подкоманды, скрытые в `ccteam internal`: обработчики хуков, низкоуровневые
+/// утилиты сессий (peek / progress / attach), mux hook-emit, web-сервер.
 #[derive(Subcommand)]
 enum InternalCommand {
-    /// Claude Code hook handlers (read the hook payload JSON on stdin).
+    /// Обработчики хуков Claude Code (читают JSON-полезную нагрузку хука из stdin).
     Hook {
         #[command(subcommand)]
         cmd: HookCommand,
     },
-    /// Best-effort registration of ccteam's MCP server for installed vendors.
+    /// Регистрация MCP-сервера ccteam для установленных вендоров в best-effort режиме.
     #[command(hide = true)]
     RegisterMcp {
-        /// Emit one machine-readable JSON line.
+        /// Вывести одну машиночитаемую JSON-строку.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Attach to a live session's tmux pane (same resolution as `session attach`).
+    /// Подключиться к tmux-панели активной сессии (та же логика, что у `session attach`).
     Attach {
         slug: String,
-        /// Chat session id; omit to auto-resolve a slug's single live session.
+        /// ID чат-сессии; не указывайте для автоматического выбора единственной активной сессии slug.
         sid: Option<String>,
     },
-    /// Print a session's pane content without attaching.
+    /// Вывести содержимое панели сессии без подключения.
     Peek {
         slug: String,
-        /// Chat session id; omit to auto-resolve a single live chat session.
+        /// ID чат-сессии; не указывайте для автоматического выбора единственной активной чат-сессии.
         sid: Option<String>,
     },
-    /// Print the project's progress.jsonl, optionally tailing.
+    /// Вывести progress.jsonl проекта, при необходимости с продолжением.
     Progress {
         slug: String,
         #[arg(long)]
         tail: bool,
     },
-    /// Mux backend utilities (`hook-emit`).
+    /// Утилиты backend Mux (`hook-emit`).
     Mux {
         #[command(subcommand)]
         cmd: MuxCommand,
     },
-    /// Serve the web UI standalone (the gateway daemon embeds it by default).
+    /// Запустить web UI отдельно (gateway-демон встраивает его по умолчанию).
     Web {
-        /// Listen address; non-loopback binds require token auth unless `--no-auth`.
+        /// Адрес прослушивания; для не-loopback привязок требуется токенная авторизация без `--no-auth`.
         #[arg(long, default_value = "0.0.0.0:7331")]
         bind: String,
-        /// DSH web companion bind. Omit to use `--bind`'s port + 1; pass
-        /// `off` to disable.
+        /// Адрес привязки DSH web companion. Не указывайте для порта `--bind` + 1; передайте
+        /// `off` для отключения.
         #[arg(long, value_name = "ADDR|off")]
         dsh_web_bind: Option<String>,
-        /// Disable token auth on write endpoints. DANGEROUS on non-loopback binds.
+        /// Отключить токенную авторизацию для write-endpoint. ОПАСНО на не-loopback привязках.
         #[arg(long, default_value_t = false)]
         no_auth: bool,
-        /// Read the auth token from this file (default `~/.ccteam/web-token`).
+        /// Прочитать токен авторизации из файла (по умолчанию `~/.ccteam/web-token`).
         #[arg(long, value_name = "PATH")]
         token_file: Option<PathBuf>,
     },
-    /// Rebuild the derived experience.jsonl index (offline repair only).
+    /// Пересобрать производный индекс experience.jsonl (только offline-исправление).
     Experience {
         #[command(subcommand)]
         cmd: ExperienceCommand,
     },
 }
 
-/// `ccteam internal experience` verbs.
+/// Команды `ccteam internal experience`.
 #[derive(Subcommand)]
 enum ExperienceCommand {
-    /// Regenerate experience.jsonl from turns + progress (verdicts preserved).
+    /// Пересоздать experience.jsonl из turns и progress (вердикты сохраняются).
     Rebuild {
-        /// Project slug.
+        /// Slug проекта.
         slug: String,
     },
 }
 
 #[derive(Subcommand)]
 enum HookCommand {
-    /// Append one event line to the project's progress journal.
+    /// Добавить одну строку события в журнал progress проекта.
     ProgressAppend { event_type: String },
-    /// SessionStart hook: validating no-op seam (no filesystem side effects).
+    /// Хук SessionStart: проверяемая no-op точка (без побочных эффектов в файловой системе).
     LoadContext,
-    /// PreToolUse hook for `AskUserQuestion`: deny, route via the async clarify flow.
+    /// Хук PreToolUse для `AskUserQuestion`: отклонить, направить в асинхронный clarify flow.
     InterceptAsk,
-    /// PermissionRequest hook: non-allowlist tool call → IM approve/deny round-trip.
+    /// Хук PermissionRequest: вызов инструмента не из allowlist → IM round-trip approve/deny.
     PermissionRequest,
-    /// Chat-mode hook callback: map each hook event to a progress emission.
+    /// Callback хука chat-режима: сопоставить каждое событие хука с отправкой progress.
     ChatProgress {
-        /// Hook event arg (e.g. `session-start`, `stop`, `tool-use`, `session-end`).
+        /// Аргумент события хука (например, `session-start`, `stop`, `tool-use`, `session-end`).
         event: String,
     },
 }
@@ -809,7 +809,9 @@ fn run_config(args: Vec<String>) -> Result<()> {
         }
         // clap caps this at 2 positionals (`num_args = 0..=2`), so the
         // 3+ arm is unreachable; keep it total for the compiler.
-        _ => anyhow::bail!("ccteam config: too many arguments (expected at most `<key> <value>`)"),
+        _ => anyhow::bail!(
+            "ccteam config: слишком много аргументов (ожидается не более `<key> <value>`)"
+        ),
     }
 }
 
@@ -828,7 +830,7 @@ fn run_host(cmd: HostCommand) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("tokio runtime")?;
+        .context("создать runtime tokio")?;
     match cmd {
         HostCommand::Join {
             daemon,
@@ -882,10 +884,10 @@ async fn host_join(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        anyhow::bail!("join failed HTTP {status}: {text}");
+        anyhow::bail!("подключение не удалось: HTTP {status}: {text}");
     }
-    let join: ccteam_core::HostJoinResponse =
-        serde_json::from_str(&text).with_context(|| format!("parse join response: {text}"))?;
+    let join: ccteam_core::HostJoinResponse = serde_json::from_str(&text)
+        .with_context(|| format!("разобрать ответ подключения: {text}"))?;
     let self_rec = ccteam_core::SatelliteSelf {
         daemon_url: daemon.trim_end_matches('/').to_string(),
         host: join.host.clone(),
@@ -896,15 +898,15 @@ async fn host_join(
     let self_path = ccteam_core::SatelliteSelf::path_in(&paths.root);
     self_rec.save(&self_path)?;
     println!(
-        "joined as host `{}` (agent token saved to {})",
+        "подключён как хост `{}` (токен агента сохранён в {})",
         join.host,
         self_path.display()
     );
     println!("heartbeat_ttl_secs={}", join.heartbeat_ttl_secs);
     println!(
-        "a running `ccteam start` on this machine connects out to the daemon within 30s \
-         (reverse connection — this satellite exposes no port; start one with `ccteam start` \
-         if it isn't running)"
+        "работающий `ccteam start` на этой машине подключится к демону в течение 30 с \
+         (обратное соединение — satellite не открывает порт; запустите `ccteam start`, \
+         если он не запущен)"
     );
     Ok(())
 }
@@ -917,7 +919,7 @@ async fn host_mint_token(
 ) -> Result<()> {
     let tok = web_token
         .or_else(|| std::env::var("CCTEAM_WEB_TOKEN").ok())
-        .ok_or_else(|| anyhow::anyhow!("--web-token or CCTEAM_WEB_TOKEN required"))?;
+        .ok_or_else(|| anyhow::anyhow!("требуется --web-token или CCTEAM_WEB_TOKEN"))?;
     let bare = tok.trim().trim_start_matches("ccteam:");
     let url = format!("{}/api/v1/hosts/join-token", daemon.trim_end_matches('/'));
     let client = reqwest::Client::new();
@@ -931,7 +933,7 @@ async fn host_mint_token(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        anyhow::bail!("mint-token failed HTTP {status}: {text}");
+        anyhow::bail!("выпуск токена не удался: HTTP {status}: {text}");
     }
     println!("{text}");
     Ok(())
@@ -947,7 +949,7 @@ async fn host_rm(
 ) -> Result<()> {
     let tok = web_token
         .or_else(|| std::env::var("CCTEAM_WEB_TOKEN").ok())
-        .ok_or_else(|| anyhow::anyhow!("--web-token or CCTEAM_WEB_TOKEN required"))?;
+        .ok_or_else(|| anyhow::anyhow!("требуется --web-token или CCTEAM_WEB_TOKEN"))?;
     let bare = tok.trim().trim_start_matches("ccteam:");
     let mut url = format!("{}/api/v1/hosts/{host_id}", daemon.trim_end_matches('/'));
     if force {
@@ -963,7 +965,7 @@ async fn host_rm(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        anyhow::bail!("rm failed HTTP {status}: {text}");
+        anyhow::bail!("удаление хоста не удалось: HTTP {status}: {text}");
     }
     println!("{text}");
     Ok(())
@@ -981,16 +983,16 @@ async fn host_rm(
 fn host_ls(paths: &CcteamPaths) -> Result<()> {
     let self_path = ccteam_core::SatelliteSelf::path_in(&paths.root);
     if !self_path.exists() {
-        println!("(not joined — no {})", self_path.display());
+        println!("(не подключён — нет {})", self_path.display());
         return Ok(());
     }
     let me = ccteam_core::SatelliteSelf::load(&self_path)?;
-    println!("host:          {}", me.host);
-    println!("daemon:        {}", me.daemon_url);
-    println!("joined_at:     {}", me.joined_at);
-    println!("heartbeat_ttl: {}s", me.heartbeat_ttl_secs);
+    println!("хост:          {}", me.host);
+    println!("демон:         {}", me.daemon_url);
+    println!("подключён:     {}", me.joined_at);
+    println!("heartbeat_ttl: {} с", me.heartbeat_ttl_secs);
     println!(
-        "agent_token:   {}…",
+        "токен агента:  {}…",
         &me.agent_token[..8.min(me.agent_token.len())]
     );
     Ok(())
@@ -1122,22 +1124,22 @@ fn run_internal_register_mcp(json_output: bool) -> Result<()> {
         println!("{}", serde_json::json!({"results": rows}));
     } else {
         for row in &rows {
-            let vendor = row["vendor"].as_str().unwrap_or("unknown");
+            let vendor = row["vendor"].as_str().unwrap_or("неизвестный");
             match row["status"].as_str().unwrap_or("error") {
                 "registered" => println!(
-                    "{vendor}: registered {}",
-                    row["path"].as_str().unwrap_or("<unknown>")
+                    "{vendor}: зарегистрирован {}",
+                    row["path"].as_str().unwrap_or("<неизвестно>")
                 ),
-                "skipped" => println!("{vendor}: skipped"),
+                "skipped" => println!("{vendor}: пропущен"),
                 _ => println!(
-                    "{vendor}: error: {}",
-                    row["error"].as_str().unwrap_or("unknown error")
+                    "{vendor}: ошибка: {}",
+                    row["error"].as_str().unwrap_or("неизвестная ошибка")
                 ),
             }
         }
     }
     if failures > 0 {
-        anyhow::bail!("{failures} vendor MCP registration(s) failed");
+        anyhow::bail!("не удалось зарегистрировать MCP для вендоров: {failures}");
     }
     Ok(())
 }
@@ -1153,7 +1155,7 @@ fn run_experience(cmd: ExperienceCommand) -> Result<()> {
             let paths = CcteamPaths::from_env()?;
             let project_dir = paths.project_dir(&slug);
             if !project_dir.exists() {
-                anyhow::bail!("project not found: {slug} ({})", project_dir.display());
+                anyhow::bail!("проект не найден: {slug} ({})", project_dir.display());
             }
             let progress = paths.progress_jsonl(&slug);
             let progress_arg = progress.exists().then_some(progress.as_path());
@@ -1162,7 +1164,7 @@ fn run_experience(cmd: ExperienceCommand) -> Result<()> {
                 progress_arg,
             )?;
             println!(
-                "experience rebuild {slug}: {turns} turn(s), {verdicts} verdict(s) preserved → {}",
+                "Индекс опыта для {slug} пересобран: ответов {turns}, сохранено вердиктов {verdicts} → {}",
                 ccteam_harness::execution::experience::experience_jsonl_path(&project_dir)
                     .display()
             );
@@ -1239,7 +1241,7 @@ fn run_mux_hook_emit(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("build tokio runtime for mux hook-emit")?;
+        .context("создать runtime tokio для mux hook-emit")?;
     match runtime.block_on(ccteam_harness::HookSinkClient::emit(&socket, &event)) {
         Ok(()) => Ok(()),
         Err(_) => {
@@ -1340,7 +1342,7 @@ fn run_hook(cmd: HookCommand) -> Result<()> {
 }
 
 fn parse_hook_stdin_json() -> Result<serde_json::Value> {
-    serde_json::from_reader(std::io::stdin().lock()).context("parse hook stdin as JSON")
+    serde_json::from_reader(std::io::stdin().lock()).context("разобрать stdin hook как JSON")
 }
 
 struct StartWebOpts {
@@ -1372,7 +1374,7 @@ fn build_daemon_runtime(workers: usize) -> Result<tokio::runtime::Runtime> {
         .max_blocking_threads(DAEMON_MAX_BLOCKING_THREADS)
         .enable_all()
         .build()
-        .context("build tokio daemon runtime")
+        .context("создать runtime демона tokio")
 }
 
 fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
@@ -1392,15 +1394,15 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
     // docs/versions/v0-8-rmux/w-flip-default-migration-plan.md.
     tracing::info!(
         backend = ?ccteam_harness::backend_kind_from_env(),
-        "ccteam start: mux backend (set CCTEAM_MUX_BACKEND=tmux to use tmux)"
+        "ccteam start: mux backend (задайте CCTEAM_MUX_BACKEND=tmux для использования tmux)"
     );
 
     let paths = CcteamPaths::from_env()?;
     let daemon_workers = ccteam_core::config::load(&paths.root)
-        .context("load daemon runtime config")?
+        .context("загрузить конфигурацию runtime демона")?
         .daemon
         .effective_workers()
-        .context("resolve daemon.workers")?;
+        .context("определить daemon.workers")?;
 
     // Ensure the global `~/.ccteam/` home (canonical dirs +
     // `hooks/hook.sh` dispatcher) is complete BEFORE the daemon starts
@@ -1410,7 +1412,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
     // Best-effort: a failure here must not crash the daemon (the
     // per-create-path `ensure_ccteam_home` is the real safety net).
     if let Err(err) = ccteam_core::ensure_ccteam_home(&paths) {
-        tracing::warn!(error = %err, "could not ensure ~/.ccteam/ home at daemon start; sessions may hit a missing hook.sh until `ccteam doctor --install-hooks`");
+        tracing::warn!(error = %err, "не удалось подготовить ~/.ccteam/ при запуске демона; сессии могут не найти hook.sh до `ccteam doctor --install-hooks`");
     }
 
     // Record the MCP URL this daemon's own web bind implies BEFORE registering,
@@ -1422,7 +1424,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         &paths.root.join("run"),
         &web.bind,
     ) {
-        tracing::warn!(error = %err, bind = %web.bind, "could not record the daemon MCP URL; vendor registration falls back to the default bind");
+        tracing::warn!(error = %err, bind = %web.bind, "не удалось записать URL MCP демона; регистрация вендоров использует адрес привязки по умолчанию");
     }
 
     let mut registered = Vec::new();
@@ -1433,11 +1435,14 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
             Err(err) => tracing::warn!(
                 vendor,
                 error = %err,
-                "could not auto-register vendor MCP at daemon start"
+                "не удалось автоматически зарегистрировать MCP вендора при запуске демона"
             ),
         }
     }
-    tracing::info!(?registered, "vendor MCP auto-registration complete");
+    tracing::info!(
+        ?registered,
+        "автоматическая регистрация MCP вендоров завершена"
+    );
 
     // V0.4.0 F60: the shipped team seed writer was deleted with the
     // phase machinery (F63 will reintroduce a workflow seed). Daemon
@@ -1456,7 +1461,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
             .unwrap_or(true)
     {
         eprintln!(
-            "ccteam: no projects under {} yet.\n  start one in another terminal: ccteam project new <slug> (e.g. `ccteam project new demo`)",
+            "ccteam: проектов в {} пока нет.\n  запустите в другом терминале: ccteam project new <slug> (например, `ccteam project new demo`)",
             paths.projects_root.display()
         );
     }
@@ -1492,12 +1497,12 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                 if let Err(err) = rt.block_on(ccteam_im::refresh_telegram_command_menu(None)) {
                     tracing::warn!(
                         error = %err,
-                        "ccteam start: Telegram command-menu refresh (setMyCommands) failed; menu may be stale"
+                        "ccteam start: не удалось обновить меню команд Telegram (setMyCommands); меню может быть устаревшим"
                     );
                 }
             }
             Err(err) => {
-                tracing::warn!(error = %err, "ccteam start: could not build runtime for Telegram menu refresh; skipping");
+                tracing::warn!(error = %err, "ccteam start: не удалось создать runtime для обновления меню Telegram; пропускаю");
             }
         }
     }
@@ -1588,7 +1593,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
-                        "ccteam start: failed to build shared gateway; web session API will be unavailable (503), daemon builds its own"
+                        "ccteam start: не удалось создать общий gateway; API web-сессий будет недоступен (503), демон создаст собственный"
                     );
                     (None, None, None)
                 }
@@ -1693,7 +1698,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         };
 
         let imd_handle = if imd.disabled {
-            tracing::info!("ccteam start: --no-imd set; IM gateway task skipped");
+            tracing::info!("ccteam start: задан --no-imd; задача IM gateway пропущена");
             None
         } else {
             let mut rx = shutdown_rx.clone();
@@ -1776,7 +1781,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                 Ok(mut sink) => {
                     tracing::info!(
                         socket = %socket.display(),
-                        "W6 hook-sink bound (CCTEAM_HOOK_VIA_DAEMON=1): daemon is single progress.jsonl writer"
+                        "W6 hook-sink подключён (CCTEAM_HOOK_VIA_DAEMON=1): демон — единственный записывающий progress.jsonl"
                     );
                     let dispatch_paths = hook_sink_paths.clone();
                     let mut rx = shutdown_rx.clone();
@@ -1804,11 +1809,11 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                                         Ok(Ok(_)) => {}
                                         Ok(Err(err)) => tracing::warn!(
                                             error = %err,
-                                            "W6 hook-sink: dispatch failed; event dropped"
+                                            "W6 hook-sink: отправка не удалась; событие отброшено"
                                         ),
                                         Err(je) => tracing::warn!(
                                             ?je,
-                                            "W6 hook-sink: dispatch task panicked"
+                                            "W6 hook-sink: задача отправки аварийно завершилась"
                                         ),
                                     }
                                 }
@@ -1821,7 +1826,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                     tracing::warn!(
                         socket = %socket.display(),
                         error = %err,
-                        "W6 hook-sink bind failed; chat-mode hooks will fail to route (set CCTEAM_HOOK_VIA_DAEMON only when intended)"
+                        "W6 hook-sink не удалось привязать; chat-mode хуки не смогут маршрутизироваться (задавайте CCTEAM_HOOK_VIA_DAEMON только намеренно)"
                     );
                     None
                 }
@@ -1838,13 +1843,13 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         if let Some(h) = web_handle {
             match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
                 Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam web exited with error"),
+                Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam web завершился с ошибкой"),
                 Ok(Err(je)) if je.is_cancelled() => {}
-                Ok(Err(je)) => tracing::warn!(?je, "ccteam web task panicked"),
+                Ok(Err(je)) => tracing::warn!(?je, "задача ccteam web аварийно завершилась"),
                 Err(_) => {
                     tracing::warn!(
                         timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
-                        "ccteam web drain timed out; aborting (port will be released by OS)"
+                        "ожидание завершения ccteam web истекло; прерываю (ОС освободит порт)"
                     );
                 }
             }
@@ -1852,26 +1857,26 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         if let Some(h) = imd_handle {
             match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
                 Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam-im exited with error"),
+                Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam-im завершился с ошибкой"),
                 Ok(Err(je)) if je.is_cancelled() => {}
-                Ok(Err(je)) => tracing::warn!(?je, "ccteam-im task panicked"),
+                Ok(Err(je)) => tracing::warn!(?je, "задача ccteam-im аварийно завершилась"),
                 Err(_) => {
                     tracing::warn!(
                         timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
-                        "ccteam-im drain timed out; aborting"
+                        "ожидание завершения ccteam-im истекло; прерываю"
                     );
                 }
             }
         }
         match tokio::time::timeout(TASK_DRAIN_TIMEOUT, mcp_handle).await {
             Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(err))) => tracing::warn!(?err, "ccteam MCP socket exited with error"),
+            Ok(Ok(Err(err))) => tracing::warn!(?err, "сокет MCP ccteam завершился с ошибкой"),
             Ok(Err(je)) if je.is_cancelled() => {}
-            Ok(Err(je)) => tracing::warn!(?je, "ccteam MCP socket task panicked"),
+            Ok(Err(je)) => tracing::warn!(?je, "задача сокета MCP ccteam аварийно завершилась"),
             Err(_) => {
                 tracing::warn!(
                     timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
-                    "ccteam MCP socket drain timed out; aborting"
+                    "ожидание завершения сокета MCP ccteam истекло; прерываю"
                 );
             }
         }
@@ -1879,11 +1884,11 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
             match tokio::time::timeout(TASK_DRAIN_TIMEOUT, h).await {
                 Ok(Ok(())) => {}
                 Ok(Err(je)) if je.is_cancelled() => {}
-                Ok(Err(je)) => tracing::warn!(?je, "W6 hook-sink task panicked"),
+                Ok(Err(je)) => tracing::warn!(?je, "задача W6 hook-sink аварийно завершилась"),
                 Err(_) => {
                     tracing::warn!(
                         timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
-                        "W6 hook-sink drain timed out; aborting"
+                        "ожидание завершения W6 hook-sink истекло; прерываю"
                     );
                 }
             }
@@ -1891,11 +1896,11 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         match tokio::time::timeout(TASK_DRAIN_TIMEOUT, satellite_handle).await {
             Ok(Ok(())) => {}
             Ok(Err(je)) if je.is_cancelled() => {}
-            Ok(Err(je)) => tracing::warn!(?je, "embedded satellite task panicked"),
+            Ok(Err(je)) => tracing::warn!(?je, "задача встроенного satellite аварийно завершилась"),
             Err(_) => {
                 tracing::warn!(
                     timeout_secs = TASK_DRAIN_TIMEOUT.as_secs(),
-                    "embedded satellite drain timed out; aborting"
+                    "ожидание завершения встроенного satellite истекло; прерываю"
                 );
             }
         }
@@ -1930,12 +1935,12 @@ where
     let socket = ccteam_core::daemon_socket_path(&paths);
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("create MCP socket dir {}", parent.display()))?;
+            .with_context(|| format!("создать каталог сокета MCP {}", parent.display()))?;
     }
     let _ = std::fs::remove_file(&socket);
     let listener = tokio::net::UnixListener::bind(&socket)
-        .with_context(|| format!("bind MCP socket {}", socket.display()))?;
-    tracing::info!(socket = %socket.display(), "ccteam MCP socket listening");
+        .with_context(|| format!("привязать сокет MCP {}", socket.display()))?;
+    tracing::info!(socket = %socket.display(), "сокет MCP ccteam ожидает подключений");
 
     let mut shutdown = Box::pin(shutdown);
     loop {
@@ -1946,7 +1951,7 @@ where
             }
             accepted = listener.accept() => {
                 let (stream, _addr) = accepted
-                    .with_context(|| format!("accept MCP socket {}", socket.display()))?;
+                    .with_context(|| format!("принять подключение сокета MCP {}", socket.display()))?;
                 let paths = paths.clone();
                 let sink = sink.clone();
                 let pending = pending.clone();
@@ -1955,7 +1960,7 @@ where
                     if let Err(err) =
                         handle_mcp_socket_connection(paths, sink, pending, gateway, stream).await
                     {
-                        tracing::warn!(error = %err, "MCP socket connection failed");
+                        tracing::warn!(error = %err, "соединение с сокетом MCP не удалось");
                     }
                 });
             }
@@ -1994,7 +1999,11 @@ async fn handle_mcp_socket_connection(
         pending,
         gateway,
     };
-    while let Some(line) = lines.next_line().await.context("read MCP socket line")? {
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .context("прочитать строку сокета MCP")?
+    {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -2034,21 +2043,21 @@ async fn wait_for_shutdown_signal() {
         let mut sigterm = match signal(SignalKind::terminate()) {
             Ok(s) => s,
             Err(err) => {
-                tracing::warn!(?err, "could not install SIGTERM handler");
+                tracing::warn!(?err, "не удалось установить обработчик SIGTERM");
                 let _ = tokio::signal::ctrl_c().await;
-                tracing::info!("ctrl+c received");
+                tracing::info!("получен ctrl+c");
                 return;
             }
         };
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => tracing::info!("ctrl+c received"),
-            _ = sigterm.recv() => tracing::info!("SIGTERM received (ccteam stop)"),
+            _ = tokio::signal::ctrl_c() => tracing::info!("получен ctrl+c"),
+            _ = sigterm.recv() => tracing::info!("получен SIGTERM (`ccteam stop`)"),
         }
     }
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("ctrl+c received");
+        tracing::info!("получен ctrl+c");
     }
 }
 
@@ -2076,11 +2085,13 @@ fn print_web_banner(paths: &CcteamPaths, web: &StartWebOpts) {
     eprintln!();
     eprintln!("┌─ ccteam web ─────────────────────────────────────────────");
     if loopback || web.no_auth {
-        eprintln!("│  URL:   {display_url}/");
+        eprintln!("│  АДРЕС: {display_url}/");
         if !loopback && web.no_auth {
-            eprintln!("│  AUTH:  DISABLED (--web-no-auth on non-loopback — LAN-wide!)");
+            eprintln!(
+                "│  АВТОРИЗАЦИЯ: ОТКЛЮЧЕНА (--web-no-auth для не-loopback — доступна всей LAN!)"
+            );
         } else {
-            eprintln!("│  AUTH:  disabled (loopback bind)");
+            eprintln!("│  АВТОРИЗАЦИЯ: отключена (привязка loopback)");
         }
     } else {
         let token_path = web
@@ -2089,7 +2100,7 @@ fn print_web_banner(paths: &CcteamPaths, web: &StartWebOpts) {
             .unwrap_or_else(|| ccteam_web::token::default_token_path(paths));
         match ccteam_web::token::generate_or_load_token(&token_path) {
             Ok(hex) => {
-                eprintln!("│  URL:   {display_url}/?token=ccteam:{hex}");
+                eprintln!("│  АДРЕС: {display_url}/?token=ccteam:{hex}");
                 // V0.4.6 F88 — auto-copy the token (full `ccteam:<hex>`
                 // form so it round-trips into a curl `-H` or a
                 // browser URL bar) unless --no-clipboard.
@@ -2098,19 +2109,21 @@ fn print_web_banner(paths: &CcteamPaths, web: &StartWebOpts) {
                     String::new()
                 } else {
                     match clipboard::copy_to_clipboard(&token_str) {
-                        Some(provider) => format!("  (copied to clipboard via {provider})"),
-                        None => "  (clipboard unavailable; copy manually)".to_string(),
+                        Some(provider) => {
+                            format!("  (скопировано в буфер обмена через {provider})")
+                        }
+                        None => "  (буфер обмена недоступен; скопируйте вручную)".to_string(),
                     }
                 };
-                eprintln!("│  TOKEN: {token_str}{suffix}");
-                eprintln!("│  FILE:  {}", token_path.display());
+                eprintln!("│  ТОКЕН: {token_str}{suffix}");
+                eprintln!("│  ФАЙЛ:  {}", token_path.display());
             }
             Err(err) => {
-                eprintln!("│  URL:   {display_url}/  (token init failed: {err})");
+                eprintln!("│  АДРЕС: {display_url}/  (не удалось инициализировать токен: {err})");
             }
         }
     }
-    eprintln!("│  BIND:  {bind}");
+    eprintln!("│  ПРИВЯЗКА: {bind}");
     eprintln!("└──────────────────────────────────────────────────────────");
     eprintln!();
 }
@@ -2142,10 +2155,12 @@ fn read_hostname() -> Option<String> {
 }
 
 fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
-    let bind: std::net::SocketAddr = web
-        .bind
-        .parse()
-        .with_context(|| format!("--web-bind {} is not a valid socket address", web.bind))?;
+    let bind: std::net::SocketAddr = web.bind.parse().with_context(|| {
+        format!(
+            "--web-bind {} не является корректным адресом сокета",
+            web.bind
+        )
+    })?;
     let dsh_web_bind = parse_dsh_web_bind(&bind, web.dsh_bind.as_deref())?;
     Ok(ccteam_web::ServeOpts {
         bind,
@@ -2163,11 +2178,11 @@ fn parse_dsh_web_bind(
     match raw {
         Some(value) if value.eq_ignore_ascii_case("off") => Ok(None),
         Some(value) => value.parse().map(Some).with_context(|| {
-            format!("--dsh-web-bind {value} is not a valid socket address or `off`")
+            format!("--dsh-web-bind {value} не является корректным адресом сокета или `off`")
         }),
         None => {
             let port = web_bind.port().checked_add(1).context(
-                "--dsh-web-bind default cannot be derived because --web-bind uses port 65535",
+                "значение --dsh-web-bind по умолчанию нельзя вывести: --web-bind использует порт 65535",
             )?;
             Ok(Some(std::net::SocketAddr::new(web_bind.ip(), port)))
         }
@@ -2178,13 +2193,13 @@ fn run_status() -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     use ccteam_core::check_daemon_health;
 
-    println!("ccteam status");
+    println!("статус ccteam");
     println!();
 
     // ① Daemon health.
     let health = check_daemon_health(&paths);
     let daemon_up = health.is_healthy();
-    println!("  daemon:  {}", health.describe());
+    println!("  демон:   {}", health.describe());
     println!();
 
     // ①b v0.9.7 (F3.4) — lazy "a newer ccteam is available" line. The
@@ -2204,7 +2219,7 @@ fn run_status() -> Result<()> {
         ccteam_core::version_check::update_available(&version_cache, binary_version)
     {
         println!(
-            "  update:  a newer ccteam is available ({binary_version} → {latest}); run `ccteam update`"
+            "  обновление: доступна новая версия ccteam ({binary_version} → {latest}); выполните `ccteam update`"
         );
         println!();
     }
@@ -2214,7 +2229,7 @@ fn run_status() -> Result<()> {
     // common no-satellite / all-aligned case stays silent.
     let host_skew = update::fleet_version_skew(&paths, binary_version);
     if !host_skew.is_empty() {
-        println!("  hosts ({} with version skew):", host_skew.len());
+        println!("  хосты (с расхождением версий: {}):", host_skew.len());
         for line in &host_skew {
             println!("    {line}");
         }
@@ -2245,9 +2260,9 @@ fn run_status() -> Result<()> {
     }
 
     if projects.is_empty() {
-        println!("  projects: (none — `ccteam project new <slug>` to create one, e.g. `ccteam project new demo`)");
+        println!("  проекты: (нет — создайте через `ccteam project new <slug>`, например `ccteam project new demo`)");
     } else {
-        println!("  projects ({}):", projects.len());
+        println!("  проекты ({}):", projects.len());
         // Session activity comes from the same file-backed progress truth the
         // JSON status and web Status rail read. Aggregation here follows the
         // resume-by-sid architecture: an idle session silent for days is the
@@ -2296,7 +2311,7 @@ fn run_status() -> Result<()> {
                     let session_status = if daemon_up {
                         act.to_string()
                     } else {
-                        "registered (daemon down)".to_string()
+                        "зарегистрирована (демон недоступен)".to_string()
                     };
                     let last_event = activity
                         .event_age_seconds
@@ -2316,13 +2331,13 @@ fn run_status() -> Result<()> {
             session_lines.sort_by_key(|l| l.0);
 
             println!(
-                "    {:<32}  age {:>8}  last-event {:>8}  {}",
+                "    {:<32}  возраст {:>8}  последнее-событие {:>8}  {}",
                 p.state.slug, age, last_event_h, verdict
             );
 
             for (_, role, vendor, session_status, sid, last_event) in session_lines {
                 println!(
-                    "        {:<10}  {:<7}  {:<26}  {:<6}  last-event {}",
+                    "        {:<10}  {:<7}  {:<26}  {:<6}  последнее-событие {}",
                     role, vendor, session_status, sid, last_event
                 );
             }
@@ -2331,7 +2346,7 @@ fn run_status() -> Result<()> {
         // stale — one terse line each (idle projects and sessions stay quiet).
         if !needs_attention.is_empty() {
             println!();
-            println!("  attention:");
+            println!("  требует внимания:");
             for (slug, sid, act, silent) in &needs_attention {
                 let hint = commands::stall_takeover_hint_for_session(slug, sid, act, silent);
                 println!("    {hint}");
@@ -2350,19 +2365,19 @@ fn run_status() -> Result<()> {
     if token_path.exists() {
         match ccteam_web::token::load_existing(&token_path) {
             Ok(hex) => {
-                println!("  web token: {hex}");
+                println!("  web-токен: {hex}");
                 match first_lan_ipv4() {
                     Some(ip) => {
-                        println!("  web url:   http://{ip}:7331/?token=ccteam:{hex}")
+                        println!("  web-адрес: http://{ip}:7331/?token=ccteam:{hex}")
                     }
-                    None => println!("  web url:   <no LAN ip detected> (use http://localhost:7331/?token=ccteam:{hex})"),
+                    None => println!("  web-адрес: <LAN IP не найден> (используйте http://localhost:7331/?token=ccteam:{hex})"),
                 }
             }
-            Err(_) => println!("  web token: <unreadable> ({})", token_path.display()),
+            Err(_) => println!("  web-токен: <не читается> ({})", token_path.display()),
         }
     } else {
         println!(
-            "  web token: <none yet — generated on first non-loopback `ccteam start`> ({})",
+            "  web-токен: <пока нет — будет создан при первом не-loopback `ccteam start`> ({})",
             token_path.display()
         );
     }
@@ -2375,7 +2390,7 @@ fn run_status() -> Result<()> {
     let tenants = ccteam_core::tenants::TenantRegistry::load(&paths.users_dir());
     if !tenants.list().is_empty() {
         println!();
-        println!("  web tenants ({}):", tenants.list().len());
+        println!("  web-пользователи ({}):", tenants.list().len());
         let host = first_lan_ipv4()
             .map(|ip| format!("http://{ip}:7331"))
             .unwrap_or_else(|| "http://localhost:7331".to_string());
@@ -2460,15 +2475,15 @@ fn show_slug_picker() -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     let projects = ccteam_core::queries::collect_projects(&paths).unwrap_or_default();
     if projects.is_empty() {
-        println!("no projects yet — `ccteam project new <slug>` to make one, e.g. `ccteam project new demo`.");
+        println!("проектов пока нет — создайте через `ccteam project new <slug>`, например `ccteam project new demo`.");
         return Ok(());
     }
-    println!("`ccteam show` needs a slug. Available:");
+    println!("`ccteam show` требует slug. Доступны:");
     for p in &projects {
         println!("  {}", p.state.slug);
     }
     println!();
-    println!("re-run as `ccteam show <slug>`.");
+    println!("повторите как `ccteam show <slug>`.");
     Ok(())
 }
 
@@ -2556,6 +2571,16 @@ mod lan_ip_tests {
             assert!(is_lan_ipv4(&ip), "returned non-LAN ip: {ip}");
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn cli_help_is_russian_but_flags_remain_stable() {
+    use clap::CommandFactory;
+    let help = Cli::command().render_help().to_string();
+    assert!(help.contains("Командный мост"));
+    assert!(help.contains("--home"));
+    assert!(help.contains("init"));
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ import {
   type ReactNode,
 } from "react";
 import { toastBus, type ToastApi, type ToastKind } from "../lib/toastBus";
+import { tr, type Lang } from "../lib/i18n";
 
 interface Toast {
   id: number;
@@ -29,7 +30,11 @@ const ToastContext = createContext<ToastApi | null>(null);
 
 const TOAST_LIFETIME_MS = 6000;
 
-export function ToastProvider({ children }: { children: ReactNode }) {
+export function ToastDismissButton({ lang, onDismiss }: { lang: Lang; onDismiss: () => void }) {
+  return <button onClick={onDismiss} className="cursor-pointer opacity-70 hover:opacity-100" aria-label={tr(lang, "关闭", "Dismiss", "Закрыть")}>×</button>;
+}
+
+export function ToastProvider({ lang, children }: { lang: Lang; children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const nextId = useRef(1);
 
@@ -81,13 +86,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             }}
           >
             <span className="flex-1 break-words">{t.message}</span>
-            <button
-              onClick={() => dismiss(t.id)}
-              className="cursor-pointer opacity-70 hover:opacity-100"
-              aria-label="Dismiss"
-            >
-              &times;
-            </button>
+            <ToastDismissButton lang={lang} onDismiss={() => dismiss(t.id)} />
           </div>
         ))}
       </div>

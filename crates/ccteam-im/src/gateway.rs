@@ -9,17 +9,17 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry};
+use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry, QuickTemplate};
 use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::execution::session_body::{self, BodyProbe, SessionBody};
 use ccteam_harness::{
     apply_title, atomic_write_durable, chat_session_name, discover_external_claude_sessions,
-    format_tokens, list_session_metas, parse_chat_session_name, truncate_title, AccountUsage,
-    AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection, DetachOutcome, Directive,
+    list_session_metas, parse_chat_session_name, truncate_title, AccountUsage, AgentSpecBrief,
+    AgentVendor, ChoiceOption, ChoicePrompt, ChoiceSelection, DetachOutcome, Directive,
     DirectiveOutcome, EventAttachment, ExternalClaudeSession, HarnessAdapter, HarnessError,
     PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
     SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource,
@@ -27,11 +27,16 @@ use ccteam_harness::{
 };
 #[cfg(test)]
 use ccteam_harness::{read_session_meta, write_session_meta};
-use futures::StreamExt;
+use futures::{future::join_all, StreamExt};
 use serde::{Deserialize, Serialize};
 
+use crate::im_callbacks;
+use crate::im_views::{
+    self, CommandView, DetachedSessionRow, ProjectRow, ProjectsView, RichReply, SessionRow,
+    SessionsView, StatusView,
+};
 use crate::pending::InteractionOrigin;
-use crate::transport::{ChannelAttachment, ChoiceReply, MessageOption};
+use crate::transport::{ButtonStyle, ChannelAttachment, ChoiceReply, MessageOption, ReplyKeyboard};
 use crate::BotRegistration;
 
 /// v0.8.7 review-fix (R-M6) — a typed "the named role has no
@@ -41,7 +46,7 @@ use crate::BotRegistration;
 /// returns `anyhow::Result`, so this is surfaced via `anyhow::Error` and the
 /// web handler recovers it with `downcast_ref::<RoleNotFound>()`.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("role 不存在:.claude/agents/{role}.md 未找到;先用 /role <已存在的角色> 或 `ccteam role add {role}` 创建")]
+#[error("Роль не найдена: отсутствует .claude/agents/{role}.md; используйте /role <существующая_роль> или `ccteam role add {role}`")]
 pub struct RoleNotFound {
     /// The role stem that was requested but has no persona file.
     pub role: String,
@@ -79,6 +84,32 @@ impl ChatKey {
     }
 }
 
+/// TG-GATE-V2 W9 — per-chat cap on outstanding `cmd:?<cmd>` confirmations
+/// (see [`Gateway::evict_oldest_confirmations`]).
+const MAX_COMMAND_CONFIRMATIONS_PER_CHAT: usize = 64;
+/// TG-GATE-V2 W9 — global cap across all chats.
+const MAX_COMMAND_CONFIRMATIONS_GLOBAL: usize = 1024;
+
+#[derive(Debug, Clone)]
+struct PendingCommandConfirmation {
+    chat: ChatKey,
+    command: String,
+    created_at: Instant,
+    ttl: Duration,
+}
+
+impl PendingCommandConfirmation {
+    fn expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.created_at) >= self.ttl
+    }
+}
+
+enum ConfirmationResolution {
+    Stale,
+    Foreign,
+    Command(String),
+}
+
 /// `slug -> tenant project principal` resolved once per ACL pass (`None` =
 /// operator-owned / unowned, i.e. no principal to inherit). The session gate
 /// runs per LIVE session, and each resolution is a `state.json` read, so the
@@ -86,6 +117,68 @@ impl ChatKey {
 /// re-reading the same project N times. See
 /// [`Gateway::memoized_tenant_project_owner`] for why it never becomes a field.
 type ProjectPrincipalMemo = std::collections::HashMap<String, Option<String>>;
+
+fn format_bulk_stop_result(stopped: &[String], failures: &[String]) -> String {
+    let mut lines = Vec::new();
+    if !stopped.is_empty() {
+        lines.push(format!(
+            "Остановлено сессий: {} ({})",
+            stopped.len(),
+            stopped.join(", ")
+        ));
+    }
+    if !failures.is_empty() {
+        lines.push(format!(
+            "Ошибок остановки: {} ({})",
+            failures.len(),
+            failures.join(", ")
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_bulk_stop_preview(sids: &BTreeSet<String>) -> String {
+    const PREVIEW_CAP: usize = 20;
+    let mut preview: Vec<&str> = sids.iter().map(String::as_str).collect();
+    preview.sort_by(|left, right| {
+        let left_number = left
+            .strip_prefix('s')
+            .and_then(|suffix| suffix.parse::<u64>().ok());
+        let right_number = right
+            .strip_prefix('s')
+            .and_then(|suffix| suffix.parse::<u64>().ok());
+        match (left_number, right_number) {
+            (Some(left_number), Some(right_number)) => {
+                left_number.cmp(&right_number).then_with(|| left.cmp(right))
+            }
+            _ => left.cmp(right),
+        }
+    });
+    preview.truncate(PREVIEW_CAP);
+    if sids.len() > PREVIEW_CAP {
+        preview.push("…");
+    }
+    format!(
+        "{} {} {}: {}",
+        crate::progress::russian_count_word(
+            sids.len(),
+            "Будет остановлена",
+            "Будут остановлены",
+            "Будут остановлены",
+        ),
+        sids.len(),
+        crate::progress::russian_count_word(sids.len(), "сессия", "сессии", "сессий"),
+        preview.join(", ")
+    )
+}
+
+fn classify_detached_termination(result: Result<bool>) -> Result<()> {
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(anyhow!("процесс не завершился")),
+        Err(error) => Err(error),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnOrigin {
@@ -435,6 +528,7 @@ pub struct Gateway {
     /// project, so it cannot reach anything of the owner's or a tenant's.
     operator_chats: BTreeMap<String, OperatorBinding>,
     current_project: BTreeMap<ChatKey, String>,
+    pending_prefix: BTreeMap<ChatKey, String>,
     /// chat → its current/focused session id. Shared (`Arc<RwLock>`) so the
     /// detached event pumps can read it to label *out-of-band* answers/errors
     /// — i.e. async events from a session that is no longer the chat's focus,
@@ -496,6 +590,10 @@ pub struct Gateway {
     /// handed to the mcp.sock handler) via [`Gateway::set_pending`]; tests
     /// get the default fresh registry.
     pending: Arc<tokio::sync::Mutex<crate::pending::PendingInteractions>>,
+    /// Five-minute, tapper-bound command confirmations. The command stays in
+    /// gateway memory so Telegram callback data never carries an executable
+    /// `/stop …` payload.
+    pending_command_confirmations: BTreeMap<String, PendingCommandConfirmation>,
     /// Path context for `/newproject` (scaffold + config-registry write).
     /// `None` in unit tests that don't exercise project creation; the
     /// daemon sets it via [`Gateway::enable_project_creation`].
@@ -682,6 +780,7 @@ impl DelegationProgressEmitter {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: None,
             slug: Some(record.slug),
         };
@@ -830,6 +929,20 @@ pub enum GatewayEventKind {
     /// A scheduled queue changed for this sid. Broadcast-only; web re-fetches
     /// the authoritative list instead of receiving queue contents over SSE.
     ScheduledChanged,
+    /// TG-GATE-V2 W8 — edit an ARBITRARY already-sent message by its platform
+    /// id (unlike [`GatewayEventKind::Progress`], which tracks its own
+    /// status-key → message-id map). Used for the `cmd:` confirmation
+    /// tap: the confirmation prompt itself is edited in place (keyboard
+    /// removed, text replaced with the resolution) instead of appending a
+    /// new message. The daemon egress calls [`Channel::edit_message`]
+    /// directly with this id; a failed edit (message gone/too old) falls
+    /// back to sending `content` as a new message, so the resolution is
+    /// never silently dropped.
+    EditMessage {
+        /// Platform message id of the message to edit (Telegram
+        /// `message_id`, as a string).
+        message_id: String,
+    },
 }
 
 /// User-visible text emitted asynchronously from a harness event stream.
@@ -858,6 +971,12 @@ pub struct GatewayEvent {
     /// for ordinary answers; non-empty when an adapter `NeedsChoice` (or a
     /// D6 hook prompt, W2) is delivered asynchronously.
     pub options: Vec<crate::transport::MessageOption>,
+    /// Button rows (TG-GATE-V2 W5) — [`crate::transport::SendMessage::button_rows`]'s
+    /// shape, rendered alongside `options`. Empty for ordinary answers;
+    /// non-empty for the live progress edit's `[⛔ Прервать]` while the
+    /// fold is not done.
+    #[allow(clippy::type_complexity)]
+    pub button_rows: Vec<Vec<crate::transport::MessageOption>>,
     /// Originating gateway session id (`s{n}`), when the event came from a
     /// tracked session's event pump / turn watchdog (V0.8.6 W5b). This is
     /// the **SSE filter key**: a per-session web SSE handler keeps only the
@@ -1491,6 +1610,8 @@ struct RoutingState {
     default_project: String,
     current_project: Vec<SavedGatewayRoute>,
     current_session: Vec<SavedGatewayRoute>,
+    #[serde(default)]
+    pending_prefix: Vec<SavedGatewayRoute>,
     /// sids live at last persist; rebuilt from meta.json on next start.
     live_sids: Vec<String>,
 }
@@ -1738,37 +1859,37 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     GatewayCommandSpec {
         name: "/status",
         arg_hint: None,
-        help: "fleet health — per-session idle/working/stuck + model·ctx",
+        help: "состояние сессий: ожидание/работа/зависание + модель·контекст",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/sessions",
         arg_hint: Some("[all]"),
-        help: "list this project's sessions (`all` = every project)",
+        help: "список сессий проекта (`all` = все проекты)",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/mcp",
         arg_hint: None,
-        help: "check this session's ccteam tool face (and what restores it)",
+        help: "проверить инструменты ccteam этой сессии (и как их восстановить)",
         in_menu: false,
     },
     GatewayCommandSpec {
         name: "/inbox",
         arg_hint: Some("[<time> <text>|cancel <dN>]"),
-        help: "list, schedule, or cancel delayed user messages",
+        help: "показать, запланировать или отменить отложенное сообщение",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/projects",
         arg_hint: None,
-        help: "list projects",
+        help: "список проектов",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/new",
         arg_hint: Some("[claude|codex|grok|opencode|kimi|pi|dsh] [role] [hitl] [model=<id>] [effort=<level>] [mode=<mode>]"),
-        help: "start a new session (`hitl` = approve tools in IM; model=/effort= go to the vendor as typed)",
+        help: "создать сессию (`hitl` = подтверждать инструменты в IM; параметры model=/effort= передаются провайдеру без изменений)",
         in_menu: true,
     },
     GatewayCommandSpec {
@@ -1777,7 +1898,7 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         // v0.8.23 review §3.2-5 — `@role` is a shorthand for "the most
         // recently active session with that role" (silent recency tie-break;
         // an unmatched role lists what IS available).
-        help: "switch to a session (`@role` = most-recent session with that role)",
+        help: "переключиться на сессию (`@role` = последняя сессия с этой ролью)",
         // v0.8.23 review §3.2-4 — the navigation verbs were menu-invisible
         // (only zero-arg commands were advertised), hiding most of the
         // multi-session workflow behind `/help`. Arg-bearing commands still
@@ -1789,43 +1910,49 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     GatewayCommandSpec {
         name: "/cd",
         arg_hint: Some("<project>"),
-        help: "switch project",
+        help: "переключить проект",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/role",
         arg_hint: Some("<role>"),
-        help: "switch the current session to a fresh agent role",
+        help: "сменить роль текущей сессии на новую",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/stop",
-        arg_hint: Some("<id>"),
-        help: "stop (destroy) a session by id",
+        arg_hint: Some("<id>|all|project|children"),
+        help: "остановить сессию по id, все доступные, видимые сессии текущего проекта или только прямых детей текущей сессии",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/interrupt",
         arg_hint: Some("[id]"),
-        help: "interrupt the running turn (keeps the session; bare = current)",
+        help: "прервать выполняющийся запрос (сессия сохранится; без id = текущая)",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/rename",
         arg_hint: Some("[<id>] <title>"),
-        help: "rename a session (bare = current; syncs the vendor's own title)",
+        help: "переименовать сессию (без id = текущая; синхронизирует заголовок провайдера)",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/newproject",
         arg_hint: Some("<slug> <path>"),
-        help: "scaffold + register a project, then switch into it",
+        help: "создать и зарегистрировать проект, затем переключиться на него",
         in_menu: true,
     },
     GatewayCommandSpec {
         name: "/help",
         arg_hint: None,
-        help: "show gateway commands",
+        help: "показать команды шлюза",
+        in_menu: true,
+    },
+    GatewayCommandSpec {
+        name: "/keys",
+        arg_hint: Some("[off]"),
+        help: "показать или скрыть быстрые шаблоны Telegram",
         in_menu: true,
     },
 ];
@@ -1876,8 +2003,8 @@ fn command_menu_description(c: &GatewayCommandSpec) -> String {
 /// vendor passthroughs (`/model`, `/compact`, …) are not gateway commands and
 /// never reach this. Web is unaffected — its control face (`submit_web_sid`)
 /// does not call this, and web navigates by GUI.
-const NEXT_HINT_STATUS: &str = "↓ 查看状态 → /status";
-const NEXT_HINT_SESSIONS: &str = "↓ 本项目会话 → /sessions";
+const NEXT_HINT_STATUS: &str = "↓ Статус → /status";
+const NEXT_HINT_SESSIONS: &str = "↓ Сессии проекта → /sessions";
 
 fn command_next_hint(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
@@ -1948,6 +2075,7 @@ impl Gateway {
             projects,
             operator_chats: BTreeMap::new(),
             current_project: BTreeMap::new(),
+            pending_prefix: BTreeMap::new(),
             current_session: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             sessions: BTreeMap::new(),
             next_session_generation: 0,
@@ -1967,6 +2095,7 @@ impl Gateway {
             pending: Arc::new(tokio::sync::Mutex::new(
                 crate::pending::PendingInteractions::new(),
             )),
+            pending_command_confirmations: BTreeMap::new(),
             project_paths: None,
             config: None,
             progress_projection: None,
@@ -2634,6 +2763,7 @@ impl Gateway {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: Some(slug.to_string()),
         });
@@ -2717,21 +2847,30 @@ impl Gateway {
     }
 
     /// An EXPLICIT user stop of a detached body (`/stop`, `session_stop`,
-    /// project stop): SIGTERM → grace → SIGKILL, then forget it. Returns
+    /// project stop): SIGTERM → grace → SIGKILL, then forget it on confirmed
+    /// termination. Returns
     /// `Ok(true)` when `sid` was detached and is now stopped; `Ok(false)` when
     /// `sid` was not detached (the caller continues with its own path).
     pub(crate) async fn stop_detached_body(&mut self, sid: &str) -> Result<bool> {
-        let Some(detached) = self.detached.remove(sid) else {
+        let Some(detached) = self.detached.get(sid).cloned() else {
             return Ok(false);
         };
-        self.principals.forget(sid);
         let body = detached.body.clone();
         let sid_owned = sid.to_string();
-        let stopped = tokio::task::spawn_blocking(move || {
+        let termination = tokio::task::spawn_blocking(move || {
             session_body::terminate(&body, &sid_owned, std::time::Duration::from_secs(5))
         })
         .await
-        .context("join body terminate")??;
+        .context("join body terminate")
+        .and_then(|result| result);
+        classify_detached_termination(termination)?;
+        self.detached.remove(sid);
+        self.principals.forget(sid);
+        self.finish_stopped_detached_body(sid, detached)?;
+        Ok(true)
+    }
+
+    fn finish_stopped_detached_body(&mut self, sid: &str, detached: DetachedBody) -> Result<()> {
         session_body::clear(&detached.cwd, sid);
         self.append_progress_event(
             &detached.slug,
@@ -2749,8 +2888,48 @@ impl Gateway {
             .unwrap()
             .retain(|_, v| v != sid);
         self.persist_routing()?;
-        tracing::info!(session = %sid, pid = detached.body.pid, stopped, "ccteam-im: detached body stopped by user");
-        Ok(true)
+        tracing::info!(session = %sid, pid = detached.body.pid, "ccteam-im: detached body stopped by user");
+        Ok(())
+    }
+
+    async fn stop_detached_bodies_bulk(
+        &mut self,
+        sids: &BTreeSet<String>,
+    ) -> Vec<(String, Result<()>)> {
+        let jobs: Vec<(String, DetachedBody)> = sids
+            .iter()
+            .filter_map(|sid| {
+                let detached = self.detached.get(sid)?.clone();
+                Some((sid.clone(), detached))
+            })
+            .collect();
+        let terminated = join_all(jobs.into_iter().map(|(sid, detached)| async move {
+            let body = detached.body.clone();
+            let sid_owned = sid.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                session_body::terminate(&body, &sid_owned, std::time::Duration::from_secs(5))
+            })
+            .await
+            .context("join body terminate")
+            .and_then(|result| result);
+            (sid, detached, result)
+        }))
+        .await;
+
+        terminated
+            .into_iter()
+            .map(
+                |(sid, detached, result)| match classify_detached_termination(result) {
+                    Ok(()) => {
+                        self.detached.remove(&sid);
+                        self.principals.forget(&sid);
+                        let outcome = self.finish_stopped_detached_body(&sid, detached);
+                        (sid, outcome)
+                    }
+                    Err(error) => (sid, Err(error)),
+                },
+            )
+            .collect()
     }
 
     /// Queue a turn behind a detached body (the session is not driveable
@@ -2766,7 +2945,7 @@ impl Gateway {
         internal: bool,
     ) -> Result<(String, String)> {
         let Some(detached) = self.detached.get(sid) else {
-            return Err(anyhow!("session {sid} is not detached"));
+            return Err(anyhow!("Сессия {sid} не отсоединена"));
         };
         crate::pending_turns::enqueue_pending_turn(
             &detached.cwd,
@@ -3039,6 +3218,7 @@ impl Gateway {
                 kind: GatewayEventKind::Answer,
                 attachments: Vec::new(),
                 options: Vec::new(),
+                button_rows: Vec::new(),
                 sid: Some(sid.to_string()),
                 slug: Some(slug.to_string()),
             });
@@ -3343,6 +3523,31 @@ impl Gateway {
         attachments: &[ChannelAttachment],
         selection: Option<&ChoiceReply>,
     ) -> Result<Vec<String>> {
+        self.handle_message_rich(
+            channel,
+            chat_id,
+            user_id,
+            message_id,
+            text,
+            attachments,
+            selection,
+        )
+        .await
+        .map(|replies| replies.into_iter().map(|reply| reply.plain).collect())
+    }
+
+    /// Route one inbound message and preserve rich command replies for Telegram.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn handle_message_rich(
+        &mut self,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        message_id: &str,
+        text: &str,
+        attachments: &[ChannelAttachment],
+        selection: Option<&ChoiceReply>,
+    ) -> Result<Vec<RichReply>> {
         let chat = ChatKey::new(channel, chat_id, user_id);
         // (v0.8.5 D3) An inbound option click (Telegram callback / web chip)
         // resolves the session's pending choice — never treated as text.
@@ -3352,28 +3557,40 @@ impl Gateway {
             // `nav:use:<sid>` — with no pending-registry token), so it is
             // resolved here, before the token-keyed choice path.
             if let Some(nav) = reply.data.strip_prefix("nav:") {
-                return self.resolve_nav_selection(&chat, nav).await;
+                return self
+                    .resolve_nav_selection(&chat, nav)
+                    .await
+                    .map(plain_replies);
             }
-            return self.resolve_selection(&chat, &reply.data).await;
+            // TG-GATE-V2 W3 — `cmd:`/`cmd:?`/`cmd:noop` inline buttons route
+            // through `handle_command`, not the token-keyed pending registry.
+            match im_callbacks::parse(&reply.data) {
+                im_callbacks::CallbackAction::Choice { .. } => {}
+                action => return self.resolve_cmd_callback(&chat, action, message_id).await,
+            }
+            return self
+                .resolve_selection(&chat, &reply.data)
+                .await
+                .map(plain_replies);
         }
         // Pi extension input/editor dialogs are represented by an External
         // pending with no buttons. While one is tagged to this ccteam sid,
         // the next text reply resolves it instead of becoming an agent turn.
         if let Some(replies) = self.resolve_free_text(&chat, text).await? {
-            return Ok(replies);
+            return Ok(plain_replies(replies));
         }
         // (v0.8.5 D3) A bare number is a short-reply to a pending choice, but
         // only when one is outstanding for the current session; otherwise
         // it's ordinary text for the agent.
         if let Some(n) = numeric_choice(text) {
             if self.has_pending_for_current(&chat).await {
-                return self.resolve_numeric(&chat, n).await;
+                return self.resolve_numeric(&chat, n).await.map(plain_replies);
             }
         }
         // Commands parse on the raw text; attachments don't apply to them.
         if text.split_whitespace().next() == Some("/inbox") && !attachments.is_empty() {
             return Err(anyhow!(
-                "/inbox scheduled messages do not support files or skills"
+                "Отложенные сообщения /inbox не поддерживают файлы или skills"
             ));
         }
         if let Some(mut reply) = self.handle_command(&chat, text).await? {
@@ -3384,7 +3601,8 @@ impl Gateway {
             if chat.channel != "web" {
                 if let Some(hint) = command_next_hint(text.split_whitespace().next().unwrap_or(""))
                 {
-                    append_next_hint(&mut reply, hint);
+                    append_next_hint(&mut reply.markdown, hint);
+                    append_next_hint(&mut reply.plain, hint);
                 }
             }
             return Ok(vec![reply]);
@@ -3397,6 +3615,20 @@ impl Gateway {
         if Self::is_gateway_command(text) {
             return Ok(Vec::new());
         }
+        if Self::channel_supports_buttons(channel)
+            && attachments.is_empty()
+            && !text.trim_start().starts_with('/')
+        {
+            if let Some(template) = self.quick_template_for_text(text) {
+                let preview = quick_template_preview(&template.prefix);
+                self.pending_prefix.insert(chat.clone(), template.prefix);
+                self.persist_routing()?;
+                return Ok(vec![RichReply::plain(format!(
+                    "Шаблон {} взведён — отправь задачу\n{preview}",
+                    template.label,
+                ))]);
+            }
+        }
         if let Some((handle, payload)) = crate::router::parse_first_mention(text) {
             if let Some(session_id) = self.session_by_handle(&chat, &handle) {
                 self.current_session
@@ -3404,11 +3636,16 @@ impl Gateway {
                     .unwrap()
                     .insert(chat.clone(), session_id);
                 if payload.is_empty() && attachments.is_empty() {
-                    return Ok(vec![format!("using @{handle}")]);
+                    return Ok(vec![RichReply::plain(format!("Выбран @{handle}"))]);
                 }
+                let payload =
+                    self.consume_quick_template_prefix(channel, &chat, &payload, attachments)?;
                 let turn =
                     wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
-                return self.submit_to_current(&chat, message_id, turn).await;
+                return self
+                    .submit_to_current(&chat, message_id, turn)
+                    .await
+                    .map(plain_replies);
             }
             if let Some(template) = self.template_by_handle(&chat, &handle) {
                 let session_id = self.start_template_session(chat.clone(), template).await?;
@@ -3417,11 +3654,16 @@ impl Gateway {
                     .unwrap()
                     .insert(chat.clone(), session_id);
                 if payload.is_empty() && attachments.is_empty() {
-                    return Ok(vec![format!("using @{handle}")]);
+                    return Ok(vec![RichReply::plain(format!("Выбран @{handle}"))]);
                 }
+                let payload =
+                    self.consume_quick_template_prefix(channel, &chat, &payload, attachments)?;
                 let turn =
                     wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
-                return self.submit_to_current(&chat, message_id, turn).await;
+                return self
+                    .submit_to_current(&chat, message_id, turn)
+                    .await
+                    .map(plain_replies);
             }
         }
         let templates = self.templates_for_chat(&chat);
@@ -3429,7 +3671,7 @@ impl Gateway {
             let mut handles: Vec<String> = templates.iter().map(|t| t.handle.clone()).collect();
             handles.sort();
             handles.dedup();
-            return Ok(vec![format_ambiguous_dm_reply(&handles)]);
+            return Ok(vec![RichReply::plain(format_ambiguous_dm_reply(&handles))]);
         }
         self.ensure_current_session(&chat).await?;
         // v0.8.10 — codex `/clear` = recycle + recreate at the gateway, so its
@@ -3447,18 +3689,22 @@ impl Gateway {
                     .map(|s| s.vendor == AgentVendor::Codex)
                     .unwrap_or(false);
                 if is_codex {
-                    return self.recycle_codex_session(chat.clone(), &sid).await;
+                    return self
+                        .recycle_codex_session(chat.clone(), &sid)
+                        .await
+                        .map(plain_replies);
                 }
             }
         }
-        let turn = wrap_inbound(channel, chat_id, user_id, message_id, text, attachments);
+        let payload = self.consume_quick_template_prefix(channel, &chat, text, attachments)?;
+        let turn = wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments);
         let mut replies = self.submit_to_current(&chat, message_id, turn).await?;
         if chat.channel != "web" && text.split_whitespace().next() == Some("/model") {
             if let Some(last) = replies.last_mut() {
                 append_next_hint(last, NEXT_HINT_STATUS);
             }
         }
-        Ok(replies)
+        Ok(plain_replies(replies))
     }
 
     /// v0.8.x (concurrency review §4.1 P1) — cheap, synchronous, read-only hot
@@ -3492,8 +3738,13 @@ impl Gateway {
         user_id: &str,
         text: &str,
         has_selection: bool,
+        has_attachments: bool,
     ) -> bool {
         if has_selection {
+            return false;
+        }
+        let chat = ChatKey::new(channel, chat_id, user_id);
+        if self.is_quick_template_interaction(&chat, text, !has_attachments) {
             return false;
         }
         if self.has_current_session(channel, chat_id, user_id) {
@@ -3535,7 +3786,7 @@ impl Gateway {
         text: &str,
         attachments: &[ChannelAttachment],
         selection: Option<&ChoiceReply>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<RichReply>> {
         let chat = ChatKey::new(channel, chat_id, user_id);
         // Re-derive the "implicit spawn candidate" decision authoritatively
         // (the daemon's `inbound_may_spawn` call is only a hint to decide
@@ -3547,9 +3798,9 @@ impl Gateway {
             && !Self::is_gateway_command(text)
             && crate::router::parse_first_mention(text).is_none();
         let candidate = if candidate_shape {
-            !crate::latency::gateway_lock(&gateway, "im.turn.candidate")
-                .await
-                .has_current_session(channel, chat_id, user_id)
+            let g = crate::latency::gateway_lock(&gateway, "im.turn.candidate").await;
+            !g.is_quick_template_interaction(&chat, text, attachments.is_empty())
+                && !g.has_current_session(channel, chat_id, user_id)
         } else {
             false
         };
@@ -3594,7 +3845,7 @@ impl Gateway {
         }
         crate::latency::gateway_lock(&gateway, "im.turn.handle")
             .await
-            .handle_message(
+            .handle_message_rich(
                 channel,
                 chat_id,
                 user_id,
@@ -3606,7 +3857,23 @@ impl Gateway {
             .await
     }
 
-    async fn handle_command(&mut self, chat: &ChatKey, text: &str) -> Result<Option<String>> {
+    async fn handle_command(&mut self, chat: &ChatKey, text: &str) -> Result<Option<RichReply>> {
+        self.handle_command_inner(chat, text, false).await
+    }
+
+    /// `already_confirmed` is `true` only for the ONE re-entry that follows a
+    /// tapped `cmd:!<token>` confirmation ([`Self::resolve_cmd_callback`]'s
+    /// `Confirmed` arm) — the tap itself WAS the yes/no choice, so a bulk
+    /// `/stop` reached this way must execute directly instead of raising a
+    /// SECOND confirmation prompt on top of the one the user just answered.
+    /// A typed `/stop all|project|children` (this function's normal `false`
+    /// entry) keeps its own preview-then-confirm prompt unchanged.
+    async fn handle_command_inner(
+        &mut self,
+        chat: &ChatKey,
+        text: &str,
+        already_confirmed: bool,
+    ) -> Result<Option<RichReply>> {
         let trimmed = text.trim();
         if !trimmed.starts_with('/') {
             return Ok(None);
@@ -3614,7 +3881,9 @@ impl Gateway {
         let mut parts = trimmed.split_whitespace();
         let cmd = parts.next().unwrap_or_default();
         match cmd {
-            "/inbox" => Ok(Some(self.handle_inbox_command(chat, trimmed)?)),
+            "/inbox" => Ok(Some(RichReply::plain(
+                self.handle_inbox_command(chat, trimmed)?,
+            ))),
             "/new" => {
                 let args: Vec<&str> = parts.collect();
                 let NewSessionArgs {
@@ -3638,16 +3907,18 @@ impl Gateway {
                         tuning,
                     )
                     .await?;
-                Ok(Some(Self::new_session_receipt(&outcome)))
+                Ok(Some(RichReply::plain(Self::new_session_receipt(&outcome))))
             }
             "/role" => {
                 let role = parts
                     .next()
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow!("用法: /role <role>"))?
+                    .ok_or_else(|| anyhow!("Использование: /role <role>"))?
                     .to_string();
                 let sid = self.switch_current_role(chat, role.clone()).await?;
-                Ok(Some(format!("switched session {sid} to role {role}")))
+                Ok(Some(RichReply::plain(format!(
+                    "Сессия {sid} переключена на роль {role}"
+                ))))
             }
             "/rename" => {
                 // Raw remainder (like `/newproject`'s path arg) — a title may
@@ -3657,7 +3928,7 @@ impl Gateway {
                 let rest = it.next().unwrap_or("").trim();
                 if rest.is_empty() {
                     return Err(anyhow!(
-                        "用法: /rename [<sid>] <新标题>(省略 sid = 重命名当前会话)"
+                        "Использование: /rename [<sid>] <новый заголовок> (без sid = текущая сессия)"
                     ));
                 }
                 // `[<sid>] <title>` — same leading-id convention as
@@ -3675,8 +3946,8 @@ impl Gateway {
                             .cloned()
                             .ok_or_else(|| {
                                 anyhow!(
-                                    "/rename 需要一个活动会话:先 /new 或发条消息,\
-                                     也可以 /rename <sid> <新标题> 指名重命名。"
+                                    "Для /rename нужна активная сессия: сначала /new или отправьте сообщение; \
+                                     либо укажите сессию: /rename <sid> <новый заголовок>."
                                 )
                             })?;
                         (sid, rest)
@@ -3686,15 +3957,17 @@ impl Gateway {
                 // too) — same visibility rule every other sid-addressed
                 // command applies.
                 if !self.chat_can_access_sid(chat, &sid) {
-                    return Ok(Some(format!("unknown session for this chat: {sid}")));
+                    return Ok(Some(RichReply::plain(format!(
+                        "Сессия {sid} недоступна этому чату"
+                    ))));
                 }
                 let renamed = self.rename_session(&sid, raw_title).await?;
-                Ok(Some(render_rename_receipt(&renamed)))
+                Ok(Some(RichReply::plain(render_rename_receipt(&renamed))))
             }
             "/use" => {
                 let arg = parts
                     .next()
-                    .ok_or_else(|| anyhow!("/use requires a session id or @role"))?;
+                    .ok_or_else(|| anyhow!("Для /use нужен id сессии или @role"))?;
                 // v0.8.23 review §3.2-5 — `/use @<role>` shorthand: resolve to
                 // the chat-visible session with that role, most recently
                 // active wins (silent recency tie-break). Only matches LIVE
@@ -3710,25 +3983,91 @@ impl Gateway {
                 };
                 // The switch itself lives in `use_session` (shared with the
                 // clickable session picker's `nav:use:<sid>` button tap).
-                self.use_session(chat, id).await.map(Some)
+                self.use_session(chat, id)
+                    .await
+                    .map(|reply| Some(RichReply::plain(reply)))
             }
             "/stop" => {
-                // v0.8.10 — stop (destroy) a session BY ID. Completes the session
-                // lifecycle: /new (create) · /clear (recycle) · /use (switch) ·
-                // /stop (destroy). Uses the SAME `stop_session` the web API's
-                // `POST /sessions/{sid}/stop` calls, so the verb is unified across
-                // IM and web. A session id is REQUIRED — a bare `/stop` is rejected
-                // because silently destroying the current session is too easy to
-                // fat-finger. `stop_session` aborts the pump, closes the vendor
-                // thread, drops the record, and clears any `current_session` route
-                // pointing at it (so stopping the current session leaves the next
-                // message to spawn a fresh default).
-                let sid = parts
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow!("/stop 必须带 session id:/stop <sid>(安全起见不支持裸 /stop)")
-                    })?
-                    .to_string();
+                // v0.10.3 — stop one session by id, or every session visible
+                // to this chat for the requested bulk scope (`children` =
+                // direct children of the chat's current session only —
+                // NEVER the parent itself, unlike `all`).
+                let target = parts.next().ok_or_else(|| {
+                    anyhow!(
+                        "Для /stop нужен id, all, project или children: /stop <sid>|all|project|children"
+                    )
+                })?;
+                let scope = target.to_ascii_lowercase();
+                if matches!(scope.as_str(), "all" | "project" | "children") {
+                    let (sids, project, parent) = match self.bulk_stop_candidates(chat, &scope) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => return Ok(Some(RichReply::plain(error.to_string()))),
+                    };
+                    if sids.is_empty() {
+                        return Ok(Some(RichReply::plain("Нет доступных сессий для остановки")));
+                    }
+                    // A confirmed `cmd:!<token>` tap re-enters here with
+                    // `already_confirmed` set — the tap itself WAS the
+                    // yes/no answer, so executing straight away (instead of
+                    // raising this second preview-confirm prompt on top of
+                    // it) is the fix, not a bypass. A typed `/stop …`
+                    // (`already_confirmed == false`) always gets the prompt.
+                    if !already_confirmed && Self::channel_supports_buttons(&chat.channel) {
+                        let nanos = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_nanos())
+                            .unwrap_or(0);
+                        let token = format!("b{:x}", (nanos as u64) & 0xff_ffff_ffff);
+                        let prompt = ChoicePrompt {
+                            token: token.clone(),
+                            title: format_bulk_stop_preview(&sids),
+                            options: vec![
+                                ChoiceOption {
+                                    id: format!("stop-{scope}"),
+                                    label: format!("Остановить {}", sids.len()),
+                                },
+                                ChoiceOption {
+                                    id: "stop-cancel".to_string(),
+                                    label: "Отмена".to_string(),
+                                },
+                            ],
+                            multi: false,
+                        };
+                        self.pending.lock().await.register(
+                            token.clone(),
+                            prompt.clone(),
+                            InteractionOrigin::BulkStop {
+                                channel: chat.channel.clone(),
+                                chat_id: chat.chat_id.clone(),
+                                user_id: chat.user_id.clone(),
+                                scope,
+                                project: project.clone(),
+                                parent: parent.clone(),
+                                snapshot: sids.iter().cloned().collect(),
+                            },
+                            Instant::now() + gateway_pending_ttl(),
+                        );
+                        self.emit_user_signal(GatewayEvent {
+                            id: format!("gateway-choice-bulk-{token}"),
+                            channel: chat.channel.clone(),
+                            chat_id: chat.chat_id.clone(),
+                            thread_ts: None,
+                            content: prompt.title.clone(),
+                            kind: GatewayEventKind::Answer,
+                            attachments: Vec::new(),
+                            options: to_message_options(&prompt),
+                            button_rows: Vec::new(),
+                            sid: None,
+                            slug: project,
+                        });
+                        return Ok(None);
+                    }
+                    let (stopped, failures) = self.stop_sessions_bulk(&sids).await;
+                    return Ok(Some(RichReply::plain(format_bulk_stop_result(
+                        &stopped, &failures,
+                    ))));
+                }
+                let sid = target.to_string();
                 // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own session.
                 // A detached body (alive from before a restart) is stoppable
                 // through the same gate, resolved from its meta.json owner.
@@ -3740,16 +4079,18 @@ impl Gateway {
                         self.is_session_detached(&sid) && self.chat_can_access_sid(chat, &sid)
                     });
                 if !accessible {
-                    return Ok(Some(format!("unknown session for this chat: {sid}")));
+                    return Ok(Some(RichReply::plain(format!(
+                        "Сессия {sid} недоступна этому чату"
+                    ))));
                 }
                 let was_detached = self.is_session_detached(&sid);
                 self.stop_session(&sid).await?;
                 if was_detached {
-                    return Ok(Some(format!(
-                        "stopped session {sid} (its body from before the restart was ended)"
-                    )));
+                    return Ok(Some(RichReply::plain(format!(
+                        "Сессия {sid} остановлена (её процесс до перезапуска завершён)"
+                    ))));
                 }
-                Ok(Some(format!("stopped session {sid}")))
+                Ok(Some(RichReply::plain(format!("Сессия {sid} остановлена"))))
             }
             "/interrupt" => {
                 // Interrupt the session's CURRENTLY-RUNNING turn WITHOUT
@@ -3772,7 +4113,7 @@ impl Gateway {
                         .get(chat)
                         .cloned()
                         .ok_or_else(|| {
-                            anyhow!("/interrupt 需要一个活动会话(或 /interrupt <sid>)")
+                            anyhow!("Для /interrupt нужна активная сессия (или /interrupt <sid>)")
                         })?,
                 };
                 // Own-only ACL — identical to /stop (a chat can interrupt only
@@ -3783,20 +4124,23 @@ impl Gateway {
                     .map(|s| self.chat_can_access(chat, s))
                     .unwrap_or(false);
                 if !accessible {
-                    return Ok(Some(format!("unknown session for this chat: {sid}")));
+                    return Ok(Some(RichReply::plain(format!(
+                        "Сессия {sid} недоступна этому чату"
+                    ))));
                 }
                 self.interrupt_session(&sid).await?;
-                Ok(Some(format!(
-                    "已中断 session {sid} 当前 turn(会话保留,可继续 /model 等)"
-                )))
+                Ok(Some(RichReply::plain(format!(
+                    "Текущий turn сессии {sid} прерван (сессия сохранена; можно продолжить /model и др.)"
+                ))))
             }
             "/cd" => {
                 let project = parts
                     .next()
-                    .ok_or_else(|| anyhow!("/cd requires a project"))?;
+                    .ok_or_else(|| anyhow!("Для /cd нужен проект"))?;
                 // The switch itself lives in `change_project` (shared with the
                 // clickable project picker's `nav:cd:<slug>` button tap).
-                self.change_project(chat, project).map(Some)
+                self.change_project(chat, project)
+                    .map(|reply| Some(RichReply::plain(reply)))
             }
             "/newproject" => {
                 // `/newproject <slug> <path>` — the path is the remainder
@@ -3807,12 +4151,12 @@ impl Gateway {
                 let slug = it
                     .next()
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| anyhow!("用法: /newproject <slug> <项目路径>"))?;
+                    .ok_or_else(|| anyhow!("Использование: /newproject <slug> <путь_проекта>"))?;
                 let path = it
                     .next()
                     .map(str::trim)
                     .filter(|p| !p.is_empty())
-                    .ok_or_else(|| anyhow!("用法: /newproject <slug> <项目路径>"))?;
+                    .ok_or_else(|| anyhow!("Использование: /newproject <slug> <путь_проекта>"))?;
                 // v0.8.20 convergence — own the project by the CANONICAL identity
                 // (`user:<tenant>` for a tenant bot), so the tenant's web console
                 // sees the IM-bot-created project too (web ACL is project-owned).
@@ -3822,7 +4166,7 @@ impl Gateway {
                 // `/cd`), so the next message spawns a session there instead of
                 // landing back in the previous project.
                 self.create_project(chat, slug, path, Some(&owner_id))
-                    .map(Some)
+                    .map(|reply| Some(RichReply::plain(reply)))
             }
             "/sessions" => {
                 // Default = the current project only (so switching between
@@ -3831,48 +4175,131 @@ impl Gateway {
                 let all = parts
                     .next()
                     .is_some_and(|a| a.eq_ignore_ascii_case("all") || a == "*");
-                let text = self.render_sessions(chat, all).await;
-                // On a button-capable channel (Telegram) the SAME list is
-                // delivered via the event sink as text + one inline "switch"
-                // button per live session (`nav:use:<sid>` tap → `/use`); the
-                // command then returns no inline reply. Every other channel
-                // (web's structured session frame, Lark's text-only send, the
-                // test mock) keeps the plain-text reply unchanged.
-                if Self::channel_supports_buttons(&chat.channel) {
-                    let options = self.session_switch_options(chat, all);
-                    self.emit_list_options(chat, text, options);
-                    Ok(None)
-                } else {
-                    Ok(Some(text))
-                }
+                Ok(Some(self.render_sessions(chat, all).await))
             }
             "/status" => Ok(Some(self.render_status(chat).await)),
-            "/mcp" => self.rebuild_tool_surface(chat).await.map(Some),
-            "/projects" => {
-                // Button-capable channel (Telegram) → a text header + one inline
-                // "switch" button per project (`nav:cd:<slug>` tap → `/cd`),
-                // delivered via the event sink. Others keep the bare
-                // newline-separated slug list as an inline reply.
-                if Self::channel_supports_buttons(&chat.channel) {
-                    let options = self.project_switch_options(chat);
-                    let cur = self.current_project_label(chat);
-                    self.emit_list_options(
-                        chat,
-                        format!("📁 项目(点击切换,✓ = 当前 {cur}):"),
-                        options,
-                    );
-                    Ok(None)
+            "/mcp" => self
+                .rebuild_tool_surface(chat)
+                .await
+                .map(|reply| Some(RichReply::plain(reply))),
+            "/projects" => Ok(Some(self.render_projects(chat))),
+            "/keys" => {
+                if !Self::channel_supports_buttons(&chat.channel) {
+                    return Ok(Some(RichReply::plain("Только для Telegram.")));
+                }
+                if parts.next() == Some("off") {
+                    self.pending_prefix.remove(chat);
+                    self.persist_routing()?;
+                    Ok(Some(
+                        RichReply::plain("Клавиатура быстрых шаблонов убрана.")
+                            .with_reply_keyboard(ReplyKeyboard::Remove),
+                    ))
                 } else {
-                    Ok(Some(self.render_projects(chat)))
+                    Ok(Some(self.render_quick_templates()))
                 }
             }
-            "/help" => Ok(Some(format!(
-                "📁 当前项目: {}\n\n{}",
-                self.current_project_label(chat),
-                render_help()
-            ))),
+            "/help" => Ok(Some(render_help())),
             _ => Ok(None),
         }
+    }
+
+    fn with_quick_templates<T>(&self, f: impl FnOnce(&[QuickTemplate]) -> T) -> T {
+        if let Some(config) = self.config.as_ref() {
+            if let Ok(config) = config.get() {
+                return f(&config.im.quick_templates);
+            }
+        }
+        let defaults = CcteamConfig::default();
+        f(&defaults.im.quick_templates)
+    }
+
+    fn quick_templates(&self) -> Vec<QuickTemplate> {
+        self.with_quick_templates(|templates| {
+            templates
+                .iter()
+                .map(|template| QuickTemplate {
+                    label: template.label.trim().to_string(),
+                    prefix: template.prefix.clone(),
+                })
+                .collect()
+        })
+    }
+
+    fn quick_template_matches(&self, text: &str) -> bool {
+        let text = text.trim();
+        self.with_quick_templates(|templates| {
+            templates
+                .iter()
+                .any(|template| template.label.trim() == text)
+        })
+    }
+
+    fn quick_template_for_text(&self, text: &str) -> Option<QuickTemplate> {
+        let text = text.trim();
+        self.with_quick_templates(|templates| {
+            templates
+                .iter()
+                .find(|template| template.label.trim() == text)
+                .map(|template| QuickTemplate {
+                    label: template.label.trim().to_string(),
+                    prefix: template.prefix.clone(),
+                })
+        })
+    }
+
+    fn is_quick_template_interaction(
+        &self,
+        chat: &ChatKey,
+        text: &str,
+        attachments_empty: bool,
+    ) -> bool {
+        attachments_empty
+            && Self::channel_supports_buttons(&chat.channel)
+            && !text.trim_start().starts_with('/')
+            && self.quick_template_matches(text)
+    }
+
+    fn render_quick_templates(&self) -> RichReply {
+        let templates = self.quick_templates();
+        let list = templates
+            .iter()
+            .map(|template| {
+                format!(
+                    "• {}\n  {}",
+                    template.label,
+                    quick_template_preview(&template.prefix)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        RichReply::plain(format!("Быстрые шаблоны:\n{list}")).with_reply_keyboard(
+            ReplyKeyboard::Buttons(
+                templates
+                    .chunks(2)
+                    .map(|row| row.iter().map(|template| template.label.clone()).collect())
+                    .collect(),
+            ),
+        )
+    }
+
+    fn consume_quick_template_prefix(
+        &mut self,
+        channel: &str,
+        chat: &ChatKey,
+        text: &str,
+        attachments: &[ChannelAttachment],
+    ) -> Result<String> {
+        if !Self::channel_supports_buttons(channel)
+            || !attachments.is_empty()
+            || text.trim_start().starts_with('/')
+        {
+            return Ok(text.to_string());
+        }
+        let Some(prefix) = self.pending_prefix.remove(chat) else {
+            return Ok(text.to_string());
+        };
+        self.persist_routing()?;
+        Ok(format!("{prefix} {text}"))
     }
 
     fn handle_inbox_command(&mut self, chat: &ChatKey, trimmed: &str) -> Result<String> {
@@ -3888,12 +4315,12 @@ impl Gateway {
             items.sort_by(crate::scheduled::scheduled_order);
             if items.is_empty() {
                 return Ok(format!(
-                    "📥 /inbox is empty (daemon timezone: {})",
+                    "📥 /inbox пуст (часовой пояс daemon: {})",
                     crate::scheduled::daemon_timezone_label()
                 ));
             }
             let mut lines = vec![format!(
-                "📥 scheduled messages (daemon timezone: {})",
+                "📥 Отложенные сообщения (часовой пояс daemon: {})",
                 crate::scheduled::daemon_timezone_label()
             )];
             for item in items {
@@ -3904,8 +4331,8 @@ impl Gateway {
                 let state = match item.status {
                     crate::scheduled::ScheduledStatus::Pending => String::new(),
                     crate::scheduled::ScheduledStatus::Failed => format!(
-                        " [failed: {}]",
-                        item.fail_reason.as_deref().unwrap_or("unknown error")
+                        " [ошибка: {}]",
+                        item.fail_reason.as_deref().unwrap_or("неизвестная ошибка")
                     ),
                 };
                 lines.push(format!(
@@ -3924,18 +4351,18 @@ impl Gateway {
             let mut parts = rest["cancel".len()..].split_whitespace();
             let id = parts
                 .next()
-                .ok_or_else(|| anyhow!("usage: /inbox cancel <dN>"))?;
+                .ok_or_else(|| anyhow!("Использование: /inbox cancel <dN>"))?;
             if parts.next().is_some() {
-                return Err(anyhow!("usage: /inbox cancel <dN>"));
+                return Err(anyhow!("Использование: /inbox cancel <dN>"));
             }
             let entry = self
                 .scheduled_items
                 .get(id)
                 .cloned()
                 .filter(|entry| self.chat_can_access_scheduled_entry(chat, entry))
-                .ok_or_else(|| anyhow!("unknown scheduled message for this chat: {id}"))?;
+                .ok_or_else(|| anyhow!("Отложенное сообщение {id} недоступно этому чату"))?;
             self.cancel_scheduled_message(&entry.item.sid, id)?;
-            return Ok(format!("cancelled {id}"));
+            return Ok(format!("Отложенное сообщение {id} отменено"));
         }
 
         let (when, text) = parse_inbox_create_args(rest)?;
@@ -3947,7 +4374,7 @@ impl Gateway {
             .get(chat)
             .cloned()
             .ok_or_else(|| {
-                anyhow!("/inbox needs a current session; use /sessions then /use <sid>")
+                anyhow!("Для /inbox нужна текущая сессия; используйте /sessions, затем /use <sid>")
             })?;
         let visible_pending = self
             .scheduled_items
@@ -3967,7 +4394,7 @@ impl Gateway {
             visible_pending,
         )?;
         Ok(format!(
-            "scheduled {} → {} at {} ({})",
+            "Отложено {} → {} на {} ({})",
             item.id,
             item.sid,
             item.send_at
@@ -4005,15 +4432,15 @@ impl Gateway {
         // admin's project by typing its slug. A hidden or nonexistent slug reads
         // identically ("unknown project"), disclosing nothing.
         if !self.can_see_project(chat, project) {
-            return Err(anyhow!("unknown project: {project}"));
+            return Err(anyhow!("Неизвестный проект: {project}"));
         }
         self.current_project
             .insert(chat.clone(), project.to_string());
         let adopted = self.adopt_session_in_project(chat, project);
         self.persist_routing()?;
         Ok(match adopted {
-            Some(sid) => format!("project set to {project} (switched to {sid})"),
-            None => format!("project set to {project} (next message starts a session there)"),
+            Some(sid) => format!("Выбран проект {project} (переключено на {sid})"),
+            None => format!("Выбран проект {project} (следующее сообщение создаст там сессию)"),
         })
     }
 
@@ -4042,7 +4469,7 @@ impl Gateway {
                 .map(|(slug, _, meta)| self.project_session_owner_visible(chat, &slug, &meta.owner))
                 .unwrap_or(false);
             if !acl_ok {
-                return Ok(format!("unknown session for this chat: {id}"));
+                return Ok(format!("Сессия {id} недоступна этому чату"));
             }
             let caller_identity = canonical_owner(chat).identity();
             // IM already owner-checked above, so no project-slug binding is
@@ -4057,9 +4484,9 @@ impl Gateway {
                         let proj = s.project.clone();
                         self.current_project.insert(chat.clone(), proj);
                     }
-                    return Ok(format!("resumed session {resumed_sid}"));
+                    return Ok(format!("Сессия {resumed_sid} возобновлена"));
                 }
-                Err(_) => return Ok(format!("unknown session for this chat: {id}")),
+                Err(_) => return Ok(format!("Сессия {id} недоступна этому чату")),
             }
         }
         let session = live_session.expect("checked above");
@@ -4077,15 +4504,15 @@ impl Gateway {
             .unwrap()
             .insert(chat.clone(), sid.clone());
         self.persist_routing()?;
-        Ok(format!("using session {sid}"))
+        Ok(format!("Используется сессия {sid}"))
     }
 
-    /// Resolve a `nav:` switch-button tap (`cd:<slug>` / `use:<sid>`) by
-    /// delegating to the SAME switch logic `/cd` / `/use` use (ACL + cold
-    /// resume included). The payload is self-describing, so no pending-registry
-    /// entry is consulted; a stale button just re-runs the (idempotent) switch
-    /// or reads as an unknown target.
+    /// Resolve a self-describing project/session switch button. Stop buttons
+    /// use the token-keyed pending registry and never enter this path.
     async fn resolve_nav_selection(&mut self, chat: &ChatKey, nav: &str) -> Result<Vec<String>> {
+        if nav.starts_with("stop:") {
+            return Ok(vec!["Этот выбор больше недоступен".to_string()]);
+        }
         if let Some(slug) = nav.strip_prefix("cd:") {
             let mut reply = self.change_project(chat, slug)?;
             if chat.channel != "web" {
@@ -4100,7 +4527,7 @@ impl Gateway {
             }
             return Ok(vec![reply]);
         }
-        Ok(vec!["invalid selection".to_string()])
+        Ok(vec!["Некорректный выбор".to_string()])
     }
 
     /// Whether a channel renders message `options` as tappable inline-keyboard
@@ -4182,96 +4609,17 @@ impl Gateway {
             .map(|owner| reply_target_for_owner(&owner))
     }
 
-    /// One "switch project" button per project (`nav:cd:<slug>`), the current
-    /// one marked `✓`. Payloads over Telegram's 64-byte `callback_data` cap are
-    /// dropped (a pathologically long slug still shows in the text list).
-    fn project_switch_options(&self, chat: &ChatKey) -> Vec<MessageOption> {
-        let cur = self.current_project_for(chat).unwrap_or_default();
-        let mut options: Vec<MessageOption> = self
-            .visible_project_slugs(chat)
-            .into_iter()
-            .map(|slug| {
-                // A consistent leading glyph (✓ current / ▸ others) lines the
-                // labels up on the left, so the picker reads as a tidy list
-                // rather than centre-floating text (owner req).
-                let label = if slug == cur {
-                    format!("✓ {slug}")
-                } else {
-                    format!("▸ {slug}")
-                };
-                MessageOption {
-                    data: format!("nav:cd:{slug}"),
-                    label,
-                    id: slug,
-                }
-            })
-            .filter(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX)
-            .collect();
-        left_align_option_labels(&mut options);
-        options
-    }
-
-    /// One "switch session" button per live, chat-visible session
-    /// (`nav:use:<sid>`), the current one marked `✓`. Scoped + ordered like
-    /// [`Self::render_sessions`] (current project unless `all`; recency then
-    /// numeric-sid descending) so the buttons track the text list. Ended
-    /// (history) sessions switch only via their text `→ /use <sid>` hint.
-    fn session_switch_options(&self, chat: &ChatKey, all: bool) -> Vec<MessageOption> {
-        let cur = self.current_project_for(chat).unwrap_or_default();
-        let mut memo = ProjectPrincipalMemo::new();
-        let mut visible: Vec<&GatewaySession> = self
-            .sessions
-            .values()
-            .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
-            .filter(|s| all || s.project == cur)
-            .collect();
-        visible.sort_by(|a, b| {
-            let la = self.session_last_active(a);
-            let lb = self.session_last_active(b);
-            lb.cmp(&la)
-                .then_with(|| session_index(&b.id).cmp(&session_index(&a.id)))
-        });
-        let current_sid = self.current_session.read().unwrap().get(chat).cloned();
-        let mut options: Vec<MessageOption> = visible
-            .into_iter()
-            .map(|s| {
-                // Label = `sid vendor (title)` (✓ prefixes the current
-                // session), arranged sid → vendor → title — same `sid vendor`
-                // opening as the text rows. The button carries the human name;
-                // a long title is clipped to `SESSION_BUTTON_TITLE_MAX_COLS`
-                // display cols so one verbose title can't widen every button
-                // (the left-align padding below pads all labels to the widest).
-                // Callback `data` is unchanged.
-                let marker = if Some(&s.id) == current_sid.as_ref() {
-                    "✓ "
-                } else {
-                    ""
-                };
-                let mut label = format!("{marker}{} {}", s.id, vendor_str(s.vendor));
-                if let Some(title) = self.session_title(s) {
-                    label.push_str(&format!(
-                        " ({})",
-                        truncate_cols(&title, SESSION_BUTTON_TITLE_MAX_COLS)
-                    ));
-                }
-                MessageOption {
-                    data: format!("nav:use:{}", s.id),
-                    label,
-                    id: s.id.clone(),
-                }
-            })
-            .filter(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX)
-            .collect();
-        left_align_option_labels(&mut options);
-        options
-    }
-
-    /// Emit a picker message (a project/session list) carrying inline `options`
-    /// to a button-capable channel, via the user-signal sink.
-    /// Delivers text + buttons as ONE message
-    /// (`spawn_gateway_event_consumer` calls `.with_options`), so the caller
-    /// returns no separate inline reply.
-    fn emit_list_options(&self, chat: &ChatKey, content: String, options: Vec<MessageOption>) {
+    /// Emit a multi-per-row [`SendMessage::button_rows`] message (TG-GATE-V2
+    /// W5) — e.g. a `cmd:?<cmd>` confirmation's `[✅ Да][❌ Отмена]` row,
+    /// where the two buttons must render side by side rather than one per
+    /// row. Delivers text + buttons as ONE message via the user-signal sink
+    /// (`spawn_gateway_event_consumer` calls `.with_button_rows`).
+    fn emit_button_rows(
+        &self,
+        chat: &ChatKey,
+        content: String,
+        button_rows: Vec<Vec<MessageOption>>,
+    ) {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -4284,7 +4632,35 @@ impl Gateway {
             content,
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
-            options,
+            options: Vec::new(),
+            button_rows,
+            sid: None,
+            slug: None,
+        });
+    }
+
+    /// Edit an already-sent Telegram message in place (TG-GATE-V2 W8) —
+    /// used to resolve a `cmd:?` confirmation tap by rewriting the
+    /// confirmation prompt itself (keyboard removed, text = `content`)
+    /// instead of appending a new message. `platform_message_id` is the
+    /// tapped message's platform id, resolved by [`telegram_callback_message_id`]
+    /// from the inbound callback's `message_id`.
+    fn emit_confirmation_edit(&self, chat: &ChatKey, platform_message_id: String, content: String) {
+        self.emit_user_signal(GatewayEvent {
+            id: format!(
+                "gateway-edit-confirm-{}-{platform_message_id}",
+                chat.chat_id
+            ),
+            channel: chat.channel.clone(),
+            chat_id: chat.chat_id.clone(),
+            thread_ts: None,
+            content,
+            kind: GatewayEventKind::EditMessage {
+                message_id: platform_message_id,
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
             sid: None,
             slug: None,
         });
@@ -4306,13 +4682,13 @@ impl Gateway {
         let paths = self
             .project_paths
             .clone()
-            .ok_or_else(|| anyhow!("project creation is not configured on this daemon"))?;
+            .ok_or_else(|| anyhow!("Создание проектов не настроено в этом daemon"))?;
         let slug = validate_slug_format(slug)?;
         // (v0.8.5) Detect a slug already registered in config.yaml even if it's
         // not yet in our in-memory cache, so /newproject can't clobber it.
         self.ensure_project_loaded(&slug);
         if self.projects.contains_key(&slug) {
-            return Err(anyhow!("project already exists: {slug}"));
+            return Err(anyhow!("Проект уже существует: {slug}"));
         }
         let abs = expand_project_path(raw_path)?;
         bootstrap_project_at_dir(&paths, &abs, &slug, "(created from web/IM chat)", "dev")
@@ -4360,7 +4736,7 @@ impl Gateway {
             tracing::warn!(error = %err, "ccteam-im: persist after /newproject failed");
         }
         Ok(format!(
-            "✅ 已创建并切换到 {slug}\n   📁 {}\n   发条消息即在此开一个会话(或 /new)",
+            "✅ Создан и выбран проект {slug}\n   📁 {}\n   Отправьте сообщение, чтобы создать здесь сессию (или /new)",
             abs.display()
         ))
     }
@@ -4481,11 +4857,11 @@ impl Gateway {
     fn new_session_receipt(outcome: &StartOutcome) -> String {
         let id = &outcome.id;
         let suffix = if outcome.permission_mode.is_hitl() {
-            " (hitl: non-allowlist tools need IM approval)"
+            " (hitl: инструменты вне allowlist требуют подтверждения в IM)"
         } else {
             ""
         };
-        format!("created session {id}{suffix}")
+        format!("Создана сессия {id}{suffix}")
     }
 
     /// v0.8.10 — codex `/clear`: recycle the current codex session and start a
@@ -5048,7 +5424,9 @@ impl Gateway {
             .unwrap()
             .get(chat)
             .cloned()
-            .ok_or_else(|| anyhow!("/role 需要一个活动会话:先 /new 或发条消息再切换。"))?;
+            .ok_or_else(|| {
+                anyhow!("Для /role нужна активная сессия: сначала /new или отправьте сообщение.")
+            })?;
         let old = self
             .sessions
             .get(&sid)
@@ -5100,7 +5478,7 @@ impl Gateway {
             Ok(Some(detail)) => detail,
             Ok(None) | Err(_) => {
                 return Err(anyhow!(
-                    "role 不存在:.claude/agents/{role}.md 未找到;用 /role <已存在的角色>"
+                    "Роль не найдена: отсутствует .claude/agents/{role}.md; используйте /role <существующая_роль>"
                 ));
             }
         };
@@ -5679,6 +6057,7 @@ impl Gateway {
                                 },
                                 attachments: Vec::new(),
                                 options: Vec::new(),
+                                button_rows: Vec::new(),
                                 sid: Some(session_id.clone()),
                                 slug: Some(session.project.clone()),
                             }) {
@@ -5969,12 +6348,13 @@ impl Gateway {
                                     (&evt, progress_path.as_ref())
                                 {
                                     let ev =
-                                        ccteam_core::progress::build_chat_turn_completed_event(
+                                        ccteam_core::progress::build_chat_turn_completed_event_with_vendor(
                                             &session.role,
                                             &session_id,
                                             "",
                                             &ccteam_harness::UnifiedTokenUsage::default(),
                                             None,
+                                            Some(vendor_str(session.vendor)),
                                         );
                                     if let Err(err) =
                                         ccteam_core::progress::append_event(ppath, &ev)
@@ -6005,12 +6385,13 @@ impl Gateway {
                                 Some(ppath),
                             ) = (turn_terminal_accounting(&evt), progress_path.as_ref())
                             {
-                                let ev = ccteam_core::progress::build_chat_turn_completed_event(
+                                let ev = ccteam_core::progress::build_chat_turn_completed_event_with_vendor(
                                     &session.role,
                                     &session_id,
                                     turn_id,
                                     usage,
                                     model,
+                                    Some(vendor_str(session.vendor)),
                                 );
                                 if let Err(err) =
                                     ccteam_core::progress::append_event(ppath, &ev)
@@ -6269,6 +6650,7 @@ impl Gateway {
                                 kind: GatewayEventKind::Answer,
                                 attachments: Vec::new(),
                                 options: Vec::new(),
+                                button_rows: Vec::new(),
                                 sid: Some(session_id.clone()),
                                 slug: Some(session.project.clone()),
                             };
@@ -6461,6 +6843,11 @@ impl Gateway {
             .into_iter()
             .map(|route| (route.chat, route.value))
             .collect();
+        self.pending_prefix = saved
+            .pending_prefix
+            .into_iter()
+            .map(|route| (route.chat, route.value))
+            .collect();
         *self.current_session.write().unwrap() = saved
             .current_session
             .into_iter()
@@ -6545,6 +6932,14 @@ impl Gateway {
                     value: value.clone(),
                 })
                 .collect(),
+            pending_prefix: self
+                .pending_prefix
+                .iter()
+                .map(|(chat, value)| SavedGatewayRoute {
+                    chat: chat.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
             live_sids: self.sessions.keys().cloned().collect(),
         };
         atomic_write_durable(path, &serde_json::to_vec_pretty(&saved)?)
@@ -6572,6 +6967,14 @@ impl Gateway {
                     .current_session
                     .read()
                     .unwrap()
+                    .iter()
+                    .map(|(chat, value)| SavedGatewayRoute {
+                        chat: chat.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+                pending_prefix: guard
+                    .pending_prefix
                     .iter()
                     .map(|(chat, value)| SavedGatewayRoute {
                         chat: chat.clone(),
@@ -6761,14 +7164,16 @@ impl Gateway {
         visible_pending: usize,
     ) -> Result<crate::scheduled::ScheduledItem> {
         if text.trim().is_empty() {
-            return Err(anyhow!("scheduled message text cannot be empty"));
+            return Err(anyhow!("Текст отложенного сообщения не может быть пустым"));
         }
         let now = chrono::Utc::now();
         if send_at <= now {
-            return Err(anyhow!("scheduled time must be in the future"));
+            return Err(anyhow!("Время отложенного сообщения должно быть в будущем"));
         }
         if send_at.signed_duration_since(now) > crate::scheduled::MAX_HORIZON {
-            return Err(anyhow!("scheduled time must be within 7 days"));
+            return Err(anyhow!(
+                "Время отложенного сообщения должно быть не дальше 7 дней"
+            ));
         }
         let (project, project_dir) = self.scheduled_target(sid)?;
         let sid_pending = self
@@ -6897,6 +7302,7 @@ impl Gateway {
             kind: GatewayEventKind::ScheduledChanged,
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(item.sid.clone()),
             slug: Some(item.project.clone()),
         });
@@ -6948,7 +7354,7 @@ impl Gateway {
             if now.signed_duration_since(entry.item.send_at) > crate::scheduled::MAX_CATCH_UP_AGE {
                 self.fail_scheduled(
                     &entry.item.id,
-                    "catch-up is older than 24 hours".to_string(),
+                    "Отложенная отправка просрочена более чем на 24 часа".to_string(),
                 );
                 continue;
             }
@@ -6980,7 +7386,9 @@ impl Gateway {
             .await?
         {
             SubmitResult::Turn { .. } | SubmitResult::Queued { .. } => Ok(()),
-            SubmitResult::Directive(_) => Err(anyhow!("scheduled body was parsed as a directive")),
+            SubmitResult::Directive(_) => Err(anyhow!(
+                "Текст отложенного сообщения распознан как directive"
+            )),
         }
     }
 
@@ -7023,12 +7431,13 @@ impl Gateway {
                 chat_id: chat_id.clone(),
                 thread_ts: None,
                 content: format!(
-                    "⏰ {} failed to send to {}: {} (kept in /inbox for 24h)",
+                    "⏰ Не удалось отправить {} в {}: {} (сохранено в /inbox на 24 ч)",
                     entry.item.id, entry.item.sid, reason
                 ),
                 kind: GatewayEventKind::Answer,
                 attachments: Vec::new(),
                 options: Vec::new(),
+                button_rows: Vec::new(),
                 sid: Some(entry.item.sid.clone()),
                 slug: Some(entry.item.project.clone()),
             });
@@ -7639,7 +8048,7 @@ impl Gateway {
         let not_live = match self.sessions.get(session_id) {
             Some(s) => !s.adapter.thread_is_live(&s.thread),
             None => {
-                return Err(anyhow!("current session missing: {session_id}"));
+                return Err(anyhow!("Текущая сессия не найдена: {session_id}"));
             }
         };
         if not_live {
@@ -7647,17 +8056,16 @@ impl Gateway {
                 let s = self
                     .sessions
                     .get(session_id)
-                    .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+                    .ok_or_else(|| anyhow!("Текущая сессия не найдена: {session_id}"))?;
                 if let Ok(mut target) = s.reply_to.lock() {
                     *target = chat.clone();
                 }
                 (s.project.clone(), chat.channel.clone())
             };
-            let cwd = self
-                .projects
-                .get(&project)
-                .cloned()
-                .ok_or_else(|| anyhow!("unknown project for pending turn: {project}"))?;
+            let cwd =
+                self.projects.get(&project).cloned().ok_or_else(|| {
+                    anyhow!("Неизвестный проект для отложенного запуска: {project}")
+                })?;
             crate::pending_turns::enqueue_pending_turn(
                 &cwd,
                 session_id,
@@ -7682,7 +8090,7 @@ impl Gateway {
         let session = self
             .sessions
             .get(session_id)
-            .ok_or_else(|| anyhow!("current session missing: {session_id}"))?;
+            .ok_or_else(|| anyhow!("Текущая сессия не найдена: {session_id}"))?;
         // Replies for this turn go back to whoever sent it.
         if let Ok(mut target) = session.reply_to.lock() {
             *target = chat.clone();
@@ -7737,6 +8145,7 @@ impl Gateway {
                 },
                 attachments: Vec::new(),
                 options: Vec::new(),
+                button_rows: Vec::new(),
                 sid: Some(session_id.to_string()),
                 slug: Some(session.project.clone()),
             });
@@ -8016,7 +8425,7 @@ impl Gateway {
                 }
             }
             if replies.is_empty() {
-                replies.push(format!("submitted turn {turn_id}"));
+                replies.push(format!("Запуск отправлен: {turn_id}"));
             }
             Ok(replies)
         }
@@ -8057,6 +8466,7 @@ impl Gateway {
                 kind: GatewayEventKind::Answer,
                 attachments: Vec::new(),
                 options: to_message_options(&prompt),
+                button_rows: Vec::new(),
                 sid: Some(session_id.to_string()),
                 slug: self.sessions.get(session_id).map(|s| s.project.clone()),
             });
@@ -8076,9 +8486,9 @@ impl Gateway {
     /// The callback `data` (`"{token}:{idx}"`) carries the token + positional
     /// index; the real option id is reverse-resolved from the taken prompt and
     /// never leaves the gateway.
-    async fn resolve_selection(&self, chat: &ChatKey, data: &str) -> Result<Vec<String>> {
+    async fn resolve_selection(&mut self, chat: &ChatKey, data: &str) -> Result<Vec<String>> {
         let Some((token, idx)) = split_callback(data) else {
-            return Ok(vec!["invalid selection".to_string()]);
+            return Ok(vec!["Некорректный выбор".to_string()]);
         };
         let taken = {
             let mut pend = self.pending.lock().await;
@@ -8091,17 +8501,222 @@ impl Gateway {
             pend.take_by_token(&token)
         };
         let Some(p) = taken else {
-            return Ok(vec!["this choice has expired".to_string()]);
+            return Ok(vec!["Этот выбор больше недоступен".to_string()]);
         };
         let Some(opt) = p.prompt.options.get(idx) else {
-            return Ok(vec!["invalid choice".to_string()]);
+            return Ok(vec!["Некорректный вариант выбора".to_string()]);
         };
         let selection = ChoiceSelection {
             token,
             ids: vec![opt.id.clone()],
             free_text: None,
         };
+        if let InteractionOrigin::BulkStop {
+            channel,
+            chat_id,
+            user_id,
+            scope: _,
+            project,
+            parent,
+            snapshot,
+        } = &p.origin
+        {
+            let snapshot: BTreeSet<String> = snapshot.iter().cloned().collect();
+            if chat.channel != *channel || chat.chat_id != *chat_id || chat.user_id != *user_id {
+                return Ok(vec!["Этот выбор больше недоступен".to_string()]);
+            }
+            let bulk_chat = ChatKey::new(channel, chat_id, user_id);
+            if selection.ids.first().map(String::as_str) == Some("stop-cancel") {
+                return Ok(vec!["Отменено".to_string()]);
+            }
+            return Ok(self
+                .stop_bulk_snapshot(&bulk_chat, project.as_deref(), parent.as_deref(), &snapshot)
+                .await);
+        }
         self.apply_pending(chat, p, selection).await
+    }
+
+    /// Route a `cmd:` inline-button tap (TG-GATE-V2 W3): `Command` runs the
+    /// named command exactly as if typed, `Confirm` renders a Russian
+    /// yes/no prompt, and an opaque token confirms or cancels it. Never called with
+    /// [`im_callbacks::CallbackAction::Choice`] — the caller
+    /// (`handle_message`) filters that arm to the existing token-keyed
+    /// [`Self::resolve_selection`] path instead.
+    ///
+    /// **No separate identity check here** (TG-GATE-V2 W5 — dropped a prior
+    /// `chat.chat_id == chat.user_id` gate that disabled every `cmd:` button
+    /// in a group chat). `Command` reaches [`Self::handle_command`], which
+    /// already applies the SAME ACL a typed `/command` gets for this
+    /// `chat` — there is no privilege a button tap gains that typing the
+    /// same text in the same chat wouldn't also have. Gating on
+    /// `chat_id == user_id` would have meant a group's `cmd:` buttons never
+    /// work at all (a group chat's shared `chat_id` never equals any
+    /// member's `user_id`), which is strictly worse than "as permissive as
+    /// typing".
+    async fn resolve_cmd_callback(
+        &mut self,
+        chat: &ChatKey,
+        action: im_callbacks::CallbackAction,
+        message_id: &str,
+    ) -> Result<Vec<RichReply>> {
+        match action {
+            im_callbacks::CallbackAction::Choice { .. } => Ok(Vec::new()),
+            im_callbacks::CallbackAction::Confirm(cmd) => {
+                let first = cmd.split_whitespace().next().unwrap_or_default();
+                if !Self::is_gateway_command(first) {
+                    return Ok(vec![RichReply::plain("Неизвестная команда")]);
+                }
+                // TG-GATE-V2 W5 — the two confirmation buttons ride ONE
+                // `SendMessage::button_rows` row (side by side), not the
+                // one-per-row `options` the project/session pickers use.
+                let token = self.register_command_confirmation(chat.clone(), cmd.clone());
+                let rows = confirm_cmd_button_rows(&token);
+                self.emit_button_rows(chat, confirm_prompt_text(&cmd), rows);
+                Ok(Vec::new())
+            }
+            im_callbacks::CallbackAction::Confirmed(token) => {
+                let cmd = match self.take_command_confirmation(chat, &token) {
+                    ConfirmationResolution::Command(cmd) => cmd,
+                    ConfirmationResolution::Foreign => return Ok(Vec::new()),
+                    ConfirmationResolution::Stale => {
+                        return Ok(vec![RichReply::plain("Подтверждение устарело")]);
+                    }
+                };
+                // TG-GATE-V2 W8 — edit the confirmation message itself
+                // in place (keyboard removed, "✅ <cmd>") instead of
+                // appending a new one; a callback with no resolvable
+                // platform message id (non-Telegram origin) keeps the
+                // prior append-a-new-message behavior.
+                let mut replies = Vec::new();
+                let ack = format!("✅ {cmd}");
+                match telegram_callback_message_id(message_id) {
+                    Some(platform_message_id) => {
+                        self.emit_confirmation_edit(chat, platform_message_id, ack)
+                    }
+                    None => replies.push(RichReply::plain(ack)),
+                }
+                // `already_confirmed: true` — this tap WAS the yes/no
+                // answer; a bulk `/stop` must execute directly, not raise a
+                // second confirmation on top of the one just answered.
+                match self.handle_command_inner(chat, &cmd, true).await? {
+                    Some(reply) => replies.push(reply),
+                    None => replies.push(RichReply::plain("Неизвестная команда")),
+                }
+                Ok(replies)
+            }
+            im_callbacks::CallbackAction::Cancelled(token) => {
+                match self.take_command_confirmation(chat, &token) {
+                    ConfirmationResolution::Foreign => Ok(Vec::new()),
+                    ConfirmationResolution::Stale => {
+                        Ok(vec![RichReply::plain("Подтверждение устарело")])
+                    }
+                    ConfirmationResolution::Command(_) => {
+                        match telegram_callback_message_id(message_id) {
+                            Some(platform_message_id) => {
+                                self.emit_confirmation_edit(
+                                    chat,
+                                    platform_message_id,
+                                    "Отменено".to_string(),
+                                );
+                                Ok(Vec::new())
+                            }
+                            None => Ok(vec![RichReply::plain("Отменено")]),
+                        }
+                    }
+                }
+            }
+            im_callbacks::CallbackAction::Command(cmd) => {
+                let first = cmd.split_whitespace().next().unwrap_or_default();
+                if !Self::is_gateway_command(first) {
+                    return Ok(vec![RichReply::plain("Неизвестная команда")]);
+                }
+                match self.handle_command(chat, &cmd).await? {
+                    Some(reply) => Ok(vec![reply]),
+                    None => Ok(vec![RichReply::plain("Неизвестная команда")]),
+                }
+            }
+        }
+    }
+
+    fn register_command_confirmation(&mut self, chat: ChatKey, command: String) -> String {
+        let now = Instant::now();
+        self.pending_command_confirmations
+            .retain(|_, pending| !pending.expired(now));
+        // TG-GATE-V2 W9 — cap the live set so a chat spamming `cmd:?…` taps
+        // (or many chats doing it at once) can't grow this map without
+        // bound between TTL sweeps; evict the OLDEST entries first (a
+        // confirmation nobody tapped yet is the least likely to matter).
+        Self::evict_oldest_confirmations(
+            &mut self.pending_command_confirmations,
+            Some(&chat),
+            MAX_COMMAND_CONFIRMATIONS_PER_CHAT - 1,
+        );
+        Self::evict_oldest_confirmations(
+            &mut self.pending_command_confirmations,
+            None,
+            MAX_COMMAND_CONFIRMATIONS_GLOBAL - 1,
+        );
+        loop {
+            let token = ccteam_core::session_secret::mint()[..8].to_string();
+            if self.pending_command_confirmations.contains_key(&token) {
+                continue;
+            }
+            self.pending_command_confirmations.insert(
+                token.clone(),
+                PendingCommandConfirmation {
+                    chat,
+                    command,
+                    created_at: now,
+                    ttl: Duration::from_secs(5 * 60),
+                },
+            );
+            return token;
+        }
+    }
+
+    /// Evict entries beyond `cap`, oldest (smallest `created_at`) first.
+    /// `chat = Some(_)` scopes the cap to that chat's own entries (the
+    /// per-chat cap); `None` scopes it to the whole map (the global cap).
+    fn evict_oldest_confirmations(
+        map: &mut BTreeMap<String, PendingCommandConfirmation>,
+        chat: Option<&ChatKey>,
+        cap: usize,
+    ) {
+        let mut scoped: Vec<(String, Instant)> = map
+            .iter()
+            .filter(|(_, pending)| chat.is_none_or(|chat| pending.chat == *chat))
+            .map(|(token, pending)| (token.clone(), pending.created_at))
+            .collect();
+        if scoped.len() <= cap {
+            return;
+        }
+        scoped.sort_by_key(|(_, created_at)| *created_at);
+        let evict_count = scoped.len() - cap;
+        for (token, _) in scoped.into_iter().take(evict_count) {
+            map.remove(&token);
+        }
+    }
+
+    fn take_command_confirmation(&mut self, chat: &ChatKey, token: &str) -> ConfirmationResolution {
+        let now = Instant::now();
+        // TG-GATE-V2 W9 — sweep expired entries on EVERY callback, not just
+        // on registration: a chat that never taps a stale confirmation
+        // again would otherwise leave it parked until the next register
+        // call from anybody.
+        self.pending_command_confirmations
+            .retain(|_, pending| !pending.expired(now));
+        let Some(pending) = self.pending_command_confirmations.get(token).cloned() else {
+            return ConfirmationResolution::Stale;
+        };
+        if pending.expired(now) {
+            self.pending_command_confirmations.remove(token);
+            return ConfirmationResolution::Stale;
+        }
+        if pending.chat != *chat {
+            return ConfirmationResolution::Foreign;
+        }
+        self.pending_command_confirmations.remove(token);
+        ConfirmationResolution::Command(pending.command)
     }
 
     /// Ask about a session's ccteam tool face the FIRST time it is activated
@@ -8230,6 +8845,7 @@ impl Gateway {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: (!slug.is_empty()).then_some(slug),
         });
@@ -8251,20 +8867,22 @@ impl Gateway {
     /// have done it. See [`ccteam_harness::ToolSurfaceRebuild`].
     async fn rebuild_tool_surface(&self, chat: &ChatKey) -> Result<String> {
         let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
-            return Ok("当前没有会话可重连;先 /new 或 /use <sid>".to_string());
+            return Ok("Нет сессии для переподключения; сначала /new или /use <sid>".to_string());
         };
         let Some(session) = self.sessions.get(&session_id) else {
             return Ok(format!(
-                "会话 {session_id} 不在活跃列表里;/sessions 查看现有会话"
+                "Сессия {session_id} не активна; посмотрите доступные через /sessions"
             ));
         };
         let adapter = Arc::clone(&session.adapter);
         let thread = session.thread.clone();
         match adapter.rebuild_tool_surface(&thread).await {
-            Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason }) => {
-                Ok(format!("🔌 {session_id} 无法原地重连:{reason}"))
-            }
-            Err(err) => Ok(format!("🔌 {session_id} 查询工具面失败:{err}")),
+            Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason }) => Ok(format!(
+                "🔌 Не удалось переподключить {session_id}: {reason}"
+            )),
+            Err(err) => Ok(format!(
+                "🔌 Не удалось проверить инструменты {session_id}: {err}"
+            )),
         }
     }
 
@@ -8272,7 +8890,7 @@ impl Gateway {
     /// pending choice (v0.8.5 D3).
     async fn resolve_numeric(&self, chat: &ChatKey, n: usize) -> Result<Vec<String>> {
         let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
-            return Ok(vec!["no choice to answer".to_string()]);
+            return Ok(vec!["Нет выбора, на который можно ответить".to_string()]);
         };
         let key = pending_key(chat, &session_id);
         let mut pend = self.pending.lock().await;
@@ -8281,14 +8899,19 @@ impl Gateway {
         pend.drain_expired(Instant::now());
         let (token, id) = {
             let Some(prompt) = pend.prompt_for(&key) else {
-                return Ok(vec!["no choice to answer".to_string()]);
+                return Ok(vec!["Нет выбора, на который можно ответить".to_string()]);
             };
             let Some(idx) = n.checked_sub(1) else {
-                return Ok(vec!["invalid choice".to_string()]);
+                return Ok(vec!["Некорректный вариант выбора".to_string()]);
             };
             match prompt.options.get(idx) {
                 Some(opt) => (prompt.token.clone(), opt.id.clone()),
-                None => return Ok(vec![format!("please reply 1–{}", prompt.options.len())]),
+                None => {
+                    return Ok(vec![format!(
+                        "Ответьте числом от 1 до {}",
+                        prompt.options.len()
+                    )])
+                }
             }
         };
         let p = pend.take(&key).expect("pending present under lock");
@@ -8343,6 +8966,9 @@ impl Gateway {
                 let _ = reply.send(selection);
                 Ok(Vec::new())
             }
+            InteractionOrigin::BulkStop { .. } => Err(anyhow!(
+                "Подтверждение остановки нельзя разрешить из веб-интерфейса"
+            )),
         }
     }
 
@@ -8394,7 +9020,7 @@ impl Gateway {
     /// slug for the banner.
     fn current_project_label(&self, chat: &ChatKey) -> String {
         self.current_project_for(chat)
-            .unwrap_or_else(|| "(无项目)".to_string())
+            .unwrap_or_else(|| "(нет проекта)".to_string())
     }
 
     /// The project a spawn must land in, or a directed error. Guests and
@@ -8404,10 +9030,10 @@ impl Gateway {
         self.current_project_for(chat).ok_or_else(|| {
             if matches!(self.principal(chat), Principal::Guest(_)) {
                 anyhow!(
-                    "这个 chat 还没有绑定到 ccteam —— 把它加入 bot 的允许列表(web 设置 → 接入 → 捕获 chat id),或让 owner 建一个用户给你"
+                    "Этот чат ещё не привязан к ccteam — добавьте его в allowlist бота (web: Настройки → Подключение → получить chat id) или попросите владельца создать вам пользователя"
                 )
             } else {
-                anyhow!("你还没有可用的项目 —— 用 /newproject <slug> <path> 建一个")
+                anyhow!("У вас нет доступных проектов — создайте через /newproject <slug> <path>")
             }
         })
     }
@@ -8749,10 +9375,10 @@ impl Gateway {
             available.sort_unstable();
             available.dedup();
             return Err(if available.is_empty() {
-                anyhow!("没有可按 role 匹配的会话 —— 用 /use <sid>,或先 /new 一个")
+                anyhow!("Нет сессии с такой ролью — используйте /use <sid> или сначала /new")
             } else {
                 anyhow!(
-                    "未找到 role `{role}` 的会话 —— 可用: {}",
+                    "Не найдена сессия с ролью `{role}` — доступны: {}",
                     available.join(", ")
                 )
             });
@@ -8780,8 +9406,8 @@ impl Gateway {
             .collect()
     }
 
-    async fn render_sessions(&self, chat: &ChatKey, all: bool) -> String {
-        // v0.8.18 柱2 档0 — own-only: a chat lists only the sessions it owns
+    async fn render_sessions(&self, chat: &ChatKey, all: bool) -> RichReply {
+        // v0.8.18 ACL regression — a chat lists only sessions it owns.
         // (the web-global + same-project leaks are gone). Soft per-chat isolation.
         let mut memo = ProjectPrincipalMemo::new();
         let accessible: Vec<&GatewaySession> = self
@@ -8845,28 +9471,103 @@ impl Gateway {
         if !waiting_sids.is_empty() {
             visible.sort_by_key(|s| !waiting_sids.contains(&s.id));
         }
-        let detached_here = self
+        let detached = self
             .detached
             .values()
             .filter(|d| (all || d.slug == cur) && self.chat_can_access_sid(chat, &d.sid))
-            .count();
+            .map(|d| DetachedSessionRow {
+                sid: d.sid.clone(),
+                pid: d.body.pid,
+            })
+            .collect::<Vec<_>>();
+        let detached_here = detached.len();
         if visible.is_empty() && is_web {
-            return "no sessions".to_string();
+            return RichReply::plain("no sessions");
         }
         if visible.is_empty() && detached_here == 0 {
             if elsewhere > 0 {
-                return format!(
-                    "📁 当前项目: {cur}\n本项目暂无会话 —— ↓ 其他项目还有 {elsewhere} 个 → /sessions all"
-                );
+                return RichReply::plain(format!(
+                    "📁 Текущий проект: {cur}\nВ этом проекте нет сессий — ↓ в других проектах: {elsewhere} → /sessions all"
+                ));
             }
-            return format!("📁 当前项目: {cur}\n暂无会话 —— /new 开一个");
+            return RichReply::plain(format!(
+                "📁 Текущий проект: {cur}\nНет сессий — создайте через /new"
+            ));
         }
-        // Render each visible session's row (async `thread_status`) once,
-        // keyed by sid for the IM tree; web keeps the flat bare-row feed.
+        // Preserve the priority ordering while rendering the IM list as a
+        // delegation tree. A malformed cycle becomes a flat tail instead of
+        // hiding a session forever.
+        let ordered_sessions: Vec<(&GatewaySession, usize)> = if is_web {
+            visible.iter().map(|session| (*session, 0)).collect()
+        } else {
+            let visible_sids: HashSet<&str> =
+                visible.iter().map(|session| session.id.as_str()).collect();
+            let by_sid: std::collections::HashMap<&str, &GatewaySession> = visible
+                .iter()
+                .map(|session| (session.id.as_str(), *session))
+                .collect();
+            let mut children_of: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for session in &visible {
+                if let Some(parent) = session.parent_sid.as_deref() {
+                    if visible_sids.contains(parent) {
+                        children_of
+                            .entry(parent)
+                            .or_default()
+                            .push(session.id.as_str());
+                    }
+                }
+            }
+            let roots: Vec<&str> = visible
+                .iter()
+                .filter(|session| {
+                    session
+                        .parent_sid
+                        .as_deref()
+                        .map(|parent| !visible_sids.contains(parent))
+                        .unwrap_or(true)
+                })
+                .map(|session| session.id.as_str())
+                .collect();
+            let mut ordered = Vec::with_capacity(visible.len());
+            let mut visited = HashSet::new();
+            let mut stack: Vec<(&str, usize)> = roots.iter().rev().map(|sid| (*sid, 0)).collect();
+            while let Some((sid, depth)) = stack.pop() {
+                if !visited.insert(sid) {
+                    continue;
+                }
+                if let Some(session) = by_sid.get(sid) {
+                    ordered.push((*session, depth));
+                }
+                if let Some(children) = children_of.get(sid) {
+                    for child in children.iter().rev() {
+                        stack.push((child, depth + 1));
+                    }
+                }
+            }
+            let mut leftovers: Vec<&str> = visible
+                .iter()
+                .map(|session| session.id.as_str())
+                .filter(|sid| !visited.contains(sid))
+                .collect();
+            leftovers.sort_by_key(|sid| session_index(sid));
+            ordered.extend(
+                leftovers
+                    .into_iter()
+                    .filter_map(|sid| by_sid.get(sid).map(|session| (*session, 0))),
+            );
+            ordered
+        };
+        let current_sid = self
+            .current_session
+            .read()
+            .ok()
+            .and_then(|sessions| sessions.get(chat).cloned());
+        // Read each visible session's status once. Web keeps its existing
+        // machine-parsed feed; every IM channel receives the shared compact view.
         let mut web_rows: Vec<String> = Vec::with_capacity(visible.len());
-        let mut rendered: std::collections::HashMap<String, String> =
-            std::collections::HashMap::with_capacity(visible.len());
-        for s in &visible {
+        let mut view_rows: Vec<SessionRow> = Vec::with_capacity(visible.len());
+        for (s, tree_depth) in ordered_sessions {
             // P3 — model + ctx from the owning adapter's `thread_status`.
             // Statusless adapters (bg / default) report `ThreadStatus::default()`
             // (no model / no context). Per-session failures degrade to the bare
@@ -8883,141 +9584,47 @@ impl Gateway {
                 });
                 continue;
             }
-            // IM row: COMPACT, single-line, `.`-joined with no padding. Leads
-            // with `sid vendor` (the SAME opening as the switch button —
-            // `session_switch_options`: `sid vendor (title)`), then — when the
-            // adapter reports them — `.model`, `.effort`, and `.window(pct%)`
-            // context: the TOTAL window (absolute, via the same
-            // `format_tokens` humanizer `ContextUsage::render` uses) + the
-            // used percentage, but NOT the absolute used count. NO project
-            // slug (the `📁 当前项目:` header already names it; `/sessions all`
-            // spans projects without a per-row slug), NO role, NO `ctx` label
-            // (all on /status); the title lives on the button; the vendor tag
-            // + activity dot are gone.
-            let mut row = format!("{} {}", s.id, vendor_str(s.vendor));
-            if let Some(st) = &status {
-                if let Some(m) = st.model.as_deref().filter(|m| !m.is_empty()) {
-                    row.push_str(&format!(
-                        ".{}",
-                        strip_vendor_prefix(vendor_str(s.vendor), m)
-                    ));
+            let model = status
+                .as_ref()
+                .and_then(|st| st.model.as_deref())
+                .filter(|model| !model.is_empty())
+                .map(|model| strip_vendor_prefix(vendor_str(s.vendor), model))
+                .unwrap_or("—");
+            let context = status
+                .as_ref()
+                .and_then(|st| st.context.as_ref())
+                .and_then(|context| context.pct())
+                .map(|percent| format!("{percent:.0}%"))
+                .unwrap_or_else(|| "—".to_string());
+            let status_label = if waiting_sids.contains(&s.id) {
+                "⏳ ожидание".to_string()
+            } else {
+                match self.live_turn(s, Instant::now()) {
+                    Some(live) if live.is_stuck() => "🔴 зависание".to_string(),
+                    Some(_) => "🔵 работает".to_string(),
+                    None => "🟢 ожидание".to_string(),
                 }
-                if let Some(e) = st.effort.as_deref().filter(|e| !e.is_empty()) {
-                    row.push_str(&format!(".{e}"));
-                }
-                if let Some(ctx) = st.context.as_ref().filter(|c| c.window_tokens > 0) {
-                    // Window known but occupancy not (a just-resumed ACP
-                    // session, a vendor with no usage channel) renders `—`,
-                    // never `0%` — the row must not claim an empty context.
-                    let pct = match ctx.pct() {
-                        Some(p) => format!("{p:.0}%"),
-                        None => "—".to_string(),
-                    };
-                    row.push_str(&format!(".{}({pct})", format_tokens(ctx.window_tokens)));
-                }
-            }
-            // v0.9.0 W2 (F2) — annotate the IM row with a non-local host.
-            if !s.host.is_empty() && s.host != "local" {
-                row.push_str(&format!(" @{}", s.host));
-            }
-            // v0.8.23 review item 9 — ⏳ marks a session pinned to the top for
-            // an outstanding HITL approval. Prefixed last so it stays the
-            // leftmost glance cue.
-            if waiting_sids.contains(&s.id) {
-                row = format!("⏳ {row}");
-            }
-            rendered.insert(s.id.clone(), row);
+            };
+            view_rows.push(SessionRow {
+                sid: s.id.clone(),
+                vendor_model: format!("{}.{}", vendor_str(s.vendor), model),
+                status: status_label,
+                context,
+                title: self.session_title(s),
+                current: current_sid.as_deref() == Some(s.id.as_str()),
+                tree_depth,
+                host: (!s.host.is_empty() && s.host != "local").then(|| s.host.clone()),
+            });
         }
         if is_web {
-            return web_rows.join("\n");
+            return RichReply::plain(web_rows.join("\n"));
         }
-        // v0.9.0 W2 (F2) — IM tree: roots (a session with no VISIBLE parent —
-        // a true root, or a parent in another project) sorted by sid, each
-        // followed by its children indented `└─ ` (recursively). A parent-chain
-        // cycle can never orphan a session: any unvisited row is appended flat.
-        let visible_sids: std::collections::HashSet<&str> =
-            visible.iter().map(|s| s.id.as_str()).collect();
-        let mut children_of: std::collections::HashMap<&str, Vec<&str>> =
-            std::collections::HashMap::new();
-        for s in &visible {
-            if let Some(p) = s.parent_sid.as_deref() {
-                if visible_sids.contains(p) {
-                    children_of.entry(p).or_default().push(s.id.as_str());
-                }
-            }
-        }
-        // Roots + children keep the ALREADY-computed `visible` order (recency +
-        // waiting-approval pin); the tree only adds indentation, never reorders
-        // (so the ⏳ pin + recency sort above are preserved).
-        let roots: Vec<&str> = visible
-            .iter()
-            .filter(|s| {
-                s.parent_sid
-                    .as_deref()
-                    .map(|p| !visible_sids.contains(p))
-                    .unwrap_or(true)
-            })
-            .map(|s| s.id.as_str())
-            .collect();
-        let mut tree_rows: Vec<String> = Vec::with_capacity(visible.len());
-        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut stack: Vec<(&str, usize)> = roots.iter().rev().map(|r| (*r, 0usize)).collect();
-        while let Some((sid, depth)) = stack.pop() {
-            if !visited.insert(sid) {
-                continue;
-            }
-            if let Some(row) = rendered.get(sid) {
-                let prefix = if depth == 0 {
-                    String::new()
-                } else {
-                    format!("{}└─ ", "   ".repeat(depth - 1))
-                };
-                tree_rows.push(format!("{prefix}{row}"));
-            }
-            if let Some(kids) = children_of.get(sid) {
-                for k in kids.iter().rev() {
-                    stack.push((k, depth + 1));
-                }
-            }
-        }
-        // Cycle-orphaned leftovers → flat, sorted by sid (never drop a row).
-        let mut leftovers: Vec<&str> = visible
-            .iter()
-            .map(|s| s.id.as_str())
-            .filter(|sid| !visited.contains(sid))
-            .collect();
-        leftovers.sort_by_key(|sid| session_index(sid));
-        for sid in leftovers {
-            if let Some(row) = rendered.get(sid) {
-                tree_rows.push(row.clone());
-            }
-        }
-        let mut out = format!("📁 当前项目: {cur}\n{}", tree_rows.join("\n"));
-        // One sid, one body: sessions whose body from before a restart is still
-        // finishing its turn are real and this chat's — list them, say what
-        // they are, and name the two things that can be done about them.
-        let detached_rows: Vec<String> = self
-            .detached
-            .values()
-            .filter(|d| (all || d.slug == cur) && self.chat_can_access_sid(chat, &d.sid))
-            .map(|d| {
-                format!(
-                    "⏳ {} detached — finishing a turn from before the ccteam restart (pid {}); \
-                     messages queue behind it, /stop {} ends it now",
-                    d.sid, d.body.pid, d.sid
-                )
-            })
-            .collect();
-        if !detached_rows.is_empty() {
-            out.push('\n');
-            out.push_str(&detached_rows.join("\n"));
-        }
-        if elsewhere > 0 {
-            out.push_str(&format!(
-                "\n↓ 其他项目还有 {elsewhere} 个会话 → /sessions all"
-            ));
-        }
-        out
+        im_views::render_sessions(&SessionsView {
+            project: cur,
+            sessions: view_rows,
+            elsewhere,
+            detached,
+        })
     }
 
     /// Best-effort `last_active` (RFC3339) for a LIVE session from the catalog.
@@ -9137,14 +9744,8 @@ impl Gateway {
             .collect()
     }
 
-    /// v0.8.19 — PULL-only fleet-health view for `/status`. One line per
-    /// accessible session: state (🟢 idle / 🔵 working / 🔴 stuck) · sid ·
-    /// session-name (`ccteam-chat-<slug>-<sid>`) · the real vendor `--resume`
-    /// id (`resume <uuid>`, or `resume —` when none) · project · role ·
-    /// state-detail · model · effort · ctx, plus the live activity counts
-    /// (`read×N·bash×M`) while working. Same ACL + iteration as
-    /// [`render_sessions`]; pure rendering (no side effects, no push, no
-    /// mutation) — it only renders when the user types `/status`.
+    /// Render the focused session's compact status card. It reads the same
+    /// live harness facts as before, then hands plain data to `im_views`.
     ///
     /// State derivation = [`Gateway::live_turn`] — the same in-flight verdict
     /// the child rows, MCP `session_list` and the web session list are given
@@ -9155,7 +9756,7 @@ impl Gateway {
     /// authoritative "still working" straight from the vendor, so it upgrades
     /// 🔴 back to 🔵 (`running_tasks` costs an adapter round-trip per session,
     /// which a fleet listing does not pay).
-    async fn render_status(&self, chat: &ChatKey) -> String {
+    async fn render_status(&self, chat: &ChatKey) -> RichReply {
         let mut memo = ProjectPrincipalMemo::new();
         let visible: Vec<&GatewaySession> = self
             .sessions
@@ -9163,7 +9764,7 @@ impl Gateway {
             .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .collect();
         if visible.is_empty() {
-            return "no sessions — start one with /new".to_string();
+            return RichReply::plain("Нет сессий — создайте через /new");
         }
         // /status = the chat's CURRENT (focused) session in DEPTH; /sessions is
         // the full fleet list. Resolve the focused sid; if none is set (or it has
@@ -9183,37 +9784,38 @@ impl Gateway {
             let cur = self.current_project_label(chat);
             let in_proj = visible.iter().filter(|s| s.project == cur).count();
             return if in_proj > 0 {
-                format!(
-                    "📁 当前项目: {cur}\n无当前会话 —— /use <id> 选一个驱动(本项目 {in_proj} 个;/sessions 看全部)"
-                )
+                RichReply::plain(format!(
+                    "📁 Текущий проект: {cur}\nНет текущей сессии — выберите через /use <id> (в проекте: {in_proj}; все — /sessions)"
+                ))
             } else {
-                format!("📁 当前项目: {cur}\n本项目暂无会话 —— 发条消息开一个(或 /new)")
+                RichReply::plain(format!("📁 Текущий проект: {cur}\nВ этом проекте нет сессий — отправьте сообщение или /new"))
             };
         };
 
-        // Pull live facts FROM the harness — never folded by ccteam: the
-        // model/effort/ctx/goal status, the running subagent/workflow list
-        // (claude's own `system:task_*` lifecycle), and account usage.
+        // Pull the focused session's live facts from its harness.
         let status = s.adapter.thread_status(&s.thread).await.ok();
         let running = s.adapter.running_tasks(&s.thread).await;
-        // Account usage is account-scoped but PER VENDOR: a Codex session must
-        // never display a Claude account's windows (and vice-versa). Prefer the
-        // current session; else borrow from another visible session OF THE SAME
-        // VENDOR whose adapter answers (so usage still shows when the current
-        // session is idle/released). No same-vendor answer ⇒ omit the row.
-        let mut account = s.adapter.account_usage(&s.thread).await;
-        if account.is_none() {
-            let vendor = s.adapter.vendor();
-            for o in &visible {
-                if o.adapter.vendor() != vendor {
-                    continue;
-                }
-                if let Some(u) = o.adapter.account_usage(&o.thread).await {
-                    account = Some(u);
-                    break;
-                }
-            }
-        }
+        // Account usage belongs to a vendor account, not a session. Query one
+        // visible session per supported vendor and omit vendors with no real
+        // account-usage channel; never print a fabricated zero.
+        let usage_sources = [
+            (AgentVendor::Claude, "CC"),
+            (AgentVendor::Codex, "CX"),
+            (AgentVendor::Opencode, "OC"),
+        ]
+        .into_iter()
+        .filter_map(|(vendor, label)| {
+            visible
+                .iter()
+                .copied()
+                .find(|session| session.vendor == vendor)
+                .map(|session| (label, session))
+        })
+        .collect::<Vec<_>>();
+        let account_usages = join_all(usage_sources.iter().map(|(label, session)| async move {
+            (*label, session.adapter.account_usage(&session.thread).await)
+        }))
+        .await;
 
         // State: a turn in flight ⇒ 🔵 working; silent past the idle window ⇒
         // 🔴 stuck — EXCEPT a BLOCKING subagent is an AUTHORITATIVE "still
@@ -9230,49 +9832,24 @@ impl Gateway {
         // ([`Gateway::live_turn`]) — this line only dresses it with durations.
         let live = self.live_turn(s, Instant::now());
         let (state, detail) = match live {
-            None => ("🟢", "idle".to_string()),
+            None => ("🟢", "ожидание".to_string()),
             // Running subagents ⇒ definitively working (overrides silence).
             Some(l) if l.is_stuck() && !turn_scoped_running => (
                 "🔴",
                 format!(
-                    "STUCK {} silent",
+                    "ЗАВИСАНИЕ: нет событий {}",
                     humanize_dur(std::time::Duration::from_secs(l.silent_seconds))
                 ),
             ),
             Some(l) => (
                 "🔵",
                 format!(
-                    "working {}",
+                    "работает {}",
                     humanize_dur(std::time::Duration::from_secs(l.elapsed_seconds))
                 ),
             ),
         };
 
-        let role = if s.role.is_empty() { "—" } else { &s.role };
-        // v0.8.23 review §3.2-5 (item 2c) — "你在哪": a standalone header line
-        // giving the project slug + current session (sid/role/title) ahead of
-        // the existing deep-view body, so the two-pointer (project × session)
-        // mental model has one line that answers both at a glance. Same
-        // format as the turn-answer context echo (`context_echo_line`), so
-        // the two surfaces read identically.
-        let title = self.session_title(s);
-        let mut out = format!(
-            "🧭 {}\n📍 当前会话 {} · {} · {} · {role} · {state} {detail}",
-            context_echo_line(&s.project, &s.id, &s.role, title.as_deref()),
-            s.id,
-            s.project,
-            vendor_str(s.vendor)
-        );
-
-        // Project working-tree PATH — disambiguates an auto-appended slug
-        // (demo2 vs demo): the real dir is unambiguous. Resolved from the loaded
-        // project map (slug → dir); omitted if the project isn't mapped.
-        if let Some(dir) = self.projects.get(&s.project) {
-            out.push_str(&format!("\n   📁 {}", dir.display()));
-        }
-
-        // Line 2: model · effort · ctx · resume (same fields /sessions shows, on
-        // their own line for the deep view). Statusless/failed → `—` placeholder.
         let model = status
             .as_ref()
             .and_then(|st| st.model.as_deref())
@@ -9288,50 +9865,11 @@ impl Gateway {
             .and_then(|st| st.context.as_ref())
             .and_then(|c| c.pct())
         {
-            Some(pct) => format!("ctx {pct:.0}%"),
-            None => "ctx —".to_string(),
+            Some(pct) => format!("контекст {pct:.0}%"),
+            None => "контекст —".to_string(),
         };
-        // The REAL `--resume` id (Anthropic session uuid), shown in full so it
-        // can be matched against `tmux ls` / `claude --resume`; `—` for a
-        // tmux/codex session that carries no stream-json uuid (never fabricated).
-        let resume = thread_vendor_uuid(&s.thread)
-            .map(|u| format!("resume {u}"))
-            .unwrap_or_else(|| "resume —".to_string());
-        out.push_str(&format!("\n   {model} · {effort} · {ctx} · {resume}"));
-
-        // Running subagents / background workflows — straight from claude's task
-        // lifecycle (NOT a fold). Subagents only exist while a turn is working;
-        // background workflows outlive the turn, so an idle session can still
-        // show its running workflows here.
-        out.push_str(&format_running_tasks(&running));
-
-        // Goal (🎯 open / ✅ met) — from the same thread_status the statusline uses.
-        if let Some(g) = status.as_ref().and_then(|st| st.goal.as_ref()) {
-            let cond = g.condition.trim();
-            if !cond.is_empty() {
-                let marker = if g.met { "✅" } else { "🎯" };
-                let shown: String = if cond.chars().count() > 60 {
-                    format!("{}…", cond.chars().take(59).collect::<String>())
-                } else {
-                    cond.to_string()
-                };
-                out.push_str(&format!("\n   {marker} {shown}"));
-            }
-        }
-
-        // Account usage (5h / weekly / credits) — the vendor rate-limit windows.
-        if let Some(u) = &account {
-            let usage = format_account_usage(u);
-            if !usage.is_empty() {
-                out.push_str("\n   ");
-                out.push_str(&usage);
-            }
-        }
-
-        // Direct delegated children belong on the root's deep status card:
-        // their work explains why an otherwise-idle parent is still waiting.
-        // Only live, chat-visible children participate. Deeper descendants
-        // are intentionally collapsed to a count to keep the phone card small.
+        // Keep direct child activity in the expandable detail, where it explains
+        // why an otherwise-idle parent is waiting without bloating the card.
         let mut direct_children: Vec<&GatewaySession> = visible
             .iter()
             .copied()
@@ -9339,73 +9877,182 @@ impl Gateway {
             .collect();
         if !direct_children.is_empty() {
             direct_children.sort_by_key(|child| session_index(&child.id));
-            let child_activity = self.session_activity_snapshot(&direct_children);
-            out.push_str("\n   👥 直接子会话:");
-            for child in &direct_children {
+        }
+        let context = ctx.strip_prefix("контекст ").unwrap_or(&ctx).to_string();
+        let path = self
+            .projects
+            .get(&s.project)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "—".to_string());
+        let child_activity = self.session_activity_snapshot(&direct_children);
+        let child_statuses = join_all(
+            direct_children
+                .iter()
+                .map(|child| child.adapter.thread_status(&child.thread)),
+        )
+        .await;
+        let child_summary = direct_children
+            .iter()
+            .zip(child_statuses)
+            .map(|(child, status)| {
                 let activity = child_activity
                     .get(&child.id)
                     .map(String::as_str)
                     .unwrap_or("idle");
+                let child_model = status
+                    .ok()
+                    .and_then(|status| status.model)
+                    .filter(|model| !model.is_empty())
+                    .map(|model| strip_vendor_prefix(vendor_str(child.vendor), &model).to_string())
+                    .unwrap_or_else(|| "—".to_string());
                 let title = self
                     .session_title(child)
                     .and_then(|title| truncate_title(&title))
                     .unwrap_or_else(|| "—".to_string());
-                out.push_str(&format!(
-                    "\n      · {} · {} · {} · {title}",
+                format!(
+                    "{} · {} · {child_model} · {} · {title}",
                     child.id,
                     vendor_str(child.vendor),
                     activity_marker(activity)
-                ));
+                )
+            })
+            .collect::<Vec<_>>();
+        let role = if s.role.is_empty() { "—" } else { &s.role };
+        let resume = thread_vendor_uuid(&s.thread).unwrap_or_else(|| "—".to_string());
+        let mut detail_lines = vec![format!("Запущено: {detail} · Роль: {role}")];
+        let running_task_lines = format_running_tasks(&running)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if !running_task_lines.is_empty() {
+            detail_lines.push(String::new());
+            detail_lines.extend(running_task_lines);
+        }
+        if let Some(goal) = status.as_ref().and_then(|status| status.goal.as_ref()) {
+            let condition = goal.condition.trim();
+            if !condition.is_empty() {
+                let marker = if goal.met { "✅" } else { "🎯" };
+                let shown: String = if condition.chars().count() > 60 {
+                    format!("{}…", condition.chars().take(59).collect::<String>())
+                } else {
+                    condition.to_string()
+                };
+                detail_lines.push(String::new());
+                detail_lines.push(format!("{marker} {shown}"));
             }
-
-            let mut descendants: HashSet<String> = direct_children
+        }
+        let usage_lines = account_usages
+            .into_iter()
+            .filter_map(|(label, usage)| {
+                usage
+                    .as_ref()
+                    .and_then(format_account_usage)
+                    .map(|usage| format!("{label}: {usage}"))
+            })
+            .collect::<Vec<_>>();
+        if !usage_lines.is_empty() {
+            detail_lines.push(String::new());
+            detail_lines.push("⚡️ Использование:".to_string());
+            detail_lines.extend(usage_lines);
+        }
+        if !child_summary.is_empty() {
+            detail_lines.push(String::new());
+            detail_lines.push(format!("👥 Дочерние ({}):", child_summary.len()));
+            for (index, child) in child_summary.into_iter().enumerate() {
+                if index > 0 {
+                    detail_lines.push(String::new());
+                }
+                detail_lines.push(format!("  • {child}"));
+            }
+        }
+        let same_project_sessions = visible
+            .iter()
+            .filter(|other| other.project == s.project && other.id != s.id)
+            .count();
+        if same_project_sessions > 0 {
+            detail_lines.push(String::new());
+            detail_lines.push(format!(
+                "↓ Другие сессии проекта: {same_project_sessions} → /sessions"
+            ));
+        }
+        if same_project_sessions == 0 {
+            detail_lines.push(String::new());
+        }
+        detail_lines.push(format!(
+            "↓ Все проекты: {} → /projects",
+            self.visible_project_slugs(chat).len()
+        ));
+        let cost_24h = self
+            .progress_projection
+            .as_ref()
+            .map(|projection| {
+                let snapshot = projection.project_snapshot(&s.project);
+                let usd = if snapshot.cost_24h_priced {
+                    format!("${:.2}", snapshot.cost.cost_24h_usd)
+                } else {
+                    "$—".to_string()
+                };
+                format!(
+                    "💰 Расход проекта 24ч: {usd} · {} токенов",
+                    format_token_volume(snapshot.tokens_24h)
+                )
+            })
+            .unwrap_or_else(|| "💰 Расход проекта 24ч: нет данных".to_string());
+        im_views::render_status(&StatusView {
+            sid: s.id.clone(),
+            project: s.project.clone(),
+            vendor: vendor_str(s.vendor).to_string(),
+            state: format!("{state} {detail}"),
+            model: model.to_string(),
+            effort: effort.to_string(),
+            context,
+            path,
+            host: if s.host.is_empty() {
+                "local".to_string()
+            } else {
+                s.host.clone()
+            },
+            detail_lines,
+            cost_24h,
+            resume,
+            child_stop_sids: direct_children
                 .iter()
                 .map(|child| child.id.clone())
-                .collect();
-            let mut frontier: Vec<String> = descendants.iter().cloned().collect();
-            while let Some(parent) = frontier.pop() {
-                for descendant in &visible {
-                    if descendant.id != s.id
-                        && descendant.parent_sid.as_deref() == Some(parent.as_str())
-                        && descendants.insert(descendant.id.clone())
-                    {
-                        frontier.push(descendant.id.clone());
-                    }
-                }
-            }
-            let deeper = descendants.len().saturating_sub(direct_children.len());
-            if deeper > 0 {
-                out.push_str(&format!("\n      … 另有 {deeper} 个更深后代"));
-            }
-        }
-
-        // Footer: the rest of the fleet lives in /sessions. Split by project so
-        // the counts line up with the project-scoped `/sessions` (same project)
-        // vs the full-fleet `/sessions all` (other projects).
-        let same = visible
-            .iter()
-            .filter(|o| o.project == s.project && o.id != s.id)
-            .count();
-        if same > 0 {
-            out.push_str(&format!("\n   ↓ 本项目其他 {same} 个会话 → /sessions"));
-        }
-        // Owner req — the last line points at the full project list (with a live
-        // count), replacing the old cross-project `/sessions all` fleet pointer.
-        // Count only the projects THIS chat may see (same ACL as `/projects`), so
-        // the pointer never advertises another owner's projects.
-        let nproj = self.visible_project_slugs(chat).len();
-        out.push_str(&format!("\n   ↓ 所有 {nproj} 个项目 → /projects"));
-        out
+                .collect(),
+        })
     }
 
-    fn render_projects(&self, chat: &ChatKey) -> String {
+    fn render_projects(&self, chat: &ChatKey) -> RichReply {
         // `visible_project_slugs` reads the SAME source web / `ccteam status` use
         // — `collect_projects` (config.yaml filtered to projects that have an
         // on-disk `state.json`) — filtered by the SAME per-owner ACL web applies,
         // so IM `/projects` never diverges from the other surfaces: a
         // half-registered project (in config, no state.json) shows in NEITHER, a
         // removed project disappears from BOTH, and each owner sees only its own.
-        self.visible_project_slugs(chat).join("\n")
+        let current = self.current_project_label(chat);
+        let projects = self
+            .visible_project_slugs(chat)
+            .into_iter()
+            .map(|slug| ProjectRow {
+                path: self
+                    .projects
+                    .get(&slug)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                sessions: self
+                    .sessions
+                    .values()
+                    .filter(|session| {
+                        session.project == slug && self.chat_can_access(chat, session)
+                    })
+                    .count(),
+                current: slug == current,
+                slug,
+            })
+            .collect();
+        im_views::render_projects(&ProjectsView { projects })
     }
 
     /// Reconcile live `ccteam-chat-*` process names against tracked sessions.
@@ -10565,6 +11212,7 @@ impl Gateway {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: Some(slug.to_string()),
         });
@@ -11918,7 +12566,7 @@ impl Gateway {
                     .unwrap_or_else(web_api_chat);
                 Some(reply.identity())
             } else {
-                return Err(anyhow!("unknown session: {sid}"));
+                return Err(anyhow!("Неизвестная сессия: {sid}"));
             }
         };
         if let Some(identity) = absent_resume_identity {
@@ -12063,7 +12711,7 @@ impl Gateway {
                 .sessions
                 .get(sid)
                 .cloned()
-                .ok_or_else(|| anyhow!("current session missing: {sid}"))?;
+                .ok_or_else(|| anyhow!("Текущая сессия не найдена: {sid}"))?;
             let chat = guard
                 .tenant_project_owner_reply_target(&session.project)
                 .unwrap_or_else(|| reply_target_for_owner(&session.owner));
@@ -12148,7 +12796,7 @@ impl Gateway {
                             return Ok(vec![text]);
                         }
                     }
-                    Ok(vec![format!("submitted turn {}", turn_id.0)])
+                    Ok(vec![format!("Запуск отправлен: {}", turn_id.0)])
                 }
             }
             DirectiveOutcome::Done { receipt } => Ok(vec![receipt]),
@@ -12177,6 +12825,7 @@ impl Gateway {
                         kind: GatewayEventKind::Answer,
                         attachments: Vec::new(),
                         options: to_message_options(&prompt),
+                        button_rows: Vec::new(),
                         sid: Some(sid.to_string()),
                         slug: Some(session.project),
                     });
@@ -12441,7 +13090,7 @@ impl Gateway {
                 }
             }
             if let Some(reply) = self.handle_command(&chat, &text).await? {
-                self.emit_sid_answer(sid, 0, reply);
+                self.emit_sid_answer(sid, 0, reply.plain);
                 return Ok(format!("command:{sid}"));
             }
         }
@@ -12468,6 +13117,7 @@ impl Gateway {
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: self.sessions.get(sid).map(|s| s.project.clone()),
         });
@@ -12496,7 +13146,7 @@ impl Gateway {
             pend.take_by_token(token)
         };
         let Some(p) = taken else {
-            return Err(anyhow!("unknown or expired token"));
+            return Err(anyhow!("Неизвестный или истёкший токен"));
         };
         // Validate the chosen id against the prompt's real option set, so a
         // bogus selection is rejected rather than silently denied. (If the id
@@ -12508,7 +13158,9 @@ impl Gateway {
             // is treated as no valid choice → drop, which makes an External
             // hook observe RecvError → its own fail-safe deny. We surface a
             // 4xx to the web caller.
-            return Err(anyhow!("invalid option id for this prompt"));
+            return Err(anyhow!(
+                "Некорректный идентификатор варианта для этого запроса"
+            ));
         }
         let selection = ChoiceSelection {
             token: token.to_string(),
@@ -12537,21 +13189,49 @@ impl Gateway {
         if self.stop_detached_body(sid).await? {
             return Ok(());
         }
+        self.stop_live_session(sid, false).await
+    }
+
+    async fn stop_session_reporting(&mut self, sid: &str) -> Result<()> {
+        if self.stop_detached_body(sid).await? {
+            return Ok(());
+        }
+        self.stop_live_session(sid, true).await
+    }
+
+    async fn stop_live_session(&mut self, sid: &str, report_close_error: bool) -> Result<()> {
         let session = self
             .sessions
             .get(sid)
             .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
         let thread = session.thread.clone();
         let adapter = Arc::clone(&session.adapter);
-        // The secret dies with the session — before the close, so a racing
-        // `/mcp` call from the dying child cannot slip through behind it.
-        self.principals.forget(sid);
-        // Abort the pump before closing so no stale pump keeps draining the
-        // retired transcript (mirrors switch_current_role).
-        if let Some(pump) = self.event_pumps.remove(sid) {
-            pump.abort();
+        if report_close_error {
+            // In the reporting (bulk) path the principal is forgotten AFTER
+            // close_thread (retry-safe), whereas the single path forgets it
+            // BEFORE close_thread (the secret dies before close). Both are
+            // acceptable because the per-session secret is defence-in-depth
+            // per AGENTS.md §三.
+            adapter
+                .close_thread(&thread)
+                .await
+                .map_err(anyhow::Error::from)?;
+            self.principals.forget(sid);
+            if let Some(pump) = self.event_pumps.remove(sid) {
+                pump.abort();
+            }
+        } else {
+            // Preserve the public single-sid teardown order for web/MCP.
+            self.principals.forget(sid);
+            if let Some(pump) = self.event_pumps.remove(sid) {
+                pump.abort();
+            }
+            let _ = adapter.close_thread(&thread).await;
         }
-        let _ = adapter.close_thread(&thread).await;
+        self.finish_stopped_live_session(sid)
+    }
+
+    fn finish_stopped_live_session(&mut self, sid: &str) -> Result<()> {
         self.sessions.remove(sid);
         // Drop every current-session route that pointed at this sid so a
         // chat doesn't keep addressing a dead session.
@@ -12561,6 +13241,148 @@ impl Gateway {
             .retain(|_, v| v != sid);
         self.persist_routing()?;
         Ok(())
+    }
+
+    /// The chat's currently-focused sid, for `/stop children`'s "direct
+    /// children of the chat's current session" scope. `None` when the chat
+    /// has no session focused (the caller turns that into a user-facing
+    /// error, matching [`Self::require_current_project`]'s style).
+    fn require_current_session_id(&self, chat: &ChatKey) -> Result<String> {
+        self.current_session
+            .read()
+            .ok()
+            .and_then(|m| m.get(chat).cloned())
+            .ok_or_else(|| {
+                anyhow!("Нет текущей сессии для /stop children — выберите через /use <id>")
+            })
+    }
+
+    fn bulk_stop_candidates(
+        &self,
+        chat: &ChatKey,
+        scope: &str,
+    ) -> Result<(BTreeSet<String>, Option<String>, Option<String>)> {
+        let project = if scope == "project" {
+            Some(self.require_current_project(chat)?)
+        } else {
+            None
+        };
+        let parent = if scope == "children" {
+            Some(self.require_current_session_id(chat)?)
+        } else {
+            None
+        };
+        let mut candidates: BTreeSet<String> = self.sessions.keys().cloned().collect();
+        candidates.extend(self.detached.keys().cloned());
+        Ok((
+            self.bulk_stop_visible_snapshot(
+                chat,
+                project.as_deref(),
+                parent.as_deref(),
+                &candidates,
+            ),
+            project,
+            parent,
+        ))
+    }
+
+    /// Re-run the single-sid ACL/aliveness predicate only over a captured set.
+    /// A confirmation is a snapshot: later sessions are never admitted, while
+    /// sessions that disappeared or became invisible are dropped at tap time.
+    /// `parent`, when set (`children` scope), additionally requires the
+    /// candidate's `parent_sid` to match it — direct children only, never
+    /// grandchildren or the parent itself.
+    fn bulk_stop_visible_snapshot(
+        &self,
+        chat: &ChatKey,
+        project: Option<&str>,
+        parent: Option<&str>,
+        candidates: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let mut memo = ProjectPrincipalMemo::new();
+        let mut sids = BTreeSet::new();
+        for sid in candidates {
+            let (accessible, session_project, session_parent) =
+                if let Some(session) = self.sessions.get(sid) {
+                    (
+                        self.chat_can_access_with(chat, session, &mut memo),
+                        session.project.clone(),
+                        session.parent_sid.clone(),
+                    )
+                } else if self.is_session_detached(sid) {
+                    let Ok((slug, _cwd, meta)) = self.find_meta_for_sid(sid) else {
+                        continue;
+                    };
+                    (
+                        self.project_owner_visible_with(chat, &slug, &meta.owner, &mut memo),
+                        slug,
+                        meta.parent_sid.clone(),
+                    )
+                } else {
+                    continue;
+                };
+            if accessible
+                && project.is_none_or(|project| project == session_project)
+                && parent.is_none_or(|parent| Some(parent) == session_parent.as_deref())
+            {
+                sids.insert(sid.clone());
+            }
+        }
+        sids
+    }
+
+    async fn stop_bulk_snapshot(
+        &mut self,
+        chat: &ChatKey,
+        project: Option<&str>,
+        parent: Option<&str>,
+        snapshot: &BTreeSet<String>,
+    ) -> Vec<String> {
+        let visible = self.bulk_stop_visible_snapshot(chat, project, parent, snapshot);
+        let dropped: Vec<String> = snapshot.difference(&visible).cloned().collect();
+        let (stopped, failures) = self.stop_sessions_bulk(&visible).await;
+        let mut lines = Vec::new();
+        let summary = format_bulk_stop_result(&stopped, &failures);
+        if !summary.is_empty() {
+            lines.push(summary);
+        }
+        if !dropped.is_empty() {
+            lines.push(format!(
+                "Пропущены сессии: {} (недоступны или уже остановлены)",
+                dropped.join(", ")
+            ));
+        }
+        if lines.is_empty() {
+            lines.push("Нет доступных сессий для остановки".to_string());
+        }
+        vec![lines.join("\n")]
+    }
+
+    async fn stop_sessions_bulk(&mut self, sids: &BTreeSet<String>) -> (Vec<String>, Vec<String>) {
+        let detached_sids: BTreeSet<String> = sids
+            .iter()
+            .filter(|sid| self.is_session_detached(sid))
+            .cloned()
+            .collect();
+        let mut stopped = Vec::new();
+        let mut failures = Vec::new();
+
+        for (sid, result) in self.stop_detached_bodies_bulk(&detached_sids).await {
+            match result {
+                Ok(()) => stopped.push(sid),
+                Err(error) => failures.push(format!("{sid} ({error})")),
+            }
+        }
+        for sid in sids {
+            if detached_sids.contains(sid) {
+                continue;
+            }
+            match self.stop_session_reporting(sid).await {
+                Ok(()) => stopped.push(sid.clone()),
+                Err(error) => failures.push(format!("{sid} ({error})")),
+            }
+        }
+        (stopped, failures)
     }
 
     /// Interrupt a session's CURRENTLY-RUNNING turn without destroying it (the
@@ -12697,6 +13519,7 @@ impl Gateway {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: Some(sid.to_string()),
             slug: Some(slug.to_string()),
         });
@@ -12873,11 +13696,11 @@ fn strip_vendor_prefix<'a>(vendor: &str, model: &'a str) -> &'a str {
 
 fn activity_marker(activity: &str) -> &'static str {
     match activity {
-        "working" => "🟡 working",
-        "idle" => "🟢 idle",
-        "stale" => "🟠 stale",
-        "stuck" => "🔴 stuck",
-        _ => "⚪ unknown",
+        "working" => "🟡 работает",
+        "idle" => "🟢 ожидание",
+        "stale" => "🟠 устарело",
+        "stuck" => "🔴 зависание",
+        _ => "⚪ неизвестно",
     }
 }
 
@@ -12899,14 +13722,17 @@ fn split_leading_sid(rest: &str) -> Option<(&str, &str)> {
 /// that only exists ccteam-side must not read as though the vendor adopted it.
 fn render_rename_receipt(r: &SessionRename) -> String {
     let mut out = match r.previous.as_deref().filter(|p| !p.is_empty()) {
-        Some(prev) => format!("已重命名 {} 「{prev}」→「{}」", r.sid, r.title),
-        None => format!("已重命名 {} →「{}」", r.sid, r.title),
+        Some(prev) => format!("Переименована {}: «{prev}» → «{}»", r.sid, r.title),
+        None => format!("Переименована {} → «{}»", r.sid, r.title),
     };
     out.push('\n');
     out.push_str(&match &r.vendor_sync {
-        TitleSync::Pushed => format!("· 已同步到 {} 自己的会话标题", r.vendor),
-        TitleSync::Deferred(reason) => format!("· 仅 ccteam 侧({reason})"),
-        TitleSync::Unsupported => format!("· 仅 ccteam 侧({} 无会话标题接口)", r.vendor),
+        TitleSync::Pushed => format!("· Синхронизировано с заголовком сессии {}", r.vendor),
+        TitleSync::Deferred(reason) => format!("· Только в ccteam ({reason})"),
+        TitleSync::Unsupported => format!(
+            "· Только в ccteam ({} не поддерживает заголовки сессий)",
+            r.vendor
+        ),
     });
     out
 }
@@ -13255,7 +14081,7 @@ fn emit_turn_stall_warning(
         .lock()
         .ok()
         .and_then(|g| *g)
-        .map(|start| format!(" (running {})", humanize_dur(start.elapsed())))
+        .map(|start| format!(" (выполняется {})", humanize_dur(start.elapsed())))
         .unwrap_or_default();
     let last_seen = session
         .latest_activity
@@ -13263,14 +14089,15 @@ fn emit_turn_stall_warning(
         .ok()
         .and_then(|g| g.clone())
         .filter(|a| !a.trim().is_empty())
-        .map(|a| format!(" Last observed activity: {a}."))
-        .unwrap_or_else(|| " No activity was ever observed for this turn.".into());
+        .map(|a| format!(" Последняя активность: {a}."))
+        .unwrap_or_else(|| " Для этого запуска активность не наблюдалась.".into());
     let content = format!(
-        "⏱️ turn {turn_id} went silent for {timeout:?} for {session_id}{elapsed} — no tokens, \
-         tool calls or progress.{last_seen} Heads-up only — the watchdog does NOT interrupt it \
-         (a long command like a benchmark legitimately emits no events, and a vendor stuck in \
-         its own retry loop reports nothing either). If it is truly stuck, `/stop` the session; \
-         tune the window via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = off)."
+        "⏱️ Запуск {turn_id} в сессии {session_id}{elapsed} не проявлял активности {timeout:?}: \
+         нет токенов, вызовов инструментов или сообщений о ходе выполнения.{last_seen} Это только \
+         уведомление: watchdog не прерывает запуск (долгая команда, например benchmark, может \
+         корректно не выдавать событий; поставщик в собственном цикле повторов тоже ничего не \
+         сообщает). Если запуск действительно завис, остановите сессию через `/stop`; окно \
+         настраивается CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = отключено)."
     );
     let _ = tx.send(GatewayEvent {
         id: format!("gateway-timeout-{session_id}-{turn_id}"),
@@ -13281,6 +14108,7 @@ fn emit_turn_stall_warning(
         kind: GatewayEventKind::Answer,
         attachments: Vec::new(),
         options: Vec::new(),
+        button_rows: Vec::new(),
         sid: Some(session_id.to_string()),
         slug: Some(session.project.clone()),
     });
@@ -13290,11 +14118,11 @@ fn emit_turn_stall_warning(
 /// template: ask the user to pick a handle instead of guessing.
 fn format_ambiguous_dm_reply(available: &[String]) -> String {
     if available.is_empty() {
-        return "No bots available in this chat.".to_string();
+        return "В этом чате нет доступных ботов.".to_string();
     }
     let mentions: Vec<String> = available.iter().map(|h| format!("@{h}")).collect();
     format!(
-        "Multiple bots in this chat. Specify one: {}",
+        "В этом чате несколько ботов. Укажите одного: {}",
         mentions.join(" ")
     )
 }
@@ -13478,9 +14306,23 @@ fn mirror_internal_web_answer(
         kind: GatewayEventKind::Answer,
         attachments: Vec::new(),
         options: Vec::new(),
+        button_rows: Vec::new(),
         sid: Some(session_id.to_string()),
         slug: Some(session.project.clone()),
     });
+}
+
+/// `[⛔ Прервать]` — the single [`SendMessage::button_rows`] row attached to
+/// a live progress edit while the turn is still running (TG-GATE-V2 W5).
+/// Taps `cmd:?/interrupt`: `resolve_cmd_callback`'s `Confirm` arm renders the
+/// usual yes/no picker before actually running `/interrupt`.
+fn progress_interrupt_button_rows() -> Vec<Vec<MessageOption>> {
+    vec![vec![MessageOption {
+        data: "cmd:?/interrupt".to_string(),
+        label: "⛔ Прервать".to_string(),
+        id: "interrupt".to_string(),
+        style: Some(ButtonStyle::Danger),
+    }]]
 }
 
 /// Send one `Progress` gateway event with the given rendered `content`.
@@ -13496,6 +14338,13 @@ fn emit_progress(
 ) -> bool {
     let (channel, chat_id) = pump_target(session);
     let status_key = format!("{session_id}-{epoch}");
+    // TG-GATE-V2 W5 — `[⛔ Прервать]` rides the edit while the fold is not
+    // done; a `done` (finalized ✅/❌) edit carries no buttons.
+    let button_rows = if done {
+        Vec::new()
+    } else {
+        progress_interrupt_button_rows()
+    };
     // `send` returns false only when the mpsc consumer is gone; surface that as
     // emit_progress's "sink closed → pump should stop" signal.
     tx.send(GatewayEvent {
@@ -13509,6 +14358,7 @@ fn emit_progress(
         kind: GatewayEventKind::Progress { status_key, done },
         attachments: Vec::new(),
         options: Vec::new(),
+        button_rows,
     })
 }
 
@@ -13540,6 +14390,7 @@ fn emit_activity(
         },
         attachments: Vec::new(),
         options: Vec::new(),
+        button_rows: Vec::new(),
         slug: Some(session.project.clone()),
     })
 }
@@ -13562,7 +14413,7 @@ fn flush_progress(
 ) -> bool {
     *last_emit = Some(std::time::Instant::now());
     *dirty = false;
-    let content = fold.render();
+    let content = fold.render(session_id);
     if !fold.done() && last_sent.as_deref() == Some(content.as_str()) {
         return true; // no visible change → don't spend an edit
     }
@@ -13582,17 +14433,14 @@ fn progress_enabled() -> bool {
     )
 }
 
-/// Minimum interval between status-message edits (default 800ms — lowered
-/// from 1500ms for snappier activity updates; the live daemon showed ZERO
-/// Telegram 429 backoff at the old rate, and each edit still pays a ~0.5s
-/// platform round-trip so this stays comfortably under the edit rate-limit).
+/// Minimum interval between status-message edits (default 20s).
 /// Override with `CCTEAM_IM_PROGRESS_THROTTLE_MS`; `=0` makes every step emit,
 /// for deterministic tests that don't rely on sleeps.
 fn progress_throttle() -> std::time::Duration {
     let ms = std::env::var("CCTEAM_IM_PROGRESS_THROTTLE_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(800);
+        .unwrap_or(20_000);
     std::time::Duration::from_millis(ms)
 }
 
@@ -13832,15 +14680,15 @@ fn format_running_tasks(running: &[RunningTask]) -> String {
         kinds.push(format!("workflow ({workflows})"));
     }
     if bg_shells > 0 {
-        kinds.push(format!("后台任务 ({bg_shells})"));
+        kinds.push(format!("фоновые задачи ({bg_shells})"));
     }
-    let mut out = format!("\n   🤖 在跑 {}:", kinds.join(" + "));
+    let mut out = format!("\n   🤖 Выполняется: {}", kinds.join(" + "));
     let mut tasks: Vec<&RunningTask> = running.iter().collect();
     tasks.sort_by_key(|t| t.started);
     for t in tasks {
         let kind = match t.task_type.as_str() {
             "local_workflow" => "workflow",
-            "local_bash" => "后台",
+            "local_bash" => "фон",
             _ if t.kind.is_empty() => "subagent",
             _ => t.kind.as_str(),
         };
@@ -13860,23 +14708,23 @@ fn format_running_tasks(running: &[RunningTask]) -> String {
     out
 }
 
-/// Render [`AccountUsage`] as the `/status` dashboard usage line:
-/// `⚡ 用量: 5h 17% (→19:00) · 周 78%⚠ (→06/29) · 额度 46% · max`. Each field is
-/// omitted when the vendor didn't report it; an empty result = nothing to show.
-fn format_account_usage(u: &AccountUsage) -> String {
+/// Render the account-usage payload after its vendor label:
+/// `5h 17% (19:00) · неделя 78% (06/29) · max`. Each field is omitted when
+/// the vendor didn't report it; an empty result means no usage line.
+fn format_account_usage(u: &AccountUsage) -> Option<String> {
     // Short reset hint from an ISO-8601 `resets_at`: HH:MM for the 5-hour window,
     // MM/DD for the weekly. Empty when unparseable.
     fn reset_hm(iso: &Option<String>) -> String {
         iso.as_deref()
             .and_then(|s| s.split('T').nth(1))
-            .map(|t| format!(" (→{})", &t[..t.len().min(5)]))
+            .map(|t| format!(" ({})", &t[..t.len().min(5)]))
             .unwrap_or_default()
     }
     fn reset_md(iso: &Option<String>) -> String {
         iso.as_deref()
             .and_then(|s| s.split('T').next())
             .and_then(|d| d.get(5..)) // "06-29" from "2026-06-29"
-            .map(|md| format!(" (→{})", md.replace('-', "/")))
+            .map(|md| format!(" ({})", md.replace('-', "/")))
             .unwrap_or_default()
     }
     let mut parts: Vec<String> = Vec::new();
@@ -13889,18 +14737,31 @@ fn format_account_usage(u: &AccountUsage) -> String {
         } else {
             ""
         };
-        parts.push(format!("周 {p}%{warn}{}", reset_md(&u.weekly_resets_at)));
+        parts.push(format!(
+            "неделя {p}%{warn}{}",
+            reset_md(&u.weekly_resets_at)
+        ));
     }
     if let Some(p) = u.credits_pct {
-        parts.push(format!("额度 {p}%"));
+        parts.push(format!("лимит {p}%"));
     }
     if parts.is_empty() {
-        return String::new();
+        return None;
     }
     if let Some(sub) = u.subscription.as_deref() {
         parts.push(sub.to_string());
     }
-    format!("⚡ 用量: {}", parts.join(" · "))
+    Some(parts.join(" · "))
+}
+
+fn format_token_volume(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn humanize_dur(d: std::time::Duration) -> String {
@@ -13925,19 +14786,15 @@ fn humanize_dur(d: std::time::Duration) -> String {
     }
 }
 
-/// The vendor `--resume` id (Anthropic session UUID) carried by a stream-json
-/// [`ThreadHandle`], or `None` for a tmux / Codex handle (which has no
-/// stream-json uuid). Read from `raw_extras["vendor_uuid"]` — the field both
-/// the spawn and resume paths populate, persisted across daemon restarts — so
-/// `/status` shows the actual id that `--resume` would use. Filters out an
-/// empty string so a blank uuid degrades to `None` (→ `resume —`).
+/// The vendor resume id persisted by stream-json spawn/resume, when the
+/// harness has one. Other protocols honestly render `resume —`.
 fn thread_vendor_uuid(thread: &ThreadHandle) -> Option<String> {
     thread
         .raw_extras
         .get("vendor_uuid")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// Outcome of [`Gateway::submit_resolved`] — the one core both user-entry
@@ -13993,71 +14850,59 @@ fn pending_key(chat: &ChatKey, session_id: &str) -> String {
     )
 }
 
-/// Telegram's hard cap on inline-button `callback_data` (bytes). The nav
-/// picker (`project_switch_options` / `session_switch_options`) drops any
-/// button whose payload would exceed it; slugs/sids are short, so this only
-/// guards a pathological slug and never the common case.
+/// Telegram's hard cap on inline-button `callback_data` (bytes). The
+/// `cmd:?<cmd>` confirmation row drops any button whose payload would
+/// exceed it; slugs/sids are short, so this only guards a pathological
+/// slug and never the common case.
 const TELEGRAM_CALLBACK_MAX: usize = 64;
 
-/// Max display columns a session title may occupy inside a `/sessions` switch
-/// button label. A longer title is clipped with `…` so one verbose title can't
-/// widen every button — the left-align padding aligns all labels to the widest.
-const SESSION_BUTTON_TITLE_MAX_COLS: usize = 32;
-
-/// Clip `s` to at most `max_cols` DISPLAY columns, appending `…` on overflow.
-/// Column-based (not char count) so a CJK double-width title clips at a stable
-/// visual width; the ellipsis reserves one column.
-fn truncate_cols(s: &str, max_cols: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    if s.width() <= max_cols {
-        return s.to_string();
-    }
-    let budget = max_cols.saturating_sub(1);
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in s.chars() {
-        let w = ch.width().unwrap_or(0);
-        if used + w > budget {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out.push('…');
-    out
+/// Russian confirmation text for a `cmd:?<cmd>` inline-button tap (TG-GATE-V2
+/// W3 — see `im_callbacks` namespace doc).
+fn confirm_prompt_text(cmd: &str) -> String {
+    format!("Точно выполнить `{cmd}`?")
 }
 
-/// Floor for [`left_align_option_labels`]'s pad target: Telegram renders every
-/// option as its OWN full-width single-button row (one button per
-/// `inline_keyboard` row — see `TelegramChannel::send`), so its text is
-/// centered within the FULL row width, not a column sized to the option set.
-/// Padding rows to only the OBSERVED max-in-set (e.g. all bare sids like
-/// "s1"/"s2"/"s28") still centers a short block deep in a wide row — visually
-/// indistinguishable from plain centering. Padding every label out to at
-/// least this many columns pushes that block toward the row's left edge on a
-/// typical phone-width chat. Approximate by nature: the bot API exposes no
-/// client viewport, so this can undershoot (desktop) or overshoot slightly.
-const PICKER_LABEL_MIN_PAD_COLS: usize = 30;
-
-/// Right-pad every picker label to at least the widest row in the SET, or
-/// [`PICKER_LABEL_MIN_PAD_COLS`], whichever is larger — so Telegram's
-/// centre-aligned button text reads as a LEFT-aligned list (owner req,
-/// tg-6955) even when every option in the set is short. Telegram strips
-/// ordinary trailing whitespace from button labels, so the pad is U+2800
-/// BRAILLE PATTERN BLANK — renders blank, survives the trim, ~1 cell wide.
-fn left_align_option_labels(options: &mut [MessageOption]) {
-    use unicode_width::UnicodeWidthStr;
-    let observed_max = options
-        .iter()
-        .map(|o| o.label.as_str().width())
-        .max()
-        .unwrap_or(0);
-    let target = observed_max.max(PICKER_LABEL_MIN_PAD_COLS);
-    for o in options.iter_mut() {
-        for _ in 0..target.saturating_sub(o.label.as_str().width()) {
-            o.label.push('\u{2800}');
-        }
+/// `[✅ Да][❌ Отмена]` — a single [`SendMessage::button_rows`] row for a
+/// `cmd:?<cmd>` confirmation. Both callback payloads carry only its opaque
+/// eight-character token, keeping executable commands out of Telegram and
+/// always below its `callback_data` cap.
+fn confirm_cmd_button_rows(token: &str) -> Vec<Vec<MessageOption>> {
+    let row: Vec<MessageOption> = vec![
+        MessageOption {
+            data: format!("cmd:!{token}"),
+            label: "✅ Да".to_string(),
+            id: "yes".to_string(),
+            style: Some(ButtonStyle::Success),
+        },
+        MessageOption {
+            data: format!("cmd:x{token}"),
+            label: "❌ Отмена".to_string(),
+            id: "no".to_string(),
+            style: Some(ButtonStyle::Danger),
+        },
+    ]
+    .into_iter()
+    .filter(|o: &MessageOption| o.data.len() <= TELEGRAM_CALLBACK_MAX)
+    .collect();
+    if row.is_empty() {
+        Vec::new()
+    } else {
+        vec![row]
     }
+}
+
+/// Recover the tapped message's platform id from an inbound `ChannelMessage`
+/// id (TG-GATE-V2 W8), when it names a Telegram callback. Telegram's
+/// `handle_callback_query` stamps `id: "tg-cb-{message_id}"` for every
+/// button tap (the confirmation prompt IS that message), so a `cmd:!`/`cmd:x`
+/// resolve can target an edit at it. `None` for anything else (a non-Telegram
+/// origin, or a `message_id` that predates this convention) — the caller
+/// falls back to appending a new message.
+fn telegram_callback_message_id(message_id: &str) -> Option<String> {
+    message_id
+        .strip_prefix("tg-cb-")
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 /// Map a harness [`ChoicePrompt`] to channel-local [`MessageOption`]s. The
@@ -14075,6 +14920,7 @@ fn to_message_options(prompt: &ChoicePrompt) -> Vec<MessageOption> {
             data: format!("{}:{}", prompt.token, i),
             label: opt.label.clone(),
             id: opt.id.clone(),
+            style: None,
         })
         .collect()
 }
@@ -14090,16 +14936,32 @@ fn render_choice_text(prompt: &ChoicePrompt) -> String {
 }
 
 /// Render the `/help` body from [`GATEWAY_COMMANDS`].
-fn render_help() -> String {
-    let mut s = String::from("Gateway commands:");
-    for c in GATEWAY_COMMANDS {
-        match c.arg_hint {
-            Some(hint) => s.push_str(&format!("\n{} {} — {}", c.name, hint, c.help)),
-            None => s.push_str(&format!("\n{} — {}", c.name, c.help)),
-        }
+fn render_help() -> RichReply {
+    let commands = GATEWAY_COMMANDS
+        .iter()
+        .map(|command| CommandView {
+            name: command.name.to_string(),
+            arg_hint: command.arg_hint.map(str::to_string),
+            help: command.help.to_string(),
+        })
+        .collect::<Vec<_>>();
+    im_views::render_help(&commands)
+}
+
+fn quick_template_preview(prefix: &str) -> String {
+    const PREVIEW_CHARS: usize = 80;
+    let first_line = prefix.lines().next().unwrap_or_default().trim();
+    let mut chars = first_line.chars();
+    let preview = chars.by_ref().take(PREVIEW_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
     }
-    s.push_str("\n\nAny other /command is forwarded to the current session's agent.");
-    s
+}
+
+fn plain_replies(replies: Vec<String>) -> Vec<RichReply> {
+    replies.into_iter().map(RichReply::plain).collect()
 }
 
 fn parse_inbox_create_args(rest: &str) -> Result<(String, String)> {
@@ -14111,7 +14973,7 @@ fn parse_inbox_create_args(rest: &str) -> Result<(String, String)> {
     }
 
     let (first, after_first) =
-        take_word(rest).ok_or_else(|| anyhow!("usage: /inbox <time> <text>"))?;
+        take_word(rest).ok_or_else(|| anyhow!("Использование: /inbox <time> <text>"))?;
     let needs_second = first == "今天"
         || first == "明天"
         || (first.len() == 10
@@ -14119,13 +14981,13 @@ fn parse_inbox_create_args(rest: &str) -> Result<(String, String)> {
             && first.as_bytes().get(7) == Some(&b'-'));
     let (when, text) = if needs_second {
         let (second, body) =
-            take_word(after_first).ok_or_else(|| anyhow!("usage: /inbox <time> <text>"))?;
+            take_word(after_first).ok_or_else(|| anyhow!("Использование: /inbox <time> <text>"))?;
         (format!("{first} {second}"), body)
     } else {
         (first.to_string(), after_first)
     };
     if text.trim().is_empty() {
-        return Err(anyhow!("scheduled message text cannot be empty"));
+        return Err(anyhow!("Текст отложенного сообщения не может быть пустым"));
     }
     Ok((when, text.to_string()))
 }
@@ -14167,7 +15029,7 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor> {
         "kimi" => Ok(AgentVendor::Kimi),
         "pi" => Ok(AgentVendor::Pi),
         "dsh" => Ok(AgentVendor::Dsh),
-        other => Err(anyhow!("unknown vendor: {other}")),
+        other => Err(anyhow!("Неизвестный провайдер: {other}")),
     }
 }
 
@@ -14218,7 +15080,7 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
             let value = value.trim();
             if value.is_empty() {
                 return Err(anyhow!(
-                    "/new: `{tok}` has no value — write `{key}=<value>`\nsyntax: {NEW_COMMAND_SYNTAX}"
+                    "У параметра /new `{tok}` нет значения — укажите `{key}=<значение>`\nСинтаксис: {NEW_COMMAND_SYNTAX}"
                 ));
             }
             match key {
@@ -14227,7 +15089,7 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
                 "mode" => tuning.mode = Some(value.to_string()),
                 other => {
                     return Err(anyhow!(
-                        "/new: unknown option `{other}=` (accepts model=<id> / m=, effort=<level> / e=, mode=<mode>)\nsyntax: {NEW_COMMAND_SYNTAX}"
+                        "Неизвестный параметр /new `{other}=` (поддерживаются model=<id> / m=, effort=<level> / e=, mode=<mode>)\nСинтаксис: {NEW_COMMAND_SYNTAX}"
                     ));
                 }
             }
@@ -14246,7 +15108,7 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
             }
             other => {
                 return Err(anyhow!(
-                    "/new: unexpected token `{other}` (role `{role}` was already given)\nsyntax: {NEW_COMMAND_SYNTAX}"
+                    "Неожиданный аргумент `{other}` (роль `{role}` уже указана)\nСинтаксис: {NEW_COMMAND_SYNTAX}"
                 ));
             }
         }
@@ -14276,15 +15138,18 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
 fn expand_project_path(raw: &str) -> Result<PathBuf> {
     let expanded = if let Some(rest) = raw.strip_prefix("~/") {
         dirs::home_dir()
-            .ok_or_else(|| anyhow!("cannot resolve home directory for ~"))?
+            .ok_or_else(|| anyhow!("Не удалось определить домашний каталог для пути ~"))?
             .join(rest)
     } else if raw == "~" {
-        dirs::home_dir().ok_or_else(|| anyhow!("cannot resolve home directory for ~"))?
+        dirs::home_dir()
+            .ok_or_else(|| anyhow!("Не удалось определить домашний каталог для пути ~"))?
     } else {
         PathBuf::from(raw)
     };
     if !expanded.is_absolute() {
-        return Err(anyhow!("项目路径必须是绝对路径(或 ~ 开头): {raw}"));
+        return Err(anyhow!(
+            "Путь проекта для /newproject должен быть абсолютным (или начинаться с ~): {raw}"
+        ));
     }
     Ok(expanded)
 }
@@ -14307,7 +15172,7 @@ fn event_text(evt: &ThreadEvent) -> Option<String> {
             ThreadItemDetails::AgentMessage(text) if !text.is_empty() => Some(text.clone()),
             _ => None,
         },
-        ThreadEvent::TurnCompleted { turn_id, .. } => Some(format!("turn completed {turn_id}")),
+        ThreadEvent::TurnCompleted { turn_id, .. } => Some(format!("Запуск завершён: {turn_id}")),
         ThreadEvent::TurnFailed { err, .. } | ThreadEvent::Error(err) => Some(err.message.clone()),
         ThreadEvent::ItemUpdated { .. }
         | ThreadEvent::ThreadStarted { .. }
@@ -14439,13 +15304,18 @@ mod tests {
     #[test]
     fn new_command_rejects_unknown_keys_with_an_honest_syntax_line() {
         let err = parse_new("claude modle=opus").unwrap_err().to_string();
-        assert!(err.contains("unknown option `modle=`"), "{err}");
+        assert!(err.contains("Неизвестный параметр /new `modle=`"), "{err}");
         assert!(err.contains("model=<id>"), "{err}");
         assert!(err.contains("effort=<level>"), "{err}");
+        assert!(err.contains("mode=<mode>"), "{err}");
         assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
 
         let err = parse_new("claude model=").unwrap_err().to_string();
-        assert!(err.contains("has no value"), "{err}");
+        assert!(
+            err.contains("У параметра /new `model=` нет значения"),
+            "{err}"
+        );
+        assert!(err.contains("model=<id>"), "{err}");
         assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
 
         // A second bare token is still the pre-existing "one role" error, now
@@ -14453,7 +15323,15 @@ mod tests {
         let err = parse_new("claude reviewer auditor")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("unexpected token `auditor`"), "{err}");
+        assert!(err.contains("Неожиданный аргумент `auditor`"), "{err}");
+        assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
+
+        let err = parse_new("nonesuch").unwrap_err().to_string();
+        assert!(err.contains("Неизвестный провайдер: nonesuch"), "{err}");
+
+        let err = parse_new("claude reviewer bogus").unwrap_err().to_string();
+        assert!(err.contains("Неожиданный аргумент `bogus`"), "{err}");
+        assert!(err.contains("hitl|skip"), "{err}");
         assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
     }
 
@@ -14470,6 +15348,592 @@ mod tests {
         assert!(hint.contains("model=<id>"), "{hint}");
         assert!(hint.contains("effort=<level>"), "{hint}");
         assert!(NEW_COMMAND_SYNTAX.contains("dsh"), "{NEW_COMMAND_SYNTAX}");
+    }
+
+    #[test]
+    fn telegram_menu_keeps_tokens_and_uses_russian_copy() {
+        let specs = menu_command_specs();
+        assert!(specs.iter().any(|spec| spec.name == "/projects"));
+        assert!(specs.iter().any(|spec| spec.name == "/new"));
+        assert!(specs.iter().any(|spec| {
+            spec.name == "/projects" && spec.description == "список проектов"
+        }));
+        assert!(specs.iter().any(|spec| {
+            spec.name == "/new" && spec.description.contains("создать сессию")
+        }));
+        assert!(specs.iter().all(|spec| {
+            ![
+                "list ",
+                "switch ",
+                "show ",
+                "start ",
+                "vendor",
+                "turn",
+                "model·ctx",
+            ]
+            .iter()
+            .any(|english| spec.description.contains(english))
+        }));
+        assert!(render_help().plain.contains("Команды шлюза"));
+    }
+
+    #[test]
+    fn routing_state_without_pending_prefix_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = crate::routing_state_path_in(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "default_project": "alpha",
+                "current_project": [{
+                    "chat": { "channel": "telegram", "chat_id": "chat-1", "user_id": "alice" },
+                    "value": "alpha",
+                }],
+                "current_session": [{
+                    "chat": { "channel": "telegram", "chat_id": "chat-1", "user_id": "alice" },
+                    "value": "s7",
+                }],
+                "live_sids": ["s7"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut gateway = Gateway::new(Arc::new(FakeAdapter::default()), "beta", tmp.path());
+        gateway.enable_persistence(tmp.path()).unwrap();
+
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        assert_eq!(gateway.default_project, "alpha");
+        assert_eq!(
+            gateway.current_project.get(&chat).map(String::as_str),
+            Some("alpha")
+        );
+        assert_eq!(
+            gateway
+                .current_session
+                .read()
+                .unwrap()
+                .get(&chat)
+                .map(String::as_str),
+            Some("s7")
+        );
+        assert!(gateway.pending_prefix.is_empty());
+        assert_eq!(gateway.restore_pending, vec!["s7"]);
+    }
+
+    #[tokio::test]
+    async fn quick_template_arms_one_message_and_clears_it_after_submit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .current_session
+            .write()
+            .unwrap()
+            .insert(chat.clone(), sid);
+        let template = CcteamConfig::default().im.quick_templates.remove(0);
+
+        let armed = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-1",
+                &template.label,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            armed,
+            vec![format!(
+                "Шаблон {} взведён — отправь задачу\n{}",
+                template.label,
+                quick_template_preview(&template.prefix)
+            )]
+        );
+        assert!(fake.submissions.lock().await.is_empty());
+        let routing: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(crate::routing_state_path_in(tmp.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(routing["pending_prefix"][0]["value"], template.prefix);
+
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-2",
+                "repair the test",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.submissions.lock().await[0].1,
+            format!("{} repair the test", template.prefix)
+        );
+        assert!(!gateway.pending_prefix.contains_key(&chat));
+        let routing: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(crate::routing_state_path_in(tmp.path())).unwrap(),
+        )
+        .unwrap();
+        assert!(routing["pending_prefix"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn quick_template_fresh_chat_arms_inline_then_consumes_in_shared_spawn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let gateway = Arc::new(tokio::sync::Mutex::new(Gateway::new(
+            fake.clone(),
+            "alpha",
+            tmp.path(),
+        )));
+        let template = CcteamConfig::default().im.quick_templates.remove(0);
+
+        assert!(
+            !gateway.lock().await.inbound_may_spawn(
+                "telegram",
+                "chat-1",
+                "alice",
+                &template.label,
+                false,
+                false,
+            ),
+            "a template tap must arm synchronously instead of entering the background spawn path"
+        );
+        let armed = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-1",
+            "alice",
+            "tg-1",
+            &template.label,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            armed,
+            vec![RichReply::plain(format!(
+                "Шаблон {} взведён — отправь задачу\n{}",
+                template.label,
+                quick_template_preview(&template.prefix),
+            ))]
+        );
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 0);
+
+        assert!(
+            gateway.lock().await.inbound_may_spawn(
+                "telegram",
+                "chat-1",
+                "alice",
+                "repair the test",
+                false,
+                false,
+            ),
+            "the consuming message must use the shared spawn path"
+        );
+
+        Gateway::handle_message_shared(
+            gateway,
+            "telegram",
+            "chat-1",
+            "alice",
+            "tg-2",
+            "repair the test",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fake.submissions.lock().await[0].1,
+            format!("{} repair the test", template.prefix)
+        );
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn quick_templates_are_telegram_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let chat = ChatKey::new("lark", "chat-1", "alice");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway.current_session.write().unwrap().insert(chat, sid);
+        let template = CcteamConfig::default().im.quick_templates.remove(0);
+
+        gateway
+            .handle_message(
+                "lark",
+                "chat-1",
+                "alice",
+                "lark-1",
+                &template.label,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fake.submissions.lock().await[0].1, template.label);
+
+        let keys = gateway
+            .handle_message_rich("lark", "chat-1", "alice", "lark-2", "/keys", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(keys[0].plain, "Только для Telegram.");
+        assert_eq!(keys[0].reply_keyboard, None);
+
+        let help = gateway
+            .handle_message_rich("lark", "chat-1", "alice", "lark-3", "/help", &[], None)
+            .await
+            .unwrap();
+        assert!(help[0].plain.contains("/keys"));
+        assert_eq!(help[0].reply_keyboard, None);
+    }
+
+    #[tokio::test]
+    async fn quick_template_prefix_survives_attachment_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let template = CcteamConfig::default().im.quick_templates.remove(0);
+        assert!(gateway.inbound_may_spawn(
+            "telegram",
+            "chat-1",
+            "alice",
+            &template.label,
+            false,
+            true,
+        ));
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .current_session
+            .write()
+            .unwrap()
+            .insert(chat.clone(), sid);
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-1",
+                &template.label,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-2",
+                "see this",
+                &[img("/tmp/shot.png")],
+                None,
+            )
+            .await
+            .unwrap();
+        let attachment_turn = fake.submissions.lock().await[0].1.clone();
+        assert!(!attachment_turn.contains(&template.prefix));
+        assert!(attachment_turn.contains("image_path=\"/tmp/shot.png\""));
+        assert_eq!(gateway.pending_prefix.get(&chat), Some(&template.prefix));
+
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-3",
+                "repair the test",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.submissions.lock().await[1].1,
+            format!("{} repair the test", template.prefix)
+        );
+    }
+
+    #[tokio::test]
+    async fn quick_template_label_caption_with_attachment_is_submitted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .current_session
+            .write()
+            .unwrap()
+            .insert(chat.clone(), sid);
+        let template = CcteamConfig::default().im.quick_templates.remove(0);
+
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-1",
+                &template.label,
+                &[img("/tmp/label.png")],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let submitted = fake.submissions.lock().await[0].1.clone();
+        assert!(submitted.contains(&template.label));
+        assert!(submitted.contains("image_path=\"/tmp/label.png\""));
+        assert!(!gateway.pending_prefix.contains_key(&chat));
+    }
+
+    #[tokio::test]
+    async fn quick_template_labels_trim_before_render_and_match() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_root = tmp.path().join("config");
+        let mut config = CcteamConfig::default();
+        config.im.quick_templates = vec![QuickTemplate {
+            label: "  Custom  ".to_string(),
+            prefix: "Custom task:".to_string(),
+        }];
+        ccteam_core::config::save(&config_root, &config).unwrap();
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let config_loader_root = config_root.clone();
+        gateway.config = Some(HotConfig::new(
+            ccteam_core::config::config_path(&config_root),
+            move || ccteam_core::config::load(&config_loader_root),
+        ));
+
+        let rendered = gateway.render_quick_templates();
+        assert_eq!(
+            rendered.reply_keyboard,
+            Some(ReplyKeyboard::Buttons(vec![vec!["Custom".to_string()]]))
+        );
+        let armed = gateway
+            .handle_message_rich(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-1",
+                "  Custom  ",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            armed[0].plain,
+            "Шаблон Custom взведён — отправь задачу\nCustom task:"
+        );
+    }
+
+    #[tokio::test]
+    async fn quick_template_prefixes_handle_submission_and_clears_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let template = CcteamConfig::default().im.quick_templates.remove(0);
+
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude codex")
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-1",
+                &template.label,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-2",
+                "@codex do X",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fake.submissions.lock().await[0].1,
+            format!("{} do X", template.prefix)
+        );
+        assert!(!gateway
+            .pending_prefix
+            .contains_key(&ChatKey::new("telegram", "chat-1", "alice")));
+    }
+
+    #[test]
+    fn quick_template_list_includes_prefix_preview() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gateway = Gateway::new(Arc::new(FakeAdapter::default()), "alpha", tmp.path());
+
+        let reply = gateway.render_quick_templates();
+        assert!(reply.plain.contains(
+            "• 🎯 Командир\n  Сначала проверь доступных в этом проекте провайдеров, затем спланируй и разложи …"
+        ));
+    }
+
+    #[tokio::test]
+    async fn second_quick_template_tap_replaces_the_pending_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway.current_session.write().unwrap().insert(chat, sid);
+        let templates = CcteamConfig::default().im.quick_templates;
+
+        for (id, label) in [("tg-1", &templates[0].label), ("tg-2", &templates[1].label)] {
+            gateway
+                .handle_message("telegram", "chat-1", "alice", id, label, &[], None)
+                .await
+                .unwrap();
+        }
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-3",
+                "finish it",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fake.submissions.lock().await[0].1,
+            format!("{} finish it", templates[1].prefix)
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_off_clears_pending_prefix_and_removes_reply_keyboard() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let template = CcteamConfig::default().im.quick_templates.remove(0);
+
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-1",
+                &template.label,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        let replies = gateway
+            .handle_message_rich(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-2",
+                "/keys off",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            replies[0].reply_keyboard,
+            Some(crate::transport::ReplyKeyboard::Remove)
+        );
+        assert!(!gateway
+            .pending_prefix
+            .contains_key(&ChatKey::new("telegram", "chat-1", "alice")));
+    }
+
+    #[tokio::test]
+    async fn help_carries_no_quick_template_keyboard() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        let replies = gateway
+            .handle_message_rich("telegram", "chat-1", "alice", "tg-1", "/help", &[], None)
+            .await
+            .unwrap();
+
+        assert_eq!(replies[0].reply_keyboard, None);
     }
 
     #[test]
@@ -15343,29 +16807,57 @@ mod tests {
         .unwrap();
     }
 
-    /// Fetch a `/sessions` or `/projects` list as the user SEES it, regardless
-    /// of whether it arrives as a plain-text inline reply (mock / web / Lark)
-    /// or — on a button-capable channel (Telegram) — as an event carrying the
-    /// list text + inline switch buttons. Returns the list text as a
-    /// single-element Vec so ACL assertions read identically across channels.
+    /// Fetch a `/sessions` or `/projects` plain fallback as the user sees it.
     async fn list_text(
         gateway: &mut Gateway,
-        events: &mut tokio::sync::broadcast::Receiver<GatewayEvent>,
+        _events: &mut tokio::sync::broadcast::Receiver<GatewayEvent>,
         channel: &str,
         chat_id: &str,
         user_id: &str,
         cmd: &str,
     ) -> Vec<String> {
-        let replies = gateway
+        gateway
             .handle_text(channel, chat_id, user_id, cmd)
             .await
+            .unwrap()
+    }
+
+    async fn stop_preview(
+        gateway: &mut Gateway,
+        events: &mut tokio::sync::broadcast::Receiver<GatewayEvent>,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        scope: &str,
+    ) -> GatewayEvent {
+        let replies = gateway
+            .handle_text(channel, chat_id, user_id, &format!("/stop {scope}"))
+            .await
             .unwrap();
-        if replies.is_empty() {
-            // Button-capable channel → the list rode the event sink.
-            vec![recv_answer(events).await.content]
-        } else {
-            replies
-        }
+        assert!(replies.is_empty(), "bulk Telegram stop uses the event sink");
+        recv_answer(events).await
+    }
+
+    async fn tap_stop(
+        gateway: &mut Gateway,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        preview: &GatewayEvent,
+    ) -> Vec<String> {
+        let data = preview.options[0].data.clone();
+        gateway
+            .handle_message(
+                channel,
+                chat_id,
+                user_id,
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply { data }),
+            )
+            .await
+            .unwrap()
     }
 
     /// Regression: a real `codex app-server` turn emits the agent message
@@ -15420,6 +16912,7 @@ mod tests {
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            button_rows: Vec::new(),
             sid: sid.map(str::to_string),
             slug: None,
         }
@@ -15817,6 +17310,7 @@ mod tests {
         /// v0.9 T2 — `close_thread` call count (stop path + discarded zombie
         /// resume both close).
         closes: AtomicUsize,
+        close_failures_remaining: Arc<AtomicUsize>,
     }
 
     impl Default for FakeAdapter {
@@ -15869,6 +17363,7 @@ mod tests {
                 title_surface: false,
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
+                close_failures_remaining: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -15920,6 +17415,11 @@ mod tests {
 
         fn with_start_barrier(mut self, barrier: Arc<TestStartBarrier>) -> Self {
             self.start_barrier = Some(barrier);
+            self
+        }
+
+        fn with_close_failures(self, count: usize) -> Self {
+            self.close_failures_remaining.store(count, Ordering::SeqCst);
             self
         }
     }
@@ -16060,7 +17560,7 @@ mod tests {
                 }
             }
             // Wake any pump task that is waiting in `events()` for new work.
-            self.events_notify.notify_one();
+            self.events_notify.notify_waiters();
             Ok(TurnId::new(turn_id))
         }
 
@@ -16148,6 +17648,22 @@ mod tests {
 
         async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
             self.closes.fetch_add(1, Ordering::SeqCst);
+            let mut remaining = self.close_failures_remaining.load(Ordering::SeqCst);
+            while remaining > 0 {
+                match self.close_failures_remaining.compare_exchange(
+                    remaining,
+                    remaining - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => {
+                        return Err(HarnessError::ShutdownFailed(
+                            "fake close failure".to_string(),
+                        ));
+                    }
+                    Err(current) => remaining = current,
+                }
+            }
             Ok(())
         }
 
@@ -16275,7 +17791,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        assert_eq!(created, vec!["created session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(created, vec!["Создана сессия s1\n↓ Статус → /status"]);
 
         let replies = gateway
             .handle_text("mock", "chat-1", "alice", "hi")
@@ -16565,6 +18081,763 @@ mod tests {
         gateway.stop_session("s1").await.unwrap();
         assert!(gateway.session_views().is_empty());
         assert!(gateway.stop_session("s1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_stops_only_visible_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string(), "chat-2".to_string()]);
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-2", "bob", "/new claude")
+            .await
+            .unwrap();
+
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "ALL",
+        )
+        .await;
+        assert_eq!(preview.content, "Будет остановлена 1 сессия: s1");
+        assert_eq!(
+            preview
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stop-all", "stop-cancel"]
+        );
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
+        assert_eq!(reply, vec!["Остановлено сессий: 1 (s1)".to_string()]);
+        assert!(!gateway.sessions.contains_key("s1"));
+        assert!(gateway.sessions.contains_key("s2"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_non_button_channel_stops_immediately() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/stop all")
+            .await
+            .unwrap();
+        assert_eq!(
+            reply[0].lines().next(),
+            Some("Остановлено сессий: 2 (s1, s2)")
+        );
+        assert!(gateway.sessions.is_empty());
+    }
+
+    #[test]
+    fn bulk_stop_preview_sorts_session_ids_numerically() {
+        let sids = (1..=11).rev().map(|n| format!("s{n}")).collect();
+
+        assert_eq!(
+            format_bulk_stop_preview(&sids),
+            "Будут остановлены 11 сессий: s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11"
+        );
+    }
+
+    #[test]
+    fn detached_termination_classification_reports_failures() {
+        assert!(classify_detached_termination(Ok(true)).is_ok());
+        assert_eq!(
+            classify_detached_termination(Ok(false))
+                .unwrap_err()
+                .to_string(),
+            "процесс не завершился"
+        );
+        assert_eq!(
+            classify_detached_termination(Err(anyhow!("kill failed")))
+                .unwrap_err()
+                .to_string(),
+            "kill failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_stops_own_detached_body_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sid1, sid2);
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            gateway
+                .bind_operator_allowlist("telegram", ["chat-1".to_string(), "chat-2".to_string()]);
+            gateway
+                .handle_text("telegram", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+            sid1 = gateway
+                .sessions
+                .keys()
+                .next()
+                .cloned()
+                .expect("first session");
+            gateway
+                .handle_text("telegram", "chat-2", "bob", "/new claude")
+                .await
+                .unwrap();
+            sid2 = gateway
+                .sessions
+                .keys()
+                .find(|sid| *sid != &sid1)
+                .cloned()
+                .expect("second session");
+        }
+        let mut own_body = plant_body(tmp.path(), &sid1);
+        let mut foreign_body = plant_body(tmp.path(), &sid2);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restarted = Gateway::new(fake, "alpha", tmp.path());
+        restarted.enable_persistence(tmp.path()).unwrap();
+        restarted.bind_operator_allowlist("telegram", ["chat-1".to_string(), "chat-2".to_string()]);
+        restarted.resume_restored_sessions().await;
+        assert!(restarted.is_session_detached(&sid1));
+        assert!(restarted.is_session_detached(&sid2));
+
+        let mut events = restarted.subscribe_events();
+        let preview = stop_preview(
+            &mut restarted,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "all",
+        )
+        .await;
+        assert_eq!(
+            preview.content,
+            format!("Будет остановлена 1 сессия: {sid1}")
+        );
+        assert_eq!(
+            preview
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stop-all", "stop-cancel"]
+        );
+        let reply = tap_stop(&mut restarted, "telegram", "chat-1", "alice", &preview).await;
+        assert_eq!(reply, vec![format!("Остановлено сессий: 1 ({sid1})")]);
+        assert!(!restarted.is_session_detached(&sid1));
+        assert!(restarted.is_session_detached(&sid2));
+        own_body.wait().expect("own detached body stopped");
+        assert!(
+            ccteam_harness::execution::session_body::body_is_alive(
+                &restarted.detached[&sid2].body,
+                &sid2
+            ),
+            "foreign body still alive"
+        );
+        foreign_body.kill().unwrap();
+        foreign_body.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_guest_leaves_foreign_live_and_detached_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid_live;
+        let sid_detached;
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            gateway.bind_operator_allowlist("mock", ["chat-1".to_string(), "chat-2".to_string()]);
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+            sid_live = gateway
+                .sessions
+                .keys()
+                .next()
+                .cloned()
+                .expect("live session");
+            gateway
+                .handle_text("mock", "chat-2", "bob", "/new claude")
+                .await
+                .unwrap();
+            sid_detached = gateway
+                .sessions
+                .keys()
+                .find(|sid| *sid != &sid_live)
+                .cloned()
+                .expect("detached session");
+        }
+        let mut detached_body = plant_body(tmp.path(), &sid_detached);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string(), "chat-2".to_string()]);
+        gateway.resume_restored_sessions().await;
+
+        let reply = gateway
+            .handle_text("mock", "guest-chat", "guest", "/stop all")
+            .await
+            .unwrap();
+        assert_eq!(
+            reply[0].lines().next(),
+            Some("Нет доступных сессий для остановки")
+        );
+        assert!(gateway.sessions.contains_key(&sid_live));
+        assert!(gateway.is_session_detached(&sid_detached));
+        detached_body.kill().unwrap();
+        detached_body.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_keeps_another_tenant_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("user:uaaa"));
+        seed_owned_project(&paths, "beta", Some("user:ubbb"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        gateway
+            .handle_text("telegram@uaaa", "chat-a", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram@ubbb", "chat-b", "bob", "/new claude")
+            .await
+            .unwrap();
+
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram@uaaa",
+            "chat-a",
+            "alice",
+            "all",
+        )
+        .await;
+        assert_eq!(preview.content, "Будет остановлена 1 сессия: s1");
+        let reply = tap_stop(&mut gateway, "telegram@uaaa", "chat-a", "alice", &preview).await;
+        assert_eq!(reply, vec!["Остановлено сессий: 1 (s1)".to_string()]);
+        assert!(!gateway.sessions.contains_key("s1"));
+        assert!(gateway.sessions.contains_key("s2"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_reports_partial_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_close_failures(1));
+        let adapter: Arc<dyn HarnessAdapter> = fake.clone();
+        let mut gateway = Gateway::new(adapter, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "all",
+        )
+        .await;
+        assert_eq!(preview.content, "Будут остановлены 2 сессии: s1, s2");
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
+        let summary: Vec<&str> = reply[0].lines().take(2).collect();
+        assert_eq!(
+            summary,
+            vec![
+                "Остановлено сессий: 1 (s2)",
+                "Ошибок остановки: 1 (s1 (shutdown failed: fake close failure))"
+            ]
+        );
+        assert!(gateway.sessions.contains_key("s1"));
+        assert!(!gateway.sessions.contains_key("s2"));
+        gateway.stop_session("s1").await.unwrap();
+        assert!(!gateway.sessions.contains_key("s1"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_keeps_tenant_session_from_operator() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, _alpha_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("user:uaaa"));
+        seed_owned_project(&paths, "operator", None);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "operator", paths.projects_root.join("operator"));
+        gateway.enable_project_creation(paths);
+        gateway.bind_operator_allowlist("telegram", ["admin-chat".to_string()]);
+        gateway
+            .handle_text("telegram@uaaa", "tenant-chat", "alice", "/cd alpha")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram@uaaa", "tenant-chat", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "admin-chat", "admin", "/new claude")
+            .await
+            .unwrap();
+
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "admin-chat",
+            "admin",
+            "all",
+        )
+        .await;
+        assert_eq!(preview.content, "Будет остановлена 1 сессия: s2");
+        let reply = tap_stop(&mut gateway, "telegram", "admin-chat", "admin", &preview).await;
+        assert_eq!(reply, vec!["Остановлено сессий: 1 (s2)".to_string()]);
+        assert!(
+            !gateway.sessions.contains_key("s2"),
+            "operator session stopped"
+        );
+        assert!(
+            gateway.sessions.contains_key("s1"),
+            "tenant session survived"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_project_stops_only_current_project_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+        gateway.register_project("beta", tmp.path());
+
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/cd beta")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/cd alpha")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/cd beta")
+            .await
+            .unwrap();
+
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "project",
+        )
+        .await;
+        assert_eq!(preview.content, "Будет остановлена 1 сессия: s2");
+        assert_eq!(
+            preview
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stop-project", "stop-cancel"]
+        );
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
+        assert_eq!(reply, vec!["Остановлено сессий: 1 (s2)".to_string()]);
+        assert!(gateway.sessions.contains_key("s1"));
+        assert!(!gateway.sessions.contains_key("s2"));
+        assert!(gateway.sessions.contains_key("s3"));
+    }
+
+    /// `/stop children` — direct children of the chat's CURRENT session
+    /// only. Contrast with `/stop all`, which would stop every session
+    /// visible to the chat, INCLUDING the current (parent) session itself —
+    /// that is exactly the footgun this scope exists to avoid.
+    #[tokio::test]
+    async fn gateway_stop_children_stops_only_direct_children_of_current_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+
+        // s1 = parent (stays current); s2, s3 = its direct children; s4 =
+        // an unrelated top-level session (no parent) that must survive.
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway.sessions.get_mut("s2").unwrap().parent_sid = Some("s1".to_string());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway.sessions.get_mut("s3").unwrap().parent_sid = Some("s1".to_string());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        // s4 stays parentless — a grandchild would also stay untouched, but
+        // there is no cheap way to build one here without the delegation
+        // plumbing; parent-vs-sibling-vs-unrelated already proves the
+        // predicate is `parent_sid == current`, not "reachable from current".
+
+        // Refocus the chat on s1 (the last `/new` moved focus to s4).
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        gateway
+            .current_session
+            .write()
+            .unwrap()
+            .insert(chat, "s1".to_string());
+
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "children",
+        )
+        .await;
+        assert_eq!(
+            preview
+                .options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stop-children", "stop-cancel"]
+        );
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
+        assert_eq!(reply, vec!["Остановлено сессий: 2 (s2, s3)".to_string()]);
+        assert!(gateway.sessions.contains_key("s1"), "parent must survive");
+        assert!(!gateway.sessions.contains_key("s2"));
+        assert!(!gateway.sessions.contains_key("s3"));
+        assert!(
+            gateway.sessions.contains_key("s4"),
+            "unrelated session must survive"
+        );
+    }
+
+    /// A confirmed `cmd:!<token>` tap for a bulk `/stop` must execute
+    /// directly — NOT raise a second preview/confirm prompt on top of the
+    /// one the tap just answered. Typed `/stop children` (exercised above)
+    /// keeps its own preview-then-confirm prompt; this proves the OTHER
+    /// entry point (the gateway `cmd:?/stop children` confirm-wrapped
+    /// button `im_views::render_status` renders) skips the double-ask.
+    #[tokio::test]
+    async fn gateway_stop_children_confirmed_cmd_tap_executes_without_second_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway.sessions.get_mut("s2").unwrap().parent_sid = Some("s1".to_string());
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        gateway
+            .current_session
+            .write()
+            .unwrap()
+            .insert(chat, "s1".to_string());
+
+        // `cmd:?/stop children` — the confirm-wrapped inline button.
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/stop children".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "the yes/no confirmation prompt goes out via the event sink, not a reply: {replies:?}"
+        );
+
+        // Tap the "yes" (`cmd:!<token>`) button the confirm prompt just
+        // registered.
+        let confirm_token = {
+            let confirmations = gateway.pending_command_confirmations.clone();
+            confirmations
+                .keys()
+                .next()
+                .cloned()
+                .expect("a confirmation must have been registered")
+        };
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("cmd:!{confirm_token}"),
+                }),
+            )
+            .await
+            .unwrap();
+        // Exactly the ack + bulk-stop RESULT — never a second yes/no prompt.
+        assert_eq!(
+            replies.len(),
+            2,
+            "ack + direct bulk-stop result: {replies:?}"
+        );
+        assert!(
+            replies[1].contains("Остановлено сессий: 1 (s2)"),
+            "must execute the stop directly: {replies:?}"
+        );
+        assert!(gateway.sessions.contains_key("s1"));
+        assert!(!gateway.sessions.contains_key("s2"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_cancel_leaves_sessions_alive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "all",
+        )
+        .await;
+        assert_eq!(preview.content, "Будет остановлена 1 сессия: s1");
+        let reply = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: preview.options[1].data.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["Отменено".to_string()]);
+        assert!(gateway.sessions.contains_key("s1"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_snapshot_excludes_session_spawned_after_preview() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "all",
+        )
+        .await;
+        assert_eq!(preview.content, "Будет остановлена 1 сессия: s1");
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
+        assert_eq!(reply, vec!["Остановлено сессий: 1 (s1)".to_string()]);
+        assert!(!gateway.sessions.contains_key("s1"));
+        assert!(gateway.sessions.contains_key("s2"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_confirmation_is_one_shot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "all",
+        )
+        .await;
+
+        let first = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
+        assert_eq!(first, vec!["Остановлено сессий: 1 (s1)".to_string()]);
+        let second = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
+        assert_eq!(second, vec!["Этот выбор больше недоступен".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_project_snapshot_ignores_current_project_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["chat-1".to_string()]);
+        gateway.register_project("beta", tmp.path());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/cd beta")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/cd alpha")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let preview = stop_preview(
+            &mut gateway,
+            &mut events,
+            "telegram",
+            "chat-1",
+            "alice",
+            "project",
+        )
+        .await;
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/cd beta")
+            .await
+            .unwrap();
+
+        let reply = tap_stop(&mut gateway, "telegram", "chat-1", "alice", &preview).await;
+        assert_eq!(reply, vec!["Остановлено сессий: 1 (s1)".to_string()]);
+        assert!(!gateway.sessions.contains_key("s1"));
+        assert!(gateway.sessions.contains_key("s2"));
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_project_refuses_without_current_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("mock:owner"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        gateway.bind_operator_allowlist("mock", ["owner-chat".to_string()]);
+
+        let reply = gateway
+            .handle_text("mock", "guest-chat", "guest", "/stop project")
+            .await
+            .unwrap();
+
+        assert!(
+            reply[0].contains("Этот чат ещё не привязан к ccteam"),
+            "{reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_stop_all_reports_empty_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "/stop all")
+            .await
+            .unwrap();
+
+        assert!(
+            reply[0].contains("Нет доступных сессий для остановки"),
+            "{reply:?}"
+        );
+    }
+
+    #[test]
+    fn gateway_stop_spec_advertises_bulk_scopes() {
+        let spec = GATEWAY_COMMANDS
+            .iter()
+            .find(|command| command.name == "/stop")
+            .expect("/stop must be registered in GATEWAY_COMMANDS");
+        assert_eq!(spec.arg_hint, Some("<id>|all|project|children"));
+        assert!(spec.help.contains("все доступные"), "{}", spec.help);
+        assert!(spec.help.contains("проекта"), "{}", spec.help);
     }
 
     /// v0.8.23 review §1.3-D item 9 — `SessionView::waiting_approval` mirrors
@@ -17029,6 +19302,8 @@ mod tests {
 
         // A project rebind never moves an existing session. Rebuild/resume
         // fails readable and requires a fresh sid on the new binding.
+        let config_path = ccteam_core::config::config_path(&ccteam_root);
+        let cached_mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
         let mut config = ccteam_core::config::load(&ccteam_root).unwrap();
         let entry = config
             .projects
@@ -17039,6 +19314,14 @@ mod tests {
         entry.remote_slug = None;
         entry.remote_path = None;
         ccteam_core::config::save(&ccteam_root, &config).unwrap();
+        // HotConfig reloads only when mtime changes. Consecutive atomic saves
+        // can share a timestamp, so make the external rebind deterministic.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&config_path)
+            .unwrap()
+            .set_modified(cached_mtime + std::time::Duration::from_secs(1))
+            .unwrap();
         fake.live.store(false, Ordering::SeqCst);
         let err = gateway
             .plan_resume_dead_session("s1")
@@ -17395,7 +19678,8 @@ mod tests {
             .unwrap();
         assert_eq!(reply.len(), 1);
         assert!(
-            reply[0].contains("已中断 session s1") && reply[0].contains("会话保留"),
+            reply[0].contains("Текущий turn сессии s1 прерван")
+                && reply[0].contains("сессия сохранена"),
             "interrupt receipt: {:?}",
             reply[0]
         );
@@ -17411,7 +19695,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(used, vec!["Используется сессия s1\n↓ Статус → /status"]);
 
         // Bare `/interrupt` targets the CURRENT session (s1) — non-destructive,
         // so no explicit sid is required (unlike /stop).
@@ -17419,7 +19703,11 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/interrupt")
             .await
             .unwrap();
-        assert!(bare[0].contains("已中断 session s1"), "bare: {:?}", bare[0]);
+        assert!(
+            bare[0].contains("Текущий turn сессии s1 прерван"),
+            "bare: {:?}",
+            bare[0]
+        );
         assert_eq!(
             fake.interrupts.lock().await.len(),
             2,
@@ -17435,7 +19723,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             foreign,
-            vec!["unknown session for this chat: s1\n↓ 查看状态 → /status"]
+            vec!["Сессия s1 недоступна этому чату\n↓ Статус → /status"]
         );
         assert_eq!(
             fake.interrupts.lock().await.len(),
@@ -18175,7 +20463,7 @@ mod tests {
             ev.content
         );
         assert!(
-            ev.content.ends_with("\n\n→ alpha/s1 (reviewer)"),
+            ev.content.contains("\n\n→ alpha/s1 (reviewer)"),
             "context echo suffix present: {:?}",
             ev.content
         );
@@ -18205,7 +20493,7 @@ mod tests {
             .unwrap();
         let im_ev = recv_answer(&mut im_events).await;
         assert!(
-            im_ev.content.ends_with("\n\n→ alpha/s1"),
+            im_ev.content.contains("\n\n→ alpha/s1") && !im_ev.content.contains("\n\n→ alpha/s1 ("),
             "roleless echo carries no (role) parens: {:?}",
             im_ev.content
         );
@@ -18563,10 +20851,10 @@ mod tests {
             gateway.chat_can_access(&tenant, gateway.sessions.get(&child).unwrap()),
             "a LIVE session in a tenant-owned project belongs to that tenant"
         );
-        let status = gateway.render_status(&tenant).await;
+        let sessions = gateway.render_sessions(&tenant, true).await.plain;
         assert!(
-            status.contains(&format!("👥 直接子会话:\n      · {child} · claude")),
-            "the tenant's /status must list its project's delegated children: {status}"
+            sessions.contains(&format!("{child} | claude.— | 🟢 ожидание | —")),
+            "the tenant's session list must include its delegated child: {sessions}"
         );
     }
 
@@ -19866,7 +22154,7 @@ mod tests {
         assert_eq!(receipt.len(), 1);
         assert_eq!(
             receipt[0],
-            "created session s2 (hitl: non-allowlist tools need IM approval)\n↓ 查看状态 → /status",
+            "Создана сессия s2 (hitl: инструменты вне allowlist требуют подтверждения в IM)\n↓ Статус → /status",
             "F1: a fresh hitl session is spawned + honestly reported, got: {receipt:?}"
         );
 
@@ -19898,7 +22186,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            receipt[0].contains("non-allowlist tools need IM approval"),
+            receipt[0].contains("инструменты вне allowlist требуют подтверждения в IM"),
             "a fresh hitl spawn must report hitl: {receipt:?}"
         );
         assert_eq!(
@@ -19935,7 +22223,10 @@ mod tests {
                 "/new claude reviewer bogus",
             )
             .await;
-        assert!(res.is_err(), "a bad permission token must be rejected");
+        let err = res.expect_err("a bad permission token must be rejected");
+        let err = err.to_string();
+        assert!(err.contains("Неожиданный аргумент `bogus`"), "{err}");
+        assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
         assert_eq!(
             fake.starts.load(Ordering::SeqCst),
             0,
@@ -20295,53 +22586,37 @@ mod tests {
         assert_eq!(answer.assistant, "LGTM, two nits inline.");
     }
 
-    /// Clickable project picker: on Telegram, `/projects` is delivered as a
-    /// header + one inline "switch" button per project (`nav:cd:<slug>`), so
-    /// the command returns NO inline reply (the buttons ride the event sink).
-    /// Non-button channels (the test mock, web, Lark) keep the plain slug list.
+    /// `/projects` has command buttons in its rich reply and a table fallback.
     #[tokio::test]
     async fn telegram_projects_delivers_switch_buttons() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
         gateway.register_project("beta", proj.path());
-        let mut events = gateway.subscribe_events();
-
-        // Telegram → the reply is empty; the list + buttons arrive as an Answer.
         let replies = gateway
-            .handle_text("telegram", "chat-1", "alice", "/projects")
+            .handle_message_rich("telegram", "chat-1", "alice", "", "/projects", &[], None)
             .await
             .unwrap();
-        assert!(
-            replies.is_empty(),
-            "a button-capable /projects returns no inline reply: {replies:?}"
-        );
-        let ev = recv_answer(&mut events).await;
-        assert!(ev.content.contains("项目"), "header: {}", ev.content);
-        let datas: Vec<&str> = ev.options.iter().map(|o| o.data.as_str()).collect();
-        assert!(datas.contains(&"nav:cd:alpha"), "options: {datas:?}");
-        assert!(datas.contains(&"nav:cd:beta"), "options: {datas:?}");
-        // The current project is marked with ✓ (default project = alpha).
-        assert!(
-            ev.options
-                .iter()
-                .any(|o| o.data == "nav:cd:alpha" && o.label.starts_with('✓')),
-            "current project marked: {:?}",
-            ev.options
-        );
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].markdown.contains("| **alpha** |"));
+        let datas = replies[0]
+            .button_rows
+            .iter()
+            .flatten()
+            .map(|option| option.data.as_str())
+            .collect::<Vec<_>>();
+        assert!(datas.contains(&"cmd:/cd alpha"), "buttons: {datas:?}");
+        assert!(datas.contains(&"cmd:/cd beta"), "buttons: {datas:?}");
 
-        // The mock channel has no buttons → the bare newline slug list, verbatim.
         let mock = gateway
             .handle_text("mock", "chat-2", "bob", "/projects")
             .await
             .unwrap();
-        assert_eq!(mock, vec!["alpha\nbeta"]);
+        assert!(mock[0].contains("slug | путь | сессий"));
+        assert!(mock[0].contains("alpha |"));
     }
 
-    /// Clickable session picker: on Telegram, `/sessions` is delivered as the
-    /// usual text list PLUS one inline "switch" button per live session
-    /// (`nav:use:<sid>`), so the command returns no inline reply. The mock
-    /// channel still gets the plain-text list (regression guard).
+    /// `/sessions` has `cmd:/use` buttons in its rich reply and a table fallback.
     #[tokio::test]
     async fn telegram_sessions_delivers_switch_buttons() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -20352,26 +22627,22 @@ mod tests {
             .await
             .unwrap();
 
-        let mut events = gateway.subscribe_events();
         let replies = gateway
-            .handle_text("telegram", "chat-1", "alice", "/sessions")
+            .handle_message_rich("telegram", "chat-1", "alice", "", "/sessions", &[], None)
             .await
             .unwrap();
-        assert!(
-            replies.is_empty(),
-            "a button-capable /sessions returns no inline reply: {replies:?}"
-        );
-        let ev = recv_answer(&mut events).await;
-        assert!(ev.content.contains("s1"), "list text: {}", ev.content);
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].markdown.contains("| **s1** |"));
         assert_eq!(
-            ev.options
+            replies[0]
+                .button_rows
                 .iter()
-                .map(|o| o.data.as_str())
+                .flatten()
+                .map(|option| option.data.as_str())
                 .collect::<Vec<_>>(),
-            vec!["nav:use:s1"],
+            vec!["cmd:/use s1"],
         );
 
-        // Mock channel = plain text list, unchanged.
         gateway
             .handle_text("mock", "chat-2", "bob", "/new claude reviewer")
             .await
@@ -20381,21 +22652,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mock.len(), 1);
-        assert!(mock[0].contains("s2 claude"), "{}", mock[0]);
+        assert!(mock[0].contains("s2 | claude.—"), "{}", mock[0]);
     }
 
-    /// Picker buttons are `sid vendor (title)` (sid → vendor → title), a `✓`
-    /// marking the current session. The ROLE is NOT on the button (it stays on
-    /// the information-rich text rows). Tail-padding stays visual-only so
-    /// Telegram left-aligns the variable-width labels.
+    /// Session buttons carry the `cmd:/use <sid>` callback and the focused
+    /// session marker from the compact table.
     #[tokio::test]
-    async fn session_picker_labels_carry_sid_vendor_and_title() {
-        use unicode_width::UnicodeWidthStr;
+    async fn session_buttons_carry_use_commands() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
-        // One roleless untitled session + one titled session: the untitled
-        // button is `sid vendor`, the titled one appends its (title).
         gateway
             .handle_text("telegram", "chat-1", "alice", "/new claude")
             .await
@@ -20404,45 +22670,23 @@ mod tests {
             .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        gateway
-            .rename_session("s2", "A long review title")
-            .await
-            .unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
-        let opts = gateway.session_switch_options(&chat, false);
-        assert_eq!(opts.len(), 2, "{opts:?}");
-        let s1 = opts.iter().find(|o| o.id == "s1").unwrap();
-        let s2 = opts.iter().find(|o| o.id == "s2").unwrap();
-        let s1_text = s1.label.trim_end_matches('\u{2800}');
-        let s2_text = s2.label.trim_end_matches('\u{2800}');
-        // Untitled → `sid vendor`; titled + current → `✓ sid vendor (title)`.
-        // Vendor is lowercase (`vendor_str`).
-        assert_eq!(s1_text, "s1 claude");
-        assert_eq!(s2_text, "✓ s2 claude (A long review title)");
-        for label in [s1_text, s2_text] {
-            assert!(
-                !label.contains("reviewer"),
-                "no role on the button: {label:?}"
-            );
-        }
-        // Both labels padded to the same display width, with braille blanks.
+        let reply = gateway.render_sessions(&chat, false).await;
+        let options = reply.button_rows.into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(
-            s1.label.as_str().width(),
-            s2.label.as_str().width(),
-            "equal width: {opts:?}"
+            options
+                .iter()
+                .map(|option| option.data.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cmd:/use s2", "cmd:/use s1"]
         );
-        assert!(
-            s1.label.ends_with('\u{2800}'),
-            "shorter row is tail-padded: {:?}",
-            s1.label
-        );
+        assert_eq!(options[0].label, "▶ s2 claude");
+        assert_eq!(options[1].label, "s1 claude");
     }
 
-    /// A verbose title is clipped to `SESSION_BUTTON_TITLE_MAX_COLS` display
-    /// columns (ellipsis included) so one long title can't widen every button.
+    /// A verbose title is capped in the compact session switch button.
     #[tokio::test]
-    async fn session_picker_title_is_width_capped() {
-        use unicode_width::UnicodeWidthStr;
+    async fn session_buttons_stay_compact_with_a_long_title() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
@@ -20453,32 +22697,16 @@ mod tests {
         let long = "A really really long session title that keeps going";
         gateway.rename_session("s1", long).await.unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
-        let opts = gateway.session_switch_options(&chat, false);
-        let label = opts[0].label.trim_end_matches('\u{2800}');
-        let title = label
-            .split_once('(')
-            .and_then(|(_, rest)| rest.strip_suffix(')'))
-            .expect("titled button label");
-        assert!(
-            title.ends_with('…'),
-            "clipped title ends with an ellipsis: {title:?}"
-        );
-        assert!(
-            title.width() <= SESSION_BUTTON_TITLE_MAX_COLS,
-            "within cap: {title:?}"
-        );
-        assert!(
-            long.starts_with(title.trim_end_matches('…')),
-            "prefix of the real title"
-        );
+        let reply = gateway.render_sessions(&chat, false).await;
+        let option = &reply.button_rows[0][0];
+        assert_eq!(option.label, "▶ s1 claude · A really re…");
+        assert_eq!(option.data, "cmd:/use s1");
+        assert!(option.data.len() <= 64);
     }
 
-    /// `/sessions` text rows START with the sid and carry NO activity dot
-    /// (🟢/🟡/🟠/🔴/⚪) or leading `[vendor]` tag — those lived on the text row
-    /// pre-cleanup; activity now lives only on `/status`, and the vendor is
-    /// still readable from the `:{vendor}:` colon field.
+    /// `/sessions` renders the required compact Russian table.
     #[tokio::test]
-    async fn gateway_sessions_text_rows_start_with_sid_and_have_no_activity_dot() {
+    async fn gateway_sessions_render_a_compact_table() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
@@ -20491,40 +22719,33 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        let row = listing[0].split('\n').nth(1).expect("a session row");
-        assert!(
-            row.starts_with("s1 claude"),
-            "row starts with the sid: {row:?}"
-        );
-        for marker in ["🟢", "🟡", "🟠", "🔴", "⚪", "[claude]"] {
-            assert!(
-                !listing[0].contains(marker),
-                "no activity dot / vendor tag on the text row: {listing:?}"
-            );
-        }
+        assert!(listing[0].contains("sid | vendor.model | статус | ctx"));
+        assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | —"));
     }
 
-    /// Picker-label padding equalizes display width across an option set.
+    /// Session buttons retain Telegram's eight-button row bound.
     #[test]
-    fn picker_label_padding_equalizes_display_width() {
-        use unicode_width::UnicodeWidthStr;
-        // Padding: mixed CJK/Latin rows end up the same display width.
-        let mut opts = vec![
-            MessageOption {
-                data: "a".into(),
-                label: "▸ s39 · grok · 「当前是什么模型」".into(),
-                id: "s39".into(),
-            },
-            MessageOption {
-                data: "b".into(),
-                label: "▸ s43 · claude · 「Completed the full reques…".into(),
-                id: "s43".into(),
-            },
-        ];
-        left_align_option_labels(&mut opts);
+    fn session_buttons_have_at_most_eight_entries_per_row() {
+        let reply = im_views::render_sessions(&SessionsView {
+            project: "alpha".into(),
+            sessions: (1..=9)
+                .map(|index| SessionRow {
+                    sid: format!("s{index}"),
+                    vendor_model: "claude.—".into(),
+                    status: "🟢 ожидание".into(),
+                    context: "—".into(),
+                    title: None,
+                    current: false,
+                    tree_depth: 0,
+                    host: None,
+                })
+                .collect(),
+            elsewhere: 0,
+            detached: Vec::new(),
+        });
         assert_eq!(
-            opts[0].label.as_str().width(),
-            opts[1].label.as_str().width()
+            reply.button_rows.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![8, 1]
         );
     }
 
@@ -20564,7 +22785,7 @@ mod tests {
         assert_eq!(
             replies,
             vec![
-                "project set to beta (next message starts a session there)\n↓ 本项目会话 → /sessions"
+                "Выбран проект beta (следующее сообщение создаст там сессию)\n↓ Сессии проекта → /sessions"
             ]
         );
         assert_eq!(gateway.current_project_for(&chat).as_deref(), Some("beta"));
@@ -20585,7 +22806,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replies, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(replies, vec!["Используется сессия s1\n↓ Статус → /status"]);
         assert_eq!(gateway.current_project_for(&chat).as_deref(), Some("alpha"));
         assert_eq!(
             gateway.current_session.read().unwrap().get(&chat).cloned(),
@@ -20607,7 +22828,530 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replies, vec!["invalid selection"]);
+        assert_eq!(replies, vec!["Некорректный выбор"]);
+    }
+
+    /// A `cmd:<command>` tap in the bot's own private chat (`chat_id ==
+    /// user_id` — see [`Gateway::resolve_cmd_callback`]'s identity-check
+    /// doc) runs the command exactly like typed text: `cmd:/status` reaches
+    /// `handle_command`'s `/status` arm, same reply as typing `/status`.
+    #[tokio::test]
+    async fn cmd_callback_routes_to_handle_command() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+
+        let typed = gateway
+            .handle_text("telegram", "42", "42", "/status")
+            .await
+            .unwrap();
+        let via_button = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(via_button, typed);
+    }
+
+    /// `cmd:?<command>` renders a Russian confirmation with `[✅ Да][❌
+    /// Отмена]` buttons — no direct text reply (the prompt is delivered as
+    /// a picker event, matching the project/session pickers), and both
+    /// buttons carry the same opaque confirmation token.
+    #[tokio::test]
+    async fn cmd_confirm_callback_renders_yes_no_buttons() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/stop s1".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "confirmation rides the picker event, not a direct reply"
+        );
+
+        let event = events.try_recv().expect("confirmation picker event");
+        assert_eq!(event.content, "Точно выполнить `/stop s1`?");
+        assert!(
+            event.options.is_empty(),
+            "confirmation rides button_rows, not options"
+        );
+        assert_eq!(event.button_rows.len(), 1);
+        assert_eq!(event.button_rows[0].len(), 2);
+        let yes = &event.button_rows[0][0];
+        let no = &event.button_rows[0][1];
+        assert_eq!(yes.label, "✅ Да");
+        assert_eq!(yes.id, "yes");
+        assert_eq!(yes.style, Some(ButtonStyle::Success));
+        assert!(yes.data.starts_with("cmd:!"));
+        assert_eq!(yes.data.len(), "cmd:!".len() + 8);
+        assert!(!yes.data.contains("/stop"));
+        assert_eq!(no.label, "❌ Отмена");
+        assert_eq!(no.id, "no");
+        assert_eq!(no.style, Some(ButtonStyle::Danger));
+        assert_eq!(no.data, format!("cmd:x{}", &yes.data[5..]));
+    }
+
+    /// TG-GATE-V2 W9 — [`Gateway::evict_oldest_confirmations`] is the
+    /// primitive both caps ride on: it must keep the NEWEST entries and drop
+    /// the oldest, and a `chat`-scoped call must never touch another chat's
+    /// entries even when evicting to make room.
+    #[test]
+    fn evict_oldest_confirmations_keeps_newest_and_respects_scope() {
+        let base = Instant::now();
+        let chat_a = ChatKey::new("telegram", "a", "a");
+        let chat_b = ChatKey::new("telegram", "b", "b");
+        let mut map: BTreeMap<String, PendingCommandConfirmation> = BTreeMap::new();
+        let mk = |chat: &ChatKey, offset_secs: u64| PendingCommandConfirmation {
+            chat: chat.clone(),
+            command: "/status".to_string(),
+            created_at: base + Duration::from_secs(offset_secs),
+            ttl: Duration::from_secs(300),
+        };
+        for (token, offset) in [("a0", 0), ("a1", 1), ("a2", 2), ("a3", 3), ("a4", 4)] {
+            map.insert(token.to_string(), mk(&chat_a, offset));
+        }
+        for (token, offset) in [("b0", 10), ("b1", 11)] {
+            map.insert(token.to_string(), mk(&chat_b, offset));
+        }
+
+        // Per-chat scope: cap chat_a to 3 — must drop its 2 OLDEST (a0, a1)
+        // and never touch chat_b's entries.
+        Gateway::evict_oldest_confirmations(&mut map, Some(&chat_a), 3);
+        assert_eq!(
+            map.keys().cloned().collect::<Vec<_>>(),
+            vec!["a2", "a3", "a4", "b0", "b1"],
+            "kept the 3 newest chat_a entries + both untouched chat_b entries"
+        );
+
+        // Global scope: cap the whole map to 4 — drops the single oldest
+        // entry remaining (a2), regardless of which chat it belongs to.
+        Gateway::evict_oldest_confirmations(&mut map, None, 4);
+        assert_eq!(
+            map.keys().cloned().collect::<Vec<_>>(),
+            vec!["a3", "a4", "b0", "b1"]
+        );
+
+        // Under the cap: a no-op, not an error.
+        Gateway::evict_oldest_confirmations(&mut map, None, 10);
+        assert_eq!(map.len(), 4);
+    }
+
+    /// Wiring test: registering more than [`MAX_COMMAND_CONFIRMATIONS_PER_CHAT`]
+    /// confirmations for ONE chat never lets that chat's live set grow past
+    /// the cap — an IM chat spamming `cmd:?…` taps can't grow the map
+    /// without bound between TTL sweeps.
+    #[tokio::test]
+    async fn register_command_confirmation_caps_per_chat() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let chat = ChatKey::new("telegram", "spammer", "spammer");
+        for _ in 0..(MAX_COMMAND_CONFIRMATIONS_PER_CHAT + 10) {
+            gateway.register_command_confirmation(chat.clone(), "/status".to_string());
+        }
+        let for_chat = gateway
+            .pending_command_confirmations
+            .values()
+            .filter(|pending| pending.chat == chat)
+            .count();
+        assert_eq!(for_chat, MAX_COMMAND_CONFIRMATIONS_PER_CHAT);
+    }
+
+    /// Confirmation tokens bind the rendered prompt to the tapper, including
+    /// in a group chat where the shared chat id cannot identify that person.
+    #[tokio::test]
+    async fn cmd_confirmation_ignores_a_different_tapper() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "group-9",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+        let event = events.try_recv().expect("confirmation picker event");
+        let yes = event.button_rows[0][0].data.clone();
+
+        let stranger = gateway
+            .handle_message(
+                "telegram",
+                "group-9",
+                "bob",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply { data: yes.clone() }),
+            )
+            .await
+            .unwrap();
+        assert!(stranger.is_empty(), "another group member must be ignored");
+
+        let owner = gateway
+            .handle_message(
+                "telegram",
+                "group-9",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply { data: yes }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            owner,
+            vec!["✅ /status", "Нет сессий — создайте через /new"]
+        );
+    }
+
+    /// A cancellation token spends only its matching confirmation.
+    #[tokio::test]
+    async fn cmd_confirmation_cancel_cancels() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        let cancel = events
+            .try_recv()
+            .expect("confirmation picker event")
+            .button_rows[0][1]
+            .data
+            .clone();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply { data: cancel }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies, vec!["Отменено"]);
+    }
+
+    /// TG-GATE-V2 W8 — when the tap arrives with a resolvable Telegram
+    /// message id (`"tg-cb-<n>"`, the real inbound shape from
+    /// `handle_callback_query`), a confirm resolves by EDITING the
+    /// confirmation message in place (keyboard cleared, text = "✅ <cmd>")
+    /// instead of appending a new reply; only the command's own result
+    /// still rides a reply.
+    #[tokio::test]
+    async fn cmd_confirmation_confirm_edits_the_prompt_message_when_id_known() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        let confirm_token = events
+            .try_recv()
+            .expect("confirmation picker event")
+            .button_rows[0][0]
+            .data
+            .clone();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: confirm_token,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replies,
+            vec!["Нет сессий — создайте через /new"],
+            "the ack no longer rides a reply — only the command's own result does"
+        );
+
+        let edit = events.try_recv().expect("edit event");
+        assert_eq!(edit.content, "✅ /status");
+        assert!(edit.button_rows.is_empty());
+        match edit.kind {
+            GatewayEventKind::EditMessage { ref message_id } => assert_eq!(message_id, "777"),
+            other => panic!("expected EditMessage, got {other:?}"),
+        }
+    }
+
+    /// Same edit-in-place treatment for a cancellation tap.
+    #[tokio::test]
+    async fn cmd_confirmation_cancel_edits_the_prompt_message_when_id_known() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "tg-cb-42",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        let cancel_token = events
+            .try_recv()
+            .expect("confirmation picker event")
+            .button_rows[0][1]
+            .data
+            .clone();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "tg-cb-42",
+                "",
+                &[],
+                Some(&ChoiceReply { data: cancel_token }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "cancellation rides the edit event, not a reply"
+        );
+
+        let edit = events.try_recv().expect("edit event");
+        assert_eq!(edit.content, "Отменено");
+        match edit.kind {
+            GatewayEventKind::EditMessage { ref message_id } => assert_eq!(message_id, "42"),
+            other => panic!("expected EditMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cmd_confirmation_unknown_or_expired_reports_stale() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let unknown = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:!deadbeef".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown, vec!["Подтверждение устарело"]);
+
+        gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        let cancel = events
+            .try_recv()
+            .expect("confirmation picker event")
+            .button_rows[0][1]
+            .data
+            .clone();
+        let token = cancel.strip_prefix("cmd:x").unwrap();
+        gateway
+            .pending_command_confirmations
+            .get_mut(token)
+            .expect("registered confirmation")
+            .created_at = Instant::now() - Duration::from_secs(301);
+
+        let expired = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply { data: cancel }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired, vec!["Подтверждение устарело"]);
+    }
+
+    /// A `cmd:` command that isn't one of `GATEWAY_COMMANDS` (typo, or a
+    /// stale button from an older build) reports unknown rather than
+    /// silently falling through as agent turn text.
+    #[tokio::test]
+    async fn cmd_callback_unknown_command_reports_unknown() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/bogus-command".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies, vec!["Неизвестная команда"]);
+    }
+
+    /// A `cmd:` tap in a GROUP chat (`chat_id != user_id`, unlike a
+    /// Telegram private chat where they're equal) routes exactly like a
+    /// private-chat tap — `Command` reaches `handle_command` (same ACL as
+    /// typed text, no separate identity gate; see
+    /// [`Gateway::resolve_cmd_callback`]'s doc), and `Confirm` still renders
+    /// the yes/no picker. TG-GATE-V2 W5 replaces the prior
+    /// `cmd_callback_wrong_user_is_ignored`, which asserted the opposite
+    /// (group taps silently dropped) — that disabled every `cmd:` button in
+    /// any group chat.
+    #[tokio::test]
+    async fn cmd_callback_routes_normally_in_group_chat() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let typed = gateway
+            .handle_text("telegram", "group-9", "someone", "/status")
+            .await
+            .unwrap();
+        let via_button = gateway
+            .handle_message(
+                "telegram",
+                "group-9",
+                "someone",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/status".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            via_button, typed,
+            "group tap must run the command, not be dropped"
+        );
+
+        let confirm_replies = gateway
+            .handle_message(
+                "telegram",
+                "group-9",
+                "someone",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/stop s1".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            confirm_replies.is_empty(),
+            "confirmation rides the picker event, not a direct reply"
+        );
+        let event = events
+            .try_recv()
+            .expect("group tap must render a confirmation picker");
+        assert_eq!(event.content, "Точно выполнить `/stop s1`?");
     }
 
     /// `strip_vendor_prefix` drops a leading `{vendor}` + separator from a
@@ -20639,7 +23383,7 @@ mod tests {
         assert_eq!(strip_vendor_prefix("claude", "claude-"), "claude-");
     }
 
-    /// P3 — `/sessions` appends each session's model + ctx from
+    /// P3 — `/sessions` appends each session's model + контекст from
     /// `thread_status`. With a `[1m]` model the window is 1M; with no
     /// status reported the legacy `id:project:vendor:role` row is unchanged.
     #[tokio::test]
@@ -20661,7 +23405,8 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(bare, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(bare.len(), 1);
+        assert!(bare[0].contains("s1 | claude.— | 🟢 ожидание | —"));
 
         // Now report a model + effort + usage → suffix appears with the
         // TOTAL window (absolute, via `format_tokens`) + percent — no project
@@ -20681,10 +23426,8 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            with_status,
-            vec!["📁 当前项目: alpha\ns1 claude.opus-4-8[1m].max.1M(19%)"]
-        );
+        assert_eq!(with_status.len(), 1);
+        assert!(with_status[0].contains("s1 | claude.opus-4-8[1m] | 🟢 ожидание | 19%"));
 
         // A non-[1m] model, no effort, renders against the 200k baseline.
         fake.set_status(ThreadStatus {
@@ -20702,10 +23445,8 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            baseline,
-            vec!["📁 当前项目: alpha\ns1 claude.sonnet-4-5.200k(94%)"]
-        );
+        assert_eq!(baseline.len(), 1);
+        assert!(baseline[0].contains("s1 | claude.sonnet-4-5 | 🟢 ожидание | 94%"));
     }
 
     /// Every vendor's IM row carries its lowercase vendor right after the sid
@@ -20765,7 +23506,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(before, vec!["📁 当前项目: alpha\ns2 claude\ns1 claude"]);
+        assert_eq!(before.len(), 1);
+        let s2 = before[0].find("s2 | claude.—").unwrap();
+        let s1 = before[0].find("s1 | claude.—").unwrap();
+        assert!(s2 < s1, "newer s2 remains first: {}", before[0]);
 
         // Tag s1 (the OLDER session) with an outstanding approval.
         let token = "pwaitpin001";
@@ -20782,11 +23526,10 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(
-            after,
-            vec!["📁 当前项目: alpha\n⏳ s1 claude\ns2 claude"],
-            "s1 pinned to the top + ⏳-marked despite being less recent"
-        );
+        assert_eq!(after.len(), 1);
+        let s1 = after[0].find("s1 | claude.— | ⏳ ожидание | —").unwrap();
+        let s2 = after[0].find("s2 | claude.—").unwrap();
+        assert!(s1 < s2, "s1 pinned to the top: {}", after[0]);
     }
 
     /// v0.8.23 review §1.3-D item 9 — the web bare-row feed (`parse_sessions_reply`'s
@@ -20837,8 +23580,8 @@ mod tests {
     /// - in flight + a recent event ⇒ 🔵 working (with elapsed).
     /// - in flight + last event stale past the idle window ⇒ 🔴 STUCK (matching
     ///   the watchdog's "silent for a full window" definition).
-    /// Also asserts model · effort · ctx come from the real `thread_status`,
-    /// and `ctx —` when no context is reported.
+    /// Also asserts model · effort · контекст come from the real `thread_status`,
+    /// and `контекст —` when no context is reported.
     #[tokio::test]
     async fn gateway_status_renders_idle_working_stuck() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -20847,7 +23590,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        // A model + effort + context so the model·effort·ctx tail is exercised.
+        // A model + effort + context so the model·effort·контекст tail is exercised.
         fake.set_status(ThreadStatus {
             model: Some("claude-opus-4-8".into()),
             context: Some(ContextUsage::known(
@@ -20866,22 +23609,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(idle.len(), 1, "one message: {idle:?}");
-        // /status = the CURRENT session deep view (📍 当前会话), NOT the fleet
-        // list. The fake adapter's handle carries no `vendor_uuid` → `resume —`.
+        // /status remains the CURRENT session's card, not the fleet table.
         assert!(
-            idle[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
+            idle[0]
+                .contains("🧭 s1 · alpha · claude\n🟢 ожидание · claude-opus-4-8 · max · ctx 41%"),
             "current-session header: {idle:?}"
-        );
-        assert!(
-            idle[0].contains("claude-opus-4-8 · max · ctx 41% · resume —"),
-            "model·effort·ctx·resume line: {idle:?}"
-        );
-        // Owner req — /status ends by pointing at the full project list with a
-        // live count (this gateway has one project, `alpha`), replacing the old
-        // `/sessions all` cross-project pointer.
-        assert!(
-            idle[0].contains("↓ 所有 1 个项目 → /projects"),
-            "/status footer points at /projects with a count: {idle:?}"
         );
 
         // (2) A turn in flight with a RECENT event → 🔵 working.
@@ -20897,7 +23629,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            working[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔵 working "),
+            working[0].contains("🔵 работает"),
             "working state: {working:?}"
         );
         assert!(
@@ -20924,10 +23656,13 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            stuck[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔴 STUCK "),
+            stuck[0].contains("🔴 ЗАВИСАНИЕ: нет событий "),
             "stuck state: {stuck:?}"
         );
-        assert!(stuck[0].contains("silent"), "silent duration: {stuck:?}");
+        assert!(
+            stuck[0].contains("нет событий 6m"),
+            "silent duration: {stuck:?}"
+        );
 
         // (4) A FRESHLY submitted turn whose `last_event_at` still holds the
         // PREVIOUS turn's last event (the pump only writes that cell) must read
@@ -20944,7 +23679,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            fresh[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔵 working "),
+            fresh[0].contains("🔵 работает"),
             "a just-submitted turn with a pre-turn stale event is working, not stuck: {fresh:?}"
         );
     }
@@ -20954,7 +23689,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (paths, project_dir) = mirror_test_paths(&tmp);
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
         // The owner's own chat(s): named in the bot allowlist ⇒ operator.
         gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
         gateway.enable_project_creation(paths.clone());
@@ -20988,6 +23723,11 @@ mod tests {
             "investigate",
         );
         ccteam_core::progress::append_event(&paths.progress_jsonl("alpha"), &progress).unwrap();
+        fake.set_status(ThreadStatus {
+            model: Some("claude-opus-4-8[1m]".into()),
+            ..Default::default()
+        })
+        .await;
 
         let out = gateway
             .handle_text("mock", "chat-1", "alice", "/status")
@@ -20995,7 +23735,7 @@ mod tests {
             .unwrap();
         assert!(
             out[0].contains(
-                "👥 直接子会话:\n      · s2 · claude · 🟡 working · delegated investigation"
+                "👥 Дочерние (1):\n  • s2 · claude · opus-4-8[1m] · 🟡 работает · delegated investigation"
             ),
             "working child is visible from its root status: {out:?}"
         );
@@ -21071,7 +23811,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            torn[0].contains(&format!("· {child} · claude · 🟡 working ·")),
+            torn[0].contains(&format!("{child} · claude · — · 🟡 работает ·")),
             "a torn line elsewhere in the stream must not blind the child row: {torn:?}"
         );
 
@@ -21090,7 +23830,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            silent[0].contains(&format!("· {child} · claude · 🟡 working ·")),
+            silent[0].contains(&format!("{child} · claude · — · 🟡 работает ·")),
             "an in-flight turn outranks a stream that says nothing: {silent:?}"
         );
 
@@ -21105,7 +23845,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            idle[0].contains(&format!("· {child} · claude · 🟢 idle ·")),
+            idle[0].contains(&format!("{child} · claude · — · 🟢 ожидание ·")),
             "no open turn ⇒ the file verdict stands: {idle:?}"
         );
     }
@@ -21124,12 +23864,87 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
             .unwrap();
-        assert_eq!(
-            out,
-            vec![format!(
-                "🧭 → alpha/s1 (reviewer)\n📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle\n   📁 {}\n   — · — · ctx — · resume —\n   ↓ 所有 1 个项目 → /projects",
+        assert!(
+            out[0].contains(&format!(
+                "🧭 s1 · alpha · claude\n🟢 ожидание · — · — · ctx —\n📁 {}\n\n",
                 proj.path().display()
-            )]
+            )),
+            "status card header changed: {out:?}"
+        );
+        assert!(out[0].contains("Роль: reviewer"), "role missing: {out:?}");
+        assert!(out[0].contains("resume —"), "resume fact missing: {out:?}");
+        assert!(
+            out[0].contains("💰 Расход проекта 24ч: нет данных"),
+            "honest missing ledger state missing: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_status_reads_project_24h_cost_from_progress_ledger() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        ccteam_core::progress::append_event(
+            &paths.progress_jsonl("alpha"),
+            &serde_json::json!({
+                "event": ccteam_harness::execution::progress_bridge::AGENT_DONE,
+                "session_id": "s1",
+                "vendor": "claude",
+                "cost_usd": 1.25,
+                "usage": {"input_tokens": 12_000_000, "output_tokens": 1_100_000},
+                "ts": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .unwrap();
+
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            out[0].contains("💰 Расход проекта 24ч: $1.25 · 13.1M токенов"),
+            "project ledger cost missing: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_status_shows_unknown_cost_and_known_token_volume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        ccteam_core::progress::append_event(
+            &paths.progress_jsonl("alpha"),
+            &serde_json::json!({
+                "event": ccteam_harness::execution::progress_bridge::CHAT_TURN_COMPLETED,
+                "sid": "s1",
+                "turn_id": "turn-1",
+                "vendor": "claude",
+                "model": "claude-fable-5",
+                "usage": {"output_tokens": 1_234},
+                "ts": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .unwrap();
+
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            out[0].contains("💰 Расход проекта 24ч: $— · 1.2k токенов"),
+            "unknown cost must remain unknown while tokens stay visible: {out:?}"
         );
     }
 
@@ -21150,12 +23965,12 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("📍 当前会话 s1 · alpha · claude · — · 🟢 idle"),
-            "roleless → role shows —, vendor still shown: {out:?}"
+            out[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
+            "roleless session remains a usable status card: {out:?}"
         );
         assert!(
-            out[0].contains("— · — · ctx — · resume —"),
-            "statusless + no-uuid → placeholders, never fabricated: {out:?}"
+            out[0].contains("🟢 ожидание · — · — · ctx —"),
+            "statusless fields stay honest placeholders: {out:?}"
         );
     }
 
@@ -21176,7 +23991,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].starts_with("🧭 → alpha/s1 (reviewer)\n📍 当前会话"),
+            out[0].starts_with("🧭 s1 · alpha · claude\n"),
             "leads with the you-are-here header before the existing body: {out:?}"
         );
     }
@@ -21190,12 +24005,11 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
             .unwrap();
-        assert_eq!(out, vec!["no sessions — start one with /new"]);
+        assert_eq!(out, vec!["Нет сессий — создайте через /new"]);
     }
 
-    /// v0.8.20 /status v2 ③ — the account-usage line renders 5h / weekly /
-    /// credits with reset hints, a ⚠ on a `warning` weekly, and the
-    /// subscription tail; an all-None usage renders the empty string.
+    /// /status account usage renders only vendor-reported windows, reset hints,
+    /// and the subscription tail; an all-None usage renders no line.
     #[test]
     fn format_account_usage_renders_windows_resets_and_warning() {
         let u = AccountUsage {
@@ -21207,12 +24021,19 @@ mod tests {
             weekly_severity: Some("warning".into()),
             credits_pct: Some(46),
         };
-        let s = format_account_usage(&u);
-        assert!(s.contains("5h 17% (→19:00)"), "{s}");
-        assert!(s.contains("周 78%⚠ (→06/29)"), "{s}");
-        assert!(s.contains("额度 46%"), "{s}");
+        let s = format_account_usage(&u).unwrap();
+        assert!(s.contains("5h 17% (19:00)"), "{s}");
+        assert!(s.contains("неделя 78%⚠ (06/29)"), "{s}");
+        assert!(s.contains("лимит 46%"), "{s}");
         assert!(s.ends_with("· max"), "{s}");
-        assert_eq!(format_account_usage(&AccountUsage::default()), "");
+        assert_eq!(format_account_usage(&AccountUsage::default()), None);
+    }
+
+    #[test]
+    fn format_token_volume_uses_one_decimal_k_and_m_units() {
+        assert_eq!(format_token_volume(999), "999");
+        assert_eq!(format_token_volume(1_234), "1.2k");
+        assert_eq!(format_token_volume(13_100_000), "13.1M");
     }
 
     /// `/status` running-task block — background workflows (`local_workflow`)
@@ -21235,7 +24056,7 @@ mod tests {
         // Subagents only → the pre-workflow header, kind from subagent_type.
         let subs = [task("a1", "code-reviewer", "review auth", "local_agent")];
         let s = format_running_tasks(&subs);
-        assert!(s.contains("在跑 subagent (1):"), "{s}");
+        assert!(s.contains("Выполняется: subagent (1)"), "{s}");
         assert!(s.contains("code-reviewer「review auth」"), "{s}");
         // Mixed → both kinds counted in the header; the workflow row is labeled
         // "workflow" even though its subagent_type is empty.
@@ -21244,13 +24065,16 @@ mod tests {
             task("w1", "", "audit the codebase", "local_workflow"),
         ];
         let s = format_running_tasks(&mixed);
-        assert!(s.contains("在跑 subagent (1) + workflow (1):"), "{s}");
+        assert!(
+            s.contains("Выполняется: subagent (1) + workflow (1)"),
+            "{s}"
+        );
         assert!(s.contains("subagent「find bugs」"), "{s}");
         assert!(s.contains("workflow「audit the codebase」"), "{s}");
         // Workflows only (e.g. an idle session with a background run).
         let wf = [task("w1", "", "migrate call sites", "local_workflow")];
         let s = format_running_tasks(&wf);
-        assert!(s.contains("在跑 workflow (1):"), "{s}");
+        assert!(s.contains("Выполняется: workflow (1)"), "{s}");
         // Background shells (`local_bash` — Bash run_in_background / Monitor)
         // get their own bucket + row label; an idle session with an in-flight
         // `make test` renders it instead of a bare `🟢 idle`.
@@ -21260,9 +24084,12 @@ mod tests {
             task("a1", "code-reviewer", "review auth", "local_agent"),
         ];
         let s = format_running_tasks(&bg);
-        assert!(s.contains("在跑 subagent (1) + 后台任务 (2):"), "{s}");
-        assert!(s.contains("后台「make test full suite」"), "{s}");
-        assert!(s.contains("后台「watch /tmp/maketest.log」"), "{s}");
+        assert!(
+            s.contains("Выполняется: subagent (1) + фоновые задачи (2)"),
+            "{s}"
+        );
+        assert!(s.contains("фон「make test full suite」"), "{s}");
+        assert!(s.contains("фон「watch /tmp/maketest.log」"), "{s}");
     }
 
     /// The outlives-turn vocabulary the working-signal check shares with the
@@ -21313,13 +24140,13 @@ mod tests {
             .handle_text("telegram", "tg-2", "bob", "/status")
             .await
             .unwrap();
-        assert_eq!(foreign, vec!["no sessions — start one with /new"]);
+        assert_eq!(foreign, vec!["Нет сессий — создайте через /new"]);
         // The web console (shared pool) DOES NOT see an IM-created session.
         let web = gateway
             .handle_text("web", "web-chat", "web-user", "/status")
             .await
             .unwrap();
-        assert_eq!(web, vec!["no sessions — start one with /new"]);
+        assert_eq!(web, vec!["Нет сессий — создайте через /new"]);
         // The owner sees its own session.
         let owner = gateway
             .handle_text("telegram", "tg-1", "rob", "/status")
@@ -21327,16 +24154,12 @@ mod tests {
             .unwrap();
         assert_eq!(owner.len(), 1);
         assert!(
-            owner[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
+            owner[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
             "got: {owner:?}"
         );
     }
 
-    /// v0.8.19 `/status` — when the session's handle carries a stream-json
-    /// `vendor_uuid` (the real Anthropic `--resume` id), `/status` surfaces it
-    /// verbatim next to the sid as `resume <uuid>` (not the `resume —`
-    /// fallback). Mirrors how the live daemon's persisted handle holds the id
-    /// across restarts.
+    /// The expandable `/status` detail retains the vendor's real resume UUID.
     #[tokio::test]
     async fn gateway_status_shows_real_vendor_resume_uuid() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -21357,13 +24180,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains(&format!("resume {uuid}")),
-            "the real --resume uuid must show in the deep view: {out:?}"
-        );
-        assert!(
-            out[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
+            out[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
             "got: {out:?}"
         );
+        assert!(out[0].contains(uuid), "resume UUID missing from: {out:?}");
     }
 
     /// v0.8.19 `/status` — registered in the command set + dispatches via
@@ -21382,7 +24202,7 @@ mod tests {
             .unwrap();
         // Dispatched as a command (the friendly empty-fleet reply), and the fake
         // adapter never received a turn submission.
-        assert_eq!(out, vec!["no sessions — start one with /new"]);
+        assert_eq!(out, vec!["Нет сессий — создайте через /new"]);
         assert!(
             fake.submissions.lock().await.is_empty(),
             "/status must not submit a turn"
@@ -21562,7 +24382,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            format!("{guest:#}").contains("绑定"),
+            format!("{guest:#}").contains("не привязан к ccteam"),
             "guest is told to get bound: {guest:#}"
         );
 
@@ -21779,7 +24599,7 @@ mod tests {
             .change_project(&tenant, "admin-proj")
             .expect_err("tenant must not /cd into the admin's project");
         assert!(
-            err.to_string().contains("unknown project"),
+            err.to_string().contains("Неизвестный проект"),
             "expected an unknown-project error, got {err}"
         );
         assert!(
@@ -21999,7 +24819,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             denied,
-            vec!["unknown session for this chat: s1\n↓ 查看状态 → /status".to_string()]
+            vec!["Сессия s1 недоступна этому чату\n↓ Статус → /status".to_string()]
         );
         assert!(
             !gateway.session_views().iter().any(|v| v.sid == "s1"),
@@ -22013,7 +24833,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             resumed,
-            vec!["resumed session s1\n↓ 查看状态 → /status".to_string()]
+            vec!["Сессия s1 возобновлена\n↓ Статус → /status".to_string()]
         );
         assert!(
             gateway.session_views().iter().any(|v| v.sid == "s1"),
@@ -22097,7 +24917,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             used,
-            vec!["using session s1\n↓ 查看状态 → /status".to_string()]
+            vec!["Используется сессия s1\n↓ Статус → /status".to_string()]
         );
     }
 
@@ -22124,7 +24944,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             used,
-            vec!["using session s2\n↓ 查看状态 → /status".to_string()],
+            vec!["Используется сессия s2\n↓ Статус → /status".to_string()],
             "ambiguous role resolves to the most-recently-active session"
         );
     }
@@ -22195,7 +25015,10 @@ mod tests {
             .handle_text("mock", "chat-2", "bob", "/sessions")
             .await
             .unwrap();
-        assert_eq!(seen, vec!["📁 当前项目: alpha\n暂无会话 —— /new 开一个"]);
+        assert_eq!(
+            seen,
+            vec!["📁 Текущий проект: alpha\nНет сессий — создайте через /new"]
+        );
 
         // …and cannot ADDRESS it: /use is refused for a non-owner and reads as
         // unknown (no existence leak).
@@ -22205,7 +25028,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             used,
-            vec!["unknown session for this chat: s1\n↓ 查看状态 → /status"]
+            vec!["Сессия s1 недоступна этому чату\n↓ Статус → /status"]
         );
 
         // The OWNER still sees + uses its own session.
@@ -22213,12 +25036,16 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(owner_sees, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(owner_sees.len(), 1);
+        assert!(owner_sees[0].contains("s1 | claude.—"));
         let owner_uses = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(owner_uses, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(
+            owner_uses,
+            vec!["Используется сессия s1\n↓ Статус → /status"]
+        );
     }
 
     /// v0.8.18 柱2 档0 (regression fix) — the web console is a SHARED operator
@@ -22256,12 +25083,13 @@ mod tests {
             "/sessions",
         )
         .await;
-        assert_eq!(seen, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].contains("s1 | claude.—"));
         let used = gateway
             .handle_text("telegram", "339498819", "rob", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(used, vec!["Используется сессия s1\n↓ Статус → /status"]);
     }
 
     /// v0.8.20 web↔IM convergence — a tenant's web console and their OWN IM bot
@@ -22337,11 +25165,11 @@ mod tests {
         )
         .await;
         // Isolated down to the BANNER: ubbb owns nothing, so it reads
-        // "(无项目)" instead of borrowing uaaa's slug — the project name of
+        // "(нет проекта)" instead of borrowing uaaa's slug — the project name of
         // another tenant used to leak here through the default-project fallback.
         assert_eq!(
             other,
-            vec!["📁 当前项目: (无项目)\n暂无会话 —— /new 开一个"],
+            vec!["📁 Текущий проект: (нет проекта)\nНет сессий — создайте через /new"],
             "ubbb's bot is isolated from uaaa"
         );
     }
@@ -22393,7 +25221,7 @@ mod tests {
         // project (`ops`), never the tenant's `alpha`.
         assert_eq!(
             seen,
-            vec!["📁 当前项目: ops\n暂无会话 —— /new 开一个"],
+            vec!["📁 Текущий проект: ops\nНет сессий — создайте через /new"],
             "a tenant's web session must not reach the admin/global IM bot: {seen:?}"
         );
 
@@ -22406,7 +25234,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             used,
-            vec!["unknown session for this chat: s1\n↓ 查看状态 → /status"]
+            vec!["Сессия s1 недоступна этому чату\n↓ Статус → /status"]
         );
 
         // Another TENANT's web console is equally blind to it.
@@ -22513,16 +25341,18 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/projects")
             .await
             .unwrap();
-        assert_eq!(projects, vec!["alpha\nbeta"]);
+        assert_eq!(projects.len(), 1);
+        assert!(projects[0].contains("alpha | "));
+        assert!(projects[0].contains("beta | "));
 
         let cd = gateway
             .handle_text("mock", "chat-1", "alice", "/cd beta")
             .await
             .unwrap();
         assert_eq!(
-            cd,
-            vec!["project set to beta (next message starts a session there)\n↓ 本项目会话 → /sessions"]
-        );
+           cd,
+            vec!["Выбран проект beta (следующее сообщение создаст там сессию)\n↓ Сессии проекта → /sessions"]
+       );
 
         gateway
             .handle_text("mock", "chat-1", "alice", "/new codex api")
@@ -22538,13 +25368,18 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 当前项目: beta\ns2 claude\ns1 codex"]);
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].contains("s2 | claude.—"));
+        assert!(sessions[0].contains("s1 | codex.—"));
 
         let use_first = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(use_first, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(
+            use_first,
+            vec!["Используется сессия s1\n↓ Статус → /status"]
+        );
         let replies = gateway
             .handle_text("mock", "chat-1", "alice", "ping")
             .await
@@ -22612,15 +25447,22 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions all")
             .await
             .unwrap();
-        assert_eq!(
-            sessions,
-            vec!["📁 当前项目: beta\ns4 claude\ns3 codex\ns2 codex\ns1 claude"]
-        );
+        assert_eq!(sessions.len(), 1);
+        for row in [
+            "s4 | claude.—",
+            "s3 | codex.—",
+            "s2 | codex.—",
+            "s1 | claude.—",
+        ] {
+            assert!(sessions[0].contains(row), "missing {row}: {}", sessions[0]);
+        }
         let projects = gateway
             .handle_text("mock", "chat-1", "alice", "/projects")
             .await
             .unwrap();
-        assert_eq!(projects, vec!["alpha\nbeta"]);
+        assert_eq!(projects.len(), 1);
+        assert!(projects[0].contains("alpha | "));
+        assert!(projects[0].contains("beta | "));
 
         let alpha_reply = gateway
             .handle_text("mock", "chat-1", "alice", "@reviewer alpha ping")
@@ -22788,7 +25630,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             replies,
-            vec!["已切换 model → opus（live）\n↓ 查看状态 → /status"]
+            vec!["已切换 model → opus（live）\n↓ Статус → /status"]
         );
     }
 
@@ -23085,14 +25927,16 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 当前项目: beta\ns2 claude\ns1 claude"]);
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].contains("s2 | claude.—"));
+        assert!(sessions[0].contains("s1 | claude.—"));
 
         assert_eq!(
             restored
                 .handle_text("mock", "chat-1", "alice", "/use s1")
                 .await
                 .unwrap(),
-            vec!["using session s1\n↓ 查看状态 → /status"]
+            vec!["Используется сессия s1\n↓ Статус → /status"]
         );
         let reply_s1 = restored
             .handle_text("mock", "chat-1", "alice", "after restart")
@@ -23105,7 +25949,7 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/use s2")
                 .await
                 .unwrap(),
-            vec!["using session s2\n↓ 查看状态 → /status"]
+            vec!["Используется сессия s2\n↓ Статус → /status"]
         );
         let reply_s2 = restored
             .handle_text("mock", "chat-1", "alice", "after restart two")
@@ -23156,14 +26000,15 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1 claude"]);
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].contains("s1 | claude.—"));
 
         assert_eq!(
             restored
                 .handle_text("mock", "chat-1", "alice", "/use s1")
                 .await
                 .unwrap(),
-            vec!["using session s1\n↓ 查看状态 → /status"]
+            vec!["Используется сессия s1\n↓ Статус → /status"]
         );
         let reply = restored
             .handle_text("mock", "chat-1", "alice", "after routing.json loss")
@@ -23489,7 +26334,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             ambiguous,
-            vec!["Multiple bots in this chat. Specify one: @lead @reviewer"]
+            vec!["В этом чате несколько ботов. Укажите одного: @lead @reviewer"]
         );
 
         let reply = gateway
@@ -23544,7 +26389,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reply.iter().any(|r| r.contains("project set to dev-gamma")),
+            reply.iter().any(|r| r.contains("Выбран проект dev-gamma")),
             "expected /cd to resolve the config-only project, got {reply:?}"
         );
     }
@@ -23623,7 +26468,8 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(before, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(before.len(), 1);
+        assert!(before[0].contains("s1 | claude.—"));
 
         // /cd to beta, where no session exists yet, clears the active session.
         let cd = gateway
@@ -23632,7 +26478,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             cd,
-            vec!["project set to beta (next message starts a session there)\n↓ 本项目会话 → /sessions"]
+            vec!["Выбран проект beta (следующее сообщение создаст там сессию)\n↓ Сессии проекта → /sessions"]
         );
 
         // The next plain message must route into a beta session, not back s1.
@@ -23650,12 +26496,12 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions all")
             .await
             .unwrap();
-        // s2's first plain message ("where am i") auto-titles it, but the title
-        // now rides the switch BUTTON, not the text row (see
-        // `session_switch_options`); s1 never sent a plain message, so it is
-        // untitled either way. s2 is roleless → empty role field
-        // (`s2 claude.beta`).
-        assert_eq!(after, vec!["📁 当前项目: beta\ns2 claude\ns1 claude"]);
+        // s2's first plain message ("where am i") auto-titles it; s1 never
+        // sent a plain message, so it is untitled either way. s2 is
+        // roleless → empty role field (`s2 claude.beta`).
+        assert_eq!(after.len(), 1);
+        assert!(after[0].contains("s2 | claude.—"));
+        assert!(after[0].contains("s1 | claude.—"));
     }
 
     #[tokio::test]
@@ -23687,7 +26533,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             cd_back,
-            vec!["project set to alpha (switched to s1)\n↓ 本项目会话 → /sessions"]
+            vec!["Выбран проект alpha (переключено на s1)\n↓ Сессии проекта → /sessions"]
         );
 
         let reply = gateway
@@ -23801,13 +26647,13 @@ mod tests {
         let usage = gateway
             .handle_text("mock", "chat-1", "alice", "/newproject demo")
             .await;
-        assert!(format!("{:#}", usage.unwrap_err()).contains("用法"));
+        assert!(format!("{:#}", usage.unwrap_err()).contains("Использование"));
         // Valid args, but project creation is not configured on this gateway.
         let err = gateway
             .handle_text("mock", "chat-1", "alice", "/newproject demo /tmp/demo")
             .await
             .expect_err("expected not-configured error");
-        assert!(format!("{err:#}").contains("not configured"));
+        assert!(format!("{err:#}").contains("не настроено"));
         assert!(Gateway::is_gateway_command("/newproject demo /x"));
     }
 
@@ -23817,7 +26663,13 @@ mod tests {
             expand_project_path("/srv/code/app").unwrap(),
             std::path::PathBuf::from("/srv/code/app")
         );
-        assert!(expand_project_path("relative/dir").is_err());
+        let relative = expand_project_path("relative/dir").unwrap_err().to_string();
+        assert!(
+            relative.contains("Путь проекта для /newproject должен быть абсолютным"),
+            "{relative}"
+        );
+        assert!(relative.contains("relative/dir"), "{relative}");
+        assert!(relative.contains("~"), "{relative}");
         let home = expand_project_path("~/code/app").unwrap();
         assert!(home.is_absolute());
         assert!(home.ends_with("code/app"));
@@ -23861,7 +26713,7 @@ mod tests {
             .handle_text("web", "web-chat", "web-user", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["unknown session for this chat: s1"]);
+        assert_eq!(used, vec!["Сессия s1 недоступна этому чату"]);
 
         // A different Telegram chat in the same default project also does NOT
         // see it (the same-project sharing leak is gone). On Telegram the list
@@ -23875,7 +26727,10 @@ mod tests {
             "/sessions",
         )
         .await;
-        assert_eq!(other, vec!["📁 当前项目: alpha\n暂无会话 —— /new 开一个"]);
+        assert_eq!(
+            other,
+            vec!["📁 Текущий проект: alpha\nНет сессий — создайте через /new"]
+        );
 
         // The OWNER (tg-1) still sees AND addresses its own session — isolation
         // doesn't break the owner's own flow.
@@ -23889,14 +26744,17 @@ mod tests {
         )
         .await;
         assert!(
-            owner_sees.iter().any(|r| r.contains("s1 claude")),
+            owner_sees.iter().any(|r| r.contains("s1 | claude.—")),
             "owner should see its own session: {owner_sees:?}"
         );
         let owner_uses = gateway
             .handle_text("telegram", "tg-1", "rob", "/use s1")
             .await
             .unwrap();
-        assert_eq!(owner_uses, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(
+            owner_uses,
+            vec!["Используется сессия s1\n↓ Статус → /status"]
+        );
     }
 
     #[tokio::test]
@@ -23919,7 +26777,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude assistant")
             .await
             .unwrap();
-        assert_eq!(first, vec!["created session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(first, vec!["Создана сессия s1\n↓ Статус → /status"]);
         // Same project + role → a SECOND, distinct session s2 (no reuse).
         let again = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude assistant")
@@ -23927,7 +26785,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             again,
-            vec!["created session s2\n↓ 查看状态 → /status"],
+            vec!["Создана сессия s2\n↓ Статус → /status"],
             "F1: a repeat /new of the same role must mint a NEW sid, not reuse s1"
         );
         // A third /new (different role) → s3.
@@ -23935,7 +26793,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        assert_eq!(other_role, vec!["created session s3\n↓ 查看状态 → /status"]);
+        assert_eq!(other_role, vec!["Создана сессия s3\n↓ Статус → /status"]);
 
         // Three sessions tracked — two same-role (s1, s2) + one (s3).
         let listing = gateway
@@ -23943,7 +26801,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            listing[0].lines().skip(1).count(),
+            listing[0]
+                .lines()
+                .filter(|line| {
+                    line.starts_with('s') && line.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
+                })
+                .count(),
             3,
             "expected 3 distinct sessions (no dedup): {}",
             listing[0]
@@ -23973,7 +26836,7 @@ mod tests {
             .await
             .expect_err("/role with no active session should error");
         assert!(
-            format!("{no_session:#}").contains("活动会话"),
+            format!("{no_session:#}").contains("активная сессия"),
             "expected the no-active-session hint: {no_session:#}"
         );
 
@@ -23995,7 +26858,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             switched,
-            vec!["switched session s1 to role reviewer\n↓ 查看状态 → /status"]
+            vec!["Сессия s1 переключена на роль reviewer\n↓ Статус → /status"]
         );
 
         // A follow-up turn now routes to the reviewer pane under the SAME sid.
@@ -24012,20 +26875,21 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(listing.len(), 1);
+        assert!(listing[0].contains("s1 | claude.—"));
 
         // `/use s1` still resolves the same (now-reviewer) session.
         let used = gateway
             .handle_text("mock", "chat-1", "alice", "/use s1")
             .await
             .unwrap();
-        assert_eq!(used, vec!["using session s1\n↓ 查看状态 → /status"]);
+        assert_eq!(used, vec!["Используется сессия s1\n↓ Статус → /status"]);
 
         // /help advertises /role.
         assert!(
-            render_help().contains("/role"),
+            render_help().plain.contains("/role"),
             "render_help should list /role: {}",
-            render_help()
+            render_help().plain
         );
     }
 
@@ -24066,7 +26930,7 @@ mod tests {
             .expect_err("/role to a missing role should error");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("role 不存在") && msg.contains("ghost.md"),
+            msg.contains("Роль не найдена") && msg.contains("ghost.md"),
             "expected the missing-role hint naming the file: {msg}"
         );
         // No teardown + re-spawn happened on the bad role.
@@ -24082,7 +26946,8 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert_eq!(listing.len(), 1);
+        assert!(listing[0].contains("s1 | claude.—"));
         // And a follow-up turn still routes to the SAME live `cto` pane.
         let still_cto = gateway
             .handle_text("mock", "chat-1", "alice", "still here?")
@@ -24097,7 +26962,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             switched,
-            vec!["switched session s1 to role reviewer\n↓ 查看状态 → /status"]
+            vec!["Сессия s1 переключена на роль reviewer\n↓ Статус → /status"]
         );
         assert_eq!(
             fake.starts.load(Ordering::SeqCst),
@@ -24125,7 +26990,7 @@ mod tests {
             .await
             .expect_err("/rename with no active session should error");
         assert!(
-            format!("{err:#}").contains("活动会话"),
+            format!("{err:#}").contains("активная сессия"),
             "expected the no-active-session hint: {err:#}"
         );
     }
@@ -24148,7 +27013,7 @@ mod tests {
             .await
             .expect_err("/rename with a blank title should error");
         assert!(
-            format!("{err:#}").contains("用法"),
+            format!("{err:#}").contains("Использование"),
             "expected the usage hint: {err:#}"
         );
     }
@@ -24179,28 +27044,22 @@ mod tests {
         assert_eq!(
             renamed,
             vec![
-                "已重命名 s1 →「my custom title」\n· 仅 ccteam 侧(claude 无会话标题接口)\
-                 \n↓ 本项目会话 → /sessions"
+                "Переименована s1 → «my custom title»\n· Только в ccteam (claude не поддерживает заголовки сессий)\
+                 \n↓ Сессии проекта → /sessions"
             ]
         );
 
-        // The title moved off the /sessions text row onto the switch button.
+        // The compact table stays terse while the switch button carries a
+        // capped title to disambiguate otherwise identical sessions.
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing, vec!["📁 当前项目: alpha\ns1 claude"]);
-        // …and the rename SURFACES on the picker button.
+        assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | —"));
         let chat = ChatKey::new("mock", "chat-1", "alice");
-        let s1_button = |g: &Gateway| {
-            g.session_switch_options(&chat, false)
-                .into_iter()
-                .find(|o| o.id == "s1")
-                .map(|o| o.label.trim_end_matches('\u{2800}').to_string())
-        };
         assert_eq!(
-            s1_button(&gateway).as_deref(),
-            Some("✓ s1 claude (my custom title)")
+            gateway.render_sessions(&chat, false).await.button_rows[0][0].label,
+            "▶ s1 claude · my custom t…"
         );
 
         // A later plain message must NOT clobber the rename via auto-title.
@@ -24212,10 +27071,12 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(listing2, vec!["📁 当前项目: alpha\ns1 claude"]);
+        assert!(listing2[0].contains("s1 | claude.— |"));
         assert_eq!(
-            s1_button(&gateway).as_deref(),
-            Some("✓ s1 claude (my custom title)"),
+            gateway
+                .session_title(gateway.sessions.get("s1").unwrap())
+                .as_deref(),
+            Some("my custom title"),
             "an explicit /rename must survive a later message (sticky user title)"
         );
     }
@@ -24267,7 +27128,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reply[0].starts_with("已重命名 s1 →「the older one」"),
+            reply[0].starts_with("Переименована s1 → «the older one»"),
             "receipt must name the targeted sid: {:?}",
             reply
         );
@@ -24300,7 +27161,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reply[0].starts_with("unknown session for this chat: s1"),
+            reply[0].starts_with("Сессия s1 недоступна этому чату"),
             "{:?}",
             reply
         );
@@ -24309,7 +27170,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            unknown[0].starts_with("unknown session for this chat: s99"),
+            unknown[0].starts_with("Сессия s99 недоступна этому чату"),
             "a foreign sid and an unknown sid must read identically: {:?}",
             unknown
         );
@@ -24341,7 +27202,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reply[0].starts_with("已重命名 s1 →「archived work」"),
+            reply[0].starts_with("Переименована s1 → «archived work»"),
             "a stopped session must rename like a live one: {:?}",
             reply
         );
@@ -24374,7 +27235,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reply[0].contains("已同步到 claude 自己的会话标题"),
+            reply[0].contains("Синхронизировано с заголовком сессии claude"),
             "a real push must be reported as synced: {:?}",
             reply
         );
@@ -24391,7 +27252,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            again[0].starts_with("已重命名 s1 「ship it」→「ship it twice」"),
+            again[0].starts_with("Переименована s1: «ship it» → «ship it twice»"),
             "the receipt must show the previous title: {:?}",
             again
         );
@@ -24515,7 +27376,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replies, vec!["this choice has expired".to_string()]);
+        assert_eq!(replies, vec!["Этот выбор больше недоступен".to_string()]);
         assert!(shared.lock().await.is_empty());
     }
 
@@ -24742,7 +27603,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(replies, vec!["this choice has expired".to_string()]);
+        assert_eq!(replies, vec!["Этот выбор больше недоступен".to_string()]);
         assert!(
             shared.lock().await.is_empty(),
             "lapsed pending drained, not resolved"
@@ -24760,6 +27621,7 @@ mod tests {
     async fn delegation_gateway_with_factory(
         project_dir: &std::path::Path,
         factory: crate::daemon::AdapterFactory,
+        start_notifier: bool,
     ) -> Arc<tokio::sync::Mutex<Gateway>> {
         let mut gw = Gateway::new_with_factory(factory, "alpha", project_dir);
         gw.register_project("alpha", project_dir);
@@ -24769,12 +27631,10 @@ mod tests {
         gw.set_event_sink(etx);
         tokio::spawn(async move { while erx.recv().await.is_some() {} });
         let gateway = Arc::new(tokio::sync::Mutex::new(gw));
-        // Production runs reconciliation before draining live signals. Finish
-        // that empty-project startup phase before returning the fixture too,
-        // so a newly-created watch cannot race a historical replay.
-        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
-        let notifier_gateway = Arc::clone(&gateway);
-        tokio::spawn(Gateway::run_delegation_notifier(notifier_gateway, drx));
+        if start_notifier {
+            let notifier_gateway = Arc::clone(&gateway);
+            tokio::spawn(Gateway::run_delegation_notifier(notifier_gateway, drx));
+        }
         gateway
     }
 
@@ -24789,7 +27649,17 @@ mod tests {
             Arc::new(FakeAdapter::new(vendor).with_turn_boundary())
                 as Arc<dyn HarnessAdapter + Send + Sync>
         });
-        delegation_gateway_with_factory(project_dir, factory).await
+        delegation_gateway_with_factory(project_dir, factory, true).await
+    }
+
+    async fn delegation_gateway_without_notifier(
+        project_dir: &std::path::Path,
+    ) -> Arc<tokio::sync::Mutex<Gateway>> {
+        let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
+            Arc::new(FakeAdapter::new(vendor).with_turn_boundary())
+                as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        delegation_gateway_with_factory(project_dir, factory, false).await
     }
 
     /// e2e: an Ambient spawn records the parent lineage + trigger + title; a
@@ -24867,8 +27737,8 @@ mod tests {
         for _ in 0..200 {
             let turns = read_all_turns(&project_dir, &parent_sid).unwrap_or_default();
             if turns.iter().any(|t| {
-                t.user.contains("[ccteam] delegated session")
-                    || t.assistant.contains("[ccteam] delegated session")
+                t.user.contains("[ccteam] делегированная сессия")
+                    || t.assistant.contains("[ccteam] делегированная сессия")
             }) {
                 notified = true;
                 break;
@@ -24908,7 +27778,7 @@ mod tests {
         ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
             .unwrap_or_default()
             .into_iter()
-            .filter(|t| t.user.contains("[ccteam] delegated session"))
+            .filter(|t| t.user.contains("[ccteam] делегированная сессия"))
             .collect()
     }
 
@@ -24925,7 +27795,7 @@ mod tests {
             };
             Arc::new(fake) as Arc<dyn HarnessAdapter + Send + Sync>
         });
-        let gateway = delegation_gateway_with_factory(&project_dir, factory).await;
+        let gateway = delegation_gateway_with_factory(&project_dir, factory, true).await;
 
         let (parent_sid, child_sid) = {
             let mut gw = gateway.lock().await;
@@ -24987,7 +27857,7 @@ mod tests {
         assert!(
             notification
                 .user
-                .starts_with("[ccteam] [delegation completed with VENDOR ERROR]"),
+                .starts_with("[ccteam] [делегирование завершено с ОШИБКОЙ ПОСТАВЩИКА]"),
             "vendor-fatal notification must lead with an explicit marker: {}",
             notification.user
         );
@@ -25096,14 +27966,14 @@ mod tests {
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
         assert_eq!(notes.len(), 1, "exactly ONE notification per vendor turn");
         assert!(
-            notes[0]
-                .user
-                .contains("is now IDLE, waiting for the next dispatch"),
+            notes[0].user.contains("ожидает следующую задачу"),
             "notification states the child went idle: {}",
             notes[0].user
         );
         assert!(
-            notes[0].user.contains("3 interim note(s)"),
+            notes[0]
+                .user
+                .contains("3 промежуточных сообщения этого запуска остались в журнале"),
             "notification folds the interim count: {}",
             notes[0].user
         );
@@ -25238,7 +28108,7 @@ mod tests {
     async fn delegation_all_and_off_modes() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().to_path_buf();
-        let gateway = delegation_gateway(&project_dir).await;
+        let gateway = delegation_gateway_without_notifier(&project_dir).await;
 
         let (parent_sid, child_sid) = {
             let mut gw = gateway.lock().await;
@@ -25293,7 +28163,7 @@ mod tests {
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
         assert_eq!(notes.len(), 1, "all-mode narration remains ledger-only");
-        assert!(notes[0].user.contains("is now IDLE"));
+        assert!(notes[0].user.contains("ожидает следующую задачу"));
 
         // `off` mode: nothing notifies, but the boundary still lands
         // delegation_completed in progress.jsonl.
@@ -25542,7 +28412,7 @@ mod tests {
         use ccteam_harness::execution::turns_mirror::{append_turn, read_all_turns, TurnRecord};
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().to_path_buf();
-        let gateway = delegation_gateway(&project_dir).await;
+        let gateway = delegation_gateway_without_notifier(&project_dir).await;
 
         // A live parent to receive the notification.
         let parent_sid = {
@@ -25600,7 +28470,7 @@ mod tests {
             read_all_turns(dir, psid)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| t.user.contains("[ccteam] delegated session"))
+                .filter(|t| t.user.contains("[ccteam] делегированная сессия"))
                 .count()
         };
         let mut delivered = 0;
@@ -25635,7 +28505,7 @@ mod tests {
         use ccteam_harness::execution::turns_mirror::{append_turn, read_all_turns, TurnRecord};
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().to_path_buf();
-        let gateway = delegation_gateway(&project_dir).await;
+        let gateway = delegation_gateway_without_notifier(&project_dir).await;
 
         let parent_sid = {
             let mut gw = gateway.lock().await;
@@ -25688,7 +28558,7 @@ mod tests {
             read_all_turns(dir, psid)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| t.user.contains("[ccteam] delegated session"))
+                .filter(|t| t.user.contains("[ccteam] делегированная сессия"))
                 .collect::<Vec<_>>()
         };
         let mut got: Vec<TurnRecord> = vec![];
@@ -25705,7 +28575,9 @@ mod tests {
             "the folded notification carries the LATEST text: {}",
             got[0].user
         );
-        assert!(got[0].user.contains("2 interim note(s)"));
+        assert!(got[0]
+            .user
+            .contains("2 промежуточных сообщения этого запуска остались в журнале"));
 
         Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -25716,8 +28588,8 @@ mod tests {
         );
     }
 
-    /// `/sessions` renders a delegation tree: children indented `└─ ` under
-    /// their parent; a non-local host + title annotate the row.
+    /// `/sessions` renders the visible delegation tree without dropping the
+    /// priority ordering among siblings.
     #[tokio::test]
     async fn delegation_sessions_tree_indents_children() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -25762,17 +28634,19 @@ mod tests {
         // Web chat drives the fleet (`all` scope, own-pool visibility).
         let out = gw
             .render_sessions(&ChatKey::new("mock", "chat-1", "alice"), true)
-            .await;
-        // Parent row precedes the indented child row (roleless → `sid claude`).
-        let pline = format!("{parent} claude");
-        let cline = format!("└─ {child} claude");
+            .await
+            .plain;
+        // A visible parent roots the child regardless of its newer recency;
+        // the child keeps its compact row but gains a delegation indent.
+        let pline = format!("{parent} | claude.— | 🟢 ожидание | —");
+        let cline = format!("└─ {child} | claude.— | 🟢 ожидание | —");
         let pi = out
             .find(&pline)
             .unwrap_or_else(|| panic!("parent row: {out}"));
         let ci = out
             .find(&cline)
-            .unwrap_or_else(|| panic!("indented child row: {out}"));
-        assert!(pi < ci, "child indented under parent:\n{out}");
+            .unwrap_or_else(|| panic!("child row: {out}"));
+        assert!(pi < ci, "parent must precede its indented child:\n{out}");
     }
 
     /// `ancestor_chain` (the stop-descendant + cycle basis): a child's chain
@@ -25943,7 +28817,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(created[0].contains("scheduled d1 → s1"), "{created:?}");
+        assert!(created[0].contains("Отложено d1 → s1"), "{created:?}");
 
         let listed = gateway
             .handle_text("mock", "chat-1", "alice", "/inbox")
@@ -25956,7 +28830,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/inbox cancel d1")
             .await
             .unwrap();
-        assert_eq!(cancelled, vec!["cancelled d1"]);
+        assert_eq!(cancelled, vec!["Отложенное сообщение d1 отменено"]);
         assert!(gateway.scheduled_items_for_sid("s1").unwrap().is_empty());
     }
 
@@ -26144,7 +29018,7 @@ mod tests {
             .fail_reason
             .as_deref()
             .unwrap()
-            .contains("older than 24 hours"));
+            .contains("Отложенная отправка просрочена более чем на 24 часа"));
         assert!(fake.submissions.lock().await.is_empty());
 
         gateway

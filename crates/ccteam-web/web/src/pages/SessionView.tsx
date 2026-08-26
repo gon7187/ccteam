@@ -26,7 +26,7 @@ import { Markdown } from "../components/Markdown";
 import { TerminalView } from "../components/TerminalView";
 import { VendorChip } from "../components/VendorChip";
 import { foldSessionLiveness, useSessionEvents } from "../hooks/useSessionEvents";
-import { makeT, type Lang } from "../lib/i18n";
+import { makeT, tr, WEB_LOCALE, type Lang } from "../lib/i18n";
 import { defaultDraft, normalizeDraft, vendorSpec, type ComposerDraft } from "../lib/vendors";
 import {
   getHistory,
@@ -80,7 +80,7 @@ export function RowTime({ ts, lang }: { ts?: string; lang: Lang }) {
   const when = new Date(ts);
   const parts = rowTimeParts(ts, new Date());
   if (!parts) return null;
-  const locale = lang === "en" ? "en-US" : "zh-CN";
+  const locale = WEB_LOCALE[lang];
   const text = when.toLocaleString(locale, {
     ...(parts.date
       ? parts.year
@@ -568,7 +568,7 @@ export default function SessionView({
 
       {showTerminal && session?.project ? (
         <div className="term-wrap">
-          <TerminalView slug={session.project} sid={sid} className="flex-1 min-h-0" />
+          <TerminalView lang={lang} slug={session.project} sid={sid} className="flex-1 min-h-0" />
         </div>
       ) : (
         <>
@@ -588,13 +588,7 @@ export default function SessionView({
                     disabled={historyPage.loadingEarlier}
                     onClick={loadEarlier}
                   >
-                    {historyPage.loadingEarlier
-                      ? lang === "en"
-                        ? "Loading…"
-                        : "加载中…"
-                      : lang === "en"
-                        ? "Load earlier"
-                        : "加载更早消息"}
+                    {historyPage.loadingEarlier ? t("loading") : tr(lang, "加载更早消息", "Load earlier", "Загрузить ранее")}
                   </button>
                 ) : null}
                 {rows.map((row) => {
@@ -677,7 +671,7 @@ export default function SessionView({
                   );
                 })}
                 {busy ? (
-                  <div className="msg agent" aria-label="生成中" data-testid="streaming-cursor">
+                  <div className="msg agent" aria-label={tr(lang, "生成中", "Generating", "Генерация")} data-testid="streaming-cursor">
                     <div className="bubble">
                       <span className="cursor" />
                     </div>
@@ -687,7 +681,7 @@ export default function SessionView({
             </div>
             {showJump ? (
               <button type="button" className="jump-latest" onClick={jumpToBottom}>
-                <ArrowDown /> 回到最新
+                <ArrowDown /> {tr(lang, "回到最新", "Back to latest", "К последним")}
               </button>
             ) : null}
           </div>
@@ -706,7 +700,7 @@ export default function SessionView({
                         dateTime={item.send_at}
                         title={`${t("scheduleLocalTime")}: ${item.send_at}`}
                       >
-                        {new Date(item.send_at).toLocaleString(lang === "en" ? "en-US" : "zh-CN", {
+                        {new Date(item.send_at).toLocaleString(WEB_LOCALE[lang], {
                           month: "2-digit",
                           day: "2-digit",
                           hour: "2-digit",

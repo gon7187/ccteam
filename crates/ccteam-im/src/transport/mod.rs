@@ -368,7 +368,7 @@ impl RejectedSenderNotifier {
 
 fn rejected_sender_notice(sender_id: &str) -> String {
     format!(
-        "此 IM 身份尚未绑定，消息未交给任何 agent。\n绑定 ID: {sender_id}\n请用此 bot 所属的 ccteam 账号打开「设置 → 接入」，绑定该 ID 后重试。"
+        "Этот IM-идентификатор ещё не привязан, сообщение не передано агенту.\nID для привязки: {sender_id}\nОткройте в аккаунте ccteam, которому принадлежит этот бот, «Настройки → Подключение», привяжите этот ID и повторите попытку."
     )
 }
 
@@ -441,6 +441,22 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+/// Visual style of a rendered button (TG-GATE-V2 W1). Maps to Telegram Rich
+/// Message `RichMessageButton.style` (`"danger"` / `"success"` / `"primary"`)
+/// when a message is sent via `sendRichMessage`; ignored by the classic
+/// `InlineKeyboardButton` path (no per-button style there) and by every
+/// non-Telegram channel.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ButtonStyle {
+    /// Primary/emphasized action.
+    Primary,
+    /// Positive/confirming action.
+    Success,
+    /// Destructive/dangerous action.
+    Danger,
+}
+
 /// A single selectable option rendered on an outbound [`SendMessage`]
 /// (v0.8.5 D3). Channel-local + deliberately opaque: `data` is whatever
 /// the gateway minted (always `"{token}:{idx}"`) and rides the platform's
@@ -465,6 +481,21 @@ pub struct MessageOption {
     /// the SAME token-keyed pending the IM callback does, never a turn.
     #[serde(default)]
     pub id: String,
+    /// TG-GATE-V2 W1 — optional visual style (danger/success/primary).
+    /// `None` = default styling. Only Telegram's Rich Message buttons block
+    /// honors it; the classic inline-keyboard fallback and other channels
+    /// ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<ButtonStyle>,
+}
+
+/// A Telegram reply keyboard request. Other channels ignore it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReplyKeyboard {
+    /// Persistent rows of plain-text buttons.
+    Buttons(Vec<Vec<String>>),
+    /// Remove the current reply keyboard.
+    Remove,
 }
 
 /// An inbound option click carried on a [`ChannelMessage`] (v0.8.5 D3).
@@ -498,6 +529,27 @@ pub struct SendMessage {
     /// buttons fall back to a numbered text list.
     #[serde(default)]
     pub options: Vec<MessageOption>,
+    /// TG-GATE-V2 W1 — Rich Messages markdown (Bot API 10.3
+    /// `InputRichMessage.markdown`). When `Some`, Telegram tries
+    /// `sendRichMessage` first; on rejection it renders this field for a
+    /// fitting classic message, otherwise sends the row's plain `content`
+    /// (splitting it inside the transport when needed). `None` ⇒ zero
+    /// behavior change (classic `sendMessage`/HTML path on `content` only).
+    /// Ignored by every other channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rich_markdown: Option<String>,
+    /// TG-GATE-V2 W1 — button rows (1..=8 buttons per row), rendered ABOVE
+    /// [`Self::options`] on both the Rich Message buttons block and the
+    /// classic `inline_keyboard` fallback. `options` (one-per-row, choice
+    /// replies) is untouched and stays a separate concept — `button_rows`
+    /// is for multi-per-row command/navigation buttons. Empty ⇒ no extra
+    /// rows (zero behavior change). Non-Telegram channels fold rows into a
+    /// numbered text list the same way `options` already does today.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub button_rows: Vec<Vec<MessageOption>>,
+    /// Telegram reply keyboard request; unsupported channels ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_keyboard: Option<ReplyKeyboard>,
 }
 
 impl SendMessage {
@@ -510,6 +562,9 @@ impl SendMessage {
             thread_ts: None,
             attachments: Vec::new(),
             options: Vec::new(),
+            rich_markdown: None,
+            button_rows: Vec::new(),
+            reply_keyboard: None,
         }
     }
 
@@ -528,6 +583,24 @@ impl SendMessage {
     /// Builder-style: attach selectable options (v0.8.5 D3).
     pub fn with_options(mut self, options: Vec<MessageOption>) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Builder-style: attach Rich Messages markdown (TG-GATE-V2 W1).
+    pub fn with_rich_markdown(mut self, rich_markdown: impl Into<String>) -> Self {
+        self.rich_markdown = Some(rich_markdown.into());
+        self
+    }
+
+    /// Builder-style: attach button rows (TG-GATE-V2 W1).
+    pub fn with_button_rows(mut self, button_rows: Vec<Vec<MessageOption>>) -> Self {
+        self.button_rows = button_rows;
+        self
+    }
+
+    /// Builder-style: attach a Telegram reply keyboard request.
+    pub fn with_reply_keyboard(mut self, reply_keyboard: ReplyKeyboard) -> Self {
+        self.reply_keyboard = Some(reply_keyboard);
         self
     }
 }
@@ -556,6 +629,16 @@ pub struct CommandSpec {
 pub trait Channel: Send + Sync {
     /// Human-readable platform name (matches credentials.json key).
     fn name(&self) -> &str;
+
+    /// Whether this channel can render `SendMessage::rich_markdown` (TG-GATE-V2
+    /// W7a). **Default `false`** — the daemon only sets `rich_markdown` (and
+    /// skips its own `split_for_channel` pre-splitting) for a channel that
+    /// answers `true` here; every other channel keeps today's plain-`content`
+    /// split + durable per-part ledger behavior byte-for-byte. Telegram is the
+    /// only channel that overrides this (its Bot API 10.3 Rich Messages).
+    fn supports_rich_messages(&self) -> bool {
+        false
+    }
 
     /// Send a single message. Returns the platform-side message id
     /// when available (Slack `ts`, Discord message id, …) for echo
@@ -589,13 +672,22 @@ pub trait Channel: Send + Sync {
     /// message via [`Channel::send`], so a channel without edit support
     /// still shows progress (just as extra messages rather than one live
     /// status). Telegram overrides with `editMessageText`.
+    ///
+    /// `button_rows` (TG-GATE-V2 W5) carries the same shape as
+    /// [`SendMessage::button_rows`] — e.g. the live progress edit's
+    /// `[⛔ Прервать]` button. The default degrades by folding it into
+    /// [`SendMessage::button_rows`] on the fallback `send`; a channel with
+    /// no native buttons ignores it or folds it into a numbered text list
+    /// (mirrors `options`' existing fallback).
     async fn edit_message(
         &self,
         recipient: &str,
         _message_id: &str,
         content: &str,
+        button_rows: &[Vec<MessageOption>],
     ) -> anyhow::Result<Option<String>> {
-        self.send(&SendMessage::new(content, recipient)).await
+        self.send(&SendMessage::new(content, recipient).with_button_rows(button_rows.to_vec()))
+            .await
     }
 
     /// Register the gateway's own commands in the channel's command menu
@@ -802,7 +894,7 @@ mod tests {
         assert_eq!(outbox[0].recipient, "339498819");
         assert_eq!(
             outbox[0].content,
-            "此 IM 身份尚未绑定，消息未交给任何 agent。\n绑定 ID: 339498819\n请用此 bot 所属的 ccteam 账号打开「设置 → 接入」，绑定该 ID 后重试。"
+            "Этот IM-идентификатор ещё не привязан, сообщение не передано агенту.\nID для привязки: 339498819\nОткройте в аккаунте ccteam, которому принадлежит этот бот, «Настройки → Подключение», привяжите этот ID и повторите попытку."
         );
 
         let lines = tokio::fs::read_to_string(&probe_path).await.unwrap();

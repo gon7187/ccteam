@@ -95,7 +95,8 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     // The hook.sh write must precede `install_project_at` so the
     // freshly-rendered `.claude/settings.local.json` hook commands point
     // at a file that actually exists.
-    ccteam_core::ensure_ccteam_home(paths).context("ensure ~/.ccteam/ home (dirs + hook.sh)")?;
+    ccteam_core::ensure_ccteam_home(paths)
+        .context("подготовить домашний каталог ~/.ccteam/ (каталоги + hook.sh)")?;
 
     // -- 2. Resolve project install target ---------------------------
     let target = resolve_install_target(&opts)?;
@@ -114,11 +115,11 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     // — a dir like `AgentServe` (caps) can't be a slug verbatim.
     let target_slug = ccteam_core::validate_slug_format(&derived_slug).with_context(|| {
         if slug_was_explicit {
-            format!("ccteam init: invalid slug {derived_slug:?}")
+            format!("ccteam init: недопустимый slug {derived_slug:?}")
         } else {
             format!(
-                "ccteam init: install-dir name {derived_slug:?} is not a valid slug \
-                 (lowercase ASCII / digits / dashes only). Pass an explicit name, e.g. \
+                "ccteam init: имя каталога установки {derived_slug:?} не является корректным slug \
+                 (только строчные ASCII / цифры / дефисы). Укажите явное имя, например \
                  `ccteam init --slug <lowercase-name>`."
             )
         }
@@ -132,11 +133,8 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
     // refuses to avoid circular-hook surprises for casual users.
     if is_ccteam_repo(&target) && !opts.force {
         return Err(anyhow::anyhow!(
-            "refusing to install ccteam in the ccteam repo itself: {}\n\n\
-             this directory contains the ccteam source — installing here would create \
-             a circular hook setup. Pick a different directory (or `cd` into your own project \
-             and re-run), or pass `--force` if you really want a ccteam project inside the \
-             ccteam source repo (e.g. for self-hosting / dogfooding).",
+            "отказ от установки ccteam в самом репозитории ccteam: {}\n\n\
+             этот каталог содержит исходники ccteam — установка создаст циклическую настройку хуков. Выберите другой каталог (или `cd` в свой проект и повторите) либо передайте `--force`, если действительно нужен проект ccteam внутри исходного репозитория (например, для self-hosting / dogfooding).",
             target.display(),
         ));
     }
@@ -178,7 +176,7 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         installed_at: chrono::Utc::now(),
     };
     ccteam_core::upsert_project_in_config(&paths.root, entry)
-        .context("upsert project into ~/.ccteam/config.yaml")?;
+        .context("добавить или обновить проект в ~/.ccteam/config.yaml")?;
 
     // -- 6. Health check + optional wizard --------------------------
     let bin = current_ccteam_bin().ok();
@@ -207,45 +205,48 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
         project_report.workflow_action,
     ));
     out.push_str(&format!(
-        "  agents dir       {} ({})\n",
+        "  каталог agents   {} ({})\n",
         target.join(".claude").join("agents").display(),
         project_report.agents_action,
     ));
     out.push_str(&format!(
-        "  config.yaml      {} (upserted)\n",
+        "  config.yaml      {} (добавлено или обновлено)\n",
         ccteam_core::ccteam_config_path(&paths.root).display(),
     ));
 
-    out.push_str("\nhealth check:\n");
+    out.push_str("\nпроверка готовности:\n");
     match &claude {
         Ok(o) if o.status.success() => out.push_str(&format!(
             "  claude   : {}\n",
             String::from_utf8_lossy(&o.stdout).trim()
         )),
-        _ => out
-            .push_str("  claude   : NOT FOUND on PATH (install: https://claude.com/claude-code)\n"),
+        _ => out.push_str(
+            "  claude   : НЕ НАЙДЕН в PATH (установка: https://claude.com/claude-code)\n",
+        ),
     }
     match &tmux {
         Some(version) => out.push_str(&format!("  tmux     : {version}\n")),
-        _ => {
-            out.push_str("  tmux     : NOT FOUND on PATH (apt install tmux / brew install tmux)\n")
-        }
+        _ => out.push_str("  tmux     : НЕ НАЙДЕН в PATH (apt install tmux / brew install tmux)\n"),
     }
     match &bin {
         Some(p) => out.push_str(&format!("  ccteam   : {}\n", p.display())),
-        None => out.push_str("  ccteam   : current_exe() failed (binary path unresolved)\n"),
+        None => {
+            out.push_str("  ccteam   : current_exe() не удался (путь к бинарнику не определён)\n")
+        }
     }
 
-    out.push_str("\nnext:\n");
-    out.push_str("  1. install: keep `ccteam` on PATH; `ccteam config` registers the MCP server for Claude + Codex\n");
-    out.push_str("  2. init: this project is now initialized\n");
-    out.push_str("  3. config: run `ccteam config` to register MCP and set IM credentials\n");
-    out.push_str("  4. start: run `ccteam start` to boot the gateway + web console\n");
+    out.push_str("\nдальше:\n");
+    out.push_str("  1. install: оставьте `ccteam` в PATH; `ccteam config` зарегистрирует MCP-сервер для Claude и Codex\n");
+    out.push_str("  2. init: проект инициализирован\n");
     out.push_str(
-        "  5. cd: send `/cd <project>`; the first message starts a roleless session (reads the project CLAUDE.md/AGENTS.md)\n",
+        "  3. config: выполните `ccteam config` для регистрации MCP и задания учётных данных IM\n",
     );
-    out.push_str("  role tip: sessions are roleless by default (read project CLAUDE.md/AGENTS.md); install or author work-roles in .claude/agents/<role>.md\n");
-    out.push_str("  guide: docs/usage.md\n");
+    out.push_str("  4. start: выполните `ccteam start` для запуска gateway и web-консоли\n");
+    out.push_str(
+        "  5. cd: отправьте `/cd <project>`; первое сообщение запустит сессию без роли (читает CLAUDE.md/AGENTS.md проекта)\n",
+    );
+    out.push_str("  подсказка о ролях: по умолчанию сессии без роли (читают CLAUDE.md/AGENTS.md проекта); установите или создайте рабочие роли в .claude/agents/<role>.md\n");
+    out.push_str("  руководство: docs/usage.md\n");
     Ok(out)
 }
 
@@ -265,14 +266,14 @@ fn resolve_install_target(opts: &InitOptions) -> Result<std::path::PathBuf> {
             p.clone()
         } else {
             std::env::current_dir()
-                .context("read cwd to resolve --in")?
+                .context("прочитать cwd для разрешения --in")?
                 .join(p)
         };
         std::fs::create_dir_all(&abs)
-            .with_context(|| format!("create --in target {}", abs.display()))?;
+            .with_context(|| format!("создать цель --in {}", abs.display()))?;
         return Ok(abs);
     }
-    std::env::current_dir().context("read cwd as install target")
+    std::env::current_dir().context("прочитать cwd как цель установки")
 }
 
 /// Heuristic to detect the ccteam source repo so we don't accidentally
@@ -353,7 +354,7 @@ fn install_project_at(
                     .is_none()
             {
                 eprintln!(
-                    "warning: --owner {owner} references no known tenant in {}; writing it anyway",
+                    "предупреждение: --owner {owner} ссылается на неизвестный tenant в {}; всё равно записываю",
                     paths.users_dir().display(),
                 );
             }
@@ -474,7 +475,7 @@ pub fn run_ls(paths: &CcteamPaths, format: OutputFormat) -> Result<String> {
 pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result<String> {
     let state_path = paths.project_state(slug);
     if !state_path.exists() {
-        bail!("project not found: {slug}");
+        bail!("проект не найден: {slug}");
     }
     let state = ProjectState::load(&state_path)?;
     let recent = collect_recent_events(paths, slug, 50)?;
@@ -526,30 +527,32 @@ fn rmux_interactive_attach(session_name: &str) -> Result<()> {
     use rmux_proto::SessionName;
 
     let socket = ccteam_harness::default_ccteam_harness_socket_path();
-    eprintln!("→ rmux attach {session_name} (socket {})", socket.display());
+    eprintln!("→ rmux attach {session_name} (сокет {})", socket.display());
 
-    let connection = match connect_or_absent(&socket).context("connect to ccteam rmux daemon")? {
+    let connection = match connect_or_absent(&socket)
+        .context("подключиться к rmux-демону ccteam")?
+    {
         ConnectResult::Connected(conn) => conn,
         ConnectResult::Absent => bail!(
-            "ccteam rmux daemon is not running (socket `{}` absent).\n  \
-             Start the project first:  ccteam start {session_name}\n  \
-             (the daemon is hosted by `ccteam start`; attach has nothing to connect to until then.)",
+            "rmux-демон ccteam не запущен (сокет `{}` отсутствует).\n  \
+             Сначала запустите проект:  ccteam start {session_name}\n  \
+             (демон запускается через `ccteam start`; до этого attach не к чему подключить.)",
             socket.display(),
         ),
     };
 
     let name = SessionName::new(session_name.to_string())
-        .map_err(|e| anyhow::anyhow!("invalid rmux session name `{session_name}`: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("некорректное имя rmux-сессии `{session_name}`: {e}"))?;
 
     let transition = connection
         .begin_attach(name)
-        .with_context(|| format!("begin attach to rmux session `{session_name}`"))?;
+        .with_context(|| format!("начать подключение к rmux-сессии `{session_name}`"))?;
 
     let upgrade = match transition {
         AttachTransition::Upgraded(upgrade) => upgrade,
         AttachTransition::Rejected(other) => bail!(
-            "rmux daemon rejected attach to session `{session_name}`: {other:?}\n  \
-             (the session may not exist — check `ccteam session ls` or start it with `ccteam start`.)",
+            "rmux-демон отклонил подключение к сессии `{session_name}`: {other:?}\n  \
+             (сессии может не быть — проверьте `ccteam session ls` или запустите через `ccteam start`.)",
         ),
     };
 
@@ -559,7 +562,7 @@ fn rmux_interactive_attach(session_name: &str) -> Result<()> {
     // pane output is lost on the attach boundary.
     let (stream, initial_bytes) = upgrade.into_parts();
     rmux_client::attach_terminal_with_initial_bytes(stream, initial_bytes)
-        .map_err(|e| anyhow::anyhow!("rmux attach session `{session_name}`: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("подключение rmux-сессии `{session_name}`: {e}"))?;
     Ok(())
 }
 
@@ -568,8 +571,8 @@ fn rmux_interactive_attach(session_name: &str) -> Result<()> {
 #[cfg(not(unix))]
 fn rmux_interactive_attach(session_name: &str) -> Result<()> {
     bail!(
-        "rmux interactive attach is not supported on this platform yet \
-         (session `{session_name}`); use the tmux backend (unset CCTEAM_MUX_BACKEND).",
+        "интерактивное подключение rmux пока не поддерживается на этой платформе \
+         (сессия `{session_name}`); используйте backend tmux (уберите CCTEAM_MUX_BACKEND).",
     )
 }
 
@@ -581,7 +584,7 @@ fn block_on_async<F: std::future::Future>(fut: F) -> Result<F::Output> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("build tokio runtime")?;
+        .context("создать runtime tokio")?;
     Ok(rt.block_on(fut))
 }
 
@@ -609,7 +612,7 @@ fn attach_interactive_by_name(session_name: &str) -> Result<()> {
     }
     let tmux_session = TmuxSession::from_name(session_name.to_string());
     if !tmux_session.exists() {
-        bail!("mux session not running: {}", tmux_session.name());
+        bail!("mux-сессия не запущена: {}", tmux_session.name());
     }
     eprintln!("→ tmux attach -t {}", tmux_session.name());
     let argv = ccteam_harness::interactive_attach_argv(
@@ -618,13 +621,13 @@ fn attach_interactive_by_name(session_name: &str) -> Result<()> {
     );
     let (bin, args) = argv
         .split_first()
-        .ok_or_else(|| anyhow::anyhow!("interactive_attach_argv returned empty argv"))?;
+        .ok_or_else(|| anyhow::anyhow!("interactive_attach_argv вернул пустой argv"))?;
     let status = Command::new(bin)
         .args(args)
         .status()
-        .context("spawn tmux attach")?;
+        .context("запустить tmux attach")?;
     if !status.success() {
-        bail!("tmux attach exited with {status}");
+        bail!("tmux attach завершился с {status}");
     }
     Ok(())
 }
@@ -673,7 +676,7 @@ pub fn resolve_chat_session_name(slug_or_name: &str, sid: Option<&str>) -> Resul
         [(_sid, name)] => Ok(Some(name.clone())),
         many => {
             let mut msg = format!(
-                "`{slug_or_name}` has {} live chat sessions; specify a sid:",
+                "у `{slug_or_name}` {} активных чат-сессий; укажите sid:",
                 many.len()
             );
             for (sid, name) in many {
@@ -741,7 +744,7 @@ fn numeric_sid(sid: &str) -> u64 {
 /// fabricates an age for a row with no `meta.json` backing, e.g. an orphan).
 fn format_last_active(raw: &str) -> String {
     match parse_rfc3339_age_secs(raw) {
-        Some(secs) => format!("{} ago", humanize_secs_local(secs)),
+        Some(secs) => format!("{} назад", humanize_secs_local(secs)),
         None => "-".to_string(),
     }
 }
@@ -783,9 +786,9 @@ fn render_sessions_table(
     }
 
     let tracked_status = if daemon_up {
-        "live"
+        "активна"
     } else {
-        "registered (daemon down)"
+        "зарегистрирована (демон недоступен)"
     };
 
     let mut rows: Vec<Row> = tracked
@@ -818,7 +821,7 @@ fn render_sessions_table(
                 role: "-".to_string(),
                 title: "-".to_string(),
                 vendor: "-".to_string(),
-                status: "orphan (untracked live pane)".to_string(),
+                status: "сирота (неотслеживаемая активная панель)".to_string(),
                 last_active: String::new(),
             });
         }
@@ -832,10 +835,10 @@ fn render_sessions_table(
 
     if rows.is_empty() {
         let mut out = String::new();
-        out.push_str("no chat sessions (none tracked, none live).\n");
+        out.push_str("чат-сессий нет (нет ни отслеживаемых, ни активных).\n");
         out.push_str(
-            "  Gateway chat sessions appear here once a bot is spawned \
-             (e.g. via Telegram `/new`).\n",
+            "  Чат-сессии gateway появятся здесь после запуска бота \
+             (например, через Telegram `/new`).\n",
         );
         return out;
     }
@@ -860,12 +863,12 @@ fn render_sessions_table(
         .map(|s| s.len())
         .max()
         .unwrap_or(0)
-        .max(11); // "LAST ACTIVE".len()
+        .max(20); // "ПОСЛЕДНЯЯ АКТИВНОСТЬ".chars().count()
 
     let mut out = String::new();
     let header = format!(
-        "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_title$}  {:<w_vendor$}  {:<w_last_active$}  STATUS",
-        "SLUG", "SID", "ROLE", "TITLE", "VENDOR", "LAST ACTIVE"
+        "{:<w_slug$}  {:<w_sid$}  {:<w_role$}  {:<w_title$}  {:<w_vendor$}  {:<w_last_active$}  СТАТУС",
+        "SLUG", "SID", "РОЛЬ", "НАЗВАНИЕ", "ВЕНДОР", "ПОСЛЕДНЯЯ АКТИВНОСТЬ"
     );
     out.push_str(header.trim_end());
     out.push('\n');
@@ -878,7 +881,7 @@ fn render_sessions_table(
         out.push('\n');
     }
     out.push('\n');
-    out.push_str("attach: `ccteam internal attach <slug> [sid]`  (Telegram: `/sessions`)\n");
+    out.push_str("подключение: `ccteam internal attach <slug> [sid]`  (Telegram: `/sessions`)\n");
     out
 }
 
@@ -889,9 +892,9 @@ pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
         let status = Command::new("claude")
             .args(["attach", &lead_id])
             .status()
-            .context("spawn claude attach")?;
+            .context("запустить claude attach")?;
         if !status.success() {
-            bail!("claude attach exited with {status}");
+            bail!("claude attach завершился с {status}");
         }
         return Ok(());
     }
@@ -920,13 +923,13 @@ pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
         );
         let (bin, args) = argv
             .split_first()
-            .ok_or_else(|| anyhow::anyhow!("interactive_attach_argv returned empty argv"))?;
+            .ok_or_else(|| anyhow::anyhow!("interactive_attach_argv вернул пустой argv"))?;
         let status = Command::new(bin)
             .args(args)
             .status()
-            .context("spawn tmux attach")?;
+            .context("запустить tmux attach")?;
         if !status.success() {
-            bail!("tmux attach exited with {status}");
+            bail!("tmux attach завершился с {status}");
         }
         return Ok(());
     }
@@ -942,15 +945,15 @@ pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
         let status = Command::new("claude")
             .args(["attach", &job_id])
             .status()
-            .context("spawn claude attach")?;
+            .context("запустить claude attach")?;
         if !status.success() {
-            bail!("claude attach exited with {status}");
+            bail!("claude attach завершился с {status}");
         }
         return Ok(());
     }
 
     bail!(
-        "no live session for `{slug}`: tmux session `{}` not running, no `claude --bg` job recorded in progress.jsonl. Spawn one with `ccteam spawn {slug} <role>`.",
+        "для `{slug}` нет активной сессии: tmux-сессия `{}` не запущена, задача `claude --bg` не записана в progress.jsonl. Запустите через `ccteam spawn {slug} <role>`.",
         tmux_session.name()
     )
 }
@@ -1114,19 +1117,19 @@ fn peek_session_by_name(session_name: &str) -> Result<String> {
         let bytes = runtime
             .block_on(async {
                 if !backend.exists(&id).await? {
-                    bail!("rmux session not running: {}", id);
+                    bail!("rmux-сессия не запущена: {}", id);
                 }
                 // 1000-line tail mirrors the tmux default scroll-region
                 // window; `with_ansi=false` returns stripped plain text.
                 backend.capture(&id, 1000, false).await
             })
-            .context("rmux capture")?;
+            .context("получить вывод rmux")?;
         return Ok(String::from_utf8_lossy(&bytes).into_owned());
     }
 
     let session = TmuxSession::from_name(session_name.to_string());
     if !session.exists() {
-        bail!("tmux session not running: {}", session.name());
+        bail!("tmux-сессия не запущена: {}", session.name());
     }
     // 1000-line tail matches the legacy raw `capture-pane -p` default
     // window (no `-S` flag → tmux's default scroll-region tail).
@@ -1142,11 +1145,11 @@ pub fn run_progress(paths: &CcteamPaths, slug: &str, tail: bool) -> Result<()> {
     use std::io::Write;
     let path = paths.progress_jsonl(slug);
     if !path.exists() {
-        bail!("no progress.jsonl yet for {slug}: {}", path.display());
+        bail!("progress.jsonl для {slug} пока нет: {}", path.display());
     }
     let mut stdout = std::io::stdout().lock();
     let initial =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        std::fs::read_to_string(&path).with_context(|| format!("прочитать {}", path.display()))?;
     stdout.write_all(initial.as_bytes())?;
     if !tail {
         return Ok(());
@@ -1227,26 +1230,26 @@ fn render_install_mcp_body(
     kimi_path: &std::path::Path,
 ) -> String {
     let mut out = String::from(
-        "ccteam config: register MCP server (Claude + Codex + Grok + OpenCode + Kimi)\n\n",
+        "ccteam config: регистрация MCP-сервера (Claude + Codex + Grok + OpenCode + Kimi)\n\n",
     );
     out.push_str(&format!(
-        "  registered ccteam MCP server for Claude   in {}\n",
+        "  MCP-сервер ccteam зарегистрирован для Claude   в {}\n",
         claude_path.display()
     ));
     out.push_str(&format!(
-        "  registered ccteam MCP server for Codex    in {}\n",
+        "  MCP-сервер ccteam зарегистрирован для Codex    в {}\n",
         codex_path.display()
     ));
     out.push_str(&format!(
-        "  registered ccteam MCP server for Grok     in {}\n",
+        "  MCP-сервер ccteam зарегистрирован для Grok     в {}\n",
         grok_path.display()
     ));
     out.push_str(&format!(
-        "  registered ccteam MCP server for OpenCode in {}\n",
+        "  MCP-сервер ccteam зарегистрирован для OpenCode в {}\n",
         opencode_path.display()
     ));
     out.push_str(&format!(
-        "  registered ccteam MCP server for Kimi     in {}\n",
+        "  MCP-сервер ccteam зарегистрирован для Kimi     в {}\n",
         kimi_path.display()
     ));
     for spec in ccteam_core::host_registry::AGENT_PROBE_SPECS
@@ -1254,14 +1257,17 @@ fn render_install_mcp_body(
         .filter(|spec| !spec.tool_surface.uses_native_mcp_config())
     {
         if let Some(notice) = spec.tool_surface_notice() {
-            out.push_str(&format!("  {} config unchanged: {notice}\n", spec.vendor));
+            out.push_str(&format!(
+                "  конфигурация {} не изменена: {notice}\n",
+                spec.vendor
+            ));
         }
     }
     let total_tools = run_verify_mcp().total_tools;
-    out.push_str(&format!("  tools surface : {total_tools}\n"));
+    out.push_str(&format!("  поверхность инструментов: {total_tools}\n"));
     out.push('\n');
     out.push_str(
-        "open a new claude / codex session to pick up the change; existing claude sessions need /reload-mcp.\n",
+        "откройте новую сессию claude / codex, чтобы применить изменение; существующим сессиям claude нужен /reload-mcp.\n",
     );
     out
 }
@@ -1311,22 +1317,22 @@ impl VerifyMcpReport {
     /// `docs/versions/v0-6-6/prd.md` §F171 Sub-3.
     pub fn render_text(&self) -> String {
         let mut out = String::new();
-        out.push_str("MCP tool surface verification (V0.6.6 F171)\n");
+        out.push_str("Проверка поверхности MCP-инструментов (V0.6.6 F171)\n");
         out.push_str("===\n");
-        out.push_str(&format!("total tools:    {}\n", self.total_tools));
-        out.push_str(&format!("active:         {}\n", self.active_count));
-        out.push_str(&format!("stubs:          {}\n", self.stub_count));
-        out.push_str("\nper-group breakdown:\n");
+        out.push_str(&format!("всего инструментов: {}\n", self.total_tools));
+        out.push_str(&format!("активных:          {}\n", self.active_count));
+        out.push_str(&format!("заглушек:          {}\n", self.stub_count));
+        out.push_str("\nразбивка по группам:\n");
         for (group, stats) in &self.per_group {
             out.push_str(&format!(
-                "  {:<12} {} active / {} stub\n",
+                "  {:<12} {} активных / {} заглушек\n",
                 format!("{group}:"),
                 stats.active,
                 stats.stub
             ));
         }
         if !self.unexpected_stubs.is_empty() {
-            out.push_str("\nunexpected STUBs (not in mcp_tool_groups::STUB_TOOLS):\n");
+            out.push_str("\nнеожиданные STUB (не входят в mcp_tool_groups::STUB_TOOLS):\n");
             for name in &self.unexpected_stubs {
                 out.push_str(&format!("  - {name}\n"));
             }
@@ -1334,12 +1340,12 @@ impl VerifyMcpReport {
         out.push('\n');
         if self.ok() {
             out.push_str(&format!(
-                "verdict: PASS — all {} tools live, no production STUBs.\n",
+                "вердикт: PASS — все {} инструментов активны, production STUB нет.\n",
                 self.total_tools
             ));
         } else {
             out.push_str(&format!(
-                "verdict: FAIL — {} unexpected STUB(s) registered.\n",
+                "вердикт: FAIL — зарегистрировано неожиданных STUB: {}.\n",
                 self.unexpected_stubs.len()
             ));
         }
@@ -1482,16 +1488,20 @@ fn render_ls_text(paths: &CcteamPaths, projects: &[ProjectSummary], daemon_up: b
     // empty-projects path) so users can disambiguate "no projects" from
     // "daemon never came up".
     out.push_str(&format!(
-        "daemon: {}\n",
-        if daemon_up { "up" } else { "down" }
+        "демон: {}\n",
+        if daemon_up {
+            "работает"
+        } else {
+            "не работает"
+        }
     ));
     if projects.is_empty() {
         out.push_str(
-            "(no projects under ~/projects/. start one with `ccteam project new <slug>`, e.g. `ccteam project new demo`.)\n",
+            "(в ~/projects/ нет проектов. Создайте: `ccteam project new <slug>`, например `ccteam project new demo`.)\n",
         );
         return out;
     }
-    out.push_str("SLUG                                     COST(24H)   AGE\n");
+    out.push_str("SLUG                                     COST(24H)   ВОЗРАСТ\n");
     for p in projects {
         // V0.4.6 F91 — cost column sources cost_24h_usd from
         // progress.jsonl (best-effort; failure → $0.00 — fresh
@@ -1608,7 +1618,7 @@ fn render_show_text(
     let mut out = String::new();
     out.push_str(&format!("# {} ({})\n\n", state.slug, state.tmux_session));
     out.push_str(&format!(
-        "current phase  : {}\n",
+        "текущая фаза   : {}\n",
         display_phase(&state.current_phase)
     ));
     // V0.4.6 F91 — cost(24h) sums every `agent_done.cost_usd` in the
@@ -1617,49 +1627,49 @@ fn render_show_text(
     // `cost used: $X.XX` line (sourced from the now-frozen
     // `state.cost_used_usd`) is removed.
     out.push_str(&format!(
-        "cost (24h)     : ${:.2}  ({} sessions)\n",
+        "стоимость (24ч): ${:.2}  ({} сессий)\n",
         cost.cost_24h_usd, cost.session_count_24h,
     ));
     out.push_str(&format!(
-        "cost (active)  : ${:.2}  ({} running)\n",
+        "стоимость (активные): ${:.2}  ({} запущено)\n",
         cost.cost_active_usd, cost.session_count_active,
     ));
-    out.push_str(&format!("cost (total)   : ${:.2}\n", cost.cost_total_usd));
+    out.push_str(&format!("стоимость (всего): ${:.2}\n", cost.cost_total_usd));
     out.push_str(&format!(
-        "context tokens : {} ({} resets)\n",
+        "токены контекста: {} (сбросов: {})\n",
         state.context_tokens_used, state.context_reset_count
     ));
     out.push_str(&format!(
-        "fix cycle      : {}\n",
+        "цикл исправления: {}\n",
         state.auto_loop_cycle_count
     ));
-    out.push_str("\nphase history:\n");
+    out.push_str("\nистория фаз:\n");
     if state.phase_history.is_empty() {
-        out.push_str("  (empty)\n");
+        out.push_str("  (пусто)\n");
     } else {
         for h in &state.phase_history {
             out.push_str(&format!("  - {} ({})\n", h.phase, h.status));
         }
     }
-    out.push_str("\nartifacts:\n");
+    out.push_str("\nартефакты:\n");
     if artifacts.is_empty() {
-        out.push_str("  (none yet)\n");
+        out.push_str("  (пока нет)\n");
     } else {
         for (k, v) in artifacts {
             out.push_str(&format!("  {:<18} {}\n", k, v.as_str().unwrap_or("<?>")));
         }
     }
 
-    out.push_str(&format!("\nactive sessions ({}):\n", sessions.len()));
+    out.push_str(&format!("\nактивные сессии ({}):\n", sessions.len()));
     if sessions.is_empty() {
-        out.push_str("  (none running)\n");
+        out.push_str("  (запущенных нет)\n");
     } else {
         for s in sessions {
             let model = s.model.as_deref().unwrap_or("—");
             let ctx = s
                 .context_remaining_pct
-                .map(|p| format!("ctx {:>3.0}%", p))
-                .unwrap_or_else(|| "ctx   —".into());
+                .map(|p| format!("контекст {:>3.0}%", p))
+                .unwrap_or_else(|| "контекст —".into());
             let age = parse_rfc3339_age_secs(&s.started_at)
                 .map(humanize_secs_local)
                 .unwrap_or_else(|| "?".into());
@@ -1669,14 +1679,14 @@ fn render_show_text(
                 .map(|j| j.chars().take(8).collect::<String>())
                 .unwrap_or_else(|| "—".into());
             out.push_str(&format!(
-                "  {:<10}  {:<8}  {:<22}  {}  ${:>6.2}  {} ago\n",
+                "  {:<10}  {:<8}  {:<22}  {}  ${:>6.2}  {} назад\n",
                 s.role, short_job, model, ctx, s.cost_usd, age
             ));
         }
-        out.push_str("\n  tip: `claude attach <id>` to take over a session live\n");
+        out.push_str("\n  подсказка: `claude attach <id>` для подключения к активной сессии\n");
     }
 
-    out.push_str(&format!("\nrecent events ({}):\n", recent.len()));
+    out.push_str(&format!("\nпоследние события ({}):\n", recent.len()));
     for e in recent {
         let ts = e.get("ts").and_then(|s| s.as_str()).unwrap_or("???");
         let event = e.get("event").and_then(|s| s.as_str()).unwrap_or("?");
@@ -1768,19 +1778,19 @@ pub fn run_web(opts: WebOptions) -> Result<()> {
     let bind: SocketAddr = opts
         .bind
         .parse()
-        .with_context(|| format!("parse --bind `{}` as SocketAddr", opts.bind))?;
+        .with_context(|| format!("разобрать --bind `{}` как SocketAddr", opts.bind))?;
     let dsh_web_bind = match opts.dsh_bind.as_deref() {
         Some(value) if value.eq_ignore_ascii_case("off") => None,
         Some(value) => Some(
             value
                 .parse()
-                .with_context(|| format!("parse --dsh-web-bind `{value}` as SocketAddr"))?,
+                .with_context(|| format!("разобрать --dsh-web-bind `{value}` как SocketAddr"))?,
         ),
         None => Some(SocketAddr::new(
             bind.ip(),
             bind.port()
                 .checked_add(1)
-                .context("derive --dsh-web-bind from --bind port")?,
+                .context("вывести --dsh-web-bind из порта --bind")?,
         )),
     };
     let serve_opts = ccteam_web::ServeOpts {
@@ -1918,8 +1928,8 @@ pub fn run_prefs_set(paths: &CcteamPaths, key: &str, value: &str) -> Result<Stri
                 "codex" => ccteam_core::preferences::OnClaudeQuota::Codex,
                 other => {
                     return Err(anyhow::anyhow!(
-                        "fallback.on_claude_quota: unsupported value {other:?} \
-                         (expected `off` or `codex`)"
+                        "fallback.on_claude_quota: неподдерживаемое значение {other:?} \
+                         (ожидалось `off` или `codex`)"
                     ));
                 }
             };
@@ -1937,14 +1947,14 @@ pub fn run_prefs_set(paths: &CcteamPaths, key: &str, value: &str) -> Result<Stri
         }
         other => {
             return Err(anyhow::anyhow!(
-                "unknown preference key: {other}\n\
-                 supported keys:\n  - fallback.on_claude_quota  (off|codex)\n  \
-                 - fallback.codex.enabled_for_roles  (comma list; empty = all roles)"
+                "неизвестный ключ предпочтения: {other}\n\
+                 поддерживаемые ключи:\n  - fallback.on_claude_quota  (off|codex)\n  \
+                 - fallback.codex.enabled_for_roles  (список через запятую; пусто = все роли)"
             ));
         }
     }
     ccteam_core::preferences::save(&paths.root, &prefs)?;
-    Ok(format!("set {key} = {value}"))
+    Ok(format!("задано {key} = {value}"))
 }
 
 // -------------------------------------------------------------------------
@@ -2157,48 +2167,48 @@ pub fn run_config_menu(paths: &CcteamPaths) -> Result<String> {
 
     if !std::io::stdin().is_terminal() {
         bail!(
-            "ccteam config: interactive menu needs a TTY.\n\
-             headless forms:\n  \
-             ccteam config show                 # print preferences\n  \
-             ccteam config get <key>            # read one preference\n  \
-             ccteam config <key> <value>        # set one preference\n  \
-             ccteam doctor --verify-mcp         # check the MCP wiring\n\
-             (MCP register + IM token onboarding need an interactive run.)"
+            "ccteam config: интерактивному меню нужен TTY.\n\
+             формы для headless:\n  \
+             ccteam config show                 # вывести предпочтения\n  \
+             ccteam config get <key>            # прочитать одно предпочтение\n  \
+             ccteam config <key> <value>        # задать одно предпочтение\n  \
+             ccteam doctor --verify-mcp         # проверить подключение MCP\n\
+             (Регистрация MCP и настройка IM-токена требуют интерактивного запуска.)"
         );
     }
 
-    println!("ccteam config — setup\n");
-    println!("  1) register / refresh the ccteam MCP server (~/.claude.json)");
-    println!("  2) set the IM (Telegram) bot token");
-    println!("  3) set Lark/Feishu app credentials");
-    println!("  4) show preferences");
-    println!("  q) quit");
-    print!("\nchoose [1-4/q]: ");
+    println!("ccteam config — настройка\n");
+    println!("  1) зарегистрировать / обновить MCP-сервер ccteam (~/.claude.json)");
+    println!("  2) задать токен IM-бота (Telegram)");
+    println!("  3) задать учётные данные приложения Lark/Feishu");
+    println!("  4) показать предпочтения");
+    println!("  q) выход");
+    print!("\nвыберите [1-4/q]: ");
     std::io::stdout().flush().ok();
 
     let mut line = String::new();
     std::io::stdin()
         .read_line(&mut line)
-        .context("read config menu choice from stdin")?;
+        .context("прочитать выбор меню config из stdin")?;
 
     match line.trim() {
         "1" => run_config_install_mcp(),
         "2" => {
-            print!("paste the Telegram bot token (from @BotFather): ");
+            print!("вставьте токен Telegram-бота (из @BotFather): ");
             std::io::stdout().flush().ok();
             let mut token = String::new();
             std::io::stdin()
                 .read_line(&mut token)
-                .context("read Telegram token from stdin")?;
+                .context("прочитать токен Telegram из stdin")?;
             println!(
-                "validating token + waiting up to {CONFIG_IM_POLL_SECONDS}s for you to DM the bot…"
+                "проверяю токен и жду до {CONFIG_IM_POLL_SECONDS} с, пока вы напишете боту в ЛС…"
             );
             run_config_set_im_token(&token)
         }
         "3" => run_config_lark_menu(),
         "4" => run_prefs_show(paths),
-        "q" | "Q" | "" => Ok("ccteam config: nothing changed.\n".to_string()),
-        other => bail!("ccteam config: unrecognized choice {other:?} (expected 1-4 or q)"),
+        "q" | "Q" | "" => Ok("ccteam config: ничего не изменено.\n".to_string()),
+        other => bail!("ccteam config: неизвестный выбор {other:?} (ожидалось 1-4 или q)"),
     }
 }
 
@@ -2217,27 +2227,27 @@ fn run_config_lark_menu() -> Result<String> {
         let mut buf = String::new();
         std::io::stdin()
             .read_line(&mut buf)
-            .with_context(|| format!("read {label:?} from stdin"))?;
+            .with_context(|| format!("прочитать {label:?} из stdin"))?;
         Ok(buf.trim().to_string())
     }
 
     println!(
-        "\nLark/Feishu app credentials (from the developer console → app → Credentials & Basic Info)."
+        "\nУчётные данные приложения Lark/Feishu (консоль разработчика → приложение → Credentials & Basic Info)."
     );
     let app_id = prompt_line("app_id (cli_…): ")?;
     let app_secret = prompt_line("app_secret: ")?;
 
     // Region: default Feishu/CN (Enter accepts the default).
-    let region = prompt_line("region — [F]eishu CN (default) / [L]ark intl: ")?;
+    let region = prompt_line("регион — [F]eishu CN (по умолчанию) / [L]ark intl: ")?;
     let use_feishu = !matches!(region.to_ascii_lowercase().as_str(), "l" | "lark" | "intl");
 
     // Provider allowlist is FAIL-CLOSED — make that loud.
     println!(
-        "\nallowed_user_ids = the open_ids (ou_…) allowed to drive the bot.\n  \
-         FAIL-CLOSED: leaving this EMPTY means the bot answers NO ONE\n  \
-         (the opposite of Telegram, where empty = open). Use `*` to allow everyone."
+        "\nallowed_user_ids = open_ids (ou_…), которым разрешено управлять ботом.\n  \
+         FAIL-CLOSED: пустой список означает, что бот НЕ ОТВЕЧАЕТ НИКОМУ\n  \
+         (в отличие от Telegram, где пусто = открыто). Используйте `*`, чтобы разрешить всем."
     );
-    let allow_raw = prompt_line("allowed open_ids (comma/space separated, or blank): ")?;
+    let allow_raw = prompt_line("разрешённые open_ids (через запятую/пробел или пусто): ")?;
     let allowed_user_ids: Vec<String> = allow_raw
         .split([',', ' ', '\t'])
         .map(|s| s.trim())
@@ -2245,7 +2255,7 @@ fn run_config_lark_menu() -> Result<String> {
         .map(str::to_string)
         .collect();
 
-    println!("validating app credentials (fetching a tenant_access_token)…");
+    println!("проверяю учётные данные приложения (получаю tenant_access_token)…");
     run_config_set_lark_creds(&app_id, &app_secret, allowed_user_ids, use_feishu)
 }
 
@@ -2258,14 +2268,14 @@ fn resolve_project_dir(paths: &CcteamPaths, slug: Option<&str>) -> Result<std::p
         Some(s) => {
             let d = paths.project_dir(s);
             if !d.exists() {
-                bail!("no project named `{s}` (looked under {})", d.display());
+                bail!("проекта с именем `{s}` нет (проверено в {})", d.display());
             }
             d
         }
-        None => std::env::current_dir().context("read cwd as the default --project target")?,
+        None => std::env::current_dir().context("прочитать cwd как цель --project по умолчанию")?,
     };
     std::fs::canonicalize(&dir)
-        .with_context(|| format!("canonicalize project dir `{}`", dir.display()))
+        .with_context(|| format!("канонизировать каталог проекта `{}`", dir.display()))
 }
 
 /// `ccteam role search <q>`. Substring search over the
@@ -2326,15 +2336,15 @@ fn render_hub_search(
         OutputFormat::Json => serde_json::to_string_pretty(&hits)?,
         OutputFormat::Text => {
             if hits.is_empty() {
-                format!("no {noun}s match `{query}` in the ccteam-hub marketplace.\n")
+                format!("в marketplace ccteam-hub нет {noun}, соответствующих `{query}`.\n")
             } else {
                 let mut out = format!(
-                    "{} {noun}(s) in the ccteam-hub marketplace{}:\n\n",
+                    "{} {noun} в marketplace ccteam-hub{}:\n\n",
                     hits.len(),
                     if query.trim().is_empty() {
                         String::new()
                     } else {
-                        format!(" matching `{query}`")
+                        format!(", соответствующих `{query}`")
                     }
                 );
                 for p in hits {
@@ -2345,7 +2355,7 @@ fn render_hub_search(
                         out.push_str(&format!("      {desc}\n"));
                     }
                 }
-                out.push_str(&format!("\nInstall one: {install_hint}\n"));
+                out.push_str(&format!("\nУстановить: {install_hint}\n"));
                 out
             }
         }
@@ -2365,11 +2375,11 @@ pub fn run_role_add(
     let index = block_on_async(ccteam_im::hub::load_catalog(&base, paths, false))??;
     let plugin = index.find(id).ok_or_else(|| {
         anyhow::anyhow!(
-            "no plugin `{id}` in the ccteam-hub marketplace — try `ccteam role search <q>`"
+            "в marketplace ccteam-hub нет плагина `{id}` — попробуйте `ccteam role search <q>`"
         )
     })?;
     if plugin.type_ == "skill" {
-        bail!("hub entry `{id}` is a skill; use: ccteam skill add {id}");
+        bail!("запись hub `{id}` — skill; используйте: ccteam skill add {id}");
     }
     let project_dir = resolve_project_dir(paths, project)?;
     let library_root = paths.skills_dir();
@@ -2388,24 +2398,24 @@ pub fn run_role_add(
     let stem = ccteam_core::sanitize_role_stem(as_role.unwrap_or(&result.id))
         .unwrap_or_else(|_| result.id.clone());
     let mut out = format!(
-        "Installed {} `{}` from the ccteam-hub marketplace{}.\n  {}\n",
+        "Установлен {} `{}` из marketplace ccteam-hub{}.\n  {}\n",
         result.type_,
         result.id,
         if result.overwrote {
-            " (overwrote existing)"
+            " (существующий перезаписан)"
         } else {
             ""
         },
         result.path.display(),
     );
     out.push_str(&format!(
-        "\nSwitch to it in a chat with `/role {stem}` (or spawn a session with that role).\n",
+        "\nПереключитесь в чате через `/role {stem}` (или запустите сессию с этой ролью).\n",
     ));
     // The body is third-party content fetched verbatim. Persona text steers an
     // agent that runs with `--dangerously-skip-permissions`, so prompt the
     // operator to read it before use rather than trusting it blind.
     out.push_str(&format!(
-        "\nNote: this plugin is third-party content fetched verbatim — review {} before use.\n",
+        "\nПримечание: это сторонний контент, полученный без изменений — проверьте {} перед использованием.\n",
         result.path.display()
     ));
     Ok(out)
@@ -2427,12 +2437,12 @@ pub fn run_role_list(
         OutputFormat::Text => {
             if roles.is_empty() {
                 format!(
-                    "no roles installed in {} (.claude/agents/ is empty or absent).\n\
-                     Browse the catalog: ccteam role search <q>\n",
+                    "в {} нет установленных ролей (.claude/agents/ пуст или отсутствует).\n\
+                     Откройте каталог: ccteam role search <q>\n",
                     project_dir.display()
                 )
             } else {
-                let mut out = format!("{} role(s) in {}:\n\n", roles.len(), project_dir.display());
+                let mut out = format!("{} ролей в {}:\n\n", roles.len(), project_dir.display());
                 for r in &roles {
                     out.push_str(&format!("  {}", r.role));
                     if !r.description.is_empty() {
@@ -2473,16 +2483,17 @@ pub fn run_skill_add(
     ))??;
     let plugin = index.find(id).ok_or_else(|| {
         anyhow::anyhow!(
-            "no skill `{id}` in the ccteam-hub marketplace — try `ccteam skill search <q>`"
+            "в marketplace ccteam-hub нет skill `{id}` — попробуйте `ccteam skill search <q>`"
         )
     })?;
     if plugin.type_ != "skill" {
         bail!(
-            "hub entry `{id}` is type `{}`; use: ccteam role add {id}",
+            "запись hub `{id}` имеет тип `{}`; используйте: ccteam role add {id}",
             plugin.type_
         );
     }
-    let project_dir = std::env::current_dir().context("read cwd for hub install context")?;
+    let project_dir =
+        std::env::current_dir().context("прочитать cwd для контекста установки hub")?;
     let library_root = paths.skills_dir();
     let result = block_on_async(ccteam_im::hub::install_plugin(
         &project_dir,
@@ -2493,10 +2504,10 @@ pub fn run_skill_add(
     ))?
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(format!(
-        "Installed skill `{}` into the user library{}:\n  {}\n",
+        "Skill `{}` установлен в пользовательскую библиотеку{}:\n  {}\n",
         result.id,
         if result.overwrote {
-            " (overwrote existing)"
+            " (существующий перезаписан)"
         } else {
             ""
         },
@@ -2512,12 +2523,12 @@ pub fn run_skill_list(paths: &CcteamPaths, json: bool) -> Result<String> {
     }
     if skills.is_empty() {
         return Ok(format!(
-            "no skills in the user library ({}).\nBrowse the catalog: ccteam skill search <q>\n",
+            "в пользовательской библиотеке нет skills ({}).\nОткройте каталог: ccteam skill search <q>\n",
             paths.skills_dir().display()
         ));
     }
     let mut out = format!(
-        "{} skill(s) in {}:\n\n",
+        "{} skills в {}:\n\n",
         skills.len(),
         paths.skills_dir().display()
     );
@@ -2540,31 +2551,33 @@ pub fn run_skill_remove(paths: &CcteamPaths, id: &str, force: bool) -> Result<St
     let target = paths.skills_dir().join(id);
     if !target.exists() {
         bail!(
-            "skill library entry `{id}` does not exist at {}",
+            "запись библиотеки skills `{id}` отсутствует в {}",
             target.display()
         );
     }
     if !target.is_dir() {
         bail!(
-            "skill library entry `{id}` is not a directory: {}",
+            "запись библиотеки skills `{id}` не является каталогом: {}",
             target.display()
         );
     }
     if !target.join("SKILL.md").is_file() && !force {
         bail!(
-            "`{id}` is a skill tree, not a single skill (no root SKILL.md); use `ccteam skill source rm {id}` for a registered source, or retry with --force"
+            "`{id}` — дерево skills, не один skill (нет корневого SKILL.md); для зарегистрированного источника используйте `ccteam skill source rm {id}` или повторите с --force"
         );
     }
     std::fs::remove_dir_all(&target)
-        .with_context(|| format!("remove skill library subtree {}", target.display()))?;
-    Ok(format!("Removed `{id}` from the user skill library.\n"))
+        .with_context(|| format!("удалить поддерево библиотеки skills {}", target.display()))?;
+    Ok(format!(
+        "`{id}` удалён из пользовательской библиотеки skills.\n"
+    ))
 }
 
 /// Refresh one hub-pinned skill, or every installed hub skill whose catalog
 /// sha differs from the library copy.
 pub fn run_skill_update(paths: &CcteamPaths, id: Option<&str>, all: bool) -> Result<String> {
     if id.is_some() == all {
-        bail!("choose exactly one of <hub-id> or --all");
+        bail!("выберите ровно одно: <hub-id> или --all");
     }
     let index = block_on_async(ccteam_im::hub::load_catalog(
         &ccteam_im::hub::hub_base(),
@@ -2572,15 +2585,15 @@ pub fn run_skill_update(paths: &CcteamPaths, id: Option<&str>, all: bool) -> Res
         false,
     ))??;
     let library_root = paths.skills_dir();
-    let project_dir = std::env::current_dir().context("read cwd for hub status context")?;
+    let project_dir = std::env::current_dir().context("прочитать cwd для контекста статуса hub")?;
 
     let candidates: Vec<&ccteam_im::hub::HubPlugin> = if let Some(id) = id {
         let plugin = index
             .find(id)
-            .ok_or_else(|| anyhow::anyhow!("no skill `{id}` in the ccteam-hub marketplace"))?;
+            .ok_or_else(|| anyhow::anyhow!("в marketplace ccteam-hub нет skill `{id}`"))?;
         if plugin.type_ != "skill" {
             bail!(
-                "hub entry `{id}` is type `{}`; use: ccteam role add {id}",
+                "запись hub `{id}` имеет тип `{}`; используйте: ccteam role add {id}",
                 plugin.type_
             );
         }
@@ -2615,18 +2628,20 @@ pub fn run_skill_update(paths: &CcteamPaths, id: Option<&str>, all: bool) -> Res
 
     if let Some(id) = id {
         if updated.iter().any(|updated| updated == id) {
-            return Ok(format!("Updated hub skill `{id}` in the user library.\n"));
+            return Ok(format!(
+                "Hub skill `{id}` обновлён в пользовательской библиотеке.\n"
+            ));
         }
         if current.iter().any(|current| current == id) {
-            return Ok(format!("Hub skill `{id}` is already current.\n"));
+            return Ok(format!("Hub skill `{id}` уже актуален.\n"));
         }
         return Ok(format!(
-            "Hub skill `{id}` is not installed; use `ccteam skill add {id}`.\n"
+            "Hub skill `{id}` не установлен; используйте `ccteam skill add {id}`.\n"
         ));
     }
 
     Ok(format!(
-        "Hub skill update complete: {} updated, {} already current.\n",
+        "Обновление hub skills завершено: обновлено {}, уже актуальны {}.\n",
         updated.len(),
         current.len()
     ))
@@ -2659,20 +2674,21 @@ fn load_skill_sources(paths: &CcteamPaths) -> Result<SkillSources> {
         return Ok(SkillSources::new());
     }
     let body = std::fs::read_to_string(&path)
-        .with_context(|| format!("read skill sources {}", path.display()))?;
-    serde_json::from_str(&body).with_context(|| format!("parse skill sources {}", path.display()))
+        .with_context(|| format!("прочитать источники skills {}", path.display()))?;
+    serde_json::from_str(&body)
+        .with_context(|| format!("разобрать источники skills {}", path.display()))
 }
 
 fn save_skill_sources(paths: &CcteamPaths, sources: &SkillSources) -> Result<()> {
     let path = skill_sources_path(paths);
     std::fs::create_dir_all(paths.skills_dir())
-        .with_context(|| format!("create skill library {}", paths.skills_dir().display()))?;
+        .with_context(|| format!("создать библиотеку skills {}", paths.skills_dir().display()))?;
     let tmp = path.with_extension("json.tmp");
     let mut body = serde_json::to_string_pretty(sources)?;
     body.push('\n');
-    std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::write(&tmp, body).with_context(|| format!("записать {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+        .with_context(|| format!("переименовать {} -> {}", tmp.display(), path.display()))
 }
 
 fn source_default_stem(origin: &str) -> Result<String> {
@@ -2680,7 +2696,9 @@ fn source_default_stem(origin: &str) -> Result<String> {
     let raw = if path.exists() {
         path.file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow::anyhow!("source path has no UTF-8 directory name: {origin}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("у пути источника нет имени каталога в UTF-8: {origin}")
+            })?
             .to_string()
     } else {
         origin
@@ -2697,13 +2715,13 @@ fn source_default_stem(origin: &str) -> Result<String> {
 fn run_checked_command(mut command: Command, description: &str) -> Result<()> {
     let output = command
         .output()
-        .with_context(|| format!("run {description}"))?;
+        .with_context(|| format!("выполнить {description}"))?;
     if output.status.success() {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     bail!(
-        "{description} failed{}",
+        "{description} завершилась ошибкой{}",
         if stderr.is_empty() {
             String::new()
         } else {
@@ -2750,7 +2768,7 @@ fn copy_source_tree(source: &std::path::Path, target: &std::path::Path) -> Resul
             })?;
         } else {
             bail!(
-                "source tree contains unsupported symlink or special file: {}",
+            "дерево источника содержит неподдерживаемую символьную ссылку или специальный файл: {}",
                 entry.path().display()
             );
         }
@@ -2770,13 +2788,13 @@ pub fn run_skill_source_add(
     let local = origin_path.exists();
     if local && !origin_path.is_dir() {
         bail!(
-            "skill source must be a directory: {}",
+            "источник skills должен быть каталогом: {}",
             origin_path.display()
         );
     }
     let is_git = !local || origin_path.join(".git").exists();
     if !is_git && reference.is_some() {
-        bail!("--ref is only valid for git skill sources");
+        bail!("--ref допустим только для git-источников skills");
     }
     let raw_stem = name
         .map(str::to_string)
@@ -2785,16 +2803,19 @@ pub fn run_skill_source_add(
     let target = paths.skills_dir().join(&stem);
     if target.exists() {
         bail!(
-            "skill source target `{stem}` already exists at {}; remove it first",
+            "цель источника skills `{stem}` уже существует в {}; сначала удалите её",
             target.display()
         );
     }
     let mut sources = load_skill_sources(paths)?;
     if sources.contains_key(&stem) {
-        bail!("skill source `{stem}` is already registered");
+        bail!("источник skills `{stem}` уже зарегистрирован");
     }
     let target_parent = target.parent().ok_or_else(|| {
-        anyhow::anyhow!("skill source target has no parent: {}", target.display())
+        anyhow::anyhow!(
+            "у цели источника skills нет родительского каталога: {}",
+            target.display()
+        )
     })?;
     std::fs::create_dir_all(target_parent)
         .with_context(|| format!("create skill source parent {}", target_parent.display()))?;
@@ -2835,7 +2856,7 @@ pub fn run_skill_source_add(
     }
     let count = ccteam_core::list_library_skills(&target).len();
     Ok(format!(
-        "Added {} skill source `{stem}` at {} ({count} skill(s) discovered).\n",
+        "Добавлен {}-источник skills `{stem}` в {} (обнаружено skills: {count}).\n",
         if is_git { "git" } else { "path" },
         target.display()
     ))
@@ -2869,14 +2890,14 @@ pub fn run_skill_source_update(
     all: bool,
 ) -> Result<String> {
     if stem.is_some() == all {
-        bail!("choose exactly one of <stem> or --all");
+        bail!("выберите ровно одно: <stem> или --all");
     }
     let sources = load_skill_sources(paths)?;
     let selected: Vec<(&String, &SkillSourceRecord)> = if let Some(stem) = stem {
         ccteam_core::validate_skill_library_id(stem)?;
         let record = sources
             .get_key_value(stem)
-            .ok_or_else(|| anyhow::anyhow!("skill source `{stem}` is not registered"))?;
+            .ok_or_else(|| anyhow::anyhow!("источник skills `{stem}` не зарегистрирован"))?;
         vec![record]
     } else {
         sources.iter().collect()
@@ -2885,21 +2906,24 @@ pub fn run_skill_source_update(
     for (stem, record) in selected {
         let target = paths.skills_dir().join(stem);
         if !target.is_dir() {
-            bail!("skill source `{stem}` is missing at {}", target.display());
+            bail!(
+                "источник skills `{stem}` отсутствует в {}",
+                target.display()
+            );
         }
         match record.kind {
             SkillSourceKind::Git => {
                 update_git_source(&target, record.r#ref.as_deref())?;
-                out.push_str(&format!("Updated git skill source `{stem}`.\n"));
+                out.push_str(&format!("Git-источник skills `{stem}` обновлён.\n"));
             }
             SkillSourceKind::Path => out.push_str(&format!(
-                "Path skill source `{stem}` is self-managed; update is a no-op (origin {}).\n",
+                "Источник skills типа path `{stem}` управляется самостоятельно; обновление ничего не делает (origin {}).\n",
                 record.origin
             )),
         }
     }
     if out.is_empty() {
-        out.push_str("No skill sources are registered.\n");
+        out.push_str("Источники skills не зарегистрированы.\n");
     }
     Ok(out)
 }
@@ -2911,9 +2935,9 @@ pub fn run_skill_source_list(paths: &CcteamPaths, json: bool) -> Result<String> 
         return Ok(serde_json::to_string_pretty(&sources)?);
     }
     if sources.is_empty() {
-        return Ok("no skill sources registered.\n".to_string());
+        return Ok("Источники skills не зарегистрированы.\n".to_string());
     }
-    let mut out = format!("{} skill source(s):\n\n", sources.len());
+    let mut out = format!("Источников skills: {}\n\n", sources.len());
     for (stem, source) in sources {
         out.push_str(&format!(
             "  {stem}  [{}]  {}{}\n",
@@ -2938,16 +2962,16 @@ pub fn run_skill_source_remove(paths: &CcteamPaths, stem: &str) -> Result<String
     ccteam_core::validate_skill_library_id(stem)?;
     let mut sources = load_skill_sources(paths)?;
     if sources.remove(stem).is_none() {
-        bail!("skill source `{stem}` is not registered");
+        bail!("источник skills `{stem}` не зарегистрирован");
     }
     let target = paths.skills_dir().join(stem);
     if target.exists() {
         std::fs::remove_dir_all(&target)
-            .with_context(|| format!("remove skill source tree {}", target.display()))?;
+            .with_context(|| format!("удалить дерево источника skills {}", target.display()))?;
     }
     save_skill_sources(paths, &sources)?;
     Ok(format!(
-        "Removed skill source `{stem}` and its library tree.\n"
+        "Источник skills `{stem}` и его дерево библиотеки удалены.\n"
     ))
 }
 
@@ -2958,15 +2982,15 @@ fn ensure_project_skill_entity(project_dir: &std::path::Path) -> Result<std::pat
     match std::fs::symlink_metadata(&entity) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(entity),
         Ok(_) => bail!(
-            "project skill entity must be a real directory, not a symlink/file: {}",
+            "сущность skills проекта должна быть настоящим каталогом, а не символьной ссылкой/файлом: {}",
             entity.display()
         ),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             std::fs::create_dir_all(&entity)
-                .with_context(|| format!("create project skill entity {}", entity.display()))?;
+                .with_context(|| format!("создать сущность skills проекта {}", entity.display()))?;
             Ok(entity)
         }
-        Err(err) => Err(err).with_context(|| format!("inspect {}", entity.display())),
+        Err(err) => Err(err).with_context(|| format!("проверить {}", entity.display())),
     }
 }
 
@@ -2990,12 +3014,12 @@ fn project_skills_link_is_correct(link: &std::path::Path, entity: &std::path::Pa
 #[cfg(unix)]
 fn create_project_skills_link(link: &std::path::Path) -> Result<()> {
     std::os::unix::fs::symlink(PROJECT_SKILLS_LINK_TARGET, link)
-        .with_context(|| format!("create project skill link {}", link.display()))
+        .with_context(|| format!("создать ссылку skills проекта {}", link.display()))
 }
 
 #[cfg(not(unix))]
 fn create_project_skills_link(_link: &std::path::Path) -> Result<()> {
-    bail!("project skill symlink management requires Unix/WSL")
+    bail!("управление символьными ссылками skills проекта требует Unix/WSL")
 }
 
 /// Ensure the neutral project skill entity and Claude discovery symlink.
@@ -3004,7 +3028,7 @@ pub fn run_skill_ensure_project(paths: &CcteamPaths, project: Option<&str>) -> R
     let entity = ensure_project_skill_entity(&project_dir)?;
     let link = project_dir.join(".claude/skills");
     std::fs::create_dir_all(project_dir.join(".claude"))
-        .with_context(|| format!("create {}/.claude", project_dir.display()))?;
+        .with_context(|| format!("создать {}/.claude", project_dir.display()))?;
     match std::fs::symlink_metadata(&link) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             create_project_skills_link(&link)?;
@@ -3012,7 +3036,7 @@ pub fn run_skill_ensure_project(paths: &CcteamPaths, project: Option<&str>) -> R
         Ok(metadata) if metadata.file_type().is_symlink() => {
             if !project_skills_link_is_correct(&link, &entity) {
                 bail!(
-                    "{} is a symlink to the wrong target; expected {}",
+                    "{} — символьная ссылка на неверную цель; ожидалась {}",
                     link.display(),
                     PROJECT_SKILLS_LINK_TARGET
                 );
@@ -3020,30 +3044,34 @@ pub fn run_skill_ensure_project(paths: &CcteamPaths, project: Option<&str>) -> R
         }
         Ok(metadata) if metadata.file_type().is_dir() => {
             let empty = std::fs::read_dir(&link)
-                .with_context(|| format!("read legacy skill dir {}", link.display()))?
+                .with_context(|| format!("прочитать устаревший каталог skills {}", link.display()))?
                 .next()
                 .is_none();
             if !empty {
                 bail!(
-                    "legacy project skill directory {} is non-empty; use `ccteam skill migrate-project{}`",
+                    "устаревший каталог skills проекта {} не пуст; используйте `ccteam skill migrate-project{}`",
                     link.display(),
                     project
                         .map(|slug| format!(" --project {slug}"))
                         .unwrap_or_default()
                 );
             }
-            std::fs::remove_dir(&link)
-                .with_context(|| format!("remove empty legacy skill dir {}", link.display()))?;
+            std::fs::remove_dir(&link).with_context(|| {
+                format!(
+                    "удалить пустой устаревший каталог skills {}",
+                    link.display()
+                )
+            })?;
             create_project_skills_link(&link)?;
         }
         Ok(_) => bail!(
-            "{} exists but is neither a directory nor the expected symlink",
+            "{} существует, но не является ни каталогом, ни ожидаемой символьной ссылкой",
             link.display()
         ),
-        Err(err) => return Err(err).with_context(|| format!("inspect {}", link.display())),
+        Err(err) => return Err(err).with_context(|| format!("проверить {}", link.display())),
     }
     Ok(format!(
-        "Project skill face ready:\n  entity: {}\n  claude: {} -> {}\n",
+        "Представление skills проекта готово:\n  сущность: {}\n  claude: {} -> {}\n",
         entity.display(),
         link.display(),
         PROJECT_SKILLS_LINK_TARGET
@@ -3057,51 +3085,52 @@ pub fn run_skill_migrate_project(paths: &CcteamPaths, project: Option<&str>) -> 
     let entity = ensure_project_skill_entity(&project_dir)?;
     let legacy = project_dir.join(".claude/skills");
     std::fs::create_dir_all(project_dir.join(".claude"))
-        .with_context(|| format!("create {}/.claude", project_dir.display()))?;
+        .with_context(|| format!("создать {}/.claude", project_dir.display()))?;
 
     let metadata = match std::fs::symlink_metadata(&legacy) {
         Ok(metadata) => Some(metadata),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(err).with_context(|| format!("inspect {}", legacy.display())),
+        Err(err) => return Err(err).with_context(|| format!("проверить {}", legacy.display())),
     };
     if let Some(metadata) = metadata.as_ref() {
         if metadata.file_type().is_symlink() {
             if project_skills_link_is_correct(&legacy, &entity) {
                 return Ok(format!(
-                    "Project skills already use the neutral entity at {}.\n",
+                    "Skills проекта уже используют нейтральную сущность в {}.\n",
                     entity.display()
                 ));
             }
             bail!(
-                "{} is a symlink to the wrong target; refusing migration",
+                "{} — символьная ссылка на неверную цель; перенос отклонён",
                 legacy.display()
             );
         }
         if !metadata.file_type().is_dir() {
             bail!(
-                "legacy project skill face is not a directory: {}",
+                "устаревшее представление skills проекта не является каталогом: {}",
                 legacy.display()
             );
         }
 
         let mut moves = Vec::new();
         for entry in std::fs::read_dir(&legacy)
-            .with_context(|| format!("read legacy skill dir {}", legacy.display()))?
+            .with_context(|| format!("прочитать устаревший каталог skills {}", legacy.display()))?
         {
-            let entry = entry.with_context(|| format!("read entry under {}", legacy.display()))?;
+            let entry =
+                entry.with_context(|| format!("прочитать запись в {}", legacy.display()))?;
             let file_type = entry
                 .file_type()
-                .with_context(|| format!("read file type for {}", entry.path().display()))?;
+                .with_context(|| format!("прочитать тип файла {}", entry.path().display()))?;
             if !file_type.is_dir() {
                 bail!(
-                    "legacy skill face contains a non-directory entry {}; move it manually before migration",
+                    "устаревшее представление skills содержит запись не-каталог {}; переместите её вручную перед переносом",
                     entry.path().display()
                 );
             }
             let destination = entity.join(entry.file_name());
             if destination.exists() {
                 bail!(
-                    "project skill migration collision at {}; resolve it before retrying",
+                    "конфликт переноса skills проекта в {}; устраните его перед повтором",
                     destination.display()
                 );
             }
@@ -3110,18 +3139,18 @@ pub fn run_skill_migrate_project(paths: &CcteamPaths, project: Option<&str>) -> 
         for (source, destination) in &moves {
             std::fs::rename(source, destination).with_context(|| {
                 format!(
-                    "move project skill {} -> {}",
+                    "переместить skill проекта {} -> {}",
                     source.display(),
                     destination.display()
                 )
             })?;
         }
         std::fs::remove_dir(&legacy)
-            .with_context(|| format!("remove legacy skill dir {}", legacy.display()))?;
+            .with_context(|| format!("удалить устаревший каталог skills {}", legacy.display()))?;
     }
     create_project_skills_link(&legacy)?;
     Ok(format!(
-        "Migrated project skills to {} and linked {} -> {}.\n",
+        "Skills проекта перенесены в {}; создана ссылка {} -> {}.\n",
         entity.display(),
         legacy.display(),
         PROJECT_SKILLS_LINK_TARGET
@@ -3180,13 +3209,14 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
             // / let claude finish / pass `--force`.
             report.refusal = Some(r.clone());
             bail!(
-                "ccteam remove `{slug}`: {}. Re-run with `--force` to override.",
+                "ccteam remove `{slug}`: {}. Повторите с `--force` для принудительного выполнения.",
                 r.message(slug)
             );
         } else {
-            report
-                .steps
-                .push(format!("forced through guard: {}", r.message(slug)));
+            report.steps.push(format!(
+                "защита принудительно пройдена: {}",
+                r.message(slug)
+            ));
         }
     }
 
@@ -3203,11 +3233,13 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
         for name in &chat_stop.would_stop {
             report
                 .steps
-                .push(format!("would stop chat session `{name}`"));
+                .push(format!("будет остановлена чат-сессия `{name}`"));
         }
     } else {
         for name in &chat_stop.stopped {
-            report.steps.push(format!("stopped chat session `{name}`"));
+            report
+                .steps
+                .push(format!("остановлена чат-сессия `{name}`"));
         }
     }
 
@@ -3227,7 +3259,7 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
     if registered.is_some() {
         if opts.dry_run {
             report.steps.push(format!(
-                "would drop config.yaml::projects entry for `{slug}` (path: {})",
+                "будет удалена запись config.yaml::projects для `{slug}` (путь: {})",
                 project_dir.display()
             ));
         } else {
@@ -3235,12 +3267,12 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
             if removed {
                 report
                     .steps
-                    .push(format!("removed config.yaml::projects entry for `{slug}`"));
+                    .push(format!("удалена запись config.yaml::projects для `{slug}`"));
             }
         }
     } else {
         report.steps.push(format!(
-            "config.yaml::projects has no entry for `{slug}` (orphan / pre-V0.4.2 install)"
+            "в config.yaml::projects нет записи для `{slug}` (сирота / установка до V0.4.2)"
         ));
     }
 
@@ -3251,19 +3283,20 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
     let daemon_up = ccteam_core::daemon::daemon_reachable(paths);
     if opts.dry_run {
         report.steps.push(if daemon_up {
-            "would write unroster trigger + await daemon acknowledgment (≤5s)".to_string()
+            "будет записан trigger снятия с roster и ожидание подтверждения демона (≤5 с)"
+                .to_string()
         } else {
-            "would skip daemon unroster (daemon not running)".to_string()
+            "снятие с roster демона будет пропущено (демон не запущен)".to_string()
         });
     } else if !daemon_up {
         report
             .steps
-            .push("daemon unroster: skipped (daemon not running)".to_string());
+            .push("снятие с roster демона: пропущено (демон не запущен)".to_string());
     } else {
         match std::fs::write(&trigger_path, slug) {
             Err(err) => report.steps.push(format!(
-                "daemon unroster: trigger write failed ({err}); \
-                 daemon will pick up config drop on next rescan"
+                "снятие с roster демона: не удалось записать trigger ({err}); \
+                 демон заметит удаление из config при следующем сканировании"
             )),
             Ok(()) => {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -3278,12 +3311,12 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
                 if acknowledged {
                     report
                         .steps
-                        .push("daemon unroster: acknowledged by daemon".to_string());
+                        .push("снятие с roster демона: подтверждено демоном".to_string());
                 } else {
                     let _ = std::fs::remove_file(&trigger_path);
                     report.steps.push(
-                        "daemon unroster: sent (daemon did not acknowledge in 5s; \
-                         will pick up on next rescan)"
+                        "снятие с roster демона: отправлено (демон не подтвердил за 5 с; \
+                         заметит при следующем сканировании)"
                             .to_string(),
                     );
                 }
@@ -3314,17 +3347,17 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
         if opts.dry_run {
             report
                 .steps
-                .push(format!("would remove {label} {}", path.display()));
+                .push(format!("будет удалён {label} {}", path.display()));
         } else if is_dir {
             std::fs::remove_dir_all(&path).with_context(|| format!("rm -rf {}", path.display()))?;
             report
                 .steps
-                .push(format!("removed {label} {}", path.display()));
+                .push(format!("удалён {label} {}", path.display()));
         } else {
             std::fs::remove_file(&path).with_context(|| format!("rm {}", path.display()))?;
             report
                 .steps
-                .push(format!("removed {label} {}", path.display()));
+                .push(format!("удалён {label} {}", path.display()));
         }
     }
 
@@ -3411,7 +3444,7 @@ fn stop_project_chat_sessions(
     }
     for name in matches {
         block_on_async(backend.kill(&MuxSessionId::new(name.clone())))?
-            .with_context(|| format!("stop chat session `{name}`"))?;
+            .with_context(|| format!("остановить чат-сессию `{name}`"))?;
         out.stopped.push(name);
     }
     Ok(out)
@@ -3435,14 +3468,21 @@ pub fn run_project_stop(_paths: &CcteamPaths, slug: &str) -> Result<String> {
     use std::fmt::Write as _;
     writeln!(out, "ccteam project stop {slug}").ok();
     for name in &stop.stopped {
-        writeln!(out, "  - stopped chat session `{name}` (resumable by id)").ok();
+        writeln!(
+            out,
+            "  - остановлена чат-сессия `{name}` (возобновляется по id)"
+        )
+        .ok();
     }
     let n = stop.stopped.len();
     writeln!(
         out,
-        "stopped {n} chat session{} for `{slug}`{}",
-        if n == 1 { "" } else { "s" },
-        if n == 0 { " (none were running)" } else { "" }
+        "остановлено чат-сессий: {n} для `{slug}`{}",
+        if n == 0 {
+            " (запущенных не было)"
+        } else {
+            ""
+        }
     )
     .ok();
     Ok(out)
@@ -3796,21 +3836,21 @@ mod tests {
         // SLUG/SID/ROLE.
         assert!(out.contains("SLUG"));
         assert!(out.contains("SID"));
-        assert!(out.contains("ROLE"));
-        assert!(out.contains("VENDOR"));
-        assert!(out.contains("LAST ACTIVE"));
+        assert!(out.contains("РОЛЬ"));
+        assert!(out.contains("ВЕНДОР"));
+        assert!(out.contains("ПОСЛЕДНЯЯ АКТИВНОСТЬ"));
 
         // Both rows present with their sid + vendor.
         let claude_line = out.lines().find(|l| l.contains("s1")).expect("claude row");
         assert!(claude_line.contains("reviewer"), "{claude_line}");
         assert!(claude_line.contains("claude"), "{claude_line}");
-        assert!(claude_line.contains("live"), "{claude_line}");
+        assert!(claude_line.contains("активна"), "{claude_line}");
 
         let codex_line = out.lines().find(|l| l.contains("s2")).expect("codex row");
         assert!(codex_line.contains("builder"), "{codex_line}");
         assert!(codex_line.contains("codex"), "{codex_line}");
         // BUG-5: codex tracked session is live, never "registered, not running".
-        assert!(codex_line.contains("live"), "{codex_line}");
+        assert!(codex_line.contains("активна"), "{codex_line}");
         assert!(
             !out.contains("registered, not running"),
             "BUG-5 regression: false not-running note returned: {out}"
@@ -3854,7 +3894,7 @@ mod tests {
         let out = render_sessions_table(&tracked, &[], true);
 
         assert!(
-            out.contains("TITLE"),
+            out.contains("НАЗВАНИЕ"),
             "header must carry a TITLE column: {out}"
         );
         let titled_line = out.lines().find(|l| l.contains("s1")).expect("titled row");
@@ -3890,7 +3930,7 @@ mod tests {
 
         let tracked_line = out.lines().find(|l| l.contains("s1")).expect("tracked");
         assert!(
-            tracked_line.contains("registered (daemon down)"),
+            tracked_line.contains("зарегистрирована (демон недоступен)"),
             "{tracked_line}"
         );
 
@@ -3899,7 +3939,7 @@ mod tests {
             .find(|l| l.contains("zombie"))
             .expect("orphan row");
         assert!(orphan_line.contains("ghost"), "{orphan_line}");
-        assert!(orphan_line.contains("orphan"), "{orphan_line}");
+        assert!(orphan_line.contains("сирота"), "{orphan_line}");
     }
 
     /// A tracked session's own live pane is reconciled (matched by
@@ -3918,7 +3958,7 @@ mod tests {
         // The live pane name matches the canonical name of the tracked s1.
         let live = vec!["ccteam-chat-alpha-s1".to_string()];
         let out = render_sessions_table(&tracked, &live, true);
-        assert!(!out.contains("orphan"), "tracked pane misflagged: {out}");
+        assert!(!out.contains("сирота"), "tracked pane misflagged: {out}");
         // Exactly one data row (s1), not two.
         assert_eq!(out.matches("s1").count(), 1, "{out}");
     }
@@ -3983,7 +4023,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let body = run_ls(&paths, OutputFormat::Text).unwrap();
-        assert!(body.contains("no projects"));
+        assert!(body.contains("нет проектов"));
     }
 
     #[test]
@@ -4011,8 +4051,8 @@ mod tests {
         let body = run_ls(&paths, OutputFormat::Text).unwrap();
         let first_line = body.lines().next().unwrap_or("");
         assert!(
-            first_line == "daemon: down",
-            "expected first line `daemon: down`; got: {first_line}",
+            first_line == "демон: не работает",
+            "expected first line `демон: не работает`; got: {first_line}",
         );
     }
 
@@ -4035,14 +4075,31 @@ mod tests {
     }
 
     #[test]
+    fn run_ls_text_is_russian_and_json_contract_is_stable() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = run_new_t4(&paths, "demo", "dev").unwrap();
+
+        let text = run_ls(&paths, OutputFormat::Text).unwrap();
+        assert!(text.contains("демон:"));
+        assert!(text.contains(&slug));
+
+        let json = run_ls(&paths, OutputFormat::Json).unwrap();
+        let value: Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(value["projects"][0]["slug"], slug);
+        assert!(value["orchestrator"]["running"].is_boolean());
+    }
+
+    #[test]
     fn f27_run_ls_text_reports_daemon_up_on_reachable_socket() {
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let _daemon = fake_daemon(&paths);
         let body = run_ls(&paths, OutputFormat::Text).unwrap();
         assert!(
-            body.starts_with("daemon: up"),
-            "expected `daemon: up` head line on reachable socket; got:\n{body}",
+            body.starts_with("демон: работает"),
+            "expected `демон: работает` head line on reachable socket; got:\n{body}",
         );
     }
 
@@ -4201,7 +4258,7 @@ mod tests {
             );
         }
         assert!(report.contains("ccteam init"));
-        assert!(report.contains("next"));
+        assert!(report.contains("дальше"));
     }
 
     /// Regression: a brand-new `ccteam init` must not create any
@@ -4333,8 +4390,8 @@ mod tests {
             "3. config:",
             "4. start:",
             "5. cd:",
-            "sessions are roleless by default",
-            "install or author work-roles in .claude/agents/<role>.md",
+            "по умолчанию сессии без роли",
+            "создайте рабочие роли в .claude/agents/<role>.md",
             "docs/usage.md",
         ] {
             assert!(
@@ -4342,6 +4399,54 @@ mod tests {
                 "init next block missing {needle:?}:\n{out}"
             );
         }
+    }
+
+    #[test]
+    fn run_show_text_is_russian_while_json_fields_remain_stable() {
+        ensure_isolation();
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let slug = run_new_t4(&paths, "demo", "dev").unwrap();
+        let text = run_show(&paths, &slug, OutputFormat::Text).unwrap();
+        assert!(text.contains("текущая фаза"), "{text}");
+        assert!(text.contains("стоимость (24ч)"), "{text}");
+        let json = run_show(&paths, &slug, OutputFormat::Json).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["state"]["slug"], slug);
+    }
+
+    #[test]
+    fn run_show_session_row_uses_russian_context_label() {
+        let state = ProjectState::initial("demo".into());
+        let sessions = [ccteam_core::ActiveSessionInfo {
+            role: "worker".into(),
+            session_id: "session-1".into(),
+            job_id: Some("job-12345678".into()),
+            cwd: None,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            cost_usd: 1.25,
+            model: Some("claude-sonnet".into()),
+            context_remaining_pct: Some(42.0),
+        }];
+        let text = render_show_text(
+            &state,
+            &ccteam_core::CostSummary::default(),
+            &[],
+            &Map::new(),
+            &sessions,
+        );
+        assert!(text.contains("контекст  42%"), "{text}");
+        assert!(!text.contains("ctx "), "{text}");
+    }
+
+    #[test]
+    fn project_skill_entity_error_is_russian() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".agents/skills");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not a directory").unwrap();
+        let err = ensure_project_skill_entity(tmp.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("должна быть настоящим каталогом"));
     }
 
     /// `ccteam init` without `--mode` defaults to artifact-driven; no
@@ -4683,7 +4788,7 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("ccteam repo itself"),
+            msg.contains("самом репозитории ccteam"),
             "expected fail-loud message; got: {msg}",
         );
         assert!(
@@ -4792,7 +4897,7 @@ mod tests {
             std::path::Path::new("/tmp/fake-kimi/mcp.json"),
         );
         assert!(
-            report.contains(&format!("tools surface : {total}")),
+            report.contains(&format!("поверхность инструментов: {total}")),
             "report must interpolate live tool count {total}: {report}",
         );
         // The stale "(interfaces §12.2)" tag must be gone.
@@ -4843,16 +4948,16 @@ mod tests {
         };
         assert!(!synth.ok());
         let text = synth.render_text();
-        assert!(text.contains("verdict: FAIL"), "text: {text}");
+        assert!(text.contains("вердикт: FAIL"), "text: {text}");
         assert!(
-            text.contains("unexpected STUBs"),
+            text.contains("неожиданные STUB"),
             "text must list unexpected STUBs section: {text}",
         );
         assert!(
             text.contains("ccteam__workflow_synth_stub"),
             "stub tool name must appear in report: {text}",
         );
-        assert!(text.contains("14 active / 1 stub"), "got: {text}");
+        assert!(text.contains("14 активных / 1 заглушек"), "got: {text}");
     }
 
     #[test]

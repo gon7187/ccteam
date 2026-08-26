@@ -179,7 +179,7 @@ pub(crate) fn run_restart_contract(
             RestartContractStatus::RestartRefused { hint }
         }
         daemon_cli::RestartOutcome::StopTimedOut { pid } => RestartContractStatus::RestartError {
-            message: format!("daemon pid {pid} did not exit within the stop wait"),
+            message: format!("процесс демона {pid} не завершился за время ожидания остановки"),
         },
         daemon_cli::RestartOutcome::Restarted { .. }
         | daemon_cli::RestartOutcome::Started { .. }
@@ -213,7 +213,7 @@ pub fn run_update(now: bool, no_restart: bool, json: bool, force: bool) -> Resul
                     "channel": channel.as_str(),
                     "suggested": "git pull && make install",
                 }),
-                "ccteam was built from source; `ccteam update` will not compile it. Update with:\n  \
+                "ccteam собран из исходников; `ccteam update` его не компилирует. Обновите через:\n  \
                  git pull && make install",
             );
             Ok(())
@@ -228,8 +228,8 @@ pub fn run_update(now: bool, no_restart: bool, json: bool, force: bool) -> Resul
                     "suggested": cmd,
                 }),
                 &format!(
-                    "the {} channel is not published yet (tracked in V094). Once it ships, update \
-                     with:\n  {}",
+                    "канал {} ещё не опубликован (отслеживается в V094). После публикации обновляйте \
+                     через:\n  {}",
                     channel.as_str(),
                     cmd
                 ),
@@ -245,8 +245,8 @@ pub fn run_update(now: bool, no_restart: bool, json: bool, force: bool) -> Resul
                 json,
                 "unknownChannel",
                 &format!(
-                    "cannot self-update: ccteam's install channel is unknown (running {exe}). \
-                     Reinstall from {}",
+                    "самообновление невозможно: канал установки ccteam неизвестен (запущен {exe}). \
+                     Переустановите из {}",
                     install_channel::REPO_URL
                 ),
             )
@@ -289,12 +289,12 @@ fn emit_up_to_date(
     };
     let stale_daemon = daemon_version.as_deref().is_some_and(|v| v != current);
     let mut human = format!(
-        "already on the latest release ({current}) — nothing to download.\n  \
-         reinstall anyway with `ccteam update --force`"
+        "уже установлен последний релиз ({current}) — скачивать нечего.\n  \
+         для переустановки выполните `ccteam update --force`"
     );
     if let Some(running) = daemon_version.as_deref().filter(|_| stale_daemon) {
         human.push_str(&format!(
-            "\n  note: the running daemon reports {running} — restart it to pick up \
+            "\n  примечание: запущенный демон сообщает {running} — перезапустите его, чтобы загрузить \
              {current}: `ccteam daemon restart`"
         ));
     }
@@ -319,18 +319,18 @@ fn run_standalone_update(paths: &CcteamPaths, restart: RestartPlan, json: bool) 
     // stays exactly one JSON line), so route the child's stdout to stderr
     // there; human mode inherits it.
     if json {
-        eprintln!("ccteam update: replaying the installer...");
+        eprintln!("ccteam update: повторно запускаю установщик...");
     } else {
-        println!("ccteam update: replaying the installer (download + verify + atomic swap)...");
+        println!("ccteam update: повторно запускаю установщик (скачивание + проверка + атомарная замена)...");
     }
-    let status = run_installer(json).context("run the ccteam installer")?;
+    let status = run_installer(json).context("запустить установщик ccteam")?;
     if !status.success() {
         fail(
             json,
             "installerFailed",
             &format!(
-                "the installer exited unsuccessfully ({status}); the existing binary is unchanged \
-                 (install.sh swaps atomically) and the daemon was NOT restarted"
+                "установщик завершился с ошибкой ({status}); существующий бинарник не изменён \
+                 (install.sh заменяет атомарно), демон НЕ перезапускался"
             ),
         );
     }
@@ -352,8 +352,8 @@ fn run_standalone_update(paths: &CcteamPaths, restart: RestartPlan, json: bool) 
                     "version": expected,
                 }),
                 &format!(
-                    "binary updated to {expected}; run `ccteam daemon restart` to load it into the \
-                     running daemon"
+                    "бинарник обновлён до {expected}; выполните `ccteam daemon restart`, чтобы загрузить его \
+                     в работающий демон"
                 ),
             );
             Ok(())
@@ -393,8 +393,8 @@ fn emit_restart_contract(json: bool, expected: &str, status: RestartContractStat
                     "version": expected,
                 }),
                 &format!(
-                    "binary updated to {expected}; the daemon is not running \
-                     (`ccteam daemon start` to launch the new version)"
+                    "бинарник обновлён до {expected}; демон не запущен \
+                     (выполните `ccteam daemon start` для запуска новой версии)"
                 ),
             );
             Ok(())
@@ -409,9 +409,9 @@ fn emit_restart_contract(json: bool, expected: &str, status: RestartContractStat
                     "version": version,
                 }),
                 &format!(
-                    "updated to {expected} and gracefully restarted the daemon (running version \
-                     {v}). Agent sessions are not killed; a session still mid-turn finishes it \
-                     and the new daemon picks it up by sid (never a second process)."
+                    "обновлено до {expected}, демон штатно перезапущен (работающая версия \
+                     {v}). Сессии агентов не завершаются; сессия в ходе ответа его закончит, \
+                     а новый демон подхватит её по sid (второго процесса не будет)."
                 ),
             );
             Ok(())
@@ -433,8 +433,8 @@ fn emit_restart_contract(json: bool, expected: &str, status: RestartContractStat
                     "expectedVersion": exp,
                 }),
                 &format!(
-                    "WARNING: updated the binary to {exp} and restarted, but the running daemon \
-                     reports version {r} — it may not have come up on the new binary. Check \
+                    "ПРЕДУПРЕЖДЕНИЕ: бинарник обновлён до {exp} и перезапущен, но работающий демон \
+                     сообщает версию {r} — возможно, он не запустился с новым бинарником. Проверьте \
                      `ccteam daemon status` / `ccteam daemon logs`."
                 ),
             );
@@ -443,13 +443,13 @@ fn emit_restart_contract(json: bool, expected: &str, status: RestartContractStat
         RestartContractStatus::RestartRefused { hint } => fail(
             json,
             "notManaged",
-            &format!("binary updated, but the restart was refused: {hint}"),
+            &format!("бинарник обновлён, но перезапуск отклонён: {hint}"),
         ),
         RestartContractStatus::RestartError { message } => fail(
             json,
             "restartFailed",
             &format!(
-                "binary updated, but the restart failed: {message}. Restart manually with \
+                "бинарник обновлён, но перезапуск не удался: {message}. Перезапустите вручную через \
                  `ccteam daemon restart`."
             ),
         ),
@@ -484,7 +484,7 @@ fn run_installer(json: bool) -> Result<ExitStatus> {
     } else {
         cmd.stdout(Stdio::inherit());
     }
-    cmd.status().context("spawn sh -c install.sh")
+    cmd.status().context("запустить sh -c install.sh")
 }
 
 /// A [`Stdio`] that writes to the process's own stderr (used to keep
@@ -555,15 +555,15 @@ fn wait_for_active_sessions_idle(paths: &CcteamPaths) {
         }
         if Instant::now() >= deadline {
             eprintln!(
-                "ccteam update: proceeding after the {}-minute cap with {active} session(s) still \
-                 active; a stream-json session keeps finishing its turn and the new daemon waits \
-                 for it (one sid, one body); an ACP/codex turn is interrupted and resumes by sid",
+                "ccteam update: продолжаю после лимита {} мин.; активны ещё {active} сессий; \
+                 stream-json сессия продолжает завершать ответ, а новый демон ждёт её (один sid, одно тело); \
+                 ответ ACP/codex прерывается и продолжается по sid",
                 IN_FLIGHT_WAIT_CAP.as_secs() / 60
             );
             return;
         }
         eprintln!(
-            "ccteam update: waiting for {active} active session(s) to go idle before restarting…"
+            "ccteam update: ожидаю перехода {active} активных сессий в idle перед перезапуском…"
         );
         std::thread::sleep(IN_FLIGHT_POLL);
     }
@@ -659,7 +659,7 @@ pub(crate) fn fleet_version_skew(paths: &CcteamPaths, daemon_version: &str) -> V
         .filter(|h| h.ccteam_version != daemon_version)
         .map(|h| {
             format!(
-                "host {} runs {}, daemon runs {} — run `ccteam update` on that host",
+                "хост {} использует {}, демон использует {} — выполните `ccteam update` на этом хосте",
                 h.id, h.ccteam_version, daemon_version
             )
         })

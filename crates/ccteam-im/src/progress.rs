@@ -20,6 +20,7 @@
 //! start/complete pair by `item.id` so it counts once.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use ccteam_harness::{ThreadEvent, ThreadItemDetails};
 use serde_json::Value;
@@ -28,10 +29,11 @@ use crate::gateway::{ActivityKind, ActivityStatus, SessionActivity};
 
 /// Phone-sized cap (chars) for a tool's argument preview.
 pub const PREVIEW_MAX: usize = 200;
-/// How many recent steps to expand below the folded summary.
-const MAX_DETAIL_LINES: usize = 2;
-/// Hard cap on rendered status lines (summary + details).
-const MAX_LINES: usize = 8;
+/// Recent tool/command lines shown in the terminal block.
+const MAX_DETAIL_LINES: usize = 12;
+/// Per-line terminal cap. At most twelve Unicode scalar lines can occupy no
+/// more than 2891 UTF-16 units including newlines, below Telegram's 3000 cap.
+const MAX_OUTPUT_LINE_CHARS: usize = 120;
 
 /// A folded category: a stable emoji + short label that several raw tool
 /// names collapse into (e.g. `Read`/`Grep`/`Glob` → `read`).
@@ -43,27 +45,27 @@ struct Category {
 
 const CAT_READ: Category = Category {
     emoji: "📖",
-    label: "read",
+    label: "чтение",
 };
 const CAT_BASH: Category = Category {
     emoji: "🔧",
-    label: "bash",
+    label: "команда",
 };
 const CAT_EDIT: Category = Category {
     emoji: "✏️",
-    label: "edit",
+    label: "правка",
 };
 const CAT_WEB: Category = Category {
     emoji: "🔎",
-    label: "web",
+    label: "веб",
 };
 const CAT_TASK: Category = Category {
     emoji: "🤖",
-    label: "task",
+    label: "задача",
 };
 const CAT_TODO: Category = Category {
     emoji: "📝",
-    label: "todo",
+    label: "план",
 };
 
 /// Map a raw tool name (Claude `ToolCall.name`, or a Codex tool) to a
@@ -83,7 +85,7 @@ fn tool_category(name: &str) -> Category {
             // in general, but tool names from the adapter live long
             // enough; we copy into the count label as an owned String, so
             // the &'static here is only the fallback emoji bucket).
-            label: "tool",
+            label: "инструмент",
         },
     }
 }
@@ -126,6 +128,14 @@ pub(crate) fn preview_args(args: &Value) -> String {
     truncate_for_preview(&raw)
 }
 
+fn literal_preview(value: &str) -> String {
+    if value.contains('`') {
+        value.to_string()
+    } else {
+        format!("`{value}`")
+    }
+}
+
 /// Map a lifecycle [`ThreadEvent`] to its [`ActivityStatus`]. Item events
 /// only — non-item events never reach this (the caller short-circuits).
 fn activity_status(evt: &ThreadEvent) -> Option<ActivityStatus> {
@@ -165,14 +175,14 @@ pub(crate) fn activity_for(evt: &ThreadEvent) -> Option<SessionActivity> {
         ThreadItemDetails::CommandExecution { cmd, .. } => Some(SessionActivity {
             kind: ActivityKind::CommandExec,
             name: "bash".to_string(),
-            summary: format!("$ {}", truncate_for_preview(cmd)),
+            summary: format!("$ {}", literal_preview(&truncate_for_preview(cmd))),
             status,
             item_id: item.id.clone(),
         }),
         ThreadItemDetails::FileChange { path, kind } => Some(SessionActivity {
             kind: ActivityKind::FileChange,
             name: kind.clone(),
-            summary: format!("{kind} {}", path.display()),
+            summary: format!("{kind} {}", literal_preview(&path.display().to_string())),
             status,
             item_id: item.id.clone(),
         }),
@@ -205,7 +215,6 @@ struct Bucket {
 /// Rolling fold of a single status epoch (one turn's progress). Feed it
 /// [`ThreadEvent`]s with [`apply`](Self::apply); render the current
 /// status text with [`render`](Self::render).
-#[derive(Default)]
 pub struct ProgressFold {
     buckets: Vec<Bucket>,
     seen_ids: HashSet<String>,
@@ -214,11 +223,28 @@ pub struct ProgressFold {
     recent: Vec<String>,
     thinking: bool,
     /// Codex streamed an `ItemUpdated{AgentMessage}` delta (drafting the
-    /// reply) — shown as a head state, never sent as its own answer.
+    /// reply), which keeps this fold eligible for a progress update.
     drafting: bool,
     done: bool,
     tool_total: usize,
     file_total: usize,
+    started_at: Instant,
+}
+
+impl Default for ProgressFold {
+    fn default() -> Self {
+        Self {
+            buckets: Vec::new(),
+            seen_ids: HashSet::new(),
+            recent: Vec::new(),
+            thinking: false,
+            drafting: false,
+            done: false,
+            tool_total: 0,
+            file_total: 0,
+            started_at: Instant::now(),
+        }
+    }
 }
 
 impl ProgressFold {
@@ -243,10 +269,14 @@ impl ProgressFold {
         self.done = true;
     }
 
-    fn bump(&mut self, cat: Category, raw_name: &str) {
+    /// `unknown_label` is the already-lowercased raw tool name
+    /// ([`count_tool`] computes it once and shares it with the detail
+    /// line, so the footer bucket and the detail line can never disagree
+    /// about an unknown tool's display name).
+    fn bump(&mut self, cat: Category, unknown_label: &str) {
         // Unknown tools fold under the wrench but keep their own label.
-        let label: String = if cat.label == "tool" {
-            raw_name.to_lowercase()
+        let label: String = if cat.label == "инструмент" {
+            unknown_label.to_string()
         } else {
             cat.label.to_string()
         };
@@ -269,17 +299,31 @@ impl ProgressFold {
     }
 
     /// Count a tool once (de-duped by `item.id`), bump its category, and
-    /// record a preview line. Returns whether state changed.
-    fn count_tool(&mut self, id: &str, cat: Category, raw_name: &str, preview: String) -> bool {
+    /// record a preview line. `content` is the tool-specific detail (args
+    /// preview / command / path); the category label is prefixed here so
+    /// every detail line reads `<emoji> <label>: <content>` instead of the
+    /// raw (often English) tool name. Unknown tools keep their raw name
+    /// after the fallback label so nothing is silently dropped. Returns
+    /// whether state changed.
+    fn count_tool(&mut self, id: &str, cat: Category, raw_name: &str, content: String) -> bool {
         if !self.seen_ids.insert(id.to_string()) {
             return false; // start/complete pair — already counted
         }
-        self.bump(cat, raw_name);
+        // Computed once: the footer bucket ([`bump`]) and this detail line
+        // must show the SAME name for an unknown tool, not two independently
+        // formatted strings that can drift apart in case or content.
+        let unknown_label = raw_name.to_lowercase();
+        self.bump(cat, &unknown_label);
         self.tool_total += 1;
         if cat == CAT_EDIT {
             self.file_total += 1;
         }
-        self.push_recent(format!("{} {preview}", cat.emoji));
+        let label = if cat.label == "инструмент" {
+            format!("{} {unknown_label}", cat.label)
+        } else {
+            cat.label.to_string()
+        };
+        self.push_recent(format!("{} {label}: {content}", cat.emoji));
         true
     }
 
@@ -292,15 +336,15 @@ impl ProgressFold {
             ThreadEvent::ItemStarted { item } | ThreadEvent::ItemCompleted { item } => {
                 match &item.details {
                     ThreadItemDetails::ToolCall { name, args } => {
-                        let preview = format!("{name}({})", preview_args(args));
-                        self.count_tool(&item.id, tool_category(name), name, preview)
+                        self.count_tool(&item.id, tool_category(name), name, preview_args(args))
                     }
                     ThreadItemDetails::CommandExecution { cmd, .. } => {
-                        let preview = format!("$ {}", truncate_for_preview(cmd));
+                        let preview = format!("$ {}", literal_preview(&truncate_for_preview(cmd)));
                         self.count_tool(&item.id, CAT_BASH, "bash", preview)
                     }
                     ThreadItemDetails::FileChange { path, kind } => {
-                        let preview = format!("{kind} {}", path.display());
+                        let preview =
+                            format!("{kind} {}", literal_preview(&path.display().to_string()));
                         self.count_tool(&item.id, CAT_EDIT, "edit", preview)
                     }
                     ThreadItemDetails::WebSearch { query } => {
@@ -364,36 +408,113 @@ impl ProgressFold {
         )
     }
 
-    fn head(&self) -> &'static str {
-        if self.drafting {
-            "✍️ drafting…"
-        } else if self.buckets.is_empty() && self.thinking {
-            "💭 thinking…"
-        } else {
-            "⏳ working…"
-        }
+    fn done_summary(&self) -> String {
+        format!(
+            "{} {} · {} {}",
+            self.tool_total,
+            russian_count_word(self.tool_total, "инструмент", "инструмента", "инструментов"),
+            self.file_total,
+            russian_count_word(self.file_total, "файл", "файла", "файлов")
+        )
     }
 
-    /// Render the current status text (≤ [`MAX_LINES`] lines).
-    pub fn render(&self) -> String {
+    /// Render the current terminal-style status text for `sid`.
+    pub fn render(&self, sid: &str) -> String {
+        let elapsed = render_elapsed(self.started_at.elapsed());
         if self.done {
-            return format!(
-                "✅ done · {} tools · {} files",
-                self.tool_total, self.file_total
-            );
+            return format!("✅ готово · {elapsed} · {}", self.done_summary());
         }
-        let mut header = self.head().to_string();
+        let mut lines = vec![format!("▶️ {sid} работает · {elapsed}")];
         let summary = self.counts_summary();
+        if !self.recent.is_empty() {
+            lines.push("```Terminal".to_string());
+            lines.extend(self.recent.iter().map(|line| terminal_line(line)));
+            lines.push("```".to_string());
+        }
         if !summary.is_empty() {
-            header.push_str(" · ");
-            header.push_str(&summary);
+            lines.push(summary);
         }
-        let mut lines = vec![header];
-        for d in &self.recent {
-            lines.push(format!("  {d}"));
-        }
-        lines.truncate(MAX_LINES);
         lines.join("\n")
+    }
+}
+
+fn render_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds >= 3600 {
+        format!(
+            "{}ч{}м{}с",
+            seconds / 3600,
+            (seconds / 60) % 60,
+            seconds % 60
+        )
+    } else if seconds >= 60 {
+        format!("{}м{}с", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}с")
+    }
+}
+
+fn terminal_line(line: &str) -> String {
+    let stripped = strip_ansi(line);
+    let flat = stripped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("```", "ˋˋˋ");
+    if flat.chars().count() <= MAX_OUTPUT_LINE_CHARS {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(MAX_OUTPUT_LINE_CHARS - 1).collect();
+    out.push('…');
+    out
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for code in chars.by_ref() {
+                    if ('@'..='~').contains(&code) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(code) = chars.next() {
+                    if code == '\u{7}' {
+                        break;
+                    }
+                    if code == '\u{1b}' && chars.next() == Some('\\') {
+                        break;
+                    }
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    out
+}
+
+pub(crate) fn russian_count_word<'a>(
+    count: usize,
+    one: &'a str,
+    few: &'a str,
+    many: &'a str,
+) -> &'a str {
+    let remainder = count % 100;
+    if (11..=14).contains(&remainder) {
+        return many;
+    }
+    match count % 10 {
+        1 => one,
+        2..=4 => few,
+        _ => many,
     }
 }
 
@@ -433,10 +554,10 @@ mod tests {
         assert!(f.apply(&started_tool("t1", "Read", json!({"file_path": "/a"}))));
         assert!(f.apply(&started_tool("t2", "Read", json!({"file_path": "/b"}))));
         assert!(f.apply(&started_tool("t3", "Bash", json!({"command": "ls"}))));
-        let r = f.render();
-        assert!(r.contains("📖 read ×2"), "got: {r}");
-        assert!(r.contains("🔧 bash ×1"), "got: {r}");
-        assert!(r.starts_with("⏳ working…"), "got: {r}");
+        let r = f.render("s42");
+        assert!(r.contains("📖 чтение ×2"), "got: {r}");
+        assert!(r.contains("🔧 команда ×1"), "got: {r}");
+        assert!(r.starts_with("▶️ s42 работает · "), "got: {r}");
     }
 
     #[test]
@@ -448,7 +569,7 @@ mod tests {
         f.apply(&started_tool("t2", "Read", json!({"file_path": "/b"})));
         f.apply(&started_tool("t3", "Bash", json!({"command": "ls"})));
         // `/status`-shaped: labels + counts only, joined by `·`, no emoji/space.
-        assert_eq!(f.compact_counts().as_deref(), Some("read×2·bash×1"));
+        assert_eq!(f.compact_counts().as_deref(), Some("чтение×2·команда×1"));
     }
 
     #[test]
@@ -457,7 +578,7 @@ mod tests {
         assert!(f.apply(&started_tool("t1", "Bash", json!({"command": "ls"}))));
         // The matching completion carries the same id → must NOT recount.
         assert!(!f.apply(&completed_tool("t1", "Bash")));
-        assert!(f.render().contains("🔧 bash ×1"));
+        assert!(f.render("s42").contains("🔧 команда ×1"));
     }
 
     #[test]
@@ -465,11 +586,15 @@ mod tests {
         let mut f = ProgressFold::new();
         let long = "x".repeat(500);
         f.apply(&started_tool("t1", "Bash", json!({ "command": long })));
-        let r = f.render();
+        let r = f.render("s42");
         // The arg preview is capped to PREVIEW_MAX chars; the whole line
         // adds only the `🔧 Bash(…)` wrapper + indent, so it stays far
         // below the untruncated 500.
-        let detail = r.lines().last().unwrap();
+        let detail = r
+            .split("```Terminal\n")
+            .nth(1)
+            .and_then(|body| body.lines().next())
+            .expect("output detail");
         assert!(
             detail.chars().count() < PREVIEW_MAX + 32,
             "detail not truncated: {} chars",
@@ -489,7 +614,7 @@ mod tests {
         };
         assert!(f.apply(&ev));
         assert!(!f.apply(&ev)); // second reasoning is a no-op
-        assert!(f.render().starts_with("💭 thinking…"));
+        assert!(f.render("s42").starts_with("▶️ s42 работает · "));
         assert!(f.has_activity());
     }
 
@@ -514,9 +639,11 @@ mod tests {
                 },
             },
         });
-        let r = f.render();
-        assert!(r.contains("🔧 bash ×1"), "got: {r}");
-        assert!(r.contains("✏️ edit ×1"), "got: {r}");
+        let r = f.render("s42");
+        assert!(r.contains("🔧 команда ×1"), "got: {r}");
+        assert!(r.contains("✏️ правка ×1"), "got: {r}");
+        assert!(r.contains("$ `cargo build`"), "got: {r}");
+        assert!(r.contains("modified `/src/lib.rs`"), "got: {r}");
     }
 
     #[test]
@@ -525,7 +652,40 @@ mod tests {
         f.apply(&started_tool("t1", "Bash", json!({"command": "ls"})));
         f.apply(&started_tool("t2", "Edit", json!({"file_path": "/a"})));
         f.mark_done();
-        assert_eq!(f.render(), "✅ done · 2 tools · 1 files");
+        let rendered = f.render("s42");
+        assert!(rendered.starts_with("✅ готово · "));
+        assert!(rendered.contains("2 инструмента · 1 файл"));
+    }
+
+    #[test]
+    fn done_count_words_follow_russian_plural_rules() {
+        assert_eq!(
+            russian_count_word(1, "инструмент", "инструмента", "инструментов"),
+            "инструмент"
+        );
+        assert_eq!(
+            russian_count_word(2, "инструмент", "инструмента", "инструментов"),
+            "инструмента"
+        );
+        assert_eq!(
+            russian_count_word(5, "инструмент", "инструмента", "инструментов"),
+            "инструментов"
+        );
+        assert_eq!(
+            russian_count_word(11, "инструмент", "инструмента", "инструментов"),
+            "инструментов"
+        );
+        assert_eq!(
+            russian_count_word(21, "инструмент", "инструмента", "инструментов"),
+            "инструмент"
+        );
+    }
+
+    #[test]
+    fn elapsed_uses_compact_russian_terminal_units() {
+        assert_eq!(render_elapsed(Duration::from_secs(5)), "5с");
+        assert_eq!(render_elapsed(Duration::from_secs(83)), "1м23с");
+        assert_eq!(render_elapsed(Duration::from_secs(3_723)), "1ч2м3с");
     }
 
     // ----- v0.8.19 shared activity summarizer -----
@@ -581,7 +741,7 @@ mod tests {
         })
         .expect("command exec is activity");
         assert_eq!(cmd.kind, ActivityKind::CommandExec);
-        assert_eq!(cmd.summary, "$ cargo build");
+        assert_eq!(cmd.summary, "$ `cargo build`");
 
         let fc = activity_for(&ThreadEvent::ItemCompleted {
             item: ThreadItem {
@@ -594,7 +754,7 @@ mod tests {
         })
         .expect("file change is activity");
         assert_eq!(fc.kind, ActivityKind::FileChange);
-        assert!(fc.summary.contains("/src/lib.rs"));
+        assert_eq!(fc.summary, "modified `/src/lib.rs`");
 
         let ws = activity_for(&ThreadEvent::ItemCompleted {
             item: ThreadItem {
@@ -636,18 +796,54 @@ mod tests {
 
     #[test]
     fn activity_for_summary_matches_the_fold_preview() {
-        // THE no-drift guarantee: the activity summary reuses the SAME helpers
-        // the IM fold renders, so a tool's activity summary equals what the
-        // fold pushed into its `recent` detail line (minus the emoji prefix).
+        // THE no-drift guarantee: the activity summary and the fold's detail
+        // line both derive from the same `preview_args` helper, so the arg
+        // preview embedded in one is embedded in the other too (the fold
+        // additionally prefixes the localized category label).
         let ev = started_tool("t1", "Read", json!({"file_path": "/etc/hosts"}));
         let act = activity_for(&ev).expect("activity");
         let mut f = ProgressFold::new();
         f.apply(&ev);
-        let detail = f.render();
-        // The fold's detail line is `📖 Read(/etc/hosts)`; the activity summary
-        // is the same `Read(/etc/hosts)` payload (no emoji).
+        let detail = f.render("s42");
         assert_eq!(act.summary, "Read(/etc/hosts)");
-        assert!(detail.contains(&act.summary), "fold detail: {detail}");
+        assert!(
+            detail.contains("📖 чтение: /etc/hosts"),
+            "fold detail: {detail}"
+        );
+    }
+
+    #[test]
+    fn bash_tool_detail_line_uses_category_label_not_raw_name() {
+        let mut f = ProgressFold::new();
+        f.apply(&started_tool(
+            "t1",
+            "Bash",
+            json!({"command": "ls graphify-out/graph.json"}),
+        ));
+        let r = f.render("s42");
+        assert!(
+            r.contains("🔧 команда: ls graphify-out/graph.json"),
+            "got: {r}"
+        );
+        assert!(!r.contains("Bash("), "raw tool name leaked: {r}");
+    }
+
+    #[test]
+    fn unknown_tool_detail_line_keeps_raw_name_after_fallback_label() {
+        let mut f = ProgressFold::new();
+        f.apply(&started_tool(
+            "t1",
+            "ToolSearch",
+            json!({"query": "select:..."}),
+        ));
+        let r = f.render("s42");
+        // Same lowercase label the footer's `toolsearch×1` bucket uses
+        // (review round 1 — detail line and bucket must never drift apart).
+        assert!(
+            r.contains("🔧 инструмент toolsearch: select:..."),
+            "got: {r}"
+        );
+        assert!(r.contains("🔧 toolsearch ×1"), "got: {r}");
     }
 
     #[test]
@@ -673,6 +869,50 @@ mod tests {
                 json!({"command": "ls"}),
             ));
         }
-        assert!(f.render().lines().count() <= MAX_LINES);
+        let rendered = f.render("s42");
+        let block = rendered
+            .split("```Terminal\n")
+            .nth(1)
+            .and_then(|body| body.split("\n```").next())
+            .expect("fenced output block");
+        assert_eq!(block.lines().count(), MAX_DETAIL_LINES);
+    }
+
+    #[test]
+    fn terminal_render_keeps_recent_output_inside_a_fenced_text_block() {
+        let mut f = ProgressFold::new();
+        for i in 0..14 {
+            f.apply(&started_tool(
+                &format!("t{i}"),
+                "Bash",
+                json!({"command": format!("\u{1b}[31mline-{i} {}", "x".repeat(200))}),
+            ));
+        }
+
+        let rendered = f.render("s42");
+        assert!(
+            rendered.starts_with("▶️ s42 работает · "),
+            "got: {rendered}"
+        );
+        assert!(rendered.contains("```Terminal\n"), "got: {rendered}");
+        assert!(!rendered.contains('\u{1b}'), "ANSI leaked: {rendered:?}");
+
+        let block = rendered
+            .split("```Terminal\n")
+            .nth(1)
+            .and_then(|body| body.split("\n```").next())
+            .expect("fenced output block");
+        assert_eq!(block.lines().count(), 12);
+        assert!(block.lines().all(|line| line.chars().count() <= 120));
+        assert!(block.encode_utf16().count() <= 3000);
+        assert!(block.contains("line-13"));
+        assert!(!block.contains("line-0"));
+        assert!(rendered.contains("🔧 команда ×14"));
+
+        let html = crate::telegram_html::render_markdown(&rendered).html;
+        assert!(
+            html.contains("<pre><code class=\"language-Terminal\">"),
+            "got: {html}"
+        );
     }
 }

@@ -92,6 +92,66 @@ pub struct CcteamConfig {
     /// enforces on every agent-initiated (Ambient) spawn/dispatch.
     #[serde(default, skip_serializing_if = "DelegationConfig::is_default")]
     pub delegation: DelegationConfig,
+
+    /// Настройки обмена сообщениями, включая кнопки быстрых шаблонов Telegram.
+    #[serde(default)]
+    pub im: ImConfig,
+}
+
+/// Настройки обмена сообщениями, общие для всех настроенных каналов.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImConfig {
+    /// Постоянные шаблоны клавиатуры ответов, доступные в Telegram.
+    #[serde(default = "default_quick_templates")]
+    pub quick_templates: Vec<QuickTemplate>,
+}
+
+impl Default for ImConfig {
+    fn default() -> Self {
+        Self {
+            quick_templates: default_quick_templates(),
+        }
+    }
+}
+
+/// Одна настраиваемая пользователем кнопка быстрого шаблона.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuickTemplate {
+    /// Текст кнопки для пользователя. Начальные и конечные пробелы игнорируются
+    /// при отображении и сопоставлении с входящим текстом.
+    pub label: String,
+    /// Префикс, добавляемый перед следующим обычным сообщением пользователя.
+    pub prefix: String,
+}
+
+/// Встроенные кнопки быстрых шаблонов для новой конфигурации.
+pub fn default_quick_templates() -> Vec<QuickTemplate> {
+    vec![
+        QuickTemplate {
+            label: "🎯 Командир".to_string(),
+            prefix: "Сначала проверь доступных в этом проекте провайдеров, затем спланируй и разложи задачу ниже и делегируй через session_spawn / session_dispatch: разработку — codex, исследование сообщества и экосистемы — grok. Ты отвечаешь за планирование, приёмку и итог; уведомления о завершении возвращаются тебе. Задача:".to_string(),
+        },
+        QuickTemplate {
+            label: "🚗 Водитель+советник".to_string(),
+            prefix: "Ты ведёшь задачу сам: двигай её вперёд напрямую. Если застрял или столкнулся с неопределённым решением, запусти через session_spawn сессию советника claude в этом же проекте, передай ей контекст, а затем сам выполни её рекомендации. Задача:".to_string(),
+        },
+        QuickTemplate {
+            label: "🔁 Кросс-ревью".to_string(),
+            prefix: "Собери решение и проведи кросс-ревью: передай требование ниже сессии codex (небольшие шаги, тесты не должны падать); после завершения передай diff сессии другого провайдера на независимую проверку (корректность / безопасность / риск регрессий). Спорные места оставь себе на арбитраж; попроси автора исправить серьёзные замечания и повторно проверить результат, затем сообщи сводку изменений и вердикт ревью. Требование:".to_string(),
+        },
+        QuickTemplate {
+            label: "⚔️ Батл".to_string(),
+            prefix: "Отправь сложную задачу ниже 2–3 свежим сессиям разных провайдеров, чтобы они независимо решили её (не подглядывая). Когда все закончат, сравни подходы и подтверждения, собери лучший итоговый ответ и укажи компромиссы. Проблема:".to_string(),
+        },
+        QuickTemplate {
+            label: "🔺 Триангуляция".to_string(),
+            prefix: "Проведи триангуляцию темы ниже: session_spawn для grok — поиск по X и актуальным обсуждениям, claude — глубокий веб-анализ, codex — проверка по исходному коду. Сопоставь три направления и объедини их в один вывод с источниками. Тема:".to_string(),
+        },
+        QuickTemplate {
+            label: "🏗 Пирамида".to_string(),
+            prefix: "Ниже — набор механических задач (массовые переименования / уборка форматирования / разбор тестов). Через session_spawn поручи недорогим провайдерам (kimi / opencode) пройти их по одной; ошибки и решения, требующие суждения, эскалируй более сильной модели, а прогресс отмечай в общем чек-листе. Список задач:".to_string(),
+        },
+    ]
 }
 
 /// Daemon runtime sizing. Every field defaults so existing config files remain
@@ -237,6 +297,7 @@ impl Default for CcteamConfig {
             claude_jobs_retention_days: default_claude_jobs_retention_days(),
             sessions: SessionsConfig::default(),
             delegation: DelegationConfig::default(),
+            im: ImConfig::default(),
         }
     }
 }
@@ -455,6 +516,7 @@ mod tests {
             claude_jobs_retention_days: default_claude_jobs_retention_days(),
             sessions: SessionsConfig::default(),
             delegation: DelegationConfig::default(),
+            im: ImConfig::default(),
         };
         save(tmp.path(), &cfg).unwrap();
         let loaded = load(tmp.path()).unwrap();
@@ -550,6 +612,34 @@ mod tests {
         assert_eq!(cfg.delegation.max_depth, 2);
         assert_eq!(cfg.delegation.max_children, 10);
         assert_eq!(cfg.delegation.max_delegated, 50);
+    }
+
+    #[test]
+    fn default_im_quick_templates_include_six_templates() {
+        let templates = &CcteamConfig::default().im.quick_templates;
+        assert_eq!(templates.len(), 6);
+        assert_eq!(templates[0].label, "🎯 Командир");
+        assert!(templates[0].prefix.ends_with("Задача:"));
+        assert_eq!(templates[5].label, "🏗 Пирамида");
+    }
+
+    #[test]
+    fn im_quick_templates_yaml_override_parses() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            config_path(tmp.path()),
+            "im:\n  quick_templates:\n    - label: Custom\n      prefix: 'Do this:'\n",
+        )
+        .unwrap();
+
+        let cfg = load(tmp.path()).unwrap();
+        assert_eq!(
+            cfg.im.quick_templates,
+            vec![QuickTemplate {
+                label: "Custom".to_string(),
+                prefix: "Do this:".to_string(),
+            }]
+        );
     }
 
     #[test]

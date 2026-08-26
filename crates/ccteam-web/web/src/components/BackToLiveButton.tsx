@@ -1,4 +1,7 @@
+import { tr, type Lang } from "../lib/i18n";
+
 interface Props {
+  lang: Lang;
   onClick: () => void;
   /** Distance from the top of the positioned parent, in Tailwind units. */
   topOffset?: "top-2" | "top-3";
@@ -12,12 +15,12 @@ interface Props {
  * Rendered in an absolutely-positioned overlay; the parent must be
  * `position: relative`.
  */
-export function BackToLiveButton({ onClick, topOffset = "top-3" }: Props) {
+export function BackToLiveButton({ lang, onClick, topOffset = "top-3" }: Props) {
   return (
     <button
       type="button"
       onClick={onClick}
-      aria-label="Back to live"
+      aria-label={tr(lang, "回到最新", "Back to live", "К последним")}
       className={`absolute left-1/2 ${topOffset} -translate-x-1/2 z-10 flex items-center gap-1.5 font-mono text-[12px] text-text-primary bg-surface-800/95 border border-surface-700 rounded-full px-3 py-1.5 shadow-lg backdrop-blur-sm active:scale-95 motion-safe:animate-[fadeIn_200ms_ease-out]`}
     >
       <svg
@@ -33,7 +36,7 @@ export function BackToLiveButton({ onClick, topOffset = "top-3" }: Props) {
       >
         <polyline points="6 9 12 15 18 9" />
       </svg>
-      Back to live
+      {tr(lang, "回到最新", "Back to live", "К последним")}
     </button>
   );
 }

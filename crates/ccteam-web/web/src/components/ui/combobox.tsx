@@ -25,6 +25,7 @@ import {
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, Search } from "lucide-react";
 import { cn } from "../../lib/utils";
+import { tr, type Lang } from "../../lib/i18n";
 
 export interface ComboboxOption {
   value: string;
@@ -34,6 +35,7 @@ export interface ComboboxOption {
 }
 
 export interface ComboboxProps {
+  lang: Lang;
   value: string;
   onChange: (value: string) => void;
   options: ComboboxOption[];
@@ -60,11 +62,12 @@ interface MenuPos {
 }
 
 export function Combobox({
+  lang,
   value,
   onChange,
   options,
-  placeholder = "选择…",
-  searchPlaceholder = "搜索…",
+  placeholder,
+  searchPlaceholder,
   disabled = false,
   className,
   buttonClassName,
@@ -73,6 +76,8 @@ export function Combobox({
   name,
   "data-testid": testId,
 }: ComboboxProps) {
+  const resolvedPlaceholder = placeholder ?? tr(lang, "选择…", "Select…", "Выберите…");
+  const resolvedSearchPlaceholder = searchPlaceholder ?? tr(lang, "搜索…", "Search…", "Поиск…");
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [rawActiveIndex, setActiveIndex] = useState(0);
@@ -221,7 +226,7 @@ export function Combobox({
               ref={searchRef}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder={searchPlaceholder}
+              placeholder={resolvedSearchPlaceholder}
               className="flex-1 bg-transparent text-xs text-text-primary outline-none placeholder:text-text-dim"
             />
           </div>
@@ -233,7 +238,7 @@ export function Combobox({
           style={{ maxHeight: pos.listMaxHeight }}
         >
           {filtered.length === 0 ? (
-            <div className="px-3 py-2 text-xs text-text-dim">无匹配项</div>
+            <div className="px-3 py-2 text-xs text-text-dim">{tr(lang, "无匹配项", "No matches", "Нет совпадений")}</div>
           ) : (
             filtered.map((opt, i) => {
               const isSel = opt.value === value;
@@ -312,7 +317,7 @@ export function Combobox({
         )}
       >
         <span className={cn("truncate text-left", !selected && "text-text-dim")}>
-          {selected ? selected.label : placeholder}
+          {selected ? selected.label : resolvedPlaceholder}
         </span>
         <ChevronDown className="h-4 w-4 shrink-0 text-text-dim" />
       </button>

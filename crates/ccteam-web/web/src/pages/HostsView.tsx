@@ -30,7 +30,7 @@
 // host whose detail probe fails renders offline (honest state — we then say
 // we cannot see what it needs, not that there is nothing to do).
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   getHostDetail,
@@ -48,7 +48,7 @@ import {
 } from "../lib/hostsApi";
 import { importProject } from "../lib/dashboardApi";
 import { copyText } from "../lib/clipboard";
-import { makeT, type Lang } from "../lib/i18n";
+import { makeT, tr, type Lang } from "../lib/i18n";
 import { vendorDotClass } from "../lib/vendors";
 import { fetchVendorLatests, isOutdated, npmPackageForVendor } from "../lib/vendorLatest";
 import { getVendorQuotas, type VendorQuota } from "../lib/vendorQuotaApi";
@@ -171,6 +171,10 @@ export default function HostsView({
   embedded = false,
 }: { lang?: Lang; /** hide page title when nested under Ops panel */ embedded?: boolean } = {}) {
   const t = makeT(lang);
+  const langRef = useRef(lang);
+  useEffect(() => {
+    langRef.current = lang;
+  }, [lang]);
   const { isAdmin } = useMe();
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   /** vendor token currently registering (scoped per host:vendor), or REFRESH. */
@@ -189,10 +193,10 @@ export default function HostsView({
       setState({ kind: "ready", hosts });
     } catch (e) {
       if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
-      const message = e instanceof Error ? e.message : "加载失败";
+      const message = e instanceof Error ? e.message : tr(lang, "加载失败", "Load failed", "Не удалось загрузить");
       setState((prev) => (prev.kind === "ready" ? prev : { kind: "error", message }));
     }
-  }, []);
+  }, [lang]);
 
   useEffect(() => {
     let cancelled = false;
@@ -203,7 +207,7 @@ export default function HostsView({
       .catch((e) => {
         if (cancelled) return;
         if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
-        const message = e instanceof Error ? e.message : "加载失败";
+        const message = e instanceof Error ? e.message : tr(langRef.current, "加载失败", "Load failed", "Не удалось загрузить");
         setState((prev) => (prev.kind === "ready" ? prev : { kind: "error", message }));
       });
     return () => {
@@ -267,7 +271,12 @@ export default function HostsView({
     } catch (e) {
       if (!(e instanceof Error && e.message === "UNAUTHENTICATED")) {
         setActionError(
-          `注册 MCP 失败（${vendor}）: ${e instanceof Error ? e.message : "未知错误"}`,
+          tr(
+            lang,
+            `注册 MCP 失败（${vendor}）: ${e instanceof Error ? e.message : "未知错误"}`,
+            `MCP registration failed (${vendor}): ${e instanceof Error ? e.message : "Unknown error"}`,
+            `Не удалось зарегистрировать MCP (${vendor}): ${e instanceof Error ? e.message : "Неизвестная ошибка"}`,
+          ),
         );
       }
     } finally {
@@ -400,7 +409,7 @@ export default function HostsView({
             fontSize: 13.5,
           }}
         >
-          探测主机失败: {state.message}
+          {tr(lang, "探测主机失败", "Host probe failed", "Не удалось проверить хост")}: {state.message}
         </div>
       ) : (
         state.hosts.map((h) =>
@@ -652,11 +661,16 @@ function VendorManageRow({
             // the write (satellite): state without a dead-end CTA.
             <span>{t("mcpNotRegistered")}</span>
           )
+        ) : agent.vendor === "dsh" && agent.installed && agent.mcp_registered ? (
+          // Already in the operator's ~/.dsh web profile — state, no CTA.
+          <span className="ok" data-testid="host-vendor-dsh-plugin-ok">
+            ✓ {t("dshPluginOk")}
+          </span>
         ) : agent.vendor === "dsh" && agent.installed && isLocal && isAdmin ? (
           // DSH's "register ccteam" writes ccteam's plugin bundle + patch row
           // into the operator's ~/.dsh web profile (server-side gate ①); the
           // human then restarts their own `dsh web` to load it. Idempotent, so
-          // the CTA stays available; the row hint explains the restart.
+          // the CTA stays until the profile actually carries our row.
           <button
             type="button"
             className="btn primary mini"

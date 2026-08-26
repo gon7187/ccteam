@@ -3,6 +3,7 @@ import type { WTerm } from "@wterm/dom";
 import type { RefObject } from "react";
 import { useLongPressDrag, type DragAxis } from "../hooks/useLongPressDrag";
 import { toastBus } from "../lib/toastBus";
+import { tr, type Lang } from "../lib/i18n";
 
 const CLIPBOARD_TEXT_TYPES = ["text/plain", "text/uri-list", "text/html"] as const;
 
@@ -42,6 +43,7 @@ function extractClipboardText(cd: DataTransfer | null): string {
 }
 
 interface Props {
+  lang: Lang;
   sendData: (data: string) => void;
   termRef: RefObject<WTerm | null>;
   keyboardHeight: number;
@@ -65,6 +67,7 @@ const ARROW_LEFT = "\x1b[D";
 const ARROW_RIGHT = "\x1b[C";
 
 export function MobileTerminalToolbar({
+  lang,
   sendData,
   termRef,
   keyboardHeight,
@@ -144,25 +147,25 @@ export function MobileTerminalToolbar({
       // soft keyboard. onClick handlers still fire normally.
       onMouseDown={(e) => e.preventDefault()}
     >
-      <button type="button" aria-label="Arrow up" className={btnBase} {...upHandlers}>
+      <button type="button" aria-label={tr(lang, "向上箭头", "Arrow up", "Стрелка вверх")} className={btnBase} {...upHandlers}>
         <span className="font-mono text-sm">{"\u2191"}</span>
         {arrowHint(upAxis)}
       </button>
-      <button type="button" aria-label="Arrow down" className={btnBase} {...downHandlers}>
+      <button type="button" aria-label={tr(lang, "向下箭头", "Arrow down", "Стрелка вниз")} className={btnBase} {...downHandlers}>
         <span className="font-mono text-sm">{"\u2193"}</span>
         {arrowHint(downAxis)}
       </button>
-      <button type="button" aria-label="Tab" className={btnBase}
+      <button type="button" aria-label={tr(lang, "Tab", "Tab", "Tab")} className={btnBase}
         onClick={() => send("\t")}>
         <span className="font-mono text-sm">Tab</span>
       </button>
-      <button type="button" aria-label="Escape" className={btnBase}
+      <button type="button" aria-label={tr(lang, "Escape", "Escape", "Escape")} className={btnBase}
         onClick={() => send("\x1b")}>
         <span className="font-mono text-sm">Esc</span>
       </button>
       <button
         type="button"
-        aria-label="Ctrl"
+        aria-label={tr(lang, "Ctrl", "Ctrl", "Ctrl")}
         aria-pressed={ctrlActive}
         className={
           ctrlActive
@@ -173,11 +176,11 @@ export function MobileTerminalToolbar({
       >
         <span className="font-mono text-xs">Ctrl</span>
       </button>
-      <button type="button" aria-label="Ctrl+C interrupt" className={btnBase}
+      <button type="button" aria-label={tr(lang, "Ctrl+C 中断", "Ctrl+C interrupt", "Прервать Ctrl+C")} className={btnBase}
         onClick={() => { send("\x03"); if (ctrlActive) onCtrlToggle(); }}>
         <span className="font-mono text-xs">^C</span>
       </button>
-      <button type="button" aria-label="Paste from clipboard" className={btnBase}
+      <button type="button" aria-label={tr(lang, "从剪贴板粘贴", "Paste from clipboard", "Вставить из буфера") } className={btnBase}
         onClick={async () => {
           haptic();
           const t = toastBus.handler;

@@ -268,19 +268,19 @@ fn parse_relative(raw: &str) -> Result<Option<Duration>, ScheduleTimeError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ScheduleTimeError {
     /// Not one of the four accepted forms.
-    #[error("invalid time; use HH:MM, YYYY-MM-DD HH:MM, +30m/+2h, or 今天/明天 HH:MM")]
+    #[error("Неверное время; используйте HH:MM, YYYY-MM-DD HH:MM, +30m/+2h или 今天/明天 HH:MM")]
     InvalidFormat,
     /// Absolute time is not in the future (today never rolls to tomorrow).
-    #[error("scheduled time must be in the future (past HH:MM does not roll to tomorrow)")]
+    #[error("Время отложенного сообщения должно быть в будущем (прошедшее HH:MM не переносится на завтра)")]
     Past,
     /// More than seven days away.
-    #[error("scheduled time must be within 7 days")]
+    #[error("Время отложенного сообщения должно быть не дальше 7 дней")]
     TooFar,
     /// DST fall-back wall time names two instants.
-    #[error("local time is ambiguous because of a timezone transition; choose another minute")]
+    #[error("Местное время неоднозначно из-за перехода часового пояса; выберите другую минуту")]
     AmbiguousLocalTime,
     /// DST spring-forward wall time does not exist.
-    #[error("local time does not exist because of a timezone transition; choose another minute")]
+    #[error("Такого местного времени нет из-за перехода часового пояса; выберите другую минуту")]
     NonexistentLocalTime,
 }
 
