@@ -9991,10 +9991,23 @@ impl Gateway {
                 let snapshot = projection.project_snapshot(&s.project);
                 // A mixed window (some turns priced, some not) must not read
                 // as a complete total: mark it as a lower bound.
-                let usd = match (snapshot.cost_24h_priced, snapshot.cost_24h_unpriced_turns) {
-                    (false, _) => "$—".to_string(),
-                    (true, 0) => format!("${:.2}", snapshot.cost.cost_24h_usd),
-                    (true, n) => format!("≥${:.2} (+{n} без цены)", snapshot.cost.cost_24h_usd),
+                let mut caveats = Vec::new();
+                if snapshot.cost_24h_unpriced_turns > 0 {
+                    caveats.push(format!("+{} без цены", snapshot.cost_24h_unpriced_turns));
+                }
+                if snapshot.cost_24h_window_truncated {
+                    caveats.push("окно неполное после ротации".to_string());
+                }
+                let usd = if !snapshot.cost_24h_priced {
+                    "$—".to_string()
+                } else if caveats.is_empty() {
+                    format!("${:.2}", snapshot.cost.cost_24h_usd)
+                } else {
+                    format!(
+                        "≥${:.2} ({})",
+                        snapshot.cost.cost_24h_usd,
+                        caveats.join(", ")
+                    )
                 };
                 format!(
                     "💰 Расход проекта 24ч: {usd} · {} токенов",
