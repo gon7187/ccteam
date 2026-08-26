@@ -25,6 +25,22 @@ struct Fragment {
 
 /// Render the supported Markdown subset as Telegram HTML.
 pub fn render_markdown(input: &str) -> RenderedMarkdown {
+    render_markdown_at_depth(input, 0)
+}
+
+const MAX_RENDER_DEPTH: usize = 16;
+
+fn render_markdown_at_depth(input: &str, depth: usize) -> RenderedMarkdown {
+    if depth > MAX_RENDER_DEPTH {
+        let mut out = Fragment::default();
+        append_escaped_text(&mut out, input);
+        return RenderedMarkdown {
+            html: out.html,
+            text_utf16_len: out.text_utf16_len,
+            has_non_whitespace: out.has_non_whitespace,
+        };
+    }
+
     let lines: Vec<&str> = input.split_inclusive('\n').collect();
     let mut out = Fragment::default();
     let mut index = 0;
@@ -145,7 +161,7 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
         if let Some((indent, content)) = unordered_item(line) {
             if fence_marker(content).is_some() {
                 let (code, next_index, has_newline) =
-                    render_list_fence(&lines, index, indent, content)
+                    render_list_fence(&lines, index, indent, content, depth)
                         .expect("fence marker checked above");
                 let mut item = Fragment::default();
                 append_escaped_text(&mut item, indent);
@@ -163,7 +179,7 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
         if let Some((indent, number, content)) = ordered_item(line) {
             if fence_marker(content).is_some() {
                 let (code, next_index, has_newline) =
-                    render_list_fence(&lines, index, indent, content)
+                    render_list_fence(&lines, index, indent, content, depth)
                         .expect("fence marker checked above");
                 let mut item = Fragment::default();
                 append_escaped_text(&mut item, indent);
@@ -624,6 +640,7 @@ fn render_list_fence(
     start: usize,
     indent: &str,
     content: &str,
+    depth: usize,
 ) -> Option<(Fragment, usize, bool)> {
     let (opening_char, opening_len) = fence_marker(content)?;
     let required_indent = indent.len() + 2;
@@ -661,7 +678,7 @@ fn render_list_fence(
         cursor += 1;
     }
 
-    let rendered = render_markdown(&source);
+    let rendered = render_markdown_at_depth(&source, depth + 1);
     let contains_code = rendered.html.contains("<pre>") || rendered.html.contains("<code>");
     Some((
         Fragment {
@@ -891,7 +908,7 @@ fn parse_link(input: &str, start: usize) -> Option<(usize, usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::render_markdown;
+    use super::{render_markdown, render_markdown_at_depth, MAX_RENDER_DEPTH};
 
     #[test]
     fn escapes_html_text() {
@@ -1119,6 +1136,18 @@ mod tests {
         assert_eq!(
             render_markdown("> > nested\n").html,
             "<blockquote>&gt; nested\n</blockquote>"
+        );
+    }
+
+    #[test]
+    fn bounds_render_recursion_and_handles_deep_quote_input() {
+        let input = format!("{}x", "> ".repeat(20_000));
+        let rendered = render_markdown(&input);
+        assert_eq!(rendered.html.matches("<blockquote>").count(), 1);
+        assert_eq!(rendered.html.matches("</blockquote>").count(), 1);
+        assert_eq!(
+            render_markdown_at_depth("**literal**", MAX_RENDER_DEPTH + 1).html,
+            "**literal**"
         );
     }
 }
