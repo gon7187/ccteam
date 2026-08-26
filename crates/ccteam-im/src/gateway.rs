@@ -9920,13 +9920,16 @@ impl Gateway {
         let role = if s.role.is_empty() { "—" } else { &s.role };
         let resume = thread_vendor_uuid(&s.thread).unwrap_or_else(|| "—".to_string());
         let mut detail_lines = vec![format!("Запущено: {detail} · Роль: {role}")];
-        detail_lines.extend(
-            format_running_tasks(&running)
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string),
-        );
+        let running_task_lines = format_running_tasks(&running)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if !running_task_lines.is_empty() {
+            detail_lines.push(String::new());
+            detail_lines.extend(running_task_lines);
+        }
         if let Some(goal) = status.as_ref().and_then(|status| status.goal.as_ref()) {
             let condition = goal.condition.trim();
             if !condition.is_empty() {
@@ -9936,6 +9939,7 @@ impl Gateway {
                 } else {
                     condition.to_string()
                 };
+                detail_lines.push(String::new());
                 detail_lines.push(format!("{marker} {shown}"));
             }
         }
