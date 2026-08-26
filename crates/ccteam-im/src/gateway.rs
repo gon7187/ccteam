@@ -20428,7 +20428,7 @@ mod tests {
             .unwrap();
         let im_ev = recv_answer(&mut im_events).await;
         assert!(
-            im_ev.content.ends_with("\n\n→ alpha/s1"),
+            im_ev.content.contains("\n\n→ alpha/s1") && !im_ev.content.contains("\n\n→ alpha/s1 ("),
             "roleless echo carries no (role) parens: {:?}",
             im_ev.content
         );
@@ -27630,8 +27630,8 @@ mod tests {
         for _ in 0..200 {
             let turns = read_all_turns(&project_dir, &parent_sid).unwrap_or_default();
             if turns.iter().any(|t| {
-                t.user.contains("[ccteam] delegated session")
-                    || t.assistant.contains("[ccteam] delegated session")
+                t.user.contains("[ccteam] делегированная сессия")
+                    || t.assistant.contains("[ccteam] делегированная сессия")
             }) {
                 notified = true;
                 break;
@@ -27671,7 +27671,7 @@ mod tests {
         ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
             .unwrap_or_default()
             .into_iter()
-            .filter(|t| t.user.contains("[ccteam] delegated session"))
+            .filter(|t| t.user.contains("[ccteam] делегированная сессия"))
             .collect()
     }
 
@@ -28363,7 +28363,7 @@ mod tests {
             read_all_turns(dir, psid)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| t.user.contains("[ccteam] delegated session"))
+                .filter(|t| t.user.contains("[ccteam] делегированная сессия"))
                 .count()
         };
         let mut delivered = 0;
@@ -28451,7 +28451,7 @@ mod tests {
             read_all_turns(dir, psid)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| t.user.contains("[ccteam] delegated session"))
+                .filter(|t| t.user.contains("[ccteam] делегированная сессия"))
                 .collect::<Vec<_>>()
         };
         let mut got: Vec<TurnRecord> = vec![];
