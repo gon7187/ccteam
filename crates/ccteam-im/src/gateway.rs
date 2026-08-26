@@ -20868,7 +20868,9 @@ mod tests {
         );
         let sessions = gateway.render_sessions(&tenant, true).await.plain;
         assert!(
-            sessions.contains(&format!("{child} | claude.— | 🟢 ожидание | —")),
+            sessions.contains(&format!(
+                "{child} | claude.— | 🟢 ожидание | delegated investigation"
+            )),
             "the tenant's session list must include its delegated child: {sessions}"
         );
     }
@@ -22631,7 +22633,7 @@ mod tests {
         assert!(mock[0].contains("alpha |"));
     }
 
-    /// `/sessions` has `cmd:/use` buttons in its rich reply and a table fallback.
+    /// `/sessions` has inline stop/use buttons in its rich reply and a plain fallback.
     #[tokio::test]
     async fn telegram_sessions_delivers_switch_buttons() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -22648,15 +22650,13 @@ mod tests {
             .unwrap();
         assert_eq!(replies.len(), 1);
         assert!(replies[0].markdown.contains("| **s1** |"));
-        assert_eq!(
-            replies[0]
-                .button_rows
-                .iter()
-                .flatten()
-                .map(|option| option.data.as_str())
-                .collect::<Vec<_>>(),
-            vec!["cmd:/use s1"],
-        );
+        assert!(replies[0]
+            .markdown
+            .contains("callback_data=\"cmd:?/stop s1\""));
+        assert!(replies[0]
+            .markdown
+            .contains("callback_data=\"cmd:/use s1\""));
+        assert!(!replies[0].plain.contains("<tg-button-row>"));
 
         gateway
             .handle_text("mock", "chat-2", "bob", "/new claude reviewer")
@@ -22687,19 +22687,34 @@ mod tests {
             .unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let reply = gateway.render_sessions(&chat, false).await;
-        let options = reply.button_rows.into_iter().flatten().collect::<Vec<_>>();
-        assert_eq!(
-            options
-                .iter()
-                .map(|option| option.data.as_str())
-                .collect::<Vec<_>>(),
-            vec!["cmd:/use s2", "cmd:/use s1"]
-        );
-        assert_eq!(options[0].label, "▶ s2 claude");
-        assert_eq!(options[1].label, "s1 claude");
+        assert!(reply.markdown.contains("callback_data=\"cmd:/use s2\""));
+        assert!(reply.markdown.contains("callback_data=\"cmd:/use s1\""));
+        assert_eq!(reply.button_rows[0][0].data, "cmd:/sessions");
+        assert_eq!(reply.button_rows[0][1].data, "cmd:?/new");
+
+        let typed = gateway
+            .handle_text("telegram", "chat-1", "alice", "/use s1")
+            .await
+            .unwrap();
+        let via_button = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/use s1".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(typed, vec!["Используется сессия s1\n↓ Статус → /status"]);
+        assert_eq!(via_button, vec!["Используется сессия s1"]);
     }
 
-    /// A verbose title is capped in the compact session switch button.
+    /// A verbose title is capped in the compact session table.
     #[tokio::test]
     async fn session_buttons_stay_compact_with_a_long_title() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -22713,10 +22728,9 @@ mod tests {
         gateway.rename_session("s1", long).await.unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let reply = gateway.render_sessions(&chat, false).await;
-        let option = &reply.button_rows[0][0];
-        assert_eq!(option.label, "▶ s1 claude · A really re…");
-        assert_eq!(option.data, "cmd:/use s1");
-        assert!(option.data.len() <= 64);
+        assert!(reply.markdown.contains("A really really long sessio…"));
+        assert!(reply.markdown.contains("callback_data=\"cmd:/use s1\""));
+        assert_eq!(reply.button_rows[0][1].data, "cmd:?/new");
     }
 
     /// `/sessions` renders the required compact Russian table.
@@ -22734,7 +22748,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert!(listing[0].contains("sid | vendor.model | статус | ctx"));
+        assert!(listing[0].contains("sid | vendor/model | state | title"));
         assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | —"));
     }
 
@@ -22760,7 +22774,7 @@ mod tests {
         });
         assert_eq!(
             reply.button_rows.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![8, 1]
+            vec![2]
         );
     }
 
@@ -23442,7 +23456,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(with_status.len(), 1);
-        assert!(with_status[0].contains("s1 | claude.opus-4-8[1m] | 🟢 ожидание | 19%"));
+        assert!(with_status[0].contains("s1 | claude.opus-4-8[1m] | 🟢 ожидание · ctx 19% | —"));
 
         // A non-[1m] model, no effort, renders against the 200k baseline.
         fake.set_status(ThreadStatus {
@@ -23461,7 +23475,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(baseline.len(), 1);
-        assert!(baseline[0].contains("s1 | claude.sonnet-4-5 | 🟢 ожидание | 94%"));
+        assert!(baseline[0].contains("s1 | claude.sonnet-4-5 | 🟢 ожидание · ctx 94% | —"));
     }
 
     /// Every vendor's IM row carries its lowercase vendor right after the sid
@@ -27112,18 +27126,19 @@ mod tests {
             ]
         );
 
-        // The compact table stays terse while the switch button carries a
-        // capped title to disambiguate otherwise identical sessions.
+        // The compact table stays terse while its title cell disambiguates
+        // otherwise identical sessions.
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | —"));
+        assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | my custom title"));
         let chat = ChatKey::new("mock", "chat-1", "alice");
-        assert_eq!(
-            gateway.render_sessions(&chat, false).await.button_rows[0][0].label,
-            "▶ s1 claude · my custom t…"
-        );
+        assert!(gateway
+            .render_sessions(&chat, false)
+            .await
+            .markdown
+            .contains("my custom title"));
 
         // A later plain message must NOT clobber the rename via auto-title.
         gateway
