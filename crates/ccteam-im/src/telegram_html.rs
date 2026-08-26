@@ -51,7 +51,8 @@ fn render_markdown_at_depth(input: &str, depth: usize) -> RenderedMarkdown {
         let raw_line = lines[index];
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
 
-        if let Some((fence_char, fence_len)) = fence_marker(line) {
+        if is_fence_line(line) {
+            let (fence_char, fence_len) = fence_marker(line).expect("checked by is_fence_line");
             let language = fence_language(line, fence_len);
             let mut body = String::new();
             let mut closing = None;
