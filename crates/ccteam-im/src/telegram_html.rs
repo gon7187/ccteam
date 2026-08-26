@@ -123,7 +123,7 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
         }
 
         if is_blockquote_line(line) {
-            let mut quote_source = String::new();
+            let mut quote = Fragment::default();
             let mut cursor = index;
             while cursor < lines.len() {
                 let raw_quote = lines[cursor];
@@ -131,20 +131,12 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
                 let Some(content) = strip_blockquote(quote_line) else {
                     break;
                 };
-                quote_source.push_str(content);
+                append_fragment(&mut quote, render_inline(content, true, true));
                 if raw_quote.ends_with('\n') {
-                    quote_source.push('\n');
+                    append_escaped_text(&mut quote, "\n");
                 }
                 cursor += 1;
             }
-            let rendered_quote = render_markdown(&quote_source);
-            let quote = Fragment {
-                contains_code: rendered_quote.html.contains("<pre>")
-                    || rendered_quote.html.contains("<code>"),
-                html: rendered_quote.html,
-                text_utf16_len: rendered_quote.text_utf16_len,
-                has_non_whitespace: rendered_quote.has_non_whitespace,
-            };
             append_fragment(&mut out, wrap("blockquote", quote));
             index = cursor;
             continue;
@@ -1119,6 +1111,14 @@ mod tests {
         assert_eq!(
             render_markdown("- ~~~rust\n  list < 1\n  ~~~").html,
             "• <pre><code class=\"language-rust\">list &lt; 1\n</code></pre>"
+        );
+    }
+
+    #[test]
+    fn does_not_nest_blockquotes_for_literal_nested_markers() {
+        assert_eq!(
+            render_markdown("> > nested\n").html,
+            "<blockquote>&gt; nested\n</blockquote>"
         );
     }
 }
