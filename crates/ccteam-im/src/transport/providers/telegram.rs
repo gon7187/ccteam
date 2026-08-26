@@ -1588,7 +1588,7 @@ fn button_rows_to_tg_html(rows: &[Vec<MessageOption>]) -> String {
         }
         out.push_str("<tg-button-row>");
         for opt in row {
-            out.push_str("<tg-button type=\"callback_data\" callback_data=\"");
+            out.push_str("<tg-button type=\"callback_data\" data=\"");
             out.push_str(&escape_tg_button_attr(&opt.data));
             out.push('"');
             if let Some(style) = button_style_str(opt.style) {
@@ -2583,11 +2583,11 @@ mod tests {
         assert!(markdown.starts_with("**hello**"));
         assert!(markdown.contains("<tg-button-row>"));
         assert!(markdown.contains(r#"type="callback_data""#));
-        assert!(markdown.contains(r#"callback_data="cmd:/stop""#));
+        assert!(markdown.contains(r#" data="cmd:/stop""#));
         assert!(markdown.contains(r#"style="danger""#));
         assert!(markdown.contains(">⛔ Стоп</tg-button>"));
         // The second button has no style attribute at all.
-        assert!(markdown.contains(r#"callback_data="cmd:/new">✏️ Новая</tg-button>"#));
+        assert!(markdown.contains(r#" data="cmd:/new">✏️ Новая</tg-button>"#));
         assert!(markdown.contains("</tg-button-row>"));
     }
 
