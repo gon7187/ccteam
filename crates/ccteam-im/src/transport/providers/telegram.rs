@@ -55,7 +55,9 @@ pub struct TelegramChannel {
     rejected_senders: RejectedSenderNotifier,
     http: reqwest::Client,
     last_offset: Arc<Mutex<i64>>,
-    bot_identity: Mutex<Option<BotIdentity>>,
+    bot_username: std::sync::RwLock<Option<String>>,
+    last_identity_attempt: std::sync::Mutex<Option<Instant>>,
+    unknown_bot_mention_warned: std::sync::atomic::AtomicBool,
     name: String,
     /// TG-GATE-V2 W1 — reason kinds (`"http_400"`, `"network_error"`, …)
     /// already logged for a rich→classic fallback, so a noisy failure mode
@@ -107,7 +109,9 @@ impl TelegramChannel {
                 .build()
                 .expect("reqwest client"),
             last_offset: Arc::new(Mutex::new(0)),
-            bot_identity: Mutex::new(None),
+            bot_username: std::sync::RwLock::new(None),
+            last_identity_attempt: std::sync::Mutex::new(None),
+            unknown_bot_mention_warned: std::sync::atomic::AtomicBool::new(false),
             name: "telegram".to_string(),
             rich_fallback_logged: Mutex::new(std::collections::HashSet::new()),
             rich_failures: std::sync::atomic::AtomicU32::new(0),
@@ -144,13 +148,8 @@ impl TelegramChannel {
         format!("{}/bot{}/{}", self.api_base, self.bot_token, method)
     }
 
-    async fn bot_identity(&self) -> BotIdentity {
-        let mut cached = self.bot_identity.lock().await;
-        if let Some(identity) = cached.as_ref() {
-            return identity.clone();
-        }
-
-        let identity = match self.http.get(self.api_url("getMe")).send().await {
+    async fn get_me_identity(&self) -> Option<BotIdentity> {
+        match self.http.get(self.api_url("getMe")).send().await {
             Ok(resp) => {
                 let status_ok = resp.status().is_success();
                 let body = if status_ok {
@@ -161,12 +160,40 @@ impl TelegramChannel {
                 identity_from_response(status_ok, body)
             }
             Err(_) => None,
-        };
-        if let Some(identity) = identity {
-            *cached = Some(identity.clone());
-            return identity;
         }
-        BotIdentity::default()
+    }
+
+    fn cached_bot_username(&self) -> Option<String> {
+        self.bot_username
+            .read()
+            .expect("telegram bot username lock")
+            .clone()
+    }
+
+    fn cache_bot_username(&self, username: Option<String>) {
+        if let Some(username) = username {
+            *self
+                .bot_username
+                .write()
+                .expect("telegram bot username lock") = Some(username);
+        }
+    }
+
+    async fn refresh_bot_username_if_due(&self) {
+        let now = Instant::now();
+        {
+            let mut last_attempt = self
+                .last_identity_attempt
+                .lock()
+                .expect("telegram getMe attempt lock");
+            if !username_refresh_due(self.cached_bot_username().is_some(), *last_attempt, now) {
+                return;
+            }
+            *last_attempt = Some(now);
+        }
+        if let Some(identity) = self.get_me_identity().await {
+            self.cache_bot_username(identity.username);
+        }
     }
 
     /// Whether a chat is permitted. An empty allowlist means whatever this
@@ -742,10 +769,9 @@ struct GetUpdatesResp {
     result: Vec<TgUpdate>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct BotIdentity {
     username: Option<String>,
-    healthy: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -765,8 +791,16 @@ fn identity_from_response(status_ok: bool, body: Option<GetMeResp>) -> Option<Bo
     let body = body.filter(|body| status_ok && body.ok)?;
     Some(BotIdentity {
         username: body.result.and_then(|user| user.username),
-        healthy: true,
     })
+}
+
+const IDENTITY_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
+fn username_refresh_due(known_username: bool, last_attempt: Option<Instant>, now: Instant) -> bool {
+    !known_username
+        && last_attempt.is_none_or(|last_attempt| {
+            now.saturating_duration_since(last_attempt) >= IDENTITY_RETRY_BACKOFF
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1301,6 +1335,7 @@ impl Channel for TelegramChannel {
             if tx.is_closed() {
                 return Ok(());
             }
+            self.refresh_bot_username_if_due().await;
             let offset = { *self.last_offset.lock().await };
             let url = self.api_url("getUpdates");
             let req = self
@@ -1368,11 +1403,21 @@ impl Channel for TelegramChannel {
                         .clone()
                         .or_else(|| m.caption.clone())
                         .unwrap_or_default();
-                    let content = if content.starts_with('/') && !content.contains(['\r', '\n']) {
-                        let identity = self.bot_identity().await;
-                        strip_bot_mention(&content, identity.username.as_deref()).into_owned()
-                    } else {
-                        content
+                    let own_username = self.cached_bot_username();
+                    let content = match strip_bot_mention(&content, own_username.as_deref()) {
+                        Cow::Owned(normalized) => {
+                            if own_username.is_none()
+                                && !self
+                                    .unknown_bot_mention_warned
+                                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                            {
+                                tracing::warn!(
+                                    "telegram stripped an @bot command before getMe resolved the bot username"
+                                );
+                            }
+                            normalized
+                        }
+                        Cow::Borrowed(_) => content,
                     };
                     let mut attachments = Vec::new();
                     let mut rejected_notice: Option<String> = None;
@@ -1441,7 +1486,17 @@ impl Channel for TelegramChannel {
     }
 
     async fn health_check(&self) -> bool {
-        self.bot_identity().await.healthy
+        *self
+            .last_identity_attempt
+            .lock()
+            .expect("telegram getMe attempt lock") = Some(Instant::now());
+        match self.get_me_identity().await {
+            Some(identity) => {
+                self.cache_bot_username(identity.username);
+                true
+            }
+            None => false,
+        }
     }
 
     fn max_message_len(&self) -> Option<usize> {
@@ -1571,11 +1626,16 @@ fn set_my_commands_body(
 }
 
 fn strip_bot_mention<'a>(text: &'a str, own_username: Option<&str>) -> Cow<'a, str> {
-    if !text.starts_with('/') || text.contains(['\r', '\n']) {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('/') {
         return Cow::Borrowed(text);
     }
-    let first_end = text.find(char::is_whitespace).unwrap_or(text.len());
-    let (command, mention) = match text[..first_end].split_once('@') {
+    let first_line_end = trimmed.find(['\r', '\n']).unwrap_or(trimmed.len());
+    let first_line = &trimmed[..first_line_end];
+    let first_token_end = first_line
+        .find(char::is_whitespace)
+        .unwrap_or(first_line.len());
+    let (command, mention) = match first_line[..first_token_end].split_once('@') {
         Some(parts) => parts,
         None => return Cow::Borrowed(text),
     };
@@ -1588,7 +1648,12 @@ fn strip_bot_mention<'a>(text: &'a str, own_username: Option<&str>) -> Cow<'a, s
     if !matches_bot {
         return Cow::Borrowed(text);
     }
-    Cow::Owned(format!("{command}{}", &text[first_end..]))
+    Cow::Owned(format!(
+        "{}{}{}",
+        &text[..text.len() - trimmed.len()],
+        command,
+        &trimmed[first_token_end..]
+    ))
 }
 
 /// Parse a Telegram message id for `setMessageReaction`, tolerating ccteam's
@@ -1671,13 +1736,35 @@ mod tests {
             "/projects arg1 arg2"
         );
         assert_eq!(
-            strip_bot_mention("/projects@codexcoder1bot\nnext", Some("codexcoder1bot")),
-            "/projects@codexcoder1bot\nnext"
+            strip_bot_mention("/new@codexcoder1bot codex\nтекст", Some("codexcoder1bot")),
+            "/new codex\nтекст"
+        );
+        assert_eq!(
+            strip_bot_mention("  /projects@codexcoder1bot", Some("codexcoder1bot")),
+            "  /projects"
         );
         assert_eq!(
             strip_bot_mention("plain text", Some("codexcoder1bot")),
             "plain text"
         );
+    }
+
+    #[test]
+    fn username_refresh_waits_a_minute_after_a_failed_attempt() {
+        let now = Instant::now();
+        assert!(username_refresh_due(false, None, now));
+        assert!(!username_refresh_due(false, Some(now), now));
+        assert!(!username_refresh_due(
+            false,
+            now.checked_sub(Duration::from_secs(59)),
+            now
+        ));
+        assert!(username_refresh_due(
+            false,
+            now.checked_sub(Duration::from_secs(60)),
+            now
+        ));
+        assert!(!username_refresh_due(true, None, now));
     }
 
     #[test]
@@ -1693,7 +1780,6 @@ mod tests {
         )
         .expect("successful getMe is cacheable");
         assert_eq!(success.username.as_deref(), Some("codexcoder1bot"));
-        assert!(success.healthy);
 
         assert!(identity_from_response(false, None).is_none());
         assert!(identity_from_response(
