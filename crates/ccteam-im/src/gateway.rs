@@ -19302,6 +19302,8 @@ mod tests {
 
         // A project rebind never moves an existing session. Rebuild/resume
         // fails readable and requires a fresh sid on the new binding.
+        let config_path = ccteam_core::config::config_path(&ccteam_root);
+        let cached_mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
         let mut config = ccteam_core::config::load(&ccteam_root).unwrap();
         let entry = config
             .projects
@@ -19312,6 +19314,14 @@ mod tests {
         entry.remote_slug = None;
         entry.remote_path = None;
         ccteam_core::config::save(&ccteam_root, &config).unwrap();
+        // HotConfig reloads only when mtime changes. Consecutive atomic saves
+        // can share a timestamp, so make the external rebind deterministic.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&config_path)
+            .unwrap()
+            .set_modified(cached_mtime + std::time::Duration::from_secs(1))
+            .unwrap();
         fake.live.store(false, Ordering::SeqCst);
         let err = gateway
             .plan_resume_dead_session("s1")
