@@ -70,7 +70,13 @@ struct DraftRoute {
 }
 
 type DraftRoutes = Arc<StdMutex<HashMap<DraftRouteKey, DraftRoute>>>;
-type DraftFinalizations = Arc<StdMutex<HashMap<String, VecDeque<Arc<AtomicU8>>>>>;
+#[derive(Default)]
+struct DraftFinalizationState {
+    by_status_key: HashMap<String, Arc<AtomicU8>>,
+    by_sid: HashMap<String, VecDeque<String>>,
+}
+
+type DraftFinalizations = Arc<StdMutex<DraftFinalizationState>>;
 
 const FINAL_PENDING: u8 = 0;
 const FINAL_ANSWER_IN_FLIGHT: u8 = 1;
@@ -104,6 +110,7 @@ struct DraftCompletion {
     recipient: String,
     thread_ts: Option<String>,
     sid: String,
+    status_key: String,
     content: String,
 }
 
@@ -1887,7 +1894,8 @@ fn spawn_gateway_event_consumer(
         let mut status_messages: HashMap<String, StatusHandle> = HashMap::new();
         let mut draft_failures: HashMap<String, DraftBreaker> = HashMap::new();
         let mut draft_keepalives: HashMap<String, DraftKeepalive> = HashMap::new();
-        let draft_finalizations: DraftFinalizations = Arc::new(StdMutex::new(HashMap::new()));
+        let draft_finalizations: DraftFinalizations =
+            Arc::new(StdMutex::new(DraftFinalizationState::default()));
         let draft_keepalive_interval = draft_keepalive_interval();
         // 👀 ack reaction handle map (v0.8.19). Keyed `"{channel}:{message_id}"`;
         // the value is the provider's reaction handle (`Some(reaction_id)` for
@@ -1943,11 +1951,10 @@ fn spawn_gateway_event_consumer(
                     if let Some(markdown) = rich_markdown {
                         out = out.with_rich_markdown(markdown);
                     }
-                    let finalization = evt
-                        .sid
-                        .as_deref()
-                        .and_then(|sid| take_answer_finalization(&draft_finalizations, sid));
-                    if let Some(state) = finalization.as_ref() {
+                    let finalization = evt.sid.as_deref().and_then(|sid| {
+                        take_answer_finalization(&draft_finalizations, sid, &evt.id)
+                    });
+                    if let Some((_, state)) = finalization.as_ref() {
                         let _ = state.compare_exchange(
                             FINAL_PENDING,
                             FINAL_ANSWER_IN_FLIGHT,
@@ -1960,11 +1967,11 @@ fn spawn_gateway_event_consumer(
                             .await;
                     if let Some(sid) = evt.sid.as_deref() {
                         if sent {
-                            if let Some(state) = finalization {
-                                remove_finalization(&draft_finalizations, sid, &state);
+                            if let Some((status_key, state)) = finalization {
+                                remove_finalization(&draft_finalizations, sid, &status_key);
                                 state.store(FINAL_SENT, Ordering::Release);
                             }
-                        } else if let Some(state) = finalization {
+                        } else if let Some((_, state)) = finalization {
                             let _ = state.compare_exchange(
                                 FINAL_ANSWER_IN_FLIGHT,
                                 FINAL_PENDING,
@@ -2123,6 +2130,7 @@ async fn deliver_progress(
                     recipient: handle.recipient,
                     thread_ts,
                     sid,
+                    status_key,
                     content,
                 });
             }
@@ -2509,41 +2517,44 @@ fn take_stopped_draft_route(
 fn take_answer_finalization(
     finalizations: &DraftFinalizations,
     sid: &str,
-) -> Option<Arc<AtomicU8>> {
+    event_id: &str,
+) -> Option<(String, Arc<AtomicU8>)> {
     let mut entries = finalizations.lock().unwrap();
-    let queue = entries.get_mut(sid)?;
-    let state = queue.front()?.clone();
+    let exact_key = answer_status_key(sid, event_id);
+    let key = exact_key
+        .filter(|key| entries.by_status_key.contains_key(key))
+        .or_else(|| entries.by_sid.get(sid)?.front().cloned())?;
+    let state = entries.by_status_key.get(&key)?.clone();
     match state.load(Ordering::Acquire) {
-        FINAL_PENDING | FINAL_ANSWER_IN_FLIGHT | FINALIZING => Some(state),
+        FINAL_PENDING | FINAL_ANSWER_IN_FLIGHT | FINALIZING => Some((key, state)),
         FINAL_SENT | FINAL_CANCELLED => {
-            // This Answer belongs to the already-completed oldest turn. Do not
-            // advance to a newer turn's completion state in the same event.
-            queue.pop_front();
-            if queue.is_empty() {
-                entries.remove(sid);
-            }
+            remove_finalization_key(&mut entries, sid, &key);
             None
         }
         _ => None,
     }
 }
 
-fn remove_finalization(finalizations: &DraftFinalizations, sid: &str, state: &Arc<AtomicU8>) {
-    let mut entries = finalizations.lock().unwrap();
-    let Some(queue) = entries.get_mut(sid) else {
+fn answer_status_key(sid: &str, event_id: &str) -> Option<String> {
+    let prefix = format!("gateway-event-{sid}-");
+    let seq = event_id.strip_prefix(&prefix)?.parse::<u64>().ok()?;
+    Some(format!("{sid}-{}", seq.checked_sub(1)?))
+}
+
+fn remove_finalization_key(entries: &mut DraftFinalizationState, sid: &str, status_key: &str) {
+    entries.by_status_key.remove(status_key);
+    let Some(queue) = entries.by_sid.get_mut(sid) else {
         return;
     };
-    if queue
-        .front()
-        .is_some_and(|current| Arc::ptr_eq(current, state))
-    {
-        queue.pop_front();
-    } else {
-        queue.retain(|current| !Arc::ptr_eq(current, state));
-    }
+    queue.retain(|key| key != status_key);
     if queue.is_empty() {
-        entries.remove(sid);
+        entries.by_sid.remove(sid);
     }
+}
+
+fn remove_finalization(finalizations: &DraftFinalizations, sid: &str, status_key: &str) {
+    let mut entries = finalizations.lock().unwrap();
+    remove_finalization_key(&mut entries, sid, status_key);
 }
 
 fn schedule_draft_finalization(
@@ -2555,10 +2566,17 @@ fn schedule_draft_finalization(
     finalizations
         .lock()
         .unwrap()
+        .by_status_key
+        .insert(completion.status_key.clone(), state.clone());
+    finalizations
+        .lock()
+        .unwrap()
+        .by_sid
         .entry(completion.sid.clone())
         .or_default()
-        .push_back(state.clone());
+        .push_back(completion.status_key.clone());
     let sid = completion.sid.clone();
+    let status_key = completion.status_key.clone();
     let finalizations = finalizations.clone();
     tokio::spawn(async move {
         tokio::time::sleep(DRAFT_FINALIZATION_GRACE).await;
@@ -2585,11 +2603,16 @@ fn schedule_draft_finalization(
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         );
-                        let cleanup_state = state.clone();
                         let cleanup_finalizations = finalizations.clone();
+                        let cleanup_sid = sid.clone();
+                        let cleanup_status_key = status_key.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(DRAFT_FINALIZATION_TTL).await;
-                            remove_finalization(&cleanup_finalizations, &sid, &cleanup_state);
+                            remove_finalization(
+                                &cleanup_finalizations,
+                                &cleanup_sid,
+                                &cleanup_status_key,
+                            );
                         });
                     }
                     return;
@@ -3345,6 +3368,7 @@ mod tests {
                 recipient: "123".to_string(),
                 thread_ts: None,
                 sid: "s42".to_string(),
+                status_key: "s42-1".to_string(),
                 content: "✅ готово · 1с · 0 инструментов · 0 файлов".to_string(),
             },
         )
@@ -3358,14 +3382,19 @@ mod tests {
         let mock = crate::transport::providers::mock::MockChannel::new()
             .with_name("telegram")
             .with_rich_support();
-        let finalizations: DraftFinalizations = Arc::new(StdMutex::new(HashMap::new()));
-        for content in ["✅ готово · первый", "✅ готово · второй"] {
+        let finalizations: DraftFinalizations =
+            Arc::new(StdMutex::new(DraftFinalizationState::default()));
+        for (epoch, content) in ["✅ готово · первый", "✅ готово · второй"]
+            .into_iter()
+            .enumerate()
+        {
             schedule_draft_finalization(
                 &finalizations,
                 DraftCompletion {
                     recipient: "123".to_string(),
                     thread_ts: None,
                     sid: "s42".to_string(),
+                    status_key: format!("s42-{epoch}"),
                     content: content.to_string(),
                 },
                 Arc::new(mock.clone()),
