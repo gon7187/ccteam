@@ -1236,6 +1236,10 @@ fn should_dispatch_inbound_content(content: &str) -> bool {
     !content.trim().is_empty()
 }
 
+fn should_dispatch_inbound_message(content: &str, has_attachment: bool) -> bool {
+    should_dispatch_inbound_content(content) || has_attachment
+}
+
 fn utf16_offset_to_byte(text: &str, offset: i64) -> Option<usize> {
     if offset < 0 {
         return None;
@@ -1888,9 +1892,17 @@ impl Channel for TelegramChannel {
                         }
                         Cow::Borrowed(content) => content.to_string(),
                     };
+                    let pending_attachment = pick_attachment(&m);
+                    if !should_dispatch_inbound_message(&content, pending_attachment.is_some()) {
+                        tracing::debug!(
+                            cid = %cid,
+                            "telegram: inbound message has no dispatchable content or attachment"
+                        );
+                        continue;
+                    }
                     let mut attachments = Vec::new();
                     let mut rejected_notice: Option<String> = None;
-                    if let Some(pending) = pick_attachment(&m) {
+                    if let Some(pending) = pending_attachment {
                         match self.stage_attachment(&cid, &pending).await {
                             Ok(Some(att)) => attachments.push(att),
                             Ok(None) => {
@@ -1918,12 +1930,12 @@ impl Channel for TelegramChannel {
                         {
                             tracing::warn!(cid = %cid, error = %err, "telegram: rejection notice send failed");
                         }
-                        if !should_dispatch_inbound_content(&content) {
-                            continue;
-                        }
                     }
-                    if !should_dispatch_inbound_content(&content) {
-                        tracing::debug!(cid = %cid, "telegram: inbound message has no dispatchable content");
+                    if !should_dispatch_inbound_content(&content) && attachments.is_empty() {
+                        tracing::debug!(
+                            cid = %cid,
+                            "telegram: inbound message has no dispatchable content after attachment staging"
+                        );
                         continue;
                     }
                     let content_len = content.len();
@@ -3204,6 +3216,37 @@ mod tests {
     fn whitespace_content_is_not_dispatchable() {
         assert!(!should_dispatch_inbound_content(" \n\t"));
         assert!(should_dispatch_inbound_content("[photo]"));
+    }
+
+    #[test]
+    fn attachment_only_message_remains_dispatchable_with_empty_content() {
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "date": 0,
+            "chat": {"id": 5},
+            "photo": [{"file_id": "photo-1"}]
+        }))
+        .expect("photo message is valid");
+        let (content, _) = message_content(&message, Some("mybot"));
+
+        assert!(content.is_empty());
+        assert!(pick_attachment(&message).is_some());
+        assert!(should_dispatch_inbound_message(content.as_ref(), true));
+    }
+
+    #[test]
+    fn textless_rich_message_without_media_is_not_dispatchable() {
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "date": 0,
+            "chat": {"id": 5},
+            "text": "",
+            "rich_message": {"blocks": [{"type": "future_block"}]}
+        }))
+        .expect("unknown rich block is valid");
+        let (content, _) = message_content(&message, Some("mybot"));
+
+        assert!(!should_dispatch_inbound_message(content.as_ref(), false));
     }
 
     #[test]
