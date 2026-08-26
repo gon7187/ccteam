@@ -485,7 +485,7 @@ fn escape_markdown(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
         match character {
-            '\\' | '*' | '_' | '`' | '|' => {
+            '\\' | '*' | '_' | '`' | '|' | '[' | ']' => {
                 escaped.push('\\');
                 escaped.push(character);
             }
@@ -570,7 +570,7 @@ mod tests {
             .iter()
             .flatten()
             .all(|button| button.data.len() <= 64));
-        assert_eq!(super::escape_markdown("x*y"), "x\\*y");
+        assert_eq!(super::escape_markdown("x*y[]"), "x\\*y\\[\\]");
     }
 
     #[test]
