@@ -2666,6 +2666,7 @@ mod tests {
     /// Persistent rich rejection must stay inside the Telegram transport:
     /// one durable row may emit several classic HTTP messages, but the ledger
     /// must still contain one logical id and one terminal Sent row.
+    #[cfg(feature = "telegram")]
     #[tokio::test(flavor = "current_thread")]
     async fn rich_fallback_needs_split_is_handled_inside_telegram_without_new_rows() {
         let tmp = TempDir::new().unwrap();
@@ -2722,8 +2723,10 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "telegram")]
     type SeenRequests = Arc<StdMutex<Vec<(String, String)>>>;
 
+    #[cfg(feature = "telegram")]
     fn spawn_persistent_rich_reject_http() -> (String, SeenRequests) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
