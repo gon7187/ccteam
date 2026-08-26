@@ -21,6 +21,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod providers;
 
+/// Internal marker used to carry Telegram's draft-stop update through the
+/// channel-neutral inbound message until the daemon resolves its sid.
+pub const STOPPED_DRAFT_PREFIX: &str = "__ccteam_stopped_message_generation:";
+
 /// Kind of an inbound [`ChannelAttachment`] (V0.8.4 P2a).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

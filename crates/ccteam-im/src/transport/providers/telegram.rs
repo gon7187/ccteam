@@ -349,6 +349,45 @@ impl TelegramChannel {
         let _ = tx.send(payload).await;
     }
 
+    async fn handle_stopped_message_generation(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        update_id: i64,
+        stopped: TgMessageGenerationStopped,
+    ) {
+        if stopped.chat.id <= 0 {
+            tracing::debug!(
+                update_id,
+                chat_id = stopped.chat.id,
+                "telegram: stopped draft update ignored outside a private chat"
+            );
+            return;
+        }
+        let chat_id = stopped.chat.id.to_string();
+        if !self.chat_allowed(&chat_id) {
+            self.reject_chat(&chat_id, update_id, (now_unix_ms() / 1000) as i64)
+                .await;
+            return;
+        }
+        let _ = tx
+            .send(ChannelMessage {
+                id: format!("tg-stop-{update_id}"),
+                sender: chat_id.clone(),
+                reply_target: chat_id,
+                content: format!(
+                    "{}{}",
+                    crate::transport::STOPPED_DRAFT_PREFIX,
+                    stopped.draft_id
+                ),
+                channel: self.name.clone(),
+                timestamp: (now_unix_ms() / 1000) as u64,
+                thread_ts: stopped.message_thread_id.map(|id| id.to_string()),
+                attachments: Vec::new(),
+                selection: None,
+            })
+            .await;
+    }
+
     /// POST a `setMessageReaction` body (the shared transport for both
     /// add/remove). Bails on a non-2xx so the caller's `?` surfaces it; the
     /// daemon egress swallows that error (reactions are fire-and-forget).
@@ -816,6 +855,16 @@ struct TgUpdate {
     // the gateway has no edit/reconciliation contract.
     #[serde(default)]
     edited_message: Option<Value>,
+    #[serde(default)]
+    stopped_message_generation: Option<TgMessageGenerationStopped>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgMessageGenerationStopped {
+    chat: TgChat,
+    #[serde(default)]
+    message_thread_id: Option<i64>,
+    draft_id: i64,
 }
 
 /// An inline-keyboard button click (v0.8.5 D3).
@@ -1895,6 +1944,11 @@ impl Channel for TelegramChannel {
                     self.handle_callback_query(&tx, cb).await;
                     continue;
                 }
+                if let Some(stopped) = upd.stopped_message_generation {
+                    self.handle_stopped_message_generation(&tx, upd.update_id, stopped)
+                        .await;
+                    continue;
+                }
                 if upd.edited_message.is_some() {
                     tracing::debug!(update_id = upd.update_id, "telegram edited_message ignored");
                     // Edits are intentionally not re-dispatched: the gateway
@@ -2243,6 +2297,32 @@ mod tests {
         let ch = TelegramChannel::new("ABC".into(), vec![]);
         let url = ch.api_url("getMe");
         assert_eq!(url, "https://api.telegram.org/botABC/getMe");
+    }
+
+    #[tokio::test]
+    async fn stopped_generation_update_becomes_daemon_marker() {
+        let ch = TelegramChannel::new("t".into(), vec![]);
+        let update: TgUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 8,
+            "stopped_message_generation": {
+                "chat": {"id": 123},
+                "message_thread_id": 7,
+                "draft_id": 77
+            }
+        }))
+        .unwrap();
+        let stopped = update.stopped_message_generation.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        ch.handle_stopped_message_generation(&tx, update.update_id, stopped)
+            .await;
+
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.reply_target, "123");
+        assert_eq!(msg.thread_ts.as_deref(), Some("7"));
+        assert_eq!(
+            msg.content,
+            format!("{}77", crate::transport::STOPPED_DRAFT_PREFIX)
+        );
     }
 
     #[tokio::test]

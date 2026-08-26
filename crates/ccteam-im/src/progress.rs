@@ -452,11 +452,14 @@ impl ProgressFold {
 
     /// Render the draft-only thinking header plus the normal live progress.
     pub fn render_draft(&self, sid: &str) -> String {
-        format!(
-            "<tg-thinking>Thinking...</tg-thinking>\n\n{}",
-            self.render(sid)
-        )
+        draft_markdown(&self.render(sid))
     }
+}
+
+/// Add Telegram's draft-only thinking block to an already-rendered progress
+/// card. The gateway owns the fold, while the daemon owns channel delivery.
+pub fn draft_markdown(progress: &str) -> String {
+    format!("<tg-thinking>Thinking...</tg-thinking>\n\n{progress}")
 }
 
 fn render_elapsed(elapsed: Duration) -> String {
