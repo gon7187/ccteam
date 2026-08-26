@@ -600,6 +600,12 @@ pub fn progress_cost_contribution(event: &Value) -> Option<ProgressCostContribut
         }),
         Some(CHAT_TURN_COMPLETED) => {
             let vendor = vendor?;
+            // Codex emits the priced `agent_done` row for the same turn. Its
+            // paneless chat mirror is activity/token telemetry only; pricing
+            // it here would double-count the turn.
+            if vendor == "codex" {
+                return None;
+            }
             let cost_vendor = match vendor {
                 "claude" => ccteam_cost::Vendor::Claude,
                 "codex" => ccteam_cost::Vendor::Codex,
@@ -1859,6 +1865,20 @@ mod tests {
         assert_eq!(contribution.vendor, Some("claude"));
         assert_eq!(contribution.sid, Some("s1"));
         assert!((contribution.cost_usd - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn codex_chat_turn_is_not_priced_beside_agent_done() {
+        let event = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "vendor": "codex",
+            "model": "gpt-5.5",
+            "usage": {"output_tokens": 1_000_000},
+        });
+
+        assert!(progress_cost_contribution(&event).is_none());
     }
 
     #[test]
