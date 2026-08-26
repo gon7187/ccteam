@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::im_callbacks;
 use crate::im_views::{
     self, CommandView, DetachedSessionRow, ProjectRow, ProjectsView, RichReply, SessionRow,
-    SessionsView, StatusView,
+    SessionsView, StatusChild, StatusView,
 };
 use crate::pending::InteractionOrigin;
 use crate::transport::{ButtonStyle, ChannelAttachment, ChoiceReply, MessageOption, ReplyKeyboard};
@@ -10047,11 +10047,14 @@ impl Gateway {
                     .session_title(child)
                     .and_then(|title| truncate_title(&title))
                     .unwrap_or_else(|| "—".to_string());
-                format!(
-                    "{} · {} · {child_model} · {} · {title}",
-                    child.id,
-                    vendor_str(child.vendor),
-                    activity_marker(activity)
+                (
+                    child.id.clone(),
+                    format!(
+                        "{} · {} · {child_model} · {} · {title}",
+                        child.id,
+                        vendor_str(child.vendor),
+                        activity_marker(activity)
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -10095,14 +10098,20 @@ impl Gateway {
             detail_lines.push("⚡️ Использование:".to_string());
             detail_lines.extend(usage_lines);
         }
+        let mut children = Vec::new();
         if !child_summary.is_empty() {
             detail_lines.push(String::new());
             detail_lines.push(format!("👥 Дочерние ({}):", child_summary.len()));
-            for (index, child) in child_summary.into_iter().enumerate() {
+            for (index, (sid, child)) in child_summary.into_iter().enumerate() {
                 if index > 0 {
                     detail_lines.push(String::new());
                 }
+                let detail_line_index = detail_lines.len();
                 detail_lines.push(format!("  • {child}"));
+                children.push(StatusChild {
+                    sid,
+                    detail_line_index,
+                });
             }
         }
         let same_project_sessions = visible
@@ -10170,10 +10179,7 @@ impl Gateway {
             detail_lines,
             cost_24h,
             resume,
-            child_stop_sids: direct_children
-                .iter()
-                .map(|child| child.id.clone())
-                .collect(),
+            children,
         })
     }
 
@@ -21012,7 +21018,9 @@ mod tests {
         );
         let sessions = gateway.render_sessions(&tenant, true).await.plain;
         assert!(
-            sessions.contains(&format!("{child} | claude.— | 🟢 ожидание | —")),
+            sessions.contains(&format!(
+                "{child} | claude.— | 🟢 ожидание | delegated investiga…"
+            )),
             "the tenant's session list must include its delegated child: {sessions}"
         );
     }
@@ -22775,7 +22783,7 @@ mod tests {
         assert!(mock[0].contains("alpha |"));
     }
 
-    /// `/sessions` has `cmd:/use` buttons in its rich reply and a table fallback.
+    /// `/sessions` has inline stop/use buttons in its rich reply and a plain fallback.
     #[tokio::test]
     async fn telegram_sessions_delivers_switch_buttons() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -22791,16 +22799,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replies.len(), 1);
-        assert!(replies[0].markdown.contains("| **s1** |"));
-        assert_eq!(
-            replies[0]
-                .button_rows
-                .iter()
-                .flatten()
-                .map(|option| option.data.as_str())
-                .collect::<Vec<_>>(),
-            vec!["cmd:/use s1"],
-        );
+        assert!(replies[0]
+            .markdown
+            .contains("**s1** · claude/— · 🟢 ожидание"));
+        assert!(replies[0].markdown.contains("data=\"cmd:?/stop s1\""));
+        assert!(replies[0].markdown.contains("data=\"cmd:/use s1\""));
+        assert!(!replies[0].plain.contains("<tg-button-row>"));
 
         gateway
             .handle_text("mock", "chat-2", "bob", "/new claude reviewer")
@@ -22831,19 +22835,34 @@ mod tests {
             .unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let reply = gateway.render_sessions(&chat, false).await;
-        let options = reply.button_rows.into_iter().flatten().collect::<Vec<_>>();
-        assert_eq!(
-            options
-                .iter()
-                .map(|option| option.data.as_str())
-                .collect::<Vec<_>>(),
-            vec!["cmd:/use s2", "cmd:/use s1"]
-        );
-        assert_eq!(options[0].label, "▶ s2 claude");
-        assert_eq!(options[1].label, "s1 claude");
+        assert!(reply.markdown.contains("data=\"cmd:/use s2\""));
+        assert!(reply.markdown.contains("data=\"cmd:/use s1\""));
+        assert_eq!(reply.button_rows[2][0].data, "cmd:/sessions");
+        assert_eq!(reply.button_rows[2][1].data, "cmd:?/new");
+
+        let typed = gateway
+            .handle_text("telegram", "chat-1", "alice", "/use s1")
+            .await
+            .unwrap();
+        let via_button = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/use s1".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(typed, vec!["Используется сессия s1\n↓ Статус → /status"]);
+        assert_eq!(via_button, vec!["Используется сессия s1"]);
     }
 
-    /// A verbose title is capped in the compact session switch button.
+    /// A verbose title is capped in the compact session table.
     #[tokio::test]
     async fn session_buttons_stay_compact_with_a_long_title() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -22857,10 +22876,14 @@ mod tests {
         gateway.rename_session("s1", long).await.unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let reply = gateway.render_sessions(&chat, false).await;
-        let option = &reply.button_rows[0][0];
-        assert_eq!(option.label, "▶ s1 claude · A really re…");
-        assert_eq!(option.data, "cmd:/use s1");
-        assert!(option.data.len() <= 64);
+        assert!(reply.markdown.contains("A really really lon…"));
+        assert!(reply.markdown.contains("data=\"cmd:/use s1\""));
+        assert_eq!(reply.button_rows[1][1].data, "cmd:?/new");
+        assert!(reply
+            .button_rows
+            .iter()
+            .flatten()
+            .all(|button| button.data.len() <= 64));
     }
 
     /// `/sessions` renders the required compact Russian table.
@@ -22878,7 +22901,6 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert!(listing[0].contains("sid | vendor.model | статус | ctx"));
         assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | —"));
     }
 
@@ -22904,8 +22926,13 @@ mod tests {
         });
         assert_eq!(
             reply.button_rows.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![8, 1]
+            vec![2; 10]
         );
+        assert!(reply
+            .button_rows
+            .iter()
+            .flatten()
+            .all(|button| button.data.len() <= 64));
     }
 
     /// Tapping a picker button switches project / session through the SAME
@@ -27427,18 +27454,19 @@ mod tests {
             ]
         );
 
-        // The compact table stays terse while the switch button carries a
-        // capped title to disambiguate otherwise identical sessions.
+        // The compact table stays terse while its title cell disambiguates
+        // otherwise identical sessions.
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | —"));
+        assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | my custom title"));
         let chat = ChatKey::new("mock", "chat-1", "alice");
-        assert_eq!(
-            gateway.render_sessions(&chat, false).await.button_rows[0][0].label,
-            "▶ s1 claude · my custom t…"
-        );
+        assert!(gateway
+            .render_sessions(&chat, false)
+            .await
+            .markdown
+            .contains("my custom title"));
 
         // A later plain message must NOT clobber the rename via auto-title.
         gateway

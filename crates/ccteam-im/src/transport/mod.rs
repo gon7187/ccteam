@@ -587,6 +587,10 @@ pub struct SendMessage {
     /// numbered text list the same way `options` already does today.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub button_rows: Vec<Vec<MessageOption>>,
+    /// Rich markdown already contains the button rows; the classic fallback
+    /// still uses `button_rows` as its inline keyboard.
+    #[serde(default)]
+    pub inline_buttons: bool,
     /// Telegram reply keyboard request; unsupported channels ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_keyboard: Option<ReplyKeyboard>,
@@ -607,6 +611,7 @@ impl SendMessage {
             options: Vec::new(),
             rich_markdown: None,
             button_rows: Vec::new(),
+            inline_buttons: false,
             reply_keyboard: None,
             callback_ephemeral: None,
         }
@@ -639,6 +644,12 @@ impl SendMessage {
     /// Builder-style: attach button rows (TG-GATE-V2 W1).
     pub fn with_button_rows(mut self, button_rows: Vec<Vec<MessageOption>>) -> Self {
         self.button_rows = button_rows;
+        self
+    }
+
+    /// Builder-style: mark button rows already embedded in Rich markdown.
+    pub fn with_inline_buttons(mut self, inline_buttons: bool) -> Self {
+        self.inline_buttons = inline_buttons;
         self
     }
 

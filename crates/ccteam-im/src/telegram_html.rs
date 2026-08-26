@@ -27,7 +27,30 @@ struct Fragment {
 
 /// Render the supported Markdown subset as Telegram HTML.
 pub fn render_markdown(input: &str) -> RenderedMarkdown {
-    render_markdown_at_depth(input, 0)
+    let input = strip_rich_button_rows(input);
+    render_markdown_at_depth(&input, 0)
+}
+
+fn strip_rich_button_rows(input: &str) -> String {
+    const OPEN: &str = "<tg-button-row>";
+    const CLOSE: &str = "</tg-button-row>";
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    loop {
+        let Some(start_offset) = input[cursor..].find(OPEN) else {
+            output.push_str(&input[cursor..]);
+            break;
+        };
+        let start = cursor + start_offset;
+        output.push_str(&input[cursor..start]);
+        let content_start = start + OPEN.len();
+        let Some(end_offset) = input[content_start..].find(CLOSE) else {
+            output.push_str(&input[start..]);
+            break;
+        };
+        cursor = content_start + end_offset + CLOSE.len();
+    }
+    output
 }
 
 const MAX_RENDER_DEPTH: usize = 16;
@@ -1014,6 +1037,16 @@ mod tests {
     #[test]
     fn escapes_html_text() {
         assert_eq!(render_markdown("<&>").html, "&lt;&amp;&gt;");
+    }
+
+    #[test]
+    fn strips_rich_inline_button_rows_from_classic_html() {
+        let rendered = render_markdown(
+            "before<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:/use s1\">Use</tg-button></tg-button-row>after",
+        );
+        assert_eq!(rendered.html, "beforeafter");
+        assert_eq!(rendered.text_utf16_len, 11);
+        assert!(!rendered.html.contains("tg-button"));
     }
 
     #[test]

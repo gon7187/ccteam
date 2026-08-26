@@ -1784,7 +1784,7 @@ fn button_rows_to_tg_html(rows: &[Vec<MessageOption>]) -> String {
         }
         out.push_str("<tg-button-row>");
         for opt in row {
-            out.push_str("<tg-button type=\"callback_data\" callback_data=\"");
+            out.push_str("<tg-button type=\"callback_data\" data=\"");
             out.push_str(&escape_tg_button_attr(&opt.data));
             out.push('"');
             if let Some(style) = button_style_str(opt.style) {
@@ -1804,6 +1804,9 @@ fn button_rows_to_tg_html(rows: &[Vec<MessageOption>]) -> String {
 /// Rich Message body budget after accounting for the optional button block
 /// appended by [`build_rich_send_body`].
 pub(crate) fn rich_markdown_budget(message: &SendMessage) -> usize {
+    if message.inline_buttons {
+        return MAX_RICH_MARKDOWN_BYTES;
+    }
     let buttons_html = button_rows_to_tg_html(&combined_button_rows(message));
     let overhead = if buttons_html.is_empty() {
         0
@@ -1819,7 +1822,11 @@ pub(crate) fn rich_markdown_budget(message: &SendMessage) -> usize {
 /// parameter (see research doc §3).
 fn build_rich_send_body(message: &SendMessage, markdown: &str) -> serde_json::Value {
     let rows = combined_button_rows(message);
-    let buttons_html = button_rows_to_tg_html(&rows);
+    let buttons_html = if message.inline_buttons {
+        String::new()
+    } else {
+        button_rows_to_tg_html(&rows)
+    };
     let full_markdown = if buttons_html.is_empty() {
         markdown.to_string()
     } else {
@@ -2873,12 +2880,26 @@ mod tests {
         assert!(markdown.starts_with("**hello**"));
         assert!(markdown.contains("<tg-button-row>"));
         assert!(markdown.contains(r#"type="callback_data""#));
-        assert!(markdown.contains(r#"callback_data="cmd:/stop""#));
+        assert!(markdown.contains(r#" data="cmd:/stop""#));
         assert!(markdown.contains(r#"style="danger""#));
         assert!(markdown.contains(">⛔ Стоп</tg-button>"));
         // The second button has no style attribute at all.
-        assert!(markdown.contains(r#"callback_data="cmd:/new">✏️ Новая</tg-button>"#));
+        assert!(markdown.contains(r#" data="cmd:/new">✏️ Новая</tg-button>"#));
         assert!(markdown.contains("</tg-button-row>"));
+    }
+
+    #[test]
+    fn rich_inline_rows_are_not_appended_again() {
+        let row = vec![opt("cmd:/use s1", "💬 Переключиться", None)];
+        let inline = r#"<tg-button-row><tg-button type="callback_data" data="cmd:/use s1">💬 Переключиться</tg-button></tg-button-row>"#;
+        let message = SendMessage::new("s1", "42")
+            .with_rich_markdown(format!("s1\n{inline}"))
+            .with_button_rows(vec![row])
+            .with_inline_buttons(true);
+        let body = build_rich_send_body(&message, message.rich_markdown.as_deref().unwrap());
+        let markdown = body["rich_message"]["markdown"].as_str().unwrap();
+        assert_eq!(markdown.matches("<tg-button-row>").count(), 1);
+        assert_eq!(markdown.matches("data=\"cmd:/use s1\"").count(), 1);
     }
 
     #[test]
@@ -3659,6 +3680,34 @@ mod tests {
             EphemeralDelivery::Unknown(_)
         ));
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn classic_fallback_strips_inline_rows_and_keeps_the_keyboard() {
+        let (base, seen) = spawn_concurrent_http(&[
+            r#"{"ok":false,"description":"rich messages unsupported"}"#,
+            r#"{"ok":true,"result":{"message_id":2}}"#,
+        ]);
+        let inline = r#"<tg-button-row><tg-button type="callback_data" data="cmd:/use s1">💬 Переключиться</tg-button></tg-button-row>"#;
+        let message = SendMessage::new("s1", "42")
+            .with_rich_markdown(format!("**s1**\n{inline}"))
+            .with_button_rows(vec![vec![opt("cmd:/use s1", "💬 Переключиться", None)]])
+            .with_inline_buttons(true);
+        let id = TelegramChannel::new("t".into(), vec![])
+            .with_api_base(base)
+            .send(&message)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("2"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        let body: serde_json::Value = serde_json::from_str(&seen[1].1).unwrap();
+        assert_eq!(body["text"], "<b>s1</b>\n");
+        assert!(!body["text"].as_str().unwrap().contains("tg-button"));
+        assert_eq!(
+            body["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            "cmd:/use s1"
+        );
     }
 
     /// Review round 2 — the overflow gate must stay keyed on whether
