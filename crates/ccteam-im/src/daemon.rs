@@ -1898,7 +1898,7 @@ fn spawn_gateway_event_consumer(
         let mut draft_keepalives: HashMap<String, DraftKeepalive> = HashMap::new();
         let draft_finalizations: DraftFinalizations =
             Arc::new(StdMutex::new(DraftFinalizationState::default()));
-        let mut finalization_sequences: HashMap<String, u64> = HashMap::new();
+        let mut next_finalization_seq = 0_u64;
         let draft_keepalive_interval = draft_keepalive_interval();
         // 👀 ack reaction handle map (v0.8.19). Keyed `"{channel}:{message_id}"`;
         // the value is the provider's reaction handle (`Some(reaction_id)` for
@@ -2017,16 +2017,10 @@ fn spawn_gateway_event_consumer(
                         );
                     }
                     if let Some(mut completion) = completion {
-                        completion.answer_seq = evt
-                            .sid
-                            .as_deref()
-                            .map(|sid| {
-                                let sequence =
-                                    finalization_sequences.entry(sid.to_string()).or_default();
-                                *sequence = sequence.saturating_add(1);
-                                *sequence
-                            })
-                            .unwrap_or(0);
+                        if evt.sid.is_some() {
+                            next_finalization_seq = next_finalization_seq.saturating_add(1);
+                            completion.answer_seq = next_finalization_seq;
+                        }
                         schedule_draft_finalization(&draft_finalizations, completion, channel);
                     }
                 }
