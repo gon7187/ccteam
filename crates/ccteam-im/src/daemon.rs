@@ -7,7 +7,7 @@
 //! - a SIGTERM future for graceful shutdown,
 //! - an optional max-runtime watchdog (test-only — production is `0`).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -73,7 +73,7 @@ type DraftRoutes = Arc<StdMutex<HashMap<DraftRouteKey, DraftRoute>>>;
 #[derive(Default)]
 struct DraftFinalizationState {
     by_status_key: HashMap<String, Arc<AtomicU8>>,
-    by_sid: HashMap<String, VecDeque<String>>,
+    by_answer_seq: HashMap<(String, u64), String>,
 }
 
 type DraftFinalizations = Arc<StdMutex<DraftFinalizationState>>;
@@ -111,6 +111,7 @@ struct DraftCompletion {
     thread_ts: Option<String>,
     sid: String,
     status_key: String,
+    answer_seq: u64,
     content: String,
 }
 
@@ -1896,6 +1897,7 @@ fn spawn_gateway_event_consumer(
         let mut draft_keepalives: HashMap<String, DraftKeepalive> = HashMap::new();
         let draft_finalizations: DraftFinalizations =
             Arc::new(StdMutex::new(DraftFinalizationState::default()));
+        let mut answer_sequences: HashMap<String, u64> = HashMap::new();
         let draft_keepalive_interval = draft_keepalive_interval();
         // 👀 ack reaction handle map (v0.8.19). Keyed `"{channel}:{message_id}"`;
         // the value is the provider's reaction handle (`Some(reaction_id)` for
@@ -1936,6 +1938,11 @@ fn spawn_gateway_event_consumer(
             };
             match evt.kind {
                 GatewayEventKind::Answer => {
+                    let answer_seq = evt.sid.as_deref().map(|sid| {
+                        let sequence = answer_sequences.entry(sid.to_string()).or_default();
+                        *sequence = sequence.saturating_add(1);
+                        *sequence
+                    });
                     // TG-GATE-V2 W7a — carry the agent's answer as
                     // `rich_markdown` too (the SAME text as `content`, which
                     // is already the markdown answer), but only for a
@@ -1952,7 +1959,9 @@ fn spawn_gateway_event_consumer(
                         out = out.with_rich_markdown(markdown);
                     }
                     let finalization = evt.sid.as_deref().and_then(|sid| {
-                        take_answer_finalization(&draft_finalizations, sid, &evt.id)
+                        answer_seq.and_then(|seq| {
+                            take_answer_finalization(&draft_finalizations, sid, seq)
+                        })
                     });
                     if let Some((_, state)) = finalization.as_ref() {
                         let _ = state.compare_exchange(
@@ -2012,7 +2021,13 @@ fn spawn_gateway_event_consumer(
                             draft_keepalive_interval,
                         );
                     }
-                    if let Some(completion) = completion {
+                    if let Some(mut completion) = completion {
+                        completion.answer_seq = evt
+                            .sid
+                            .as_deref()
+                            .and_then(|sid| answer_sequences.get(sid).copied())
+                            .unwrap_or(0)
+                            .saturating_add(1);
                         schedule_draft_finalization(&draft_finalizations, completion, channel);
                     }
                 }
@@ -2249,6 +2264,7 @@ async fn deliver_progress(
                     thread_ts,
                     sid,
                     status_key,
+                    answer_seq: 0,
                     content,
                 });
             }
@@ -2635,13 +2651,13 @@ fn take_stopped_draft_route(
 fn take_answer_finalization(
     finalizations: &DraftFinalizations,
     sid: &str,
-    event_id: &str,
+    answer_seq: u64,
 ) -> Option<(String, Arc<AtomicU8>)> {
     let mut entries = finalizations.lock().unwrap();
-    let exact_key = answer_status_key(sid, event_id);
-    let key = exact_key
-        .filter(|key| entries.by_status_key.contains_key(key))
-        .or_else(|| entries.by_sid.get(sid)?.front().cloned())?;
+    let key = entries
+        .by_answer_seq
+        .get(&(sid.to_string(), answer_seq))?
+        .clone();
     let state = entries.by_status_key.get(&key)?.clone();
     match state.load(Ordering::Acquire) {
         FINAL_PENDING | FINAL_ANSWER_IN_FLIGHT | FINALIZING => Some((key, state)),
@@ -2653,21 +2669,11 @@ fn take_answer_finalization(
     }
 }
 
-fn answer_status_key(sid: &str, event_id: &str) -> Option<String> {
-    let prefix = format!("gateway-event-{sid}-");
-    let seq = event_id.strip_prefix(&prefix)?.parse::<u64>().ok()?;
-    Some(format!("{sid}-{}", seq.checked_sub(1)?))
-}
-
 fn remove_finalization_key(entries: &mut DraftFinalizationState, sid: &str, status_key: &str) {
     entries.by_status_key.remove(status_key);
-    let Some(queue) = entries.by_sid.get_mut(sid) else {
-        return;
-    };
-    queue.retain(|key| key != status_key);
-    if queue.is_empty() {
-        entries.by_sid.remove(sid);
-    }
+    entries
+        .by_answer_seq
+        .retain(|(mapped_sid, _), mapped_key| mapped_sid != sid || mapped_key != status_key);
 }
 
 fn remove_finalization(finalizations: &DraftFinalizations, sid: &str, status_key: &str) {
@@ -2685,11 +2691,12 @@ fn schedule_draft_finalization(
     entries
         .by_status_key
         .insert(completion.status_key.clone(), state.clone());
-    entries
-        .by_sid
-        .entry(completion.sid.clone())
-        .or_default()
-        .push_back(completion.status_key.clone());
+    if completion.answer_seq > 0 {
+        entries.by_answer_seq.insert(
+            (completion.sid.clone(), completion.answer_seq),
+            completion.status_key.clone(),
+        );
+    }
     drop(entries);
     let sid = completion.sid.clone();
     let status_key = completion.status_key.clone();
@@ -3485,6 +3492,7 @@ mod tests {
                 thread_ts: None,
                 sid: "s42".to_string(),
                 status_key: "s42-1".to_string(),
+                answer_seq: 0,
                 content: "✅ готово · 1с · 0 инструментов · 0 файлов".to_string(),
             },
         )
@@ -3511,6 +3519,7 @@ mod tests {
                     thread_ts: None,
                     sid: "s42".to_string(),
                     status_key: format!("s42-{epoch}"),
+                    answer_seq: 0,
                     content: content.to_string(),
                 },
                 Arc::new(mock.clone()),
@@ -3666,7 +3675,11 @@ mod tests {
         let mut channels: ChannelMap = HashMap::new();
         channels.insert("telegram".to_string(), channel.clone());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let consumer = spawn_gateway_event_consumer(rx, Arc::new(RwLock::new(channels)));
+        let consumer = spawn_gateway_event_consumer(
+            rx,
+            Arc::new(RwLock::new(channels)),
+            Arc::new(StdMutex::new(HashMap::new())),
+        );
 
         tx.send(GatewayEvent {
             id: "ephemeral-fallback".to_string(),
@@ -3764,7 +3777,11 @@ mod tests {
         let mut channels: ChannelMap = HashMap::new();
         channels.insert("telegram".to_string(), channel.clone());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let consumer = spawn_gateway_event_consumer(rx, Arc::new(RwLock::new(channels)));
+        let consumer = spawn_gateway_event_consumer(
+            rx,
+            Arc::new(RwLock::new(channels)),
+            Arc::new(StdMutex::new(HashMap::new())),
+        );
 
         tx.send(GatewayEvent {
             id: "stale-ephemeral".to_string(),
@@ -3845,7 +3862,11 @@ mod tests {
         let mut channels: ChannelMap = HashMap::new();
         channels.insert("telegram".to_string(), channel.clone());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let consumer = spawn_gateway_event_consumer(rx, Arc::new(RwLock::new(channels)));
+        let consumer = spawn_gateway_event_consumer(
+            rx,
+            Arc::new(RwLock::new(channels)),
+            Arc::new(StdMutex::new(HashMap::new())),
+        );
 
         let fake = Arc::new(ClaudeStreamJsonAdapter::new());
         let project = TempDir::new().unwrap();
@@ -3967,7 +3988,11 @@ mod tests {
         let mut channels: ChannelMap = HashMap::new();
         channels.insert("telegram".to_string(), channel.clone());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let consumer = spawn_gateway_event_consumer(rx, Arc::new(RwLock::new(channels)));
+        let consumer = spawn_gateway_event_consumer(
+            rx,
+            Arc::new(RwLock::new(channels)),
+            Arc::new(StdMutex::new(HashMap::new())),
+        );
 
         tx.send(GatewayEvent {
             id: "unknown-ephemeral".to_string(),
