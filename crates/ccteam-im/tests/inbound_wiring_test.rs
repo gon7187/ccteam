@@ -3106,6 +3106,7 @@ async fn daemon_delivers_gateway_event_attachment_to_channel() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
     tx.send(GatewayEvent {
         id: "csf-1".into(),
+        cid: None,
         channel: "telegram".into(),
         chat_id: "chat-77".into(),
         thread_ts: None,
