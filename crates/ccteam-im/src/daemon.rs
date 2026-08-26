@@ -1564,6 +1564,7 @@ async fn deliver_gateway_replies(
 struct StatusHandle {
     message_id: String,
     recipient: String,
+    fallback_logged: bool,
 }
 
 fn spawn_gateway_event_consumer(
@@ -1747,12 +1748,35 @@ async fn deliver_progress(
             )
             .await
         {
-            tracing::warn!(
-                channel = %channel_name,
-                status_key = %status_key,
-                error = %err,
-                "ccteam-im: progress edit failed"
-            );
+            if !err.to_string().contains("message is not modified") {
+                if !handle.fallback_logged {
+                    tracing::warn!(
+                        channel = %channel_name,
+                        status_key = %status_key,
+                        error = %err,
+                        "ccteam-im: progress edit failed; sending replacement"
+                    );
+                }
+                let replacement = SendMessage::new(content, handle.recipient.clone())
+                    .in_thread(thread_ts)
+                    .with_button_rows(button_rows);
+                match channel.send(&replacement).await {
+                    Ok(Some(message_id)) if !done => {
+                        status_messages.insert(
+                            status_key.clone(),
+                            StatusHandle {
+                                message_id,
+                                recipient: handle.recipient,
+                                fallback_logged: true,
+                            },
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(send_err) => {
+                        tracing::warn!(channel = %channel_name, status_key = %status_key, error = %send_err, "ccteam-im: progress replacement send failed")
+                    }
+                }
+            }
         }
         if done {
             status_messages.remove(&status_key);
@@ -1770,6 +1794,7 @@ async fn deliver_progress(
                 StatusHandle {
                     message_id,
                     recipient: chat_id,
+                    fallback_logged: false,
                 },
             );
         }
