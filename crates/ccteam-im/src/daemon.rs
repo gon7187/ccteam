@@ -1074,6 +1074,7 @@ fn tenants_fingerprint(args: &DaemonArgs) -> String {
 /// the tenant + replies return through THIS bot, not a colliding shared
 /// `"telegram"`). The global/admin bot keeps its bare platform name. Only
 /// tenants WITH IM creds get a channel.
+#[cfg(any(feature = "telegram", feature = "lark"))]
 fn build_tenant_channels(
     reg: &ccteam_core::tenants::TenantRegistry,
     probe_path: Option<&Path>,
@@ -1117,6 +1118,14 @@ fn build_tenant_channels(
         }
     }
     out
+}
+
+#[cfg(not(any(feature = "telegram", feature = "lark")))]
+fn build_tenant_channels(
+    _reg: &ccteam_core::tenants::TenantRegistry,
+    _probe_path: Option<&Path>,
+) -> Vec<(String, Arc<dyn Channel + Send + Sync>)> {
+    Vec::new()
 }
 
 fn build_gateway(
@@ -1236,7 +1245,7 @@ pub async fn refresh_telegram_command_menu(credentials_path: Option<&Path>) -> R
     #[cfg(not(feature = "telegram"))]
     {
         let _ = credentials_path;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(feature = "telegram")]
