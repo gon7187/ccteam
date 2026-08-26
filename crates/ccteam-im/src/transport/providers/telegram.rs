@@ -2113,7 +2113,7 @@ mod tests {
     #[test]
     fn rich_send_body_carries_reply_keyboard_without_duplicate_inline_buttons() {
         let reply_keyboard =
-            crate::transport::ReplyKeyboard::Buttons(vec![vec!["🎯 Commander".to_string()]]);
+            crate::transport::ReplyKeyboard::Buttons(vec![vec!["🎯 Командир".to_string()]]);
         let keyboard_only = SendMessage::new("hello", "42")
             .with_rich_markdown("**hello**")
             .with_reply_keyboard(reply_keyboard.clone());
@@ -2175,11 +2175,11 @@ mod tests {
     fn reply_keyboard_json_renders_persistent_buttons_and_removal() {
         assert_eq!(
             reply_keyboard_json(&crate::transport::ReplyKeyboard::Buttons(vec![vec![
-                "🎯 Commander".to_string(),
-                "🏗 Pyramid".to_string(),
+                "🎯 Командир".to_string(),
+                "🏗 Пирамида".to_string(),
             ]])),
             serde_json::json!({
-                "keyboard": [[{"text": "🎯 Commander"}, {"text": "🏗 Pyramid"}]],
+                "keyboard": [[{"text": "🎯 Командир"}, {"text": "🏗 Пирамида"}]],
                 "resize_keyboard": true,
                 "is_persistent": true,
             })
