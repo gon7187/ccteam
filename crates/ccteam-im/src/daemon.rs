@@ -32,6 +32,7 @@ use crate::gateway::{Gateway, GatewayEvent, GatewayEventKind};
 use crate::im_views::RichReply;
 use crate::latency::now_unix_ms;
 use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
+#[cfg(feature = "telegram")]
 use crate::transport::providers::telegram::TelegramChannel;
 use crate::transport::{Channel, ChannelMessage, SendMessage};
 use crate::{list_bots, BotRegistration};
@@ -1232,15 +1233,24 @@ pub fn build_gateway_for_daemon(
 ///
 /// [`menu_command_specs`]: crate::gateway::menu_command_specs
 pub async fn refresh_telegram_command_menu(credentials_path: Option<&Path>) -> Result<()> {
-    let creds = credentials::load(credentials_path)?;
-    let Some(tg) = creds.telegram.as_ref() else {
-        return Ok(()); // no Telegram configured → nothing to refresh
-    };
-    let specs = crate::gateway::menu_command_specs();
-    // The allowlist is irrelevant to setMyCommands (it gates inbound reads,
-    // not this outbound publish), so an empty list keeps the channel minimal.
-    let channel = TelegramChannel::new(tg.bot_token.clone(), Vec::new());
-    channel.register_commands(&specs).await
+    #[cfg(not(feature = "telegram"))]
+    {
+        let _ = credentials_path;
+        return Ok(());
+    }
+
+    #[cfg(feature = "telegram")]
+    {
+        let creds = credentials::load(credentials_path)?;
+        let Some(tg) = creds.telegram.as_ref() else {
+            return Ok(()); // no Telegram configured → nothing to refresh
+        };
+        let specs = crate::gateway::menu_command_specs();
+        // The allowlist is irrelevant to setMyCommands (it gates inbound reads,
+        // not this outbound publish), so an empty list keeps the channel minimal.
+        let channel = TelegramChannel::new(tg.bot_token.clone(), Vec::new());
+        channel.register_commands(&specs).await
+    }
 }
 
 /// Surface `ccteam-chat-*` processes that outlived a prior daemon but are not
@@ -1896,8 +1906,11 @@ async fn send_gateway_outbound(
     // ceiling. Each row carries the matching plain fallback; Telegram may
     // split that fallback internally if the row degrades to classic.
     let parts = match channel.max_message_len() {
-        Some(_) if message.attachments.is_empty() && message.rich_markdown.is_some() => {
+        Some(_limit) if message.attachments.is_empty() && message.rich_markdown.is_some() => {
+            #[cfg(feature = "telegram")]
             let rich_limit = crate::transport::providers::telegram::rich_markdown_budget(&message);
+            #[cfg(not(feature = "telegram"))]
+            let rich_limit = _limit;
             crate::sanitize::split_rich_markdown_with_plain(
                 message.rich_markdown.as_deref().expect("checked above"),
                 &message.content,
