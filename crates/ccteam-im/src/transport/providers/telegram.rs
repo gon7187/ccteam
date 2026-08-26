@@ -30,7 +30,7 @@ use crate::transport::{
 
 /// `getUpdates` long-poll seconds.
 const POLL_TIMEOUT_SECS: u64 = 25;
-const ALLOWED_UPDATE_TYPES: &str = r#"["message","callback_query"]"#;
+const ALLOWED_UPDATE_TYPES: &str = r#"["message","callback_query","stopped_message_generation"]"#;
 
 /// Conservative per-message ceiling in **UTF-16 code units**. Telegram's
 /// hard `sendMessage` limit is 4096 UTF-16 units; we reserve headroom for
@@ -1648,6 +1648,16 @@ fn build_rich_send_body(message: &SendMessage, markdown: &str) -> serde_json::Va
     body
 }
 
+fn build_rich_draft_body(chat_id: i64, draft_id: i64, markdown: &str) -> serde_json::Value {
+    serde_json::json!({
+        "chat_id": chat_id,
+        "draft_id": draft_id,
+        "rich_message": { "markdown": markdown },
+        "can_stop": true,
+        "keep_on_stop": true,
+    })
+}
+
 /// Build the `editMessageText` request body using `rich_message` (Bot API
 /// 10.3) instead of `text`. TG-GATE-V2 W5 — `button_rows` (e.g. the live
 /// progress edit's `[⛔ Прервать]`) rides the same trailing
@@ -1744,6 +1754,40 @@ impl Channel for TelegramChannel {
     /// (TG-GATE-V2 W7a).
     fn supports_rich_messages(&self) -> bool {
         true
+    }
+
+    async fn send_draft(
+        &self,
+        recipient: &str,
+        draft_id: i64,
+        markdown: &str,
+    ) -> anyhow::Result<()> {
+        let chat_id = recipient
+            .parse::<i64>()
+            .with_context(|| format!("telegram draft: invalid chat id {recipient}"))?;
+        if chat_id <= 0 {
+            anyhow::bail!("telegram draft: chat id must be a private chat");
+        }
+        if draft_id == 0 {
+            anyhow::bail!("telegram draft: draft id must be non-zero");
+        }
+        let resp = self
+            .http
+            .post(self.api_url("sendRichMessageDraft"))
+            .json(&build_rich_draft_body(chat_id, draft_id, markdown))
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("telegram sendRichMessageDraft {chat_id}#{draft_id} → {status}: {text}");
+        }
+        if body_reports_failure(&text) {
+            anyhow::bail!(
+                "telegram sendRichMessageDraft {chat_id}#{draft_id} → 200 with ok:false: {text}"
+            );
+        }
+        Ok(())
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
@@ -2199,6 +2243,25 @@ mod tests {
         let ch = TelegramChannel::new("ABC".into(), vec![]);
         let url = ch.api_url("getMe");
         assert_eq!(url, "https://api.telegram.org/botABC/getMe");
+    }
+
+    #[tokio::test]
+    async fn send_draft_posts_rich_message_draft_body() {
+        let (base, seen) = spawn_sequential_http(&[r#"{"ok":true}"#]);
+        let ch = TelegramChannel::new("t".into(), vec![]).with_api_base(base);
+        let markdown = "<tg-thinking>Thinking...</tg-thinking>\n\n▶️ s42 работает · 1с\n\n```Terminal\n🔧 команда: ls\n```";
+
+        ch.send_draft("123", 77, markdown).await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].0.contains("sendRichMessageDraft"), "{seen:?}");
+        let body: serde_json::Value = serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!(body["chat_id"], 123);
+        assert_eq!(body["draft_id"], 77);
+        assert_eq!(body["can_stop"], true);
+        assert_eq!(body["keep_on_stop"], true);
+        assert_eq!(body["rich_message"]["markdown"], markdown);
     }
 
     #[test]

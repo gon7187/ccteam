@@ -35,6 +35,19 @@ const MAX_DETAIL_LINES: usize = 12;
 /// more than 2891 UTF-16 units including newlines, below Telegram's 3000 cap.
 const MAX_OUTPUT_LINE_CHARS: usize = 120;
 
+/// Stable positive Bot API draft id derived from a session id.
+pub fn draft_id(sid: &str) -> i64 {
+    let hash = sid.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        hash.wrapping_mul(0x100000001b3_u64) ^ u64::from(byte)
+    });
+    let id = hash & i64::MAX as u64;
+    if id == 0 {
+        1
+    } else {
+        id as i64
+    }
+}
+
 /// A folded category: a stable emoji + short label that several raw tool
 /// names collapse into (e.g. `Read`/`Grep`/`Glob` → `read`).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -436,6 +449,14 @@ impl ProgressFold {
         }
         lines.join("\n")
     }
+
+    /// Render the draft-only thinking header plus the normal live progress.
+    pub fn render_draft(&self, sid: &str) -> String {
+        format!(
+            "<tg-thinking>Thinking...</tg-thinking>\n\n{}",
+            self.render(sid)
+        )
+    }
 }
 
 fn render_elapsed(elapsed: Duration) -> String {
@@ -655,6 +676,23 @@ mod tests {
         let rendered = f.render("s42");
         assert!(rendered.starts_with("✅ готово · "));
         assert!(rendered.contains("2 инструмента · 1 файл"));
+    }
+
+    #[test]
+    fn draft_id_is_stable_positive_and_nonzero() {
+        assert_eq!(draft_id("s42"), draft_id("s42"));
+        assert!(draft_id("s42") > 0);
+        assert_ne!(draft_id("s42"), draft_id("s43"));
+    }
+
+    #[test]
+    fn draft_render_has_thinking_header_and_terminal_progress() {
+        let mut f = ProgressFold::new();
+        f.apply(&started_tool("t1", "Bash", json!({"command": "ls"})));
+        let rendered = f.render_draft("s42");
+        assert!(rendered.starts_with("<tg-thinking>Thinking...</tg-thinking>\n\n"));
+        assert!(rendered.contains("▶️ s42 работает · "));
+        assert!(rendered.contains("```Terminal\n"));
     }
 
     #[test]

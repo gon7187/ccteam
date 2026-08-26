@@ -640,6 +640,17 @@ pub trait Channel: Send + Sync {
         false
     }
 
+    /// Send or refresh a transient rich-message draft. Channels without a
+    /// native draft API keep the ordinary progress send/edit path.
+    async fn send_draft(
+        &self,
+        _recipient: &str,
+        _draft_id: i64,
+        _markdown: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("draft messages unsupported")
+    }
+
     /// Send a single message. Returns the platform-side message id
     /// when available (Slack `ts`, Discord message id, …) for echo
     /// suppression in the outbound tailer.
