@@ -30,6 +30,7 @@ use crate::transport::{
 
 /// `getUpdates` long-poll seconds.
 const POLL_TIMEOUT_SECS: u64 = 25;
+const ALLOWED_UPDATE_TYPES: &str = r#"["message","callback_query"]"#;
 
 /// Conservative per-message ceiling in **UTF-16 code units**. Telegram's
 /// hard `sendMessage` limit is 4096 UTF-16 units; we reserve headroom for
@@ -812,10 +813,11 @@ struct TgUpdate {
     // v0.8.5 D3 — inline-keyboard button clicks.
     #[serde(default)]
     callback_query: Option<TgCallbackQuery>,
-    // Bot API 10.3 edits are acknowledged by advancing the offset, but are
-    // not re-dispatched: the gateway has no edit/reconciliation contract.
+    // Keep edits raw and tolerant: malformed edits must not reject a batch or
+    // stall the offset. They are acknowledged but not re-dispatched because
+    // the gateway has no edit/reconciliation contract.
     #[serde(default)]
-    edited_message: Option<TgMessage>,
+    edited_message: Option<Value>,
 }
 
 /// An inline-keyboard button click (v0.8.5 D3).
@@ -1819,6 +1821,7 @@ impl Channel for TelegramChannel {
                 .query(&[
                     ("timeout", POLL_TIMEOUT_SECS.to_string()),
                     ("offset", offset.to_string()),
+                    ("allowed_updates", ALLOWED_UPDATE_TYPES.to_string()),
                 ])
                 .send()
                 .await;
@@ -1852,12 +1855,8 @@ impl Channel for TelegramChannel {
                     self.handle_callback_query(&tx, cb).await;
                     continue;
                 }
-                if let Some(edited) = upd.edited_message {
-                    tracing::debug!(
-                        message_id = edited.message_id,
-                        chat_id = edited.chat.id,
-                        "telegram edited_message ignored"
-                    );
+                if upd.edited_message.is_some() {
+                    tracing::debug!(update_id = upd.update_id, "telegram edited_message ignored");
                     // Edits are intentionally not re-dispatched: the gateway
                     // has no update-in-place or duplicate-turn contract.
                     continue;
@@ -3249,6 +3248,16 @@ mod tests {
         }))
         .expect("edited_message is a valid update variant");
         assert!(update.message.is_none());
+        assert!(update.edited_message.is_some());
+    }
+
+    #[test]
+    fn malformed_edited_message_does_not_reject_the_update() {
+        let update: TgUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 7,
+            "edited_message": {"message_id": "not-an-integer"}
+        }))
+        .expect("malformed edits must be tolerated");
         assert!(update.edited_message.is_some());
     }
 }
