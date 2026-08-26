@@ -290,47 +290,38 @@ fn render_table(lines: &[&str], start: usize) -> Option<(Fragment, usize, bool)>
         index += 1;
     }
 
-    let cells: Vec<Vec<TableCell>> = rows
+    let cells: Vec<Vec<String>> = rows
         .iter()
-        .map(|row| row.iter().map(|cell| table_cell(cell)).collect())
+        .map(|row| row.iter().map(|cell| table_cell_text(cell)).collect())
         .collect();
     let widths: Vec<usize> = (0..cells[0].len())
         .map(|column| {
             cells
                 .iter()
-                .map(|row| row[column].plain.width())
+                .map(|row| row[column].width())
                 .max()
                 .unwrap_or(0)
         })
         .collect();
 
     let mut body = String::new();
-    let mut html_body = String::new();
-    append_table_row(&mut body, &cells[0], &widths, false);
-    append_table_row(&mut html_body, &cells[0], &widths, true);
+    append_table_row(&mut body, &cells[0], &widths);
     trim_table_row_end(&mut body);
-    trim_table_row_end(&mut html_body);
     body.push('\n');
-    html_body.push('\n');
     for (column, width) in widths.iter().enumerate() {
         if column > 0 {
             body.push_str("-+-");
-            html_body.push_str("-+-");
         }
         body.extend(std::iter::repeat_n('-', *width));
-        html_body.extend(std::iter::repeat_n('-', *width));
     }
     for row in &cells[1..] {
         body.push('\n');
-        html_body.push('\n');
-        append_table_row(&mut body, row, &widths, false);
-        append_table_row(&mut html_body, row, &widths, true);
+        append_table_row(&mut body, row, &widths);
         trim_table_row_end(&mut body);
-        trim_table_row_end(&mut html_body);
     }
 
     let fragment = Fragment {
-        html: format!("<pre>{html_body}</pre>"),
+        html: format!("<pre>{}</pre>", escape_html(&body)),
         text_utf16_len: utf16_len(&body),
         has_non_whitespace: body.chars().any(|ch| !ch.is_whitespace()),
         contains_code: true,
@@ -339,21 +330,13 @@ fn render_table(lines: &[&str], start: usize) -> Option<(Fragment, usize, bool)>
     Some((fragment, index, has_newline))
 }
 
-struct TableCell {
-    plain: String,
-    html: String,
-}
-
-fn append_table_row(body: &mut String, row: &[TableCell], widths: &[usize], html: bool) {
+fn append_table_row(body: &mut String, row: &[String], widths: &[usize]) {
     for (column, cell) in row.iter().enumerate() {
         if column > 0 {
             body.push_str(" | ");
         }
-        body.push_str(if html { &cell.html } else { &cell.plain });
-        body.extend(std::iter::repeat_n(
-            ' ',
-            widths[column] - cell.plain.width(),
-        ));
+        body.push_str(cell);
+        body.extend(std::iter::repeat_n(' ', widths[column] - cell.width()));
     }
 }
 
@@ -382,7 +365,7 @@ fn is_table_separator_cell(cell: &str) -> bool {
     without_edges.len() >= 3 && without_edges.chars().all(|ch| ch == '-')
 }
 
-fn table_cell(cell: &str) -> TableCell {
+fn table_cell_text(cell: &str) -> String {
     let rendered = render_inline(cell, true, true);
     let mut plain = strip_rendered_tags(&rendered.html);
     if plain.width() > 24 {
@@ -398,43 +381,9 @@ fn table_cell(cell: &str) -> TableCell {
         }
         truncated.push('…');
         plain = truncated;
-        return TableCell {
-            html: escape_html(&plain),
-            plain,
-        };
+        return plain;
     }
-    TableCell {
-        html: preserve_bold_tags(&rendered.html),
-        plain,
-    }
-}
-
-fn preserve_bold_tags(input: &str) -> String {
-    let mut out = String::new();
-    let mut index = 0;
-    while index < input.len() {
-        let tail = &input[index..];
-        if tail.starts_with("<b>") {
-            out.push_str("<b>");
-            index += 3;
-            continue;
-        }
-        if tail.starts_with("</b>") {
-            out.push_str("</b>");
-            index += 4;
-            continue;
-        }
-        if tail.starts_with('<') {
-            if let Some(end) = tail.find('>') {
-                index += end + 1;
-                continue;
-            }
-        }
-        let character = tail.chars().next().expect("valid char boundary");
-        out.push(character);
-        index += character.len_utf8();
-    }
-    out
+    plain
 }
 
 fn strip_rendered_tags(input: &str) -> String {
@@ -1228,10 +1177,10 @@ mod tests {
         );
         assert_eq!(
             rendered.html,
-            "<pre>Name  | Status\n------+--------\n<b>Alice</b> | ok\nBob   | pending</pre>\n"
+            "<pre>Name  | Status\n------+--------\nAlice | ok\nBob   | pending</pre>\n"
         );
         assert!(!rendered.html.contains("<a "));
-        assert!(rendered.html.contains("<b>Alice</b>"));
+        assert!(!rendered.html.contains("<b>"));
     }
 
     #[test]

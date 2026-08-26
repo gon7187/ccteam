@@ -646,9 +646,8 @@ mod tests {
     /// Rich Messages field); `.plain` is the universal fallback every
     /// channel (Lark, Slack, the classic Telegram send) reads verbatim and
     /// must stay unformatted. `render_markdown` (the Telegram classic-path
-    /// HTML converter) must turn the sid's `**` into `<b>` while escaping
-    /// HTML-special characters riding along in another cell, without
-    /// corrupting the surrounding tag.
+    /// HTML converter) must keep the table inside a plain `<pre>` while
+    /// escaping HTML-special characters riding along in another cell.
     #[test]
     fn sessions_markdown_bold_sid_survives_html_special_chars_in_other_cells() {
         let sessions = vec![SessionRow {
@@ -673,7 +672,18 @@ mod tests {
             reply.plain
         );
         let html = crate::telegram_html::render_markdown(&reply.markdown).html;
-        assert!(html.contains("<b>s1</b>"), "got: {html}");
+        let table = html
+            .split_once("<pre>")
+            .and_then(|(_, rest)| rest.split_once("</pre>").map(|(body, _)| body))
+            .expect("sessions table must be rendered inside <pre>");
+        assert!(
+            table.contains("s1"),
+            "sid must remain plain table text: {html}"
+        );
+        assert!(
+            !table.contains("<b>"),
+            "table cells must stay unformatted: {html}"
+        );
         assert!(
             html.contains("claude.&lt;script&gt;&amp;\""),
             "special chars must be escaped, not left raw: {html}"
