@@ -139,7 +139,7 @@ fn render_markdown_at_depth(input: &str, depth: usize) -> RenderedMarkdown {
         }
 
         if is_blockquote_line(line) {
-            let mut quote = Fragment::default();
+            let mut quote_source = String::new();
             let mut cursor = index;
             while cursor < lines.len() {
                 let raw_quote = lines[cursor];
@@ -147,13 +147,15 @@ fn render_markdown_at_depth(input: &str, depth: usize) -> RenderedMarkdown {
                 let Some(content) = strip_blockquote(quote_line) else {
                     break;
                 };
-                append_fragment(&mut quote, render_inline(content, true, true));
+                quote_source.push_str(content);
                 if raw_quote.ends_with('\n') {
-                    append_escaped_text(&mut quote, "\n");
+                    quote_source.push('\n');
                 }
                 cursor += 1;
             }
-            append_fragment(&mut out, wrap("blockquote", quote));
+            for part in render_blockquote_parts(&quote_source) {
+                append_fragment(&mut out, part);
+            }
             index = cursor;
             continue;
         }
@@ -692,6 +694,69 @@ fn render_list_fence(
     ))
 }
 
+fn render_blockquote_parts(source: &str) -> Vec<Fragment> {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mut parts = Vec::new();
+    let mut quote = Fragment::default();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let raw_line = lines[index];
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        if let Some((fence_char, fence_len)) = fence_marker(line) {
+            if !quote.html.is_empty() {
+                parts.push(wrap("blockquote", std::mem::take(&mut quote)));
+            }
+            let language = fence_language(line, fence_len);
+            let mut body = String::new();
+            let mut closing = None;
+            let mut cursor = index + 1;
+            while cursor < lines.len() {
+                let candidate = lines[cursor];
+                let candidate_line = candidate.strip_suffix('\n').unwrap_or(candidate);
+                if is_fence_closer(candidate_line, fence_char, fence_len) {
+                    closing = Some(candidate.ends_with('\n'));
+                    break;
+                }
+                body.push_str(candidate);
+                cursor += 1;
+            }
+            let mut code = render_code_block(&body, language);
+            if closing == Some(true) {
+                append_escaped_text(&mut code, "\n");
+            }
+            parts.push(code);
+            index = closing.map_or(lines.len(), |_| cursor + 1);
+            continue;
+        }
+
+        if let Some((table, next_index, has_newline)) = render_table(&lines, index) {
+            if !quote.html.is_empty() {
+                parts.push(wrap("blockquote", std::mem::take(&mut quote)));
+            }
+            parts.push(table);
+            if has_newline {
+                let mut newline = Fragment::default();
+                append_escaped_text(&mut newline, "\n");
+                parts.push(newline);
+            }
+            index = next_index;
+            continue;
+        }
+
+        append_fragment(&mut quote, render_inline(line, true, true));
+        if raw_line.ends_with('\n') {
+            append_escaped_text(&mut quote, "\n");
+        }
+        index += 1;
+    }
+
+    if !quote.html.is_empty() {
+        parts.push(wrap("blockquote", quote));
+    }
+    parts
+}
+
 fn strip_blockquote(line: &str) -> Option<&str> {
     let trimmed = line.trim_start();
     trimmed
@@ -1123,7 +1188,7 @@ mod tests {
     fn renders_fences_inside_blockquotes_and_list_items() {
         assert_eq!(
             render_markdown("> ````\n> ```\n> quoted < 1\n> ````").html,
-            "<blockquote><pre><code>```\nquoted &lt; 1\n</code></pre></blockquote>"
+            "<pre><code>```\nquoted &lt; 1\n</code></pre>"
         );
         assert_eq!(
             render_markdown("- ~~~rust\n  list < 1\n  ~~~").html,
@@ -1148,6 +1213,14 @@ mod tests {
         assert_eq!(
             render_markdown_at_depth("**literal**", MAX_RENDER_DEPTH + 1).html,
             "**literal**"
+        );
+    }
+
+    #[test]
+    fn keeps_fenced_code_outside_blockquote_tags() {
+        assert_eq!(
+            render_markdown("> before\n> ```\n> code\n> ```\n> after\n").html,
+            "<blockquote>before\n</blockquote><pre><code>code\n</code></pre>\n<blockquote>after\n</blockquote>"
         );
     }
 }
