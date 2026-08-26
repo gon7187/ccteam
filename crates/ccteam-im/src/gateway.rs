@@ -9903,7 +9903,7 @@ impl Gateway {
                     .ok()
                     .and_then(|status| status.model)
                     .filter(|model| !model.is_empty())
-                    .map(|model| model.to_string())
+                    .map(|model| strip_vendor_prefix(vendor_str(child.vendor), &model).to_string())
                     .unwrap_or_else(|| "—".to_string());
                 let title = self
                     .session_title(child)
@@ -23694,7 +23694,7 @@ mod tests {
         );
         ccteam_core::progress::append_event(&paths.progress_jsonl("alpha"), &progress).unwrap();
         fake.set_status(ThreadStatus {
-            model: Some("gpt-5.6-terra".into()),
+            model: Some("claude-opus-4-8[1m]".into()),
             ..Default::default()
         })
         .await;
@@ -23705,7 +23705,7 @@ mod tests {
             .unwrap();
         assert!(
             out[0].contains(
-                "👥 Дочерние (1):\n  • s2 · claude · gpt-5.6-terra · 🟡 работает · delegated investigation"
+                "👥 Дочерние (1):\n  • s2 · claude · opus-4-8[1m] · 🟡 работает · delegated investigation"
             ),
             "working child is visible from its root status: {out:?}"
         );
