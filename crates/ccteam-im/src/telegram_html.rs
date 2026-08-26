@@ -315,8 +315,10 @@ fn render_table(lines: &[&str], start: usize) -> Option<(Fragment, usize, bool)>
     for (column, width) in widths.iter().enumerate() {
         if column > 0 {
             body.push_str("-+-");
+            html_body.push_str("-+-");
         }
         body.extend(std::iter::repeat_n('-', *width));
+        html_body.extend(std::iter::repeat_n('-', *width));
     }
     for row in &cells[1..] {
         body.push('\n');
