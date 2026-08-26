@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::im_callbacks;
 use crate::im_views::{
     self, CommandView, DetachedSessionRow, ProjectRow, ProjectsView, RichReply, SessionRow,
-    SessionsView, StatusView,
+    SessionsView, StatusChild, StatusView,
 };
 use crate::pending::InteractionOrigin;
 use crate::transport::{ButtonStyle, ChannelAttachment, ChoiceReply, MessageOption, ReplyKeyboard};
@@ -9909,11 +9909,14 @@ impl Gateway {
                     .session_title(child)
                     .and_then(|title| truncate_title(&title))
                     .unwrap_or_else(|| "—".to_string());
-                format!(
-                    "{} · {} · {child_model} · {} · {title}",
-                    child.id,
-                    vendor_str(child.vendor),
-                    activity_marker(activity)
+                (
+                    child.id.clone(),
+                    format!(
+                        "{} · {} · {child_model} · {} · {title}",
+                        child.id,
+                        vendor_str(child.vendor),
+                        activity_marker(activity)
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -9957,14 +9960,20 @@ impl Gateway {
             detail_lines.push("⚡️ Использование:".to_string());
             detail_lines.extend(usage_lines);
         }
+        let mut children = Vec::new();
         if !child_summary.is_empty() {
             detail_lines.push(String::new());
             detail_lines.push(format!("👥 Дочерние ({}):", child_summary.len()));
-            for (index, child) in child_summary.into_iter().enumerate() {
+            for (index, (sid, child)) in child_summary.into_iter().enumerate() {
                 if index > 0 {
                     detail_lines.push(String::new());
                 }
+                let detail_line_index = detail_lines.len();
                 detail_lines.push(format!("  • {child}"));
+                children.push(StatusChild {
+                    sid,
+                    detail_line_index,
+                });
             }
         }
         let same_project_sessions = visible
@@ -10032,10 +10041,7 @@ impl Gateway {
             detail_lines,
             cost_24h,
             resume,
-            child_stop_sids: direct_children
-                .iter()
-                .map(|child| child.id.clone())
-                .collect(),
+            children,
         })
     }
 
@@ -20869,7 +20875,7 @@ mod tests {
         let sessions = gateway.render_sessions(&tenant, true).await.plain;
         assert!(
             sessions.contains(&format!(
-                "{child} | claude.— | 🟢 ожидание | delegated investigation"
+                "{child} | claude.— | 🟢 ожидание | delegated investiga…"
             )),
             "the tenant's session list must include its delegated child: {sessions}"
         );
@@ -22649,13 +22655,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replies.len(), 1);
-        assert!(replies[0].markdown.contains("| **s1** |"));
         assert!(replies[0]
             .markdown
-            .contains("callback_data=\"cmd:?/stop s1\""));
-        assert!(replies[0]
-            .markdown
-            .contains("callback_data=\"cmd:/use s1\""));
+            .contains("**s1** · claude/— · 🟢 ожидание"));
+        assert!(replies[0].markdown.contains("data=\"cmd:?/stop s1\""));
+        assert!(replies[0].markdown.contains("data=\"cmd:/use s1\""));
         assert!(!replies[0].plain.contains("<tg-button-row>"));
 
         gateway
@@ -22687,10 +22691,10 @@ mod tests {
             .unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let reply = gateway.render_sessions(&chat, false).await;
-        assert!(reply.markdown.contains("callback_data=\"cmd:/use s2\""));
-        assert!(reply.markdown.contains("callback_data=\"cmd:/use s1\""));
-        assert_eq!(reply.button_rows[0][0].data, "cmd:/sessions");
-        assert_eq!(reply.button_rows[0][1].data, "cmd:?/new");
+        assert!(reply.markdown.contains("data=\"cmd:/use s2\""));
+        assert!(reply.markdown.contains("data=\"cmd:/use s1\""));
+        assert_eq!(reply.button_rows[2][0].data, "cmd:/sessions");
+        assert_eq!(reply.button_rows[2][1].data, "cmd:?/new");
 
         let typed = gateway
             .handle_text("telegram", "chat-1", "alice", "/use s1")
@@ -22728,9 +22732,14 @@ mod tests {
         gateway.rename_session("s1", long).await.unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let reply = gateway.render_sessions(&chat, false).await;
-        assert!(reply.markdown.contains("A really really long sessio…"));
-        assert!(reply.markdown.contains("callback_data=\"cmd:/use s1\""));
-        assert_eq!(reply.button_rows[0][1].data, "cmd:?/new");
+        assert!(reply.markdown.contains("A really really lon…"));
+        assert!(reply.markdown.contains("data=\"cmd:/use s1\""));
+        assert_eq!(reply.button_rows[1][1].data, "cmd:?/new");
+        assert!(reply
+            .button_rows
+            .iter()
+            .flatten()
+            .all(|button| button.data.len() <= 64));
     }
 
     /// `/sessions` renders the required compact Russian table.
@@ -22748,7 +22757,6 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert!(listing[0].contains("sid | vendor/model | state | title"));
         assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | —"));
     }
 
@@ -22774,8 +22782,13 @@ mod tests {
         });
         assert_eq!(
             reply.button_rows.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![2]
+            vec![2; 10]
         );
+        assert!(reply
+            .button_rows
+            .iter()
+            .flatten()
+            .all(|button| button.data.len() <= 64));
     }
 
     /// Tapping a picker button switches project / session through the SAME
@@ -23456,7 +23469,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(with_status.len(), 1);
-        assert!(with_status[0].contains("s1 | claude.opus-4-8[1m] | 🟢 ожидание · ctx 19% | —"));
+        assert!(with_status[0].contains("s1 | claude.opus-4-8[1m] | 🟢 ожидание | 19%"));
 
         // A non-[1m] model, no effort, renders against the 200k baseline.
         fake.set_status(ThreadStatus {
@@ -23475,7 +23488,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(baseline.len(), 1);
-        assert!(baseline[0].contains("s1 | claude.sonnet-4-5 | 🟢 ожидание · ctx 94% | —"));
+        assert!(baseline[0].contains("s1 | claude.sonnet-4-5 | 🟢 ожидание | 94%"));
     }
 
     /// Every vendor's IM row carries its lowercase vendor right after the sid
