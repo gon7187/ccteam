@@ -1296,14 +1296,13 @@ fn message_content<'a>(message: &'a TgMessage, own_username: Option<&str>) -> (C
             message.caption_entities.is_empty(),
         );
     }
+    let rich = message
+        .rich_message
+        .as_ref()
+        .map(rich_message_to_text)
+        .unwrap_or_default();
     (
-        Cow::Owned(
-            message
-                .rich_message
-                .as_ref()
-                .map(rich_message_to_text)
-                .unwrap_or_default(),
-        ),
+        Cow::Owned(normalize_inbound_text(&rich, &[], own_username).into_owned()),
         false,
     )
 }
@@ -3159,6 +3158,20 @@ mod tests {
             normalize_inbound_text("/go@MyBot", &[], Some("mybot")),
             "/go"
         );
+    }
+
+    #[test]
+    fn rich_message_content_uses_command_normalization() {
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "date": 0,
+            "chat": {"id": 5},
+            "text": "",
+            "rich_message": {"blocks": [{"type": "paragraph", "text": "/status@mybot"}]}
+        }))
+        .expect("rich command update is valid");
+
+        assert_eq!(message_content(&message, Some("mybot")).0, "/status");
     }
 
     #[test]
