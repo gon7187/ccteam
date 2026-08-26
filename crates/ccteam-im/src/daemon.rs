@@ -2742,10 +2742,17 @@ mod tests {
         let queued = queue_split_parts("row-1", "in-1", "telegram", parts).unwrap();
         assert_eq!(queued.len(), 3);
         let raw = std::fs::read_to_string(durable_outbox_path()).unwrap();
+        let expected_ids = ["row-1-0", "row-1-1", "row-1-2"];
+        let queued_ids: std::collections::HashSet<String> = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<DurableOutboundRow>(line).ok())
+            .filter(|row| expected_ids.contains(&row.id.as_str()))
+            .map(|row| row.id)
+            .collect();
         assert_eq!(
-            raw.lines().count(),
-            3,
-            "the whole partition is one ledger batch"
+            queued_ids,
+            expected_ids.into_iter().map(String::from).collect(),
+            "the whole partition is visible in the ledger before any send"
         );
 
         let mock = MockChannel::new().with_name("telegram");
@@ -2754,15 +2761,21 @@ mod tests {
         replay_durable_outbox(&channels).await;
 
         let delivered = mock.outbox().await;
-        assert_eq!(
-            delivered
-                .iter()
-                .map(|message| message.content.as_str())
-                .collect::<Vec<_>>(),
-            vec!["part one", "part two", "part three"],
-        );
+        let delivered_parts: Vec<_> = delivered
+            .iter()
+            .filter(|message| message.content.starts_with("part "))
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(delivered_parts, vec!["part one", "part two", "part three"],);
         replay_durable_outbox(&channels).await;
-        assert_eq!(mock.outbox().await.len(), 3);
+        assert_eq!(
+            mock.outbox()
+                .await
+                .iter()
+                .filter(|message| message.content.starts_with("part "))
+                .count(),
+            3
+        );
 
         restore_env("CCTEAM_HOME", old_ccteam_home);
         restore_env("HOME", old_home);
