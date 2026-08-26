@@ -1689,6 +1689,63 @@ fn spawn_gateway_event_consumer(
                             .await;
                     }
                 }
+                GatewayEventKind::EphemeralAnswer {
+                    callback,
+                    fallback_edit_message_id,
+                } => {
+                    let mut out = SendMessage::new(evt.content.clone(), evt.chat_id.clone())
+                        .in_thread(evt.thread_ts.clone())
+                        .with_button_rows(evt.button_rows.clone())
+                        .with_callback_ephemeral(
+                            callback.callback_query_id,
+                            callback.receiver_user_id,
+                        );
+                    if channel.supports_rich_messages() {
+                        out = out.with_rich_markdown(evt.content.clone());
+                    }
+                    if let Err(err) = channel.send(&out).await {
+                        tracing::warn!(
+                            channel = %evt.channel,
+                            error = %err,
+                            "ccteam-im: ephemeral callback response failed; using prior delivery path"
+                        );
+                        if let Some(message_id) = fallback_edit_message_id {
+                            if let Err(edit_err) = channel
+                                .edit_message(
+                                    &evt.chat_id,
+                                    &message_id,
+                                    &evt.content,
+                                    &evt.button_rows,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    channel = %evt.channel,
+                                    message_id,
+                                    error = %edit_err,
+                                    "ccteam-im: confirmation edit failed, falling back to a new message"
+                                );
+                                let out = SendMessage::new(evt.content, evt.chat_id)
+                                    .in_thread(evt.thread_ts)
+                                    .with_button_rows(evt.button_rows);
+                                send_gateway_outbound(
+                                    &evt.id,
+                                    0,
+                                    &evt.channel,
+                                    channel.as_ref(),
+                                    out,
+                                )
+                                .await;
+                            }
+                        } else {
+                            let out = SendMessage::new(evt.content, evt.chat_id)
+                                .in_thread(evt.thread_ts)
+                                .with_button_rows(evt.button_rows);
+                            send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out)
+                                .await;
+                        }
+                    }
+                }
                 // v0.8.19 — the 👀 ack reaction (IM-only; web/discord/slack keep
                 // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
                 // Activity arm's discipline: ALL fire-and-forget — log + swallow,

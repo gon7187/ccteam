@@ -506,6 +506,21 @@ pub enum ReplyKeyboard {
 pub struct ChoiceReply {
     /// The clicked option's opaque callback payload (`"{token}:{idx}"`).
     pub data: String,
+    /// Telegram callback context for a one-shot ephemeral reply. `None` for
+    /// ordinary button systems and Telegram private chats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_ephemeral: Option<CallbackEphemeral>,
+}
+
+/// Callback facts required by Telegram's one-shot ephemeral reply API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CallbackEphemeral {
+    /// Telegram callback query that triggered the response.
+    pub callback_query_id: String,
+    /// Telegram user who alone receives the response.
+    pub receiver_user_id: i64,
+    /// Whether Telegram may replace the callback's source message.
+    pub replace_callback_query_message: bool,
 }
 
 /// Message to send through a channel.
@@ -550,6 +565,9 @@ pub struct SendMessage {
     /// Telegram reply keyboard request; unsupported channels ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_keyboard: Option<ReplyKeyboard>,
+    /// Telegram-only response to a group callback. Other channels ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_ephemeral: Option<CallbackEphemeral>,
 }
 
 impl SendMessage {
@@ -565,6 +583,7 @@ impl SendMessage {
             rich_markdown: None,
             button_rows: Vec::new(),
             reply_keyboard: None,
+            callback_ephemeral: None,
         }
     }
 
@@ -601,6 +620,20 @@ impl SendMessage {
     /// Builder-style: attach a Telegram reply keyboard request.
     pub fn with_reply_keyboard(mut self, reply_keyboard: ReplyKeyboard) -> Self {
         self.reply_keyboard = Some(reply_keyboard);
+        self
+    }
+
+    /// Render this callback response only to the user who tapped the button.
+    pub fn with_callback_ephemeral(
+        mut self,
+        callback_query_id: impl Into<String>,
+        receiver_user_id: i64,
+    ) -> Self {
+        self.callback_ephemeral = Some(CallbackEphemeral {
+            callback_query_id: callback_query_id.into(),
+            receiver_user_id,
+            replace_callback_query_message: true,
+        });
         self
     }
 }

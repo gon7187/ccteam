@@ -792,7 +792,10 @@ impl LarkChannel {
                             timestamp: now_secs(),
                             thread_ts: None,
                             attachments: Vec::new(),
-                            selection: Some(ChoiceReply { data: action.data }),
+                            selection: Some(ChoiceReply {
+                                data: action.data,
+                                callback_ephemeral: None,
+                            }),
                         };
                         if tx.send(cm).await.is_err() { break; }
                         continue;

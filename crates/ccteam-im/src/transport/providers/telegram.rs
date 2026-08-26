@@ -66,6 +66,8 @@ pub struct TelegramChannel {
     /// already logged for a rich→classic fallback, so a noisy failure mode
     /// logs once (debug) instead of once per message.
     rich_fallback_logged: Mutex<std::collections::HashSet<String>>,
+    /// Failure kinds already logged for an ephemeral→legacy fallback.
+    ephemeral_fallback_logged: Mutex<std::collections::HashSet<String>>,
     /// TG-GATE-V2 W7a — consecutive rich-message failures (send + edit
     /// share one counter — both hit the same Bot API surface). Any success
     /// resets it to 0 (a transient blip must not trip the breaker).
@@ -117,6 +119,7 @@ impl TelegramChannel {
             unknown_bot_mention_warned: std::sync::atomic::AtomicBool::new(false),
             name: "telegram".to_string(),
             rich_fallback_logged: Mutex::new(std::collections::HashSet::new()),
+            ephemeral_fallback_logged: Mutex::new(std::collections::HashSet::new()),
             rich_failures: std::sync::atomic::AtomicU32::new(0),
             rich_disabled: std::sync::atomic::AtomicBool::new(false),
             rich_probe_counter: std::sync::atomic::AtomicU32::new(0),
@@ -335,6 +338,18 @@ impl TelegramChannel {
             .and_then(|u| u.username.clone())
             .or_else(|| cb.from.as_ref().map(|u| u.id.to_string()))
             .unwrap_or_else(|| "anonymous".to_string());
+        let callback_ephemeral = (msg.chat.kind.as_deref() == Some("group")
+            || msg.chat.kind.as_deref() == Some("supergroup"))
+        .then(|| {
+            cb.from
+                .as_ref()
+                .map(|user| crate::transport::CallbackEphemeral {
+                    callback_query_id: cb.id.clone(),
+                    receiver_user_id: user.id,
+                    replace_callback_query_message: msg.ephemeral_message_id.is_none(),
+                })
+        })
+        .flatten();
         let payload = ChannelMessage {
             id: callback_message_id(msg.message_id),
             sender,
@@ -344,7 +359,10 @@ impl TelegramChannel {
             timestamp: (now_unix_ms() / 1000) as u64,
             thread_ts: None,
             attachments: Vec::new(),
-            selection: Some(ChoiceReply { data }),
+            selection: Some(ChoiceReply {
+                data,
+                callback_ephemeral,
+            }),
         };
         let _ = tx.send(payload).await;
     }
@@ -530,6 +548,17 @@ impl TelegramChannel {
         count % RICH_HALF_OPEN_PROBE_EVERY != 0
     }
 
+    async fn log_ephemeral_fallback_once(&self, reason: &str) {
+        if self
+            .ephemeral_fallback_logged
+            .lock()
+            .await
+            .insert(reason.to_string())
+        {
+            tracing::warn!(channel = %self.name, reason, "telegram ephemeral response failed; falling back");
+        }
+    }
+
     /// Record one rich attempt's outcome. A success resets the consecutive
     /// failure streak AND (TG-GATE-V2 W9 N5) reopens the breaker if it was
     /// tripped — a half-open probe succeeding IS the recovery signal; the
@@ -579,6 +608,10 @@ impl TelegramChannel {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            if message.callback_ephemeral.is_some() {
+                self.log_ephemeral_fallback_once(&format!("http_{}", status.as_u16()))
+                    .await;
+            }
             return Err(format!("http_{}", status.as_u16()));
         }
         if body_reports_failure(&text) {
@@ -645,6 +678,13 @@ impl TelegramChannel {
         if payload.formatted {
             body["parse_mode"] = serde_json::json!("HTML");
         }
+        if let Some(ephemeral) = message.callback_ephemeral.as_ref() {
+            body["ephemeral_message_parameters"] = serde_json::json!({
+                "receiver_user_id": ephemeral.receiver_user_id,
+                "callback_query_id": ephemeral.callback_query_id,
+                "replace_callback_query_message": ephemeral.replace_callback_query_message,
+            });
+        }
         if include_buttons {
             if let Some(keyboard) = reply_markup_json(message) {
                 body["reply_markup"] = keyboard;
@@ -689,6 +729,9 @@ impl TelegramChannel {
         // (`body_reports_failure`); the classic path had no equivalent, so a
         // degraded-server-side 200 read as delivered.
         if body_reports_failure(&resp_text) {
+            if message.callback_ephemeral.is_some() {
+                self.log_ephemeral_fallback_once("ok_false").await;
+            }
             anyhow::bail!(
                 "telegram sendMessage {} → 200 with ok:false: {}",
                 message.recipient,
@@ -833,6 +876,8 @@ struct TgCallbackQuery {
 #[derive(Debug, Deserialize)]
 struct TgMessage {
     message_id: i64,
+    #[serde(default)]
+    ephemeral_message_id: Option<i64>,
     date: i64,
     chat: TgChat,
     #[serde(default)]
@@ -860,6 +905,8 @@ struct TgMessage {
 #[derive(Debug, Deserialize)]
 struct TgChat {
     id: i64,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1639,6 +1686,13 @@ fn build_rich_send_body(message: &SendMessage, markdown: &str) -> serde_json::Va
         .and_then(|s| s.parse::<i64>().ok())
     {
         body["reply_parameters"] = serde_json::json!({ "message_id": rt });
+    }
+    if let Some(ephemeral) = message.callback_ephemeral.as_ref() {
+        body["ephemeral_message_parameters"] = serde_json::json!({
+            "receiver_user_id": ephemeral.receiver_user_id,
+            "callback_query_id": ephemeral.callback_query_id,
+            "replace_callback_query_message": ephemeral.replace_callback_query_message,
+        });
     }
     if rows.is_empty() {
         if let Some(reply_keyboard) = message.reply_keyboard.as_ref() {
@@ -2599,6 +2653,22 @@ mod tests {
     }
 
     #[test]
+    fn rich_send_body_carries_callback_ephemeral_parameters() {
+        let message = SendMessage::new("confirm", "-100")
+            .with_rich_markdown("confirm")
+            .with_callback_ephemeral("cb-42", 7);
+
+        assert_eq!(
+            build_rich_send_body(&message, "confirm")["ephemeral_message_parameters"],
+            serde_json::json!({
+                "receiver_user_id": 7,
+                "callback_query_id": "cb-42",
+                "replace_callback_query_message": true,
+            })
+        );
+    }
+
+    #[test]
     fn rich_markdown_budget_includes_button_block() {
         let plain = SendMessage::new("hello", "42");
         assert_eq!(rich_markdown_budget(&plain), MAX_RICH_MARKDOWN_BYTES);
@@ -2820,7 +2890,8 @@ mod tests {
     #[test]
     fn rich_markdown_not_content_is_the_classic_fallback_source() {
         let message = SendMessage::new("s1 has no bold", "42")
-            .with_rich_markdown("**s1** has no bold, and neither does <script>&");
+            .with_rich_markdown("**s1** has no bold, and neither does <script>&")
+            .with_callback_ephemeral("cb-42", 7);
         let markdown = message.rich_markdown.as_deref().expect("set above");
 
         // The universal fallback field a non-Telegram channel would send
@@ -2938,7 +3009,8 @@ mod tests {
         let mut ch = TelegramChannel::new("t".into(), vec![]);
         ch.api_base = base;
         let message = SendMessage::new("s1 has no bold", "42")
-            .with_rich_markdown("**s1** has no bold, and neither does <script>&");
+            .with_rich_markdown("**s1** has no bold, and neither does <script>&")
+            .with_callback_ephemeral("cb-42", 7);
 
         let id = ch.send(&message).await.unwrap();
         assert_eq!(id.as_deref(), Some("1"));
@@ -2959,6 +3031,9 @@ mod tests {
             "second call must be the classic fallback: {:?}",
             seen[1]
         );
+        for (_, body) in seen.iter() {
+            assert!(body.contains(r#""ephemeral_message_parameters":{"callback_query_id":"cb-42","receiver_user_id":7,"replace_callback_query_message":true}"#), "missing ephemeral callback context: {body}");
+        }
         let classic_body = &seen[1].1;
         assert!(
             classic_body.contains("<b>s1</b>"),

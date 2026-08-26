@@ -943,6 +943,14 @@ pub enum GatewayEventKind {
         /// `message_id`, as a string).
         message_id: String,
     },
+    /// Telegram-only private callback response. On delivery failure the daemon
+    /// performs the pre-ephemeral edit/send path recorded here.
+    EphemeralAnswer {
+        /// Callback that authorizes the one-shot response.
+        callback: crate::transport::CallbackEphemeral,
+        /// Existing confirmation prompt to edit if the ephemeral send fails.
+        fallback_edit_message_id: Option<String>,
+    },
 }
 
 /// User-visible text emitted asynchronously from a harness event stream.
@@ -3566,7 +3574,16 @@ impl Gateway {
             // through `handle_command`, not the token-keyed pending registry.
             match im_callbacks::parse(&reply.data) {
                 im_callbacks::CallbackAction::Choice { .. } => {}
-                action => return self.resolve_cmd_callback(&chat, action, message_id).await,
+                action => {
+                    return self
+                        .resolve_cmd_callback(
+                            &chat,
+                            action,
+                            message_id,
+                            reply.callback_ephemeral.as_ref(),
+                        )
+                        .await
+                }
             }
             return self
                 .resolve_selection(&chat, &reply.data)
@@ -4619,6 +4636,7 @@ impl Gateway {
         chat: &ChatKey,
         content: String,
         button_rows: Vec<Vec<MessageOption>>,
+        callback: Option<&crate::transport::CallbackEphemeral>,
     ) {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4630,7 +4648,12 @@ impl Gateway {
             chat_id: chat.chat_id.clone(),
             thread_ts: None,
             content,
-            kind: GatewayEventKind::Answer,
+            kind: callback.map_or(GatewayEventKind::Answer, |callback| {
+                GatewayEventKind::EphemeralAnswer {
+                    callback: callback.clone(),
+                    fallback_edit_message_id: None,
+                }
+            }),
             attachments: Vec::new(),
             options: Vec::new(),
             button_rows,
@@ -4657,6 +4680,34 @@ impl Gateway {
             content,
             kind: GatewayEventKind::EditMessage {
                 message_id: platform_message_id,
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: None,
+            slug: None,
+        });
+    }
+
+    fn emit_confirmation_ephemeral(
+        &self,
+        chat: &ChatKey,
+        callback: crate::transport::CallbackEphemeral,
+        fallback_edit_message_id: String,
+        content: String,
+    ) {
+        self.emit_user_signal(GatewayEvent {
+            id: format!(
+                "gateway-ephemeral-confirm-{}-{fallback_edit_message_id}",
+                chat.chat_id
+            ),
+            channel: chat.channel.clone(),
+            chat_id: chat.chat_id.clone(),
+            thread_ts: None,
+            content,
+            kind: GatewayEventKind::EphemeralAnswer {
+                callback,
+                fallback_edit_message_id: Some(fallback_edit_message_id),
             },
             attachments: Vec::new(),
             options: Vec::new(),
@@ -8558,6 +8609,7 @@ impl Gateway {
         chat: &ChatKey,
         action: im_callbacks::CallbackAction,
         message_id: &str,
+        callback: Option<&crate::transport::CallbackEphemeral>,
     ) -> Result<Vec<RichReply>> {
         match action {
             im_callbacks::CallbackAction::Choice { .. } => Ok(Vec::new()),
@@ -8571,7 +8623,7 @@ impl Gateway {
                 // one-per-row `options` the project/session pickers use.
                 let token = self.register_command_confirmation(chat.clone(), cmd.clone());
                 let rows = confirm_cmd_button_rows(&token);
-                self.emit_button_rows(chat, confirm_prompt_text(&cmd), rows);
+                self.emit_button_rows(chat, confirm_prompt_text(&cmd), rows, callback);
                 Ok(Vec::new())
             }
             im_callbacks::CallbackAction::Confirmed(token) => {
@@ -8589,11 +8641,18 @@ impl Gateway {
                 // prior append-a-new-message behavior.
                 let mut replies = Vec::new();
                 let ack = format!("✅ {cmd}");
-                match telegram_callback_message_id(message_id) {
-                    Some(platform_message_id) => {
+                match (callback, telegram_callback_message_id(message_id)) {
+                    (Some(callback), Some(platform_message_id)) => self
+                        .emit_confirmation_ephemeral(
+                            chat,
+                            callback.clone(),
+                            platform_message_id,
+                            ack,
+                        ),
+                    (None, Some(platform_message_id)) => {
                         self.emit_confirmation_edit(chat, platform_message_id, ack)
                     }
-                    None => replies.push(RichReply::plain(ack)),
+                    (_, None) => replies.push(RichReply::plain(ack)),
                 }
                 // `already_confirmed: true` — this tap WAS the yes/no
                 // answer; a bulk `/stop` must execute directly, not raise a
@@ -8611,8 +8670,17 @@ impl Gateway {
                         Ok(vec![RichReply::plain("Подтверждение устарело")])
                     }
                     ConfirmationResolution::Command(_) => {
-                        match telegram_callback_message_id(message_id) {
-                            Some(platform_message_id) => {
+                        match (callback, telegram_callback_message_id(message_id)) {
+                            (Some(callback), Some(platform_message_id)) => {
+                                self.emit_confirmation_ephemeral(
+                                    chat,
+                                    callback.clone(),
+                                    platform_message_id,
+                                    "Отменено".to_string(),
+                                );
+                                Ok(Vec::new())
+                            }
+                            (None, Some(platform_message_id)) => {
                                 self.emit_confirmation_edit(
                                     chat,
                                     platform_message_id,
@@ -8620,7 +8688,7 @@ impl Gateway {
                                 );
                                 Ok(Vec::new())
                             }
-                            None => Ok(vec![RichReply::plain("Отменено")]),
+                            (_, None) => Ok(vec![RichReply::plain("Отменено")]),
                         }
                     }
                 }
@@ -16869,7 +16937,10 @@ mod tests {
                 "",
                 "",
                 &[],
-                Some(&ChoiceReply { data }),
+                Some(&ChoiceReply {
+                    data,
+                    callback_ephemeral: None,
+                }),
             )
             .await
             .unwrap()
@@ -18617,6 +18688,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/stop children".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -18646,6 +18718,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: format!("cmd:!{confirm_token}"),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -18695,6 +18768,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: preview.options[1].data.clone(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -22793,6 +22867,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "nav:cd:beta".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -22817,6 +22892,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "nav:use:s1".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -22839,6 +22915,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "nav:bogus".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -22870,6 +22947,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -22898,6 +22976,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/stop s1".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -22927,6 +23006,46 @@ mod tests {
         assert_eq!(no.id, "no");
         assert_eq!(no.style, Some(ButtonStyle::Danger));
         assert_eq!(no.data, format!("cmd:x{}", &yes.data[5..]));
+    }
+
+    #[tokio::test]
+    async fn cmd_confirmation_carries_group_callback_ephemeral_metadata() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-10",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/stop all".to_string(),
+                    callback_ephemeral: Some(crate::transport::CallbackEphemeral {
+                        callback_query_id: "cb-42".to_string(),
+                        receiver_user_id: 7,
+                        replace_callback_query_message: true,
+                    }),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+        match events.try_recv().expect("confirmation event").kind {
+            GatewayEventKind::EphemeralAnswer {
+                callback,
+                fallback_edit_message_id,
+            } => {
+                assert_eq!(callback.callback_query_id, "cb-42");
+                assert_eq!(callback.receiver_user_id, 7);
+                assert_eq!(fallback_edit_message_id, None);
+            }
+            other => panic!("expected EphemeralAnswer, got {other:?}"),
+        }
     }
 
     /// TG-GATE-V2 W9 — [`Gateway::evict_oldest_confirmations`] is the
@@ -23014,6 +23133,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23030,7 +23150,10 @@ mod tests {
                 "",
                 "",
                 &[],
-                Some(&ChoiceReply { data: yes.clone() }),
+                Some(&ChoiceReply {
+                    data: yes.clone(),
+                    callback_ephemeral: None,
+                }),
             )
             .await
             .unwrap();
@@ -23044,7 +23167,10 @@ mod tests {
                 "",
                 "",
                 &[],
-                Some(&ChoiceReply { data: yes }),
+                Some(&ChoiceReply {
+                    data: yes,
+                    callback_ephemeral: None,
+                }),
             )
             .await
             .unwrap();
@@ -23072,6 +23198,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23091,7 +23218,10 @@ mod tests {
                 "",
                 "",
                 &[],
-                Some(&ChoiceReply { data: cancel }),
+                Some(&ChoiceReply {
+                    data: cancel,
+                    callback_ephemeral: None,
+                }),
             )
             .await
             .unwrap();
@@ -23121,6 +23251,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23142,6 +23273,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: confirm_token,
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23179,6 +23311,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23198,7 +23331,10 @@ mod tests {
                 "tg-cb-42",
                 "",
                 &[],
-                Some(&ChoiceReply { data: cancel_token }),
+                Some(&ChoiceReply {
+                    data: cancel_token,
+                    callback_ephemeral: None,
+                }),
             )
             .await
             .unwrap();
@@ -23232,6 +23368,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:!deadbeef".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23248,6 +23385,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23273,7 +23411,10 @@ mod tests {
                 "",
                 "",
                 &[],
-                Some(&ChoiceReply { data: cancel }),
+                Some(&ChoiceReply {
+                    data: cancel,
+                    callback_ephemeral: None,
+                }),
             )
             .await
             .unwrap();
@@ -23299,6 +23440,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:/bogus-command".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23336,6 +23478,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23355,6 +23498,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/stop s1".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -25771,6 +25915,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "t1:1".into(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -27388,6 +27533,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: format!("{token}:1"),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -27435,6 +27581,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "hdead:0".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -27662,6 +27809,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: format!("{token}:0"),
+                    callback_ephemeral: None,
                 }),
             )
             .await
