@@ -7,7 +7,7 @@
 //! - a SIGTERM future for graceful shutdown,
 //! - an optional max-runtime watchdog (test-only — production is `0`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -69,7 +69,7 @@ struct DraftRoute {
 }
 
 type DraftRoutes = Arc<StdMutex<HashMap<DraftRouteKey, DraftRoute>>>;
-type DraftFinalizations = Arc<StdMutex<HashMap<String, Arc<AtomicU8>>>>;
+type DraftFinalizations = Arc<StdMutex<HashMap<String, VecDeque<Arc<AtomicU8>>>>>;
 
 const FINAL_PENDING: u8 = 0;
 const FINAL_ANSWER_IN_FLIGHT: u8 = 1;
@@ -1945,7 +1945,7 @@ fn spawn_gateway_event_consumer(
                     let finalization = evt
                         .sid
                         .as_deref()
-                        .and_then(|sid| draft_finalizations.lock().unwrap().get(sid).cloned());
+                        .and_then(|sid| take_answer_finalization(&draft_finalizations, sid));
                     if let Some(state) = finalization.as_ref() {
                         let _ = state.compare_exchange(
                             FINAL_PENDING,
@@ -1959,12 +1959,17 @@ fn spawn_gateway_event_consumer(
                             .await;
                     if let Some(sid) = evt.sid.as_deref() {
                         if sent {
-                            draft_finalizations.lock().unwrap().remove(sid);
                             if let Some(state) = finalization {
+                                remove_finalization(&draft_finalizations, sid, &state);
                                 state.store(FINAL_SENT, Ordering::Release);
                             }
                         } else if let Some(state) = finalization {
-                            state.store(FINAL_PENDING, Ordering::Release);
+                            let _ = state.compare_exchange(
+                                FINAL_ANSWER_IN_FLIGHT,
+                                FINAL_PENDING,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
                         }
                     }
                 }
@@ -2500,21 +2505,58 @@ fn take_stopped_draft_route(
         .remove(&(channel.to_string(), chat_id.to_string(), draft_id))
 }
 
+fn take_answer_finalization(
+    finalizations: &DraftFinalizations,
+    sid: &str,
+) -> Option<Arc<AtomicU8>> {
+    let mut entries = finalizations.lock().unwrap();
+    let queue = entries.get_mut(sid)?;
+    let state = queue.front()?.clone();
+    match state.load(Ordering::Acquire) {
+        FINAL_PENDING | FINAL_ANSWER_IN_FLIGHT | FINALIZING => Some(state),
+        FINAL_SENT | FINAL_CANCELLED => {
+            // This Answer belongs to the already-completed oldest turn. Do not
+            // advance to a newer turn's completion state in the same event.
+            queue.pop_front();
+            if queue.is_empty() {
+                entries.remove(sid);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn remove_finalization(finalizations: &DraftFinalizations, sid: &str, state: &Arc<AtomicU8>) {
+    let mut entries = finalizations.lock().unwrap();
+    let Some(queue) = entries.get_mut(sid) else {
+        return;
+    };
+    if queue
+        .front()
+        .is_some_and(|current| Arc::ptr_eq(current, state))
+    {
+        queue.pop_front();
+    } else {
+        queue.retain(|current| !Arc::ptr_eq(current, state));
+    }
+    if queue.is_empty() {
+        entries.remove(sid);
+    }
+}
+
 fn schedule_draft_finalization(
     finalizations: &DraftFinalizations,
     completion: DraftCompletion,
     channel: Arc<dyn Channel + Send + Sync>,
 ) {
     let state = Arc::new(AtomicU8::new(FINAL_PENDING));
-    if let Some(previous) = finalizations
+    finalizations
         .lock()
         .unwrap()
-        .insert(completion.sid.clone(), state.clone())
-    {
-        previous.store(FINAL_CANCELLED, Ordering::Release);
-    }
-    let sid = completion.sid.clone();
-    let finalizations = finalizations.clone();
+        .entry(completion.sid.clone())
+        .or_default()
+        .push_back(state.clone());
     tokio::spawn(async move {
         tokio::time::sleep(DRAFT_FINALIZATION_GRACE).await;
         loop {
@@ -2534,14 +2576,12 @@ fn schedule_draft_finalization(
                         .is_ok()
                     {
                         send_completed_draft(channel, completion).await;
-                        state.store(FINAL_SENT, Ordering::Release);
-                        let mut entries = finalizations.lock().unwrap();
-                        if entries
-                            .get(&sid)
-                            .is_some_and(|current| Arc::ptr_eq(current, &state))
-                        {
-                            entries.remove(&sid);
-                        }
+                        let _ = state.compare_exchange(
+                            FINALIZING,
+                            FINAL_SENT,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
                     }
                     return;
                 }
@@ -3287,6 +3327,38 @@ mod tests {
         .await;
 
         assert_eq!(*calls.lock().unwrap(), vec![true, true, false]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn draft_finalization_keeps_same_sid_turns_separate() {
+        let mock = crate::transport::providers::mock::MockChannel::new()
+            .with_name("telegram")
+            .with_rich_support();
+        let finalizations: DraftFinalizations = Arc::new(StdMutex::new(HashMap::new()));
+        for content in ["✅ готово · первый", "✅ готово · второй"] {
+            schedule_draft_finalization(
+                &finalizations,
+                DraftCompletion {
+                    recipient: "123".to_string(),
+                    thread_ts: None,
+                    sid: "s42".to_string(),
+                    content: content.to_string(),
+                },
+                Arc::new(mock.clone()),
+            );
+        }
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(DRAFT_FINALIZATION_GRACE).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let outbox = mock.outbox().await;
+        assert_eq!(outbox.len(), 2, "same sid can have two distinct turns");
+        assert_eq!(outbox[0].content, "✅ готово · первый");
+        assert_eq!(outbox[1].content, "✅ готово · второй");
     }
 
     /// v0.8.19 — the daemon egress 👀-reaction handle-map round-trips. A
