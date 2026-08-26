@@ -33,8 +33,7 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
         let raw_line = lines[index];
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
 
-        if is_fence_line(line) {
-            let fence_len = fence_length(line).expect("checked by is_fence_line");
+        if let Some((fence_char, fence_len)) = fence_marker(line) {
             let language = fence_language(line, fence_len);
             let mut body = String::new();
             let mut closing = None;
@@ -42,7 +41,7 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
             while cursor < lines.len() {
                 let candidate = lines[cursor];
                 let candidate_line = candidate.strip_suffix('\n').unwrap_or(candidate);
-                if is_fence_closer(candidate_line, fence_len) {
+                if is_fence_closer(candidate_line, fence_char, fence_len) {
                     closing = Some(candidate.ends_with('\n'));
                     break;
                 }
@@ -124,7 +123,7 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
         }
 
         if is_blockquote_line(line) {
-            let mut quote = Fragment::default();
+            let mut quote_source = String::new();
             let mut cursor = index;
             while cursor < lines.len() {
                 let raw_quote = lines[cursor];
@@ -132,17 +131,60 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
                 let Some(content) = strip_blockquote(quote_line) else {
                     break;
                 };
-                // Telegram disallows pre in blockquotes, but inline code and
-                // links are valid there.
-                append_fragment(&mut quote, render_inline(content, true, true));
+                quote_source.push_str(content);
                 if raw_quote.ends_with('\n') {
-                    append_escaped_text(&mut quote, "\n");
+                    quote_source.push('\n');
                 }
                 cursor += 1;
             }
+            let rendered_quote = render_markdown(&quote_source);
+            let quote = Fragment {
+                contains_code: rendered_quote.html.contains("<pre>")
+                    || rendered_quote.html.contains("<code>"),
+                html: rendered_quote.html,
+                text_utf16_len: rendered_quote.text_utf16_len,
+                has_non_whitespace: rendered_quote.has_non_whitespace,
+            };
             append_fragment(&mut out, wrap("blockquote", quote));
             index = cursor;
             continue;
+        }
+
+        if let Some((indent, content)) = unordered_item(line) {
+            if fence_marker(content).is_some() {
+                let (code, next_index, has_newline) =
+                    render_list_fence(&lines, index, indent, content)
+                        .expect("fence marker checked above");
+                let mut item = Fragment::default();
+                append_escaped_text(&mut item, indent);
+                append_escaped_text(&mut item, "• ");
+                append_fragment(&mut item, code);
+                if has_newline {
+                    append_escaped_text(&mut item, "\n");
+                }
+                append_fragment(&mut out, item);
+                index = next_index;
+                continue;
+            }
+        }
+
+        if let Some((indent, number, content)) = ordered_item(line) {
+            if fence_marker(content).is_some() {
+                let (code, next_index, has_newline) =
+                    render_list_fence(&lines, index, indent, content)
+                        .expect("fence marker checked above");
+                let mut item = Fragment::default();
+                append_escaped_text(&mut item, indent);
+                append_escaped_text(&mut item, number);
+                append_escaped_text(&mut item, ". ");
+                append_fragment(&mut item, code);
+                if has_newline {
+                    append_escaped_text(&mut item, "\n");
+                }
+                append_fragment(&mut out, item);
+                index = next_index;
+                continue;
+            }
         }
 
         let line_fragment = if let Some(content) = heading_content(line) {
@@ -534,7 +576,7 @@ fn utf16_len(text: &str) -> usize {
 /// can be tested against the exact fence-line predicate it must never
 /// corrupt by appending a `(i/n)` suffix onto the same line.
 pub(crate) fn is_fence_line(line: &str) -> bool {
-    line.trim_start().starts_with("```")
+    fence_marker(line).is_some()
 }
 
 fn fence_language(line: &str, fence_len: usize) -> Option<&str> {
@@ -567,16 +609,78 @@ fn strip_html_blockquote_open(line: &str) -> Option<(bool, &str)> {
     }
 }
 
-fn fence_length(line: &str) -> Option<usize> {
+fn fence_marker(line: &str) -> Option<(u8, usize)> {
     let trimmed = line.trim_start();
-    let length = trimmed.bytes().take_while(|byte| *byte == b'`').count();
-    (length >= 3).then_some(length)
+    let marker = *trimmed.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let length = trimmed.bytes().take_while(|byte| *byte == marker).count();
+    (length >= 3).then_some((marker, length))
 }
 
-fn is_fence_closer(line: &str, opening_len: usize) -> bool {
+fn is_fence_closer(line: &str, opening_char: u8, opening_len: usize) -> bool {
     let trimmed = line.trim_start();
-    let length = fence_length(line).unwrap_or(0);
-    length >= opening_len && trimmed[length..].trim().is_empty()
+    let Some((marker, length)) = fence_marker(line) else {
+        return false;
+    };
+    marker == opening_char && length >= opening_len && trimmed[length..].trim().is_empty()
+}
+
+fn render_list_fence(
+    lines: &[&str],
+    start: usize,
+    indent: &str,
+    content: &str,
+) -> Option<(Fragment, usize, bool)> {
+    let (opening_char, opening_len) = fence_marker(content)?;
+    let required_indent = indent.len() + 2;
+    let mut source = content.to_owned();
+    if lines[start].ends_with('\n') {
+        source.push('\n');
+    }
+
+    let mut cursor = start + 1;
+    let mut closed = false;
+    while let Some(raw_line) = lines.get(cursor) {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let is_indented = line.len() >= required_indent
+            && line.as_bytes()[..required_indent]
+                .iter()
+                .all(|byte| *byte == b' ');
+        let candidate = if is_indented {
+            &line[required_indent..]
+        } else if line.trim().is_empty() {
+            ""
+        } else if fence_marker(line).is_some() {
+            line.trim_start()
+        } else {
+            break;
+        };
+        if is_fence_closer(candidate, opening_char, opening_len) {
+            cursor += 1;
+            closed = true;
+            break;
+        }
+        source.push_str(candidate);
+        if raw_line.ends_with('\n') {
+            source.push('\n');
+        }
+        cursor += 1;
+    }
+
+    let rendered = render_markdown(&source);
+    let contains_code = rendered.html.contains("<pre>") || rendered.html.contains("<code>");
+    Some((
+        Fragment {
+            html: rendered.html,
+            text_utf16_len: rendered.text_utf16_len,
+            has_non_whitespace: rendered.has_non_whitespace,
+            contains_code,
+        },
+        cursor,
+        closed && lines[cursor - 1].ends_with('\n'),
+    ))
 }
 
 fn strip_blockquote(line: &str) -> Option<&str> {
@@ -991,6 +1095,30 @@ mod tests {
         assert_eq!(
             rendered.html,
             "<pre>Long                     | Value\n------------------------+-----\nabcdefghijklmnopqrstuvw… | &lt;tag&gt;</pre>\n"
+        );
+    }
+
+    #[test]
+    fn renders_tilde_fences_and_closes_unterminated_fences_at_eof() {
+        assert_eq!(
+            render_markdown("~~~~rust\n```\nvalue < 1\n~~~~").html,
+            "<pre><code class=\"language-rust\">```\nvalue &lt; 1\n</code></pre>"
+        );
+        assert_eq!(
+            render_markdown("~~~\nvalue < 1").html,
+            "<pre><code>value &lt; 1</code></pre>"
+        );
+    }
+
+    #[test]
+    fn renders_fences_inside_blockquotes_and_list_items() {
+        assert_eq!(
+            render_markdown("> ````\n> ```\n> quoted < 1\n> ````").html,
+            "<blockquote><pre><code>```\nquoted &lt; 1\n</code></pre></blockquote>"
+        );
+        assert_eq!(
+            render_markdown("- ~~~rust\n  list < 1\n  ~~~").html,
+            "• <pre><code class=\"language-rust\">list &lt; 1\n</code></pre>"
         );
     }
 }
