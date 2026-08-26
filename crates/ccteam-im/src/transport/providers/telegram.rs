@@ -132,6 +132,12 @@ impl TelegramChannel {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_api_base(mut self, api_base: String) -> Self {
+        self.api_base = api_base;
+        self
+    }
+
     /// Treat an EMPTY allowlist as "answer nobody" instead of "answer
     /// everybody" — the posture every per-tenant bot takes (see
     /// [`Self::open_when_unset`]).

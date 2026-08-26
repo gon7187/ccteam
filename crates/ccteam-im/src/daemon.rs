@@ -2650,79 +2650,147 @@ mod tests {
         assert_eq!(statuses["status"].replacement_fallbacks, 0);
     }
 
-    /// Persistent rich rejection must stay inside the transport contract:
-    /// the daemon has one already-partitioned row, while the transport may
-    /// emit several classic messages without creating nested ledger rows.
+    /// Persistent rich rejection must stay inside the Telegram transport:
+    /// one durable row may emit several classic HTTP messages, but the ledger
+    /// must still contain one logical id and one terminal Sent row.
     #[tokio::test(flavor = "current_thread")]
-    async fn rich_fallback_needs_split_is_handled_inside_transport_without_new_rows() {
-        use crate::transport::providers::mock::MockChannel;
-
-        struct RichRejectingClassicChannel {
-            inner: MockChannel,
-            limit: usize,
-        }
-
-        #[async_trait::async_trait]
-        impl Channel for RichRejectingClassicChannel {
-            fn name(&self) -> &str {
-                self.inner.name()
-            }
-
-            fn max_message_len(&self) -> Option<usize> {
-                Some(self.limit)
-            }
-
-            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
-                if message.rich_markdown.is_some() {
-                    let mut last = None;
-                    for content in crate::sanitize::split_for_channel(&message.content, self.limit)
-                    {
-                        let mut classic = message.clone();
-                        classic.content = content;
-                        classic.rich_markdown = None;
-                        last = self.inner.send(&classic).await?;
-                    }
-                    return Ok(last);
-                }
-                self.inner.send(message).await
-            }
-
-            async fn listen(
-                &self,
-                tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-            ) -> anyhow::Result<()> {
-                self.inner.listen(tx).await
-            }
-        }
-
+    async fn rich_fallback_needs_split_is_handled_inside_telegram_without_new_rows() {
         let tmp = TempDir::new().unwrap();
         let _outbox = isolate_outbox(&tmp);
 
-        let mock = MockChannel::new().with_name("telegram");
-        let inner = mock.clone();
-        let channel = RichRejectingClassicChannel {
-            inner: mock,
-            limit: 40,
-        };
-        let message =
-            SendMessage::new("plain fallback ".repeat(12), "chat-1").with_rich_markdown("**rich**");
+        let (base, seen) = spawn_persistent_rich_reject_http();
+        let channel = TelegramChannel::new("token".into(), vec![]).with_api_base(base);
+        let plain = "😀".repeat(2000);
+        let message = SendMessage::new(plain.clone(), "chat-1").with_rich_markdown("**rich**");
         send_gateway_outbound("in-1", 0, "telegram", &channel, message).await;
 
-        let delivered = inner.outbox().await;
-        assert!(
-            delivered.len() > 1,
-            "transport must emit classic sub-messages"
-        );
-        assert!(delivered
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "one rich rejection and two classic sends");
+        assert!(seen[0].0.contains("sendRichMessage"));
+        let classic = seen
             .iter()
-            .all(|message| message.rich_markdown.is_none()));
-        assert!(delivered.iter().all(|message| message.content.len() <= 40));
-        let ledger = std::fs::read_to_string(durable_outbox_path()).unwrap();
-        let ids: std::collections::HashSet<String> = ledger
+            .filter(|(request, _)| request.contains("sendMessage"))
+            .collect::<Vec<_>>();
+        assert_eq!(classic.len(), 2, "plain fallback is sent in two chunks");
+        let classic_text = classic
+            .iter()
+            .map(|(_, body)| {
+                serde_json::from_str::<serde_json::Value>(body).unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(classic_text
+            .iter()
+            .all(|text| text.encode_utf16().count() <= 3900));
+        assert_eq!(classic_text.concat(), plain);
+
+        let rows = std::fs::read_to_string(durable_outbox_path())
+            .unwrap()
             .lines()
-            .map(|line| serde_json::from_str::<DurableOutboundRow>(line).unwrap().id)
-            .collect();
-        assert_eq!(ids, ["in-1-0".to_string()].into_iter().collect());
+            .map(|line| serde_json::from_str::<DurableOutboundRow>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "queued row plus one terminal row");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1,
+            "classic chunks must not create nested outbox ids"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.state == DurableOutboundState::Sent)
+                .count(),
+            1,
+            "the logical row is marked sent exactly once"
+        );
+    }
+
+    type SeenRequests = Arc<StdMutex<Vec<(String, String)>>>;
+
+    fn spawn_persistent_rich_reject_http() -> (String, SeenRequests) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_thread = seen.clone();
+        std::thread::spawn(move || {
+            for classic_id in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let mut header_end = None;
+                let mut content_length = 0;
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            request.extend_from_slice(&buffer[..read]);
+                            if header_end.is_none() {
+                                if let Some(position) =
+                                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                                {
+                                    let end = position + 4;
+                                    header_end = Some(end);
+                                    let headers = String::from_utf8_lossy(&request[..end]);
+                                    content_length = headers
+                                        .lines()
+                                        .find_map(|line| {
+                                            let (name, value) = line.split_once(':')?;
+                                            name.eq_ignore_ascii_case("content-length")
+                                                .then(|| value.trim().parse::<usize>().ok())
+                                                .flatten()
+                                        })
+                                        .unwrap_or(0);
+                                }
+                            }
+                            if let Some(end) = header_end {
+                                if request.len().saturating_sub(end) >= content_length {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let end = header_end.unwrap_or(request.len());
+                let request_line = String::from_utf8_lossy(&request[..end])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let body = String::from_utf8_lossy(&request[end..]).to_string();
+                seen_thread
+                    .lock()
+                    .unwrap()
+                    .push((request_line.clone(), body));
+                let rich = request_line.contains("sendRichMessage");
+                let response_body = if rich {
+                    r#"{"ok":false,"description":"rich messages unsupported"}"#.to_string()
+                } else {
+                    format!(
+                        r#"{{"ok":true,"result":{{"message_id":{}}}}}"#,
+                        classic_id + 1
+                    )
+                };
+                let status = if rich { "400 Bad Request" } else { "200 OK" };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), seen)
     }
 
     #[tokio::test(flavor = "current_thread")]
