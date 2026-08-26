@@ -165,7 +165,7 @@ fn render_markdown_at_depth(input: &str, depth: usize) -> RenderedMarkdown {
         if let Some((indent, content)) = unordered_item(line) {
             if fence_marker(content).is_some() {
                 let (code, next_index, has_newline) =
-                    render_list_fence(&lines, index, indent, content, depth)
+                    render_list_fence(&lines, index, indent.len() + 2, content, depth)
                         .expect("fence marker checked above");
                 let mut item = Fragment::default();
                 append_escaped_text(&mut item, indent);
@@ -182,9 +182,14 @@ fn render_markdown_at_depth(input: &str, depth: usize) -> RenderedMarkdown {
 
         if let Some((indent, number, content)) = ordered_item(line) {
             if fence_marker(content).is_some() {
-                let (code, next_index, has_newline) =
-                    render_list_fence(&lines, index, indent, content, depth)
-                        .expect("fence marker checked above");
+                let (code, next_index, has_newline) = render_list_fence(
+                    &lines,
+                    index,
+                    indent.len() + number.len() + 2,
+                    content,
+                    depth,
+                )
+                .expect("fence marker checked above");
                 let mut item = Fragment::default();
                 append_escaped_text(&mut item, indent);
                 append_escaped_text(&mut item, number);
@@ -656,12 +661,11 @@ fn is_fence_closer(line: &str, opening_char: u8, opening_len: usize) -> bool {
 fn render_list_fence(
     lines: &[&str],
     start: usize,
-    indent: &str,
+    marker_width: usize,
     content: &str,
     depth: usize,
 ) -> Option<(Fragment, usize, bool)> {
     let (opening_char, opening_len) = fence_marker(content)?;
-    let required_indent = indent.len() + 2;
     let mut source = content.to_owned();
     if lines[start].ends_with('\n') {
         source.push('\n');
@@ -671,12 +675,12 @@ fn render_list_fence(
     let mut closed = false;
     while let Some(raw_line) = lines.get(cursor) {
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-        let is_indented = line.len() >= required_indent
-            && line.as_bytes()[..required_indent]
+        let is_indented = line.len() >= marker_width
+            && line.as_bytes()[..marker_width]
                 .iter()
                 .all(|byte| *byte == b' ');
         let candidate = if is_indented {
-            &line[required_indent..]
+            &line[marker_width..]
         } else if line.trim().is_empty() {
             ""
         } else if fence_marker(line).is_some() {
@@ -1246,6 +1250,14 @@ mod tests {
             render_markdown("| 名称 | Значение |\n| --- | --- |\n| 😀😀 | x |\n| 甲 | long |\n")
                 .html,
             "<pre>名称 | Значение\n-----+---------\n😀😀 | x\n甲   | long</pre>\n"
+        );
+    }
+
+    #[test]
+    fn removes_the_full_ordered_list_marker_before_code() {
+        assert_eq!(
+            render_markdown("1. ```\n   code\n   ```").html,
+            "1. <pre><code>code\n</code></pre>"
         );
     }
 }
