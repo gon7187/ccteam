@@ -2437,6 +2437,7 @@ async fn send_stopped_draft_not_found(
     }
 }
 
+#[cfg(test)]
 fn stopped_draft_command(
     channel: &str,
     chat_id: &str,

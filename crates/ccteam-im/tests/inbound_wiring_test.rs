@@ -862,6 +862,14 @@ async fn stopped_generation_update_dispatches_stop_for_draft_owner() {
         "draft must be published first"
     );
     assert!(
+        inner
+            .outbox()
+            .await
+            .iter()
+            .any(|message| message.content.starts_with("▶️")),
+        "stopped draft must be preserved as a normal message before /stop"
+    );
+    assert!(
         adapter.close_calls.load(Ordering::SeqCst) >= 1,
         "stopped_message_generation must dispatch /stop to the owning session"
     );
