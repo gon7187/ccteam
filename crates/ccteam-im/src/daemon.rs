@@ -3215,9 +3215,21 @@ mod tests {
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
+        let mut observed = 0;
+        let mut post_times = Vec::new();
+        let initial_drafts = mock.drafts().await;
+        while observed < initial_drafts.len() {
+            post_times.push(tokio::time::Instant::now());
+            observed += 1;
+        }
         for _ in 0..20 {
             tokio::time::advance(Duration::from_secs(2)).await;
             tokio::task::yield_now().await;
+            let drafts = mock.drafts().await;
+            while observed < drafts.len() {
+                post_times.push(tokio::time::Instant::now());
+                observed += 1;
+            }
         }
 
         let drafts = mock.drafts().await;
@@ -3230,6 +3242,9 @@ mod tests {
             drafts.len()
         );
         assert!(drafts.windows(2).all(|pair| pair[0].1 == pair[1].1));
+        assert!(post_times
+            .windows(2)
+            .all(|pair| pair[1].duration_since(pair[0]) <= Duration::from_secs(25)));
     }
 
     #[tokio::test(start_paused = true)]
