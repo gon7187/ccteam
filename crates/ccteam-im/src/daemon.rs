@@ -74,6 +74,7 @@ type DraftRoutes = Arc<StdMutex<HashMap<DraftRouteKey, DraftRoute>>>;
 struct DraftFinalizationState {
     by_status_key: HashMap<String, Arc<AtomicU8>>,
     by_answer_seq: HashMap<(String, u64), String>,
+    pending_by_sid: HashMap<String, (u64, String)>,
 }
 
 type DraftFinalizations = Arc<StdMutex<DraftFinalizationState>>;
@@ -1897,7 +1898,7 @@ fn spawn_gateway_event_consumer(
         let mut draft_keepalives: HashMap<String, DraftKeepalive> = HashMap::new();
         let draft_finalizations: DraftFinalizations =
             Arc::new(StdMutex::new(DraftFinalizationState::default()));
-        let mut answer_sequences: HashMap<String, u64> = HashMap::new();
+        let mut finalization_sequences: HashMap<String, u64> = HashMap::new();
         let draft_keepalive_interval = draft_keepalive_interval();
         // 👀 ack reaction handle map (v0.8.19). Keyed `"{channel}:{message_id}"`;
         // the value is the provider's reaction handle (`Some(reaction_id)` for
@@ -1938,11 +1939,6 @@ fn spawn_gateway_event_consumer(
             };
             match evt.kind {
                 GatewayEventKind::Answer => {
-                    let answer_seq = evt.sid.as_deref().map(|sid| {
-                        let sequence = answer_sequences.entry(sid.to_string()).or_default();
-                        *sequence = sequence.saturating_add(1);
-                        *sequence
-                    });
                     // TG-GATE-V2 W7a — carry the agent's answer as
                     // `rich_markdown` too (the SAME text as `content`, which
                     // is already the markdown answer), but only for a
@@ -1959,9 +1955,8 @@ fn spawn_gateway_event_consumer(
                         out = out.with_rich_markdown(markdown);
                     }
                     let finalization = evt.sid.as_deref().and_then(|sid| {
-                        answer_seq.and_then(|seq| {
-                            take_answer_finalization(&draft_finalizations, sid, seq)
-                        })
+                        let answer_seq = pending_answer_seq(&draft_finalizations, sid)?;
+                        take_answer_finalization(&draft_finalizations, sid, answer_seq)
                     });
                     if let Some((_, state)) = finalization.as_ref() {
                         let _ = state.compare_exchange(
@@ -2025,9 +2020,13 @@ fn spawn_gateway_event_consumer(
                         completion.answer_seq = evt
                             .sid
                             .as_deref()
-                            .and_then(|sid| answer_sequences.get(sid).copied())
-                            .unwrap_or(0)
-                            .saturating_add(1);
+                            .map(|sid| {
+                                let sequence =
+                                    finalization_sequences.entry(sid.to_string()).or_default();
+                                *sequence = sequence.saturating_add(1);
+                                *sequence
+                            })
+                            .unwrap_or(0);
                         schedule_draft_finalization(&draft_finalizations, completion, channel);
                     }
                 }
@@ -2654,10 +2653,17 @@ fn take_answer_finalization(
     answer_seq: u64,
 ) -> Option<(String, Arc<AtomicU8>)> {
     let mut entries = finalizations.lock().unwrap();
+    let (pending_seq, pending_key) = entries.pending_by_sid.get(sid)?.clone();
+    if pending_seq != answer_seq {
+        return None;
+    }
     let key = entries
         .by_answer_seq
         .get(&(sid.to_string(), answer_seq))?
         .clone();
+    if key != pending_key {
+        return None;
+    }
     let state = entries.by_status_key.get(&key)?.clone();
     match state.load(Ordering::Acquire) {
         FINAL_PENDING | FINAL_ANSWER_IN_FLIGHT | FINALIZING => Some((key, state)),
@@ -2669,8 +2675,24 @@ fn take_answer_finalization(
     }
 }
 
+fn pending_answer_seq(finalizations: &DraftFinalizations, sid: &str) -> Option<u64> {
+    finalizations
+        .lock()
+        .unwrap()
+        .pending_by_sid
+        .get(sid)
+        .map(|(answer_seq, _)| *answer_seq)
+}
+
 fn remove_finalization_key(entries: &mut DraftFinalizationState, sid: &str, status_key: &str) {
     entries.by_status_key.remove(status_key);
+    if entries
+        .pending_by_sid
+        .get(sid)
+        .is_some_and(|(_, pending_key)| pending_key == status_key)
+    {
+        entries.pending_by_sid.remove(sid);
+    }
     entries
         .by_answer_seq
         .retain(|(mapped_sid, _), mapped_key| mapped_sid != sid || mapped_key != status_key);
@@ -2692,6 +2714,14 @@ fn schedule_draft_finalization(
         .by_status_key
         .insert(completion.status_key.clone(), state.clone());
     if completion.answer_seq > 0 {
+        if let Some((old_seq, _)) = entries.pending_by_sid.insert(
+            completion.sid.clone(),
+            (completion.answer_seq, completion.status_key.clone()),
+        ) {
+            entries
+                .by_answer_seq
+                .remove(&(completion.sid.clone(), old_seq));
+        }
         entries.by_answer_seq.insert(
             (completion.sid.clone(), completion.answer_seq),
             completion.status_key.clone(),
@@ -3537,6 +3567,35 @@ mod tests {
         assert_eq!(outbox.len(), 2, "same sid can have two distinct turns");
         assert_eq!(outbox[0].content, "✅ готово · первый");
         assert_eq!(outbox[1].content, "✅ готово · второй");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn draft_finalization_does_not_cross_tool_only_turns() {
+        let mock = crate::transport::providers::mock::MockChannel::new()
+            .with_name("telegram")
+            .with_rich_support();
+        let finalizations: DraftFinalizations =
+            Arc::new(StdMutex::new(DraftFinalizationState::default()));
+        for (seq, content) in [(1, "✅ готово · tool-only"), (2, "✅ готово · answer")].into_iter()
+        {
+            schedule_draft_finalization(
+                &finalizations,
+                DraftCompletion {
+                    recipient: "123".to_string(),
+                    thread_ts: None,
+                    sid: "s42".to_string(),
+                    status_key: format!("s42-{seq}"),
+                    answer_seq: seq,
+                    content: content.to_string(),
+                },
+                Arc::new(mock.clone()),
+            );
+        }
+
+        assert!(take_answer_finalization(&finalizations, "s42", 1).is_none());
+        let (status_key, _) = take_answer_finalization(&finalizations, "s42", 2)
+            .expect("the next Answer belongs to the latest completed turn");
+        assert_eq!(status_key, "s42-2");
     }
 
     /// v0.8.19 — the daemon egress 👀-reaction handle-map round-trips. A
