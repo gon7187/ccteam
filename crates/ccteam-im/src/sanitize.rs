@@ -234,9 +234,9 @@ pub fn split_rich_markdown_numbered(markdown: &str, limit: usize) -> Vec<String>
                 .iter()
                 .enumerate()
                 .map(|(index, part)| {
-                    part.len().saturating_add(
-                        2 + (index + 1).to_string().len() + total.to_string().len() + 3,
-                    )
+                    part.len()
+                        .saturating_add(if part.ends_with('\n') { 1 } else { 2 })
+                        .saturating_add((index + 1).to_string().len() + total.to_string().len() + 3)
                 })
                 .max()
                 .unwrap_or_default()
@@ -262,7 +262,10 @@ pub fn split_rich_markdown_numbered(markdown: &str, limit: usize) -> Vec<String>
     parts
         .into_iter()
         .enumerate()
-        .map(|(i, part)| format!("{}\n\n({}/{total})", part.trim_end(), i + 1))
+        .map(|(i, part)| {
+            let separator = if part.ends_with('\n') { "\n" } else { "\n\n" };
+            format!("{part}{separator}({}/{total})", i + 1)
+        })
         .collect()
 }
 
@@ -333,7 +336,7 @@ fn split_rich_raw(markdown: &str, budget: usize) -> Vec<String> {
     let mut current = String::new();
     for block in blocks {
         if block.len() > budget {
-            if !current.trim().is_empty() {
+            if !current.is_empty() {
                 parts.push(current);
                 current = String::new();
             }
