@@ -342,6 +342,12 @@ fn split_rich_raw(markdown: &str, budget: usize) -> Vec<String> {
             }
             if fence_line(block.lines().next().unwrap_or_default()).is_some() {
                 parts.extend(split_rich_fence(&block, budget));
+            } else if block
+                .lines()
+                .next()
+                .is_some_and(|line| line.trim_start().starts_with("<details"))
+            {
+                parts.extend(split_rich_details(&block, budget));
             } else {
                 parts.extend(split_rich_lines(&block, budget));
             }
@@ -365,6 +371,45 @@ fn is_table_separator(line: &str) -> bool {
             let cell = cell.trim();
             !cell.is_empty() && cell.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
         })
+}
+
+fn split_rich_details(block: &str, budget: usize) -> Vec<String> {
+    let mut lines = block.split_inclusive('\n');
+    let opener = lines.next().unwrap_or_default();
+    let open_line = if opener.ends_with('\n') {
+        opener.to_string()
+    } else {
+        format!("{opener}\n")
+    };
+    let close_line = "</details>";
+    if open_line.len() + close_line.len() + 1 > budget {
+        return raw_split_bytes(block, budget);
+    }
+    let room = budget - open_line.len() - close_line.len() - 1;
+    let mut parts = Vec::new();
+    let mut current = open_line.clone();
+    for line in lines {
+        if line.trim().starts_with(close_line) {
+            continue;
+        }
+        for chunk in raw_split_bytes(line, room.max(1)) {
+            if current.len() + chunk.len() + close_line.len() + 1 > budget && current != open_line {
+                finish_details_part(&mut parts, &mut current, close_line);
+                current = open_line.clone();
+            }
+            current.push_str(&chunk);
+        }
+    }
+    finish_details_part(&mut parts, &mut current, close_line);
+    parts
+}
+
+fn finish_details_part(parts: &mut Vec<String>, current: &mut String, close_line: &str) {
+    if !current.ends_with('\n') {
+        current.push('\n');
+    }
+    current.push_str(close_line);
+    parts.push(std::mem::take(current));
 }
 
 fn split_rich_lines(block: &str, budget: usize) -> Vec<String> {
@@ -1090,6 +1135,23 @@ mod tests {
             assert!(
                 parts.iter().any(|part| part.contains(block)),
                 "lost atomic block: {block:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rich_split_closes_and_reopens_unterminated_details() {
+        let markdown = format!("<details>\n{}", "body\n".repeat(80));
+        let parts = split_rich_markdown_numbered(&markdown, 180);
+        assert!(parts.len() > 1);
+        for part in &parts {
+            assert!(
+                part.contains("<details>"),
+                "details was not reopened: {part:?}"
+            );
+            assert!(
+                part.contains("</details>"),
+                "details was not closed: {part:?}"
             );
         }
     }
