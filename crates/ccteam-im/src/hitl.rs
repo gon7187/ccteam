@@ -392,6 +392,7 @@ async fn ask_external_choice(
     if sink
         .send(GatewayEvent {
             id: format!("permission-{token}"),
+            cid: None,
             channel: ctx.channel.clone(),
             chat_id: ctx.chat_id.clone(),
             thread_ts: None,

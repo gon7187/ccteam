@@ -854,6 +854,7 @@ fn build_send_file_event(
     })?;
     Ok(crate::gateway::GatewayEvent {
         id: format!("chat-send-file-{slug}-{role}-{seq}"),
+        cid: None,
         channel,
         chat_id,
         thread_ts: None,
@@ -1047,6 +1048,7 @@ async fn execute_interaction_ask(
     if sink
         .send(GatewayEvent {
             id: format!("interaction-{token}"),
+            cid: None,
             channel,
             chat_id,
             thread_ts: None,
@@ -1278,6 +1280,7 @@ async fn execute_permission_ask(
     if sink
         .send(GatewayEvent {
             id: format!("permission-{token}"),
+            cid: None,
             channel,
             chat_id,
             thread_ts: None,

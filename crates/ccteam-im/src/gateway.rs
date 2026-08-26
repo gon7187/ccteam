@@ -764,6 +764,7 @@ impl DelegationProgressEmitter {
                 record.child_sid,
                 record.turn.as_deref().unwrap_or("")
             ),
+            cid: None,
             channel: String::new(),
             chat_id: String::new(),
             thread_ts: None,
@@ -962,6 +963,8 @@ pub enum GatewayEventKind {
 pub struct GatewayEvent {
     /// Stable outbound id prefix used by the durable ledger.
     pub id: String,
+    /// Safe correlation id from the inbound event, when this event answers it.
+    pub cid: Option<String>,
     /// IM channel name (`telegram`, `ws`, ...).
     pub channel: String,
     /// Platform chat/recipient id.
@@ -2761,6 +2764,7 @@ impl Gateway {
                 "session-{state}-{sid}-{}",
                 chrono::Utc::now().timestamp_millis()
             ),
+            cid: None,
             channel: String::new(),
             chat_id: String::new(),
             thread_ts: None,
@@ -3219,6 +3223,7 @@ impl Gateway {
             );
             g.emit_user_signal(GatewayEvent {
                 id: format!("gateway-recovered-{turn_id}"),
+                cid: None,
                 channel: reply_to.channel.clone(),
                 chat_id: reply_to.chat_id.clone(),
                 thread_ts: None,
@@ -3918,7 +3923,7 @@ impl Gateway {
     }
 
     async fn handle_command(&mut self, chat: &ChatKey, text: &str) -> Result<Option<RichReply>> {
-        self.handle_command_inner(chat, text, false).await
+        self.handle_command_inner(chat, text, false, None).await
     }
 
     /// `already_confirmed` is `true` only for the ONE re-entry that follows a
@@ -3933,6 +3938,7 @@ impl Gateway {
         chat: &ChatKey,
         text: &str,
         already_confirmed: bool,
+        cid: Option<&str>,
     ) -> Result<Option<RichReply>> {
         let trimmed = text.trim();
         if !trimmed.starts_with('/') {
@@ -4109,6 +4115,7 @@ impl Gateway {
                         );
                         self.emit_user_signal(GatewayEvent {
                             id: format!("gateway-choice-bulk-{token}"),
+                            cid: cid.map(str::to_string),
                             channel: chat.channel.clone(),
                             chat_id: chat.chat_id.clone(),
                             thread_ts: None,
@@ -4131,6 +4138,8 @@ impl Gateway {
                 // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own session.
                 // A detached body (alive from before a restart) is stoppable
                 // through the same gate, resolved from its meta.json owner.
+                let was_detached = self.is_session_detached(&sid);
+                let known_sid = self.sessions.contains_key(&sid) || was_detached;
                 let accessible = self
                     .sessions
                     .get(&sid)
@@ -4139,12 +4148,18 @@ impl Gateway {
                         self.is_session_detached(&sid) && self.chat_can_access_sid(chat, &sid)
                     });
                 if !accessible {
+                    tracing::warn!(
+                        cid = cid.unwrap_or("n/a"),
+                        sid = %sid,
+                        channel = crate::transport::platform_of(&chat.channel),
+                        reason = if known_sid { "not_visible" } else { "unknown_sid" },
+                        "ccteam-im: /stop session is inaccessible"
+                    );
                     return Ok(Some(RichReply::plain(format!(
                         "Сессия {sid} недоступна этому чату"
                     ))));
                 }
-                let was_detached = self.is_session_detached(&sid);
-                self.stop_session(&sid).await?;
+                self.stop_session_with_cid(&sid, cid).await?;
                 if was_detached {
                     return Ok(Some(RichReply::plain(format!(
                         "Сессия {sid} остановлена (её процесс до перезапуска завершён)"
@@ -4703,6 +4718,7 @@ impl Gateway {
     fn emit_button_rows(
         &self,
         chat: &ChatKey,
+        cid: &str,
         content: String,
         button_rows: Vec<Vec<MessageOption>>,
         callback: Option<&crate::transport::CallbackEphemeral>,
@@ -4713,6 +4729,7 @@ impl Gateway {
             .unwrap_or(0);
         self.emit_user_signal(GatewayEvent {
             id: format!("gateway-picker-{}-{nanos}", chat.chat_id),
+            cid: Some(cid.to_string()),
             channel: chat.channel.clone(),
             chat_id: chat.chat_id.clone(),
             thread_ts: None,
@@ -4737,12 +4754,19 @@ impl Gateway {
     /// instead of appending a new message. `platform_message_id` is the
     /// tapped message's platform id, resolved by [`telegram_callback_message_id`]
     /// from the inbound callback's `message_id`.
-    fn emit_confirmation_edit(&self, chat: &ChatKey, platform_message_id: String, content: String) {
+    fn emit_confirmation_edit(
+        &self,
+        chat: &ChatKey,
+        cid: &str,
+        platform_message_id: String,
+        content: String,
+    ) {
         self.emit_user_signal(GatewayEvent {
             id: format!(
                 "gateway-edit-confirm-{}-{platform_message_id}",
                 chat.chat_id
             ),
+            cid: Some(cid.to_string()),
             channel: chat.channel.clone(),
             chat_id: chat.chat_id.clone(),
             thread_ts: None,
@@ -4761,11 +4785,18 @@ impl Gateway {
     fn emit_confirmation_ephemeral(
         &self,
         chat: &ChatKey,
+        cid: &str,
         callback: crate::transport::CallbackEphemeral,
         fallback_edit_message_id: String,
         content: String,
     ) {
-        self.emit_ephemeral_reply(chat, &callback, Some(fallback_edit_message_id), content);
+        self.emit_ephemeral_reply(
+            chat,
+            cid,
+            &callback,
+            Some(fallback_edit_message_id),
+            content,
+        );
     }
 
     fn route_callback_replies(
@@ -4788,6 +4819,7 @@ impl Gateway {
             .join("\n\n");
         self.emit_ephemeral_reply(
             chat,
+            &crate::transport::safe_correlation_id(message_id),
             callback,
             telegram_callback_message_id(message_id),
             content,
@@ -4807,6 +4839,7 @@ impl Gateway {
         };
         self.emit_ephemeral_reply(
             chat,
+            &crate::transport::safe_correlation_id(message_id),
             callback,
             telegram_callback_message_id(message_id),
             error.to_string(),
@@ -4817,6 +4850,7 @@ impl Gateway {
     fn emit_ephemeral_reply(
         &self,
         chat: &ChatKey,
+        cid: &str,
         callback: &crate::transport::CallbackEphemeral,
         fallback_edit_message_id: Option<String>,
         content: String,
@@ -4826,6 +4860,7 @@ impl Gateway {
             .unwrap_or(&callback.callback_query_id);
         self.emit_user_signal(GatewayEvent {
             id: format!("gateway-ephemeral-confirm-{}-{event_id}", chat.chat_id),
+            cid: Some(cid.to_string()),
             channel: chat.channel.clone(),
             chat_id: chat.chat_id.clone(),
             thread_ts: None,
@@ -6223,6 +6258,7 @@ impl Gateway {
                                 .unwrap_or_else(|_| session.owner.clone());
                             if !tx.send(GatewayEvent {
                                 id: format!("gateway-reaction-clear-{session_id}-{ack_msg_id}"),
+                                cid: None,
                                 channel: ack_target.channel.clone(),
                                 chat_id: ack_target.chat_id.clone(),
                                 thread_ts: None,
@@ -6819,6 +6855,7 @@ impl Gateway {
                                 || latest_turn_origin(&session) == TurnOrigin::User;
                             let answer = GatewayEvent {
                                 id: format!("gateway-event-{session_id}-{seq}"),
+                                cid: None,
                                 channel,
                                 chat_id,
                                 thread_ts: None,
@@ -7471,6 +7508,7 @@ impl Gateway {
     fn emit_scheduled_changed(&self, item: &crate::scheduled::ScheduledItem) {
         let _ = self.events_broadcast.send(GatewayEvent {
             id: format!("scheduled-changed-{}-{}", item.sid, item.id),
+            cid: None,
             channel: "web".to_string(),
             chat_id: "web-api".to_string(),
             thread_ts: None,
@@ -7603,6 +7641,7 @@ impl Gateway {
         {
             self.emit_user_signal(GatewayEvent {
                 id: format!("scheduled-failed-{}", entry.item.id),
+                cid: None,
                 channel: channel.clone(),
                 chat_id: chat_id.clone(),
                 thread_ts: None,
@@ -8311,6 +8350,7 @@ impl Gateway {
             }
             self.emit_user_signal(GatewayEvent {
                 id: format!("gateway-reaction-add-{session_id}-{message_id}"),
+                cid: None,
                 channel: chat.channel.clone(),
                 chat_id: chat.chat_id.clone(),
                 thread_ts: None,
@@ -8635,6 +8675,7 @@ impl Gateway {
         if let Some(tx) = self.event_sink.clone() {
             let _ = tx.send(GatewayEvent {
                 id: format!("gateway-choice-{session_id}-{}", prompt.token),
+                cid: None,
                 channel: chat.channel.clone(),
                 chat_id: chat.chat_id.clone(),
                 thread_ts: None,
@@ -8736,11 +8777,13 @@ impl Gateway {
         message_id: &str,
         callback: Option<&crate::transport::CallbackEphemeral>,
     ) -> Result<Vec<RichReply>> {
+        let cid = crate::transport::safe_correlation_id(message_id);
         match action {
             im_callbacks::CallbackAction::Choice { .. } => Ok(Vec::new()),
             im_callbacks::CallbackAction::Confirm(cmd) => {
                 let first = cmd.split_whitespace().next().unwrap_or_default();
                 if !Self::is_gateway_command(first) {
+                    log_command_callback(&cid, chat, "confirm", "invalid", None, "invalid");
                     return Ok(vec![RichReply::plain("Неизвестная команда")]);
                 }
                 // TG-GATE-V2 W5 — the two confirmation buttons ride ONE
@@ -8748,17 +8791,37 @@ impl Gateway {
                 // one-per-row `options` the project/session pickers use.
                 let token = self.register_command_confirmation(chat.clone(), cmd.clone());
                 let rows = confirm_cmd_button_rows(&token);
-                self.emit_button_rows(chat, confirm_prompt_text(&cmd), rows, callback);
+                self.emit_button_rows(chat, &cid, confirm_prompt_text(&cmd), rows, callback);
+                log_command_callback(&cid, chat, "confirm", first, None, "picker");
                 Ok(Vec::new())
             }
             im_callbacks::CallbackAction::Confirmed(token) => {
                 let cmd = match self.take_command_confirmation(chat, &token) {
                     ConfirmationResolution::Command(cmd) => cmd,
-                    ConfirmationResolution::Foreign => return Ok(Vec::new()),
+                    ConfirmationResolution::Foreign => {
+                        log_command_callback(
+                            &cid,
+                            chat,
+                            "confirmed",
+                            "unknown",
+                            Some("foreign"),
+                            "none",
+                        );
+                        return Ok(Vec::new());
+                    }
                     ConfirmationResolution::Stale => {
-                        return Ok(self.emit_stale_confirmation(chat, callback, message_id));
+                        log_command_callback(
+                            &cid,
+                            chat,
+                            "confirmed",
+                            "unknown",
+                            Some("stale"),
+                            "none",
+                        );
+                        return Ok(self.emit_stale_confirmation(chat, &cid, callback, message_id));
                     }
                 };
+                let first = cmd.split_whitespace().next().unwrap_or_default();
                 // TG-GATE-V2 W8 — edit the confirmation message itself
                 // in place (keyboard removed, "✅ <cmd>") instead of
                 // appending a new one; a callback with no resolvable
@@ -8769,7 +8832,7 @@ impl Gateway {
                 if callback.is_none() {
                     match telegram_callback_message_id(message_id) {
                         Some(platform_message_id) => {
-                            self.emit_confirmation_edit(chat, platform_message_id, ack)
+                            self.emit_confirmation_edit(chat, &cid, platform_message_id, ack)
                         }
                         None => replies.push(RichReply::plain(ack)),
                     }
@@ -8777,23 +8840,86 @@ impl Gateway {
                 // `already_confirmed: true` — this tap WAS the yes/no
                 // answer; a bulk `/stop` must execute directly, not raise a
                 // second confirmation on top of the one just answered.
-                match self.handle_command_inner(chat, &cmd, true).await? {
-                    Some(reply) => replies.push(reply),
-                    None => replies.push(RichReply::plain("Неизвестная команда")),
+                match self
+                    .handle_command_inner(chat, &cmd, true, Some(&cid))
+                    .await
+                {
+                    Ok(Some(reply)) => {
+                        log_command_callback(
+                            &cid,
+                            chat,
+                            "confirmed",
+                            first,
+                            Some("command"),
+                            "reply",
+                        );
+                        replies.push(reply);
+                    }
+                    Ok(None) => {
+                        log_command_callback(
+                            &cid,
+                            chat,
+                            "confirmed",
+                            first,
+                            Some("command"),
+                            "none",
+                        );
+                        replies.push(RichReply::plain("Неизвестная команда"));
+                    }
+                    Err(error) => {
+                        tracing::info!(
+                            cid = %cid,
+                            channel = crate::transport::platform_of(&chat.channel),
+                            action = "confirmed",
+                            command = first,
+                            resolution = "command",
+                            outcome = "error",
+                            error_kind = callback_error_kind(&error),
+                            "ccteam-im: command callback failed"
+                        );
+                        return Err(error);
+                    }
                 }
                 Ok(replies)
             }
             im_callbacks::CallbackAction::Cancelled(token) => {
                 match self.take_command_confirmation(chat, &token) {
-                    ConfirmationResolution::Foreign => Ok(Vec::new()),
-                    ConfirmationResolution::Stale => {
-                        Ok(self.emit_stale_confirmation(chat, callback, message_id))
+                    ConfirmationResolution::Foreign => {
+                        log_command_callback(
+                            &cid,
+                            chat,
+                            "cancelled",
+                            "unknown",
+                            Some("foreign"),
+                            "none",
+                        );
+                        Ok(Vec::new())
                     }
-                    ConfirmationResolution::Command(_) => {
+                    ConfirmationResolution::Stale => {
+                        log_command_callback(
+                            &cid,
+                            chat,
+                            "cancelled",
+                            "unknown",
+                            Some("stale"),
+                            "none",
+                        );
+                        Ok(self.emit_stale_confirmation(chat, &cid, callback, message_id))
+                    }
+                    ConfirmationResolution::Command(cmd) => {
+                        log_command_callback(
+                            &cid,
+                            chat,
+                            "cancelled",
+                            cmd.split_whitespace().next().unwrap_or_default(),
+                            Some("command"),
+                            "none",
+                        );
                         match (callback, telegram_callback_message_id(message_id)) {
                             (Some(callback), Some(platform_message_id)) => {
                                 self.emit_confirmation_ephemeral(
                                     chat,
+                                    &cid,
                                     callback.clone(),
                                     platform_message_id,
                                     "Отменено".to_string(),
@@ -8803,6 +8929,7 @@ impl Gateway {
                             (None, Some(platform_message_id)) => {
                                 self.emit_confirmation_edit(
                                     chat,
+                                    &cid,
                                     platform_message_id,
                                     "Отменено".to_string(),
                                 );
@@ -8816,11 +8943,33 @@ impl Gateway {
             im_callbacks::CallbackAction::Command(cmd) => {
                 let first = cmd.split_whitespace().next().unwrap_or_default();
                 if !Self::is_gateway_command(first) {
+                    log_command_callback(&cid, chat, "command", "invalid", None, "invalid");
                     return Ok(vec![RichReply::plain("Неизвестная команда")]);
                 }
-                match self.handle_command(chat, &cmd).await? {
-                    Some(reply) => Ok(vec![reply]),
-                    None => Ok(vec![RichReply::plain("Неизвестная команда")]),
+                match self
+                    .handle_command_inner(chat, &cmd, false, Some(&cid))
+                    .await
+                {
+                    Ok(Some(reply)) => {
+                        log_command_callback(&cid, chat, "command", first, None, "reply");
+                        Ok(vec![reply])
+                    }
+                    Ok(None) => {
+                        log_command_callback(&cid, chat, "command", first, None, "none");
+                        Ok(vec![RichReply::plain("Неизвестная команда")])
+                    }
+                    Err(error) => {
+                        tracing::info!(
+                            cid = %cid,
+                            channel = crate::transport::platform_of(&chat.channel),
+                            action = "command",
+                            command = first,
+                            outcome = "error",
+                            error_kind = callback_error_kind(&error),
+                            "ccteam-im: command callback failed"
+                        );
+                        Err(error)
+                    }
                 }
             }
         }
@@ -8829,6 +8978,7 @@ impl Gateway {
     fn emit_stale_confirmation(
         &self,
         chat: &ChatKey,
+        cid: &str,
         callback: Option<&crate::transport::CallbackEphemeral>,
         message_id: &str,
     ) -> Vec<RichReply> {
@@ -8836,6 +8986,7 @@ impl Gateway {
             (Some(callback), Some(platform_message_id)) => {
                 self.emit_confirmation_ephemeral(
                     chat,
+                    cid,
                     callback.clone(),
                     platform_message_id,
                     "Подтверждение устарело".to_string(),
@@ -9045,6 +9196,7 @@ impl Gateway {
         );
         self.emit_user_signal(GatewayEvent {
             id: format!("principal-unused-{sid}"),
+            cid: None,
             channel: String::new(),
             chat_id: String::new(),
             thread_ts: None,
@@ -11438,6 +11590,7 @@ impl Gateway {
         }
         self.emit_user_signal(GatewayEvent {
             id: format!("session-evicted-{sid}"),
+            cid: None,
             channel: String::new(),
             chat_id: String::new(),
             thread_ts: None,
@@ -13058,6 +13211,7 @@ impl Gateway {
                 if let Some(tx) = event_sink {
                     let _ = tx.send(GatewayEvent {
                         id: format!("gateway-choice-{sid}-{}", prompt.token),
+                        cid: None,
                         channel: chat.channel,
                         chat_id: chat.chat_id,
                         thread_ts: None,
@@ -13350,6 +13504,7 @@ impl Gateway {
             .unwrap_or(0);
         self.emit_user_signal(GatewayEvent {
             id: format!("gateway-directive-{sid}-{nanos}-{i}"),
+            cid: None,
             channel: chat.channel.clone(),
             chat_id: chat.chat_id.clone(),
             thread_ts: None,
@@ -13423,13 +13578,37 @@ impl Gateway {
     /// `close_thread` is tolerated (adapter close is idempotent). Never
     /// file-purges — deregister-only, per the locked W5b decision.
     pub async fn stop_session(&mut self, sid: &str) -> Result<()> {
+        self.stop_session_with_cid(sid, None).await
+    }
+
+    async fn stop_session_with_cid(&mut self, sid: &str, cid: Option<&str>) -> Result<()> {
+        let was_detached = self.is_session_detached(sid);
         // A body that outlived the previous daemon is not in the live map but
         // IS this sid's body: an explicit stop ends it (the one case the daemon
         // signals such a process — on the user's word, never on its own).
-        if self.stop_detached_body(sid).await? {
-            return Ok(());
+        let result = match self.stop_detached_body(sid).await {
+            Ok(true) => Ok(()),
+            Ok(false) => self.stop_live_session(sid, false).await,
+            Err(error) => Err(error),
+        };
+        match &result {
+            Ok(()) => tracing::info!(
+                cid = cid.unwrap_or("n/a"),
+                sid,
+                was_detached,
+                outcome = "ok",
+                "ccteam-im: session stopped"
+            ),
+            Err(error) => tracing::info!(
+                cid = cid.unwrap_or("n/a"),
+                sid,
+                was_detached,
+                outcome = "err",
+                error_kind = callback_error_kind(error),
+                "ccteam-im: session stop failed"
+            ),
         }
-        self.stop_live_session(sid, false).await
+        result
     }
 
     async fn stop_session_reporting(&mut self, sid: &str) -> Result<()> {
@@ -13749,6 +13928,7 @@ impl Gateway {
     fn emit_session_renamed(&self, sid: &str, slug: &str) {
         self.emit_user_signal(GatewayEvent {
             id: format!("session-renamed-{sid}"),
+            cid: None,
             channel: String::new(),
             chat_id: String::new(),
             thread_ts: None,
@@ -14341,6 +14521,7 @@ fn emit_turn_stall_warning(
     );
     let _ = tx.send(GatewayEvent {
         id: format!("gateway-timeout-{session_id}-{turn_id}"),
+        cid: None,
         channel,
         chat_id,
         thread_ts: None,
@@ -14533,6 +14714,7 @@ fn mirror_internal_web_answer(
     };
     let _ = tx.send_delivery_only(GatewayEvent {
         id: format!("gateway-mirror-{session_id}-{seq}"),
+        cid: None,
         channel,
         chat_id,
         thread_ts: None,
@@ -14589,6 +14771,7 @@ fn emit_progress(
     // emit_progress's "sink closed → pump should stop" signal.
     tx.send(GatewayEvent {
         id: format!("gateway-progress-{status_key}"),
+        cid: None,
         channel,
         chat_id,
         thread_ts: None,
@@ -14619,6 +14802,7 @@ fn emit_activity(
     let content = activity.summary.clone();
     tx.send(GatewayEvent {
         id: format!("gateway-activity-{status_key}-{}", activity.item_id),
+        cid: None,
         channel,
         chat_id,
         thread_ts: None,
@@ -15138,6 +15322,32 @@ fn confirm_cmd_button_rows(token: &str) -> Vec<Vec<MessageOption>> {
 /// resolve can target an edit at it. `None` for anything else (a non-Telegram
 /// origin, or a `message_id` that predates this convention) — the caller
 /// falls back to appending a new message.
+fn log_command_callback(
+    cid: &str,
+    chat: &ChatKey,
+    action: &str,
+    command: &str,
+    resolution: Option<&str>,
+    outcome: &str,
+) {
+    tracing::info!(
+        cid = %cid,
+        channel = crate::transport::platform_of(&chat.channel),
+        action,
+        command,
+        resolution = resolution.unwrap_or("n/a"),
+        outcome,
+        "ccteam-im: command callback"
+    );
+}
+
+fn callback_error_kind(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<GatewayRequestError>()
+        .map(GatewayRequestError::error_code)
+        .unwrap_or("command_error")
+}
+
 fn telegram_callback_message_id(message_id: &str) -> Option<String> {
     message_id
         .strip_prefix("tg-cb-")
@@ -17148,6 +17358,7 @@ mod tests {
     fn fake_event(sid: Option<&str>) -> GatewayEvent {
         GatewayEvent {
             id: "e1".into(),
+            cid: None,
             channel: "web".into(),
             chat_id: "web-api".into(),
             thread_ts: None,
@@ -23214,7 +23425,7 @@ mod tests {
                 "telegram",
                 "42",
                 "42",
-                "",
+                "tg-cb-42",
                 "",
                 &[],
                 Some(&ChoiceReply {
@@ -23230,6 +23441,7 @@ mod tests {
         );
 
         let event = events.try_recv().expect("confirmation picker event");
+        assert_eq!(event.cid.as_deref(), Some("tg-cb-42"));
         assert_eq!(event.content, "Точно выполнить `/stop s1`?");
         assert!(
             event.options.is_empty(),
@@ -23249,6 +23461,42 @@ mod tests {
         assert_eq!(no.id, "no");
         assert_eq!(no.style, Some(ButtonStyle::Danger));
         assert_eq!(no.data, format!("cmd:x{}", &yes.data[5..]));
+    }
+
+    #[tokio::test]
+    async fn cmd_callback_bulk_stop_picker_keeps_inbound_cid() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        seed_role(proj.path(), "reviewer");
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let created = gateway
+            .handle_text("telegram", "42", "42", "/new claude reviewer")
+            .await
+            .unwrap();
+        assert_eq!(created, vec!["Создана сессия s1\n↓ Статус → /status"]);
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "tg-cb-43",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/stop all".to_string(),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(replies, vec!["Неизвестная команда"]);
+        assert_eq!(
+            recv_answer(&mut events).await.cid.as_deref(),
+            Some("tg-cb-43")
+        );
     }
 
     #[tokio::test]
@@ -23279,7 +23527,9 @@ mod tests {
             .await
             .unwrap();
         assert!(replies.is_empty());
-        match events.try_recv().expect("confirmation event").kind {
+        let event = events.try_recv().expect("confirmation event");
+        assert_eq!(event.cid.as_deref(), Some("tg-cb-10"));
+        match event.kind {
             GatewayEventKind::EphemeralAnswer {
                 callback,
                 fallback_edit_message_id,
