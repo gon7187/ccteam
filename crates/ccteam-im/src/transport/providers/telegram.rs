@@ -1156,10 +1156,7 @@ fn rich_block_to_text(block: &RichBlock) -> Option<String> {
                     .unwrap_or_default(),
             ])
         }),
-        "collage" | "slideshow" => block
-            .caption
-            .as_ref()
-            .map(|caption| rich_caption_to_text(caption)),
+        "collage" | "slideshow" => block.caption.as_ref().map(rich_caption_to_text),
         "photo" => Some(rich_media_placeholder(
             "[photo]".to_string(),
             block.caption.as_ref(),
@@ -1252,14 +1249,6 @@ fn utf16_offset_to_byte(text: &str, offset: i64) -> Option<usize> {
         units += character.len_utf16();
     }
     (units == offset).then_some(text.len())
-}
-
-fn normalize_inbound_text<'a>(
-    text: &'a str,
-    entities: &[TgEntity],
-    own_username: Option<&str>,
-) -> Cow<'a, str> {
-    normalize_inbound_text_with_heuristic(text, entities, own_username).0
 }
 
 fn normalize_inbound_text_with_heuristic<'a>(
@@ -3161,7 +3150,7 @@ mod tests {
             length: "/go@MyBot".encode_utf16().count() as i64,
         }];
         assert_eq!(
-            normalize_inbound_text("/go@MyBot 😀", &entities, Some("mybot")),
+            normalize_inbound_text_with_heuristic("/go@MyBot 😀", &entities, Some("mybot")).0,
             "/go 😀"
         );
     }
@@ -3174,11 +3163,11 @@ mod tests {
             length: 8,
         }];
         assert_eq!(
-            normalize_inbound_text("/go@MyBot", &entities, Some("mybot")),
+            normalize_inbound_text_with_heuristic("/go@MyBot", &entities, Some("mybot")).0,
             "/go@MyBot"
         );
         assert_eq!(
-            normalize_inbound_text("/go@MyBot", &[], Some("mybot")),
+            normalize_inbound_text_with_heuristic("/go@MyBot", &[], Some("mybot")).0,
             "/go"
         );
     }
