@@ -61,6 +61,15 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
             continue;
         }
 
+        if let Some((table, next_index, has_newline)) = render_table(&lines, index) {
+            append_fragment(&mut out, table);
+            if has_newline {
+                append_escaped_text(&mut out, "\n");
+            }
+            index = next_index;
+            continue;
+        }
+
         // Review round 2 — `im_views::render_status`/`render_sessions`
         // splice a literal `<blockquote expandable>…</blockquote>` (a
         // Telegram Rich Message extension our own `> ` syntax below has no
@@ -190,6 +199,147 @@ fn render_code_block(body: &str, language: Option<&str>) -> Fragment {
         has_non_whitespace: body.chars().any(|ch| !ch.is_whitespace()),
         contains_code: true,
     }
+}
+
+fn render_table(lines: &[&str], start: usize) -> Option<(Fragment, usize, bool)> {
+    let header = table_row(lines.get(start)?.strip_suffix('\n').unwrap_or(lines[start]))?;
+    let separator = table_row(
+        lines
+            .get(start + 1)?
+            .strip_suffix('\n')
+            .unwrap_or(lines[start + 1]),
+    )?;
+    if header.len() != separator.len()
+        || header.is_empty()
+        || !separator.iter().all(|cell| is_table_separator_cell(cell))
+    {
+        return None;
+    }
+
+    let mut rows = vec![header];
+    let mut index = start + 2;
+    while let Some(raw_line) = lines.get(index) {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let Some(row) = table_row(line) else {
+            break;
+        };
+        if row.len() != rows[0].len() {
+            break;
+        }
+        rows.push(row);
+        index += 1;
+    }
+
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| table_cell_text(cell)).collect())
+        .collect();
+    let widths: Vec<usize> = (0..cells[0].len())
+        .map(|column| {
+            cells
+                .iter()
+                .map(|row| row[column].chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+
+    let mut body = String::new();
+    append_table_row(&mut body, &cells[0], &widths);
+    body.push('\n');
+    for (column, width) in widths.iter().enumerate() {
+        if column > 0 {
+            body.push('+');
+        }
+        body.extend(std::iter::repeat_n('-', *width));
+    }
+    for row in &cells[1..] {
+        body.push('\n');
+        append_table_row(&mut body, row, &widths);
+    }
+
+    let fragment = Fragment {
+        html: format!("<pre>{}</pre>", escape_html(&body)),
+        text_utf16_len: utf16_len(&body),
+        has_non_whitespace: body.chars().any(|ch| !ch.is_whitespace()),
+        contains_code: true,
+    };
+    let has_newline = lines[index - 1].ends_with('\n');
+    Some((fragment, index, has_newline))
+}
+
+fn append_table_row(body: &mut String, row: &[String], widths: &[usize]) {
+    for (column, cell) in row.iter().enumerate() {
+        if column > 0 {
+            body.push_str(" | ");
+        }
+        body.push_str(cell);
+        body.extend(std::iter::repeat_n(
+            ' ',
+            widths[column] - cell.chars().count(),
+        ));
+    }
+}
+
+fn table_row(line: &str) -> Option<Vec<&str>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let trimmed = trimmed
+        .strip_prefix('|')
+        .unwrap_or(trimmed)
+        .strip_suffix('|')
+        .unwrap_or_else(|| trimmed.strip_prefix('|').unwrap_or(trimmed));
+    Some(trimmed.split('|').map(str::trim).collect())
+}
+
+fn is_table_separator_cell(cell: &str) -> bool {
+    let cell = cell.trim();
+    let without_left = cell.strip_prefix(':').unwrap_or(cell);
+    let without_edges = without_left.strip_suffix(':').unwrap_or(without_left);
+    without_edges.len() >= 3 && without_edges.chars().all(|ch| ch == '-')
+}
+
+fn table_cell_text(cell: &str) -> String {
+    let rendered = render_inline(cell, true, true);
+    let mut plain = strip_rendered_tags(&rendered.html);
+    if plain.chars().count() > 24 {
+        plain = plain.chars().take(23).collect();
+        plain.push('…');
+    }
+    plain
+}
+
+fn strip_rendered_tags(input: &str) -> String {
+    let mut out = String::new();
+    let mut index = 0;
+    while index < input.len() {
+        let tail = &input[index..];
+        if tail.starts_with('<') {
+            if let Some(end) = tail.find('>') {
+                index += end + 1;
+                continue;
+            }
+        }
+        if let Some((entity, character)) = [
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+            ("&amp;", '&'),
+            ("&quot;", '"'),
+        ]
+        .into_iter()
+        .find(|(entity, _)| tail.starts_with(entity))
+        {
+            out.push(character);
+            index += entity.len();
+            continue;
+        }
+        let ch = tail.chars().next().expect("valid char boundary");
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
 }
 
 fn render_inline(input: &str, allow_code: bool, allow_links: bool) -> Fragment {
@@ -818,5 +968,29 @@ mod tests {
                 rendered.html.matches("</code>").count()
             );
         }
+    }
+
+    #[test]
+    fn renders_gfm_tables_as_padded_plain_text_pre() {
+        let rendered = render_markdown(
+            "| Name | Status |\n| :--- | ---: |\n| **Alice** | [ok](https://e.test?a=1&b=2) |\n| Bob | `pending` |\n",
+        );
+        assert_eq!(
+            rendered.html,
+            "<pre>Name  | Status \n-----+-------\nAlice | ok     \nBob   | pending</pre>\n"
+        );
+        assert!(!rendered.html.contains("<a "));
+        assert!(!rendered.html.contains("<b>"));
+    }
+
+    #[test]
+    fn caps_gfm_table_cells_without_emitting_markup() {
+        let rendered = render_markdown(
+            "| Long | Value |\n| --- | --- |\n| abcdefghijklmnopqrstuvwxyz | <tag> |\n",
+        );
+        assert_eq!(
+            rendered.html,
+            "<pre>Long                     | Value\n------------------------+-----\nabcdefghijklmnopqrstuvw… | &lt;tag&gt;</pre>\n"
+        );
     }
 }
