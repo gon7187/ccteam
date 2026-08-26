@@ -245,6 +245,7 @@ mod tests {
             clicked.selection,
             Some(ChoiceReply {
                 data: "tok:2".into()
+                callback_ephemeral: None,
             })
         );
         assert!(clicked.attachments.is_empty());
