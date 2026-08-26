@@ -298,16 +298,18 @@ fn render_table(lines: &[&str], start: usize) -> Option<(Fragment, usize, bool)>
 
     let mut body = String::new();
     append_table_row(&mut body, &cells[0], &widths);
+    trim_table_row_end(&mut body);
     body.push('\n');
     for (column, width) in widths.iter().enumerate() {
         if column > 0 {
-            body.push('+');
+            body.push_str("-+-");
         }
         body.extend(std::iter::repeat_n('-', *width));
     }
     for row in &cells[1..] {
         body.push('\n');
         append_table_row(&mut body, row, &widths);
+        trim_table_row_end(&mut body);
     }
 
     let fragment = Fragment {
@@ -331,6 +333,11 @@ fn append_table_row(body: &mut String, row: &[String], widths: &[usize]) {
             widths[column] - cell.chars().count(),
         ));
     }
+}
+
+fn trim_table_row_end(body: &mut String) {
+    let trimmed_len = body.trim_end_matches(' ').len();
+    body.truncate(trimmed_len);
 }
 
 fn table_row(line: &str) -> Option<Vec<&str>> {
@@ -1155,7 +1162,7 @@ mod tests {
         );
         assert_eq!(
             rendered.html,
-            "<pre>Name  | Status \n-----+-------\nAlice | ok     \nBob   | pending</pre>\n"
+            "<pre>Name  | Status\n------+--------\nAlice | ok\nBob   | pending</pre>\n"
         );
         assert!(!rendered.html.contains("<a "));
         assert!(!rendered.html.contains("<b>"));
@@ -1168,7 +1175,7 @@ mod tests {
         );
         assert_eq!(
             rendered.html,
-            "<pre>Long                     | Value\n------------------------+-----\nabcdefghijklmnopqrstuvw… | &lt;tag&gt;</pre>\n"
+            "<pre>Long                     | Value\n-------------------------+------\nabcdefghijklmnopqrstuvw… | &lt;tag&gt;</pre>\n"
         );
     }
 
