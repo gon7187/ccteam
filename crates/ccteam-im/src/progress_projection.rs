@@ -121,6 +121,8 @@ pub struct ProjectProjectionSnapshot {
     pub sessions: HashMap<String, SessionProjection>,
     /// Raw input+output tokens in the trailing 24-hour window.
     pub tokens_24h: u64,
+    /// Whether at least one 24-hour row has a trustworthy USD amount.
+    pub cost_24h_priced: bool,
     /// Delegation lifecycle and rolling counters.
     pub delegations: DelegationProjection,
     /// Low-frequency workflow facts needed by the legacy workflow summary.
@@ -190,6 +192,7 @@ impl ProjectProjectionSnapshot {
 struct CostBucket {
     total: f64,
     count: u32,
+    priced: u32,
     tokens: u64,
     by_vendor: BTreeMap<String, f64>,
 }
@@ -649,7 +652,7 @@ fn fold_turn(state: &mut SlugState, event: &Value, source: TurnSource, now: Date
             fold_cost(state, cost, event, now);
         }
         if tokens > 0 {
-            fold_tokens(state, tokens, recent_event_minute(event, now));
+            fold_tokens(state, tokens, recent_event_minute(event, now), now);
         }
         return;
     };
@@ -663,18 +666,21 @@ fn fold_turn(state: &mut SlugState, event: &Value, source: TurnSource, now: Date
 
     let folded = FoldedTurn {
         source,
-        cost_usd: cost.as_ref().map(|value| value.cost_usd),
+        cost_usd: cost
+            .as_ref()
+            .filter(|value| value.is_priced)
+            .map(|value| value.cost_usd),
         vendor: cost
             .as_ref()
             .and_then(|value| value.vendor.map(str::to_string)),
         tokens,
         event_minute: recent_event_minute(event, now),
     };
-    if let Some(cost) = cost {
+    if let Some(cost) = cost.filter(|value| value.is_priced) {
         fold_cost(state, cost, event, now);
     }
     if tokens > 0 {
-        fold_tokens(state, tokens, folded.event_minute);
+        fold_tokens(state, tokens, folded.event_minute, now);
     }
     state.folded_turns.insert(identity, folded);
 }
@@ -692,6 +698,7 @@ fn unfold_turn(state: &mut SlugState, turn: &FoldedTurn) {
             if let Some(bucket) = state.minute_cost.get_mut(&event_minute) {
                 bucket.total -= cost;
                 bucket.count = bucket.count.saturating_sub(1);
+                bucket.priced = bucket.priced.saturating_sub(1);
                 if let Some(vendor) = turn.vendor.as_deref() {
                     *bucket.by_vendor.entry(vendor.to_string()).or_insert(0.0) -= cost;
                 }
@@ -713,6 +720,9 @@ fn fold_cost(
     event: &Value,
     now: DateTime<Utc>,
 ) {
+    if !contribution.is_priced {
+        return;
+    }
     let cost = contribution.cost_usd;
     state.lifetime_cost += cost;
     let vendor = contribution.vendor;
@@ -733,12 +743,15 @@ fn fold_cost(
     let bucket = state.minute_cost.entry(event_minute).or_default();
     bucket.total += cost;
     bucket.count = bucket.count.saturating_add(1);
+    bucket.priced = bucket.priced.saturating_add(1);
     if let Some(vendor) = vendor {
         *bucket.by_vendor.entry(vendor.to_string()).or_insert(0.0) += cost;
     }
 }
 
-fn fold_tokens(state: &mut SlugState, tokens: u64, event_minute: Option<i64>) {
+fn fold_tokens(state: &mut SlugState, tokens: u64, event_minute: Option<i64>, now: DateTime<Utc>) {
+    let oldest = minute(now).saturating_sub(MINUTES_24H);
+    state.minute_cost.retain(|minute, _| *minute >= oldest);
     if let Some(event_minute) = event_minute {
         let bucket = state.minute_cost.entry(event_minute).or_default();
         bucket.tokens = bucket.tokens.saturating_add(tokens);
@@ -853,6 +866,10 @@ fn snapshot(state: &SlugState, now: DateTime<Utc>) -> ProjectProjectionSnapshot 
             .range(oldest..)
             .map(|(_, bucket)| bucket.tokens)
             .sum(),
+        cost_24h_priced: state
+            .minute_cost
+            .range(oldest..)
+            .any(|(_, bucket)| bucket.priced > 0),
         delegations,
         workflow_events: state.workflow_events.clone(),
         last_unscoped: state.last_unscoped.clone(),

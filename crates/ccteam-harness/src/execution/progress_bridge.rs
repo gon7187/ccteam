@@ -393,6 +393,8 @@ impl Default for ProgressCheckpoint {
 pub struct ProgressCostContribution<'a> {
     /// Numeric `cost_usd` on an `agent_done` row (missing means zero).
     pub cost_usd: f64,
+    /// Whether the USD value came from a reported or verified price.
+    pub is_priced: bool,
     /// Optional vendor label from the same row.
     pub vendor: Option<&'a str>,
     /// Optional canonical or legacy session id from the same row.
@@ -595,6 +597,7 @@ pub fn progress_cost_contribution(event: &Value) -> Option<ProgressCostContribut
     match event_kind_name(event) {
         Some(AGENT_DONE) => Some(ProgressCostContribution {
             cost_usd: event.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0),
+            is_priced: event.get("cost_usd").and_then(Value::as_f64).is_some(),
             vendor,
             sid,
         }),
@@ -624,6 +627,7 @@ pub fn progress_cost_contribution(event: &Value) -> Option<ProgressCostContribut
             let cost = ccteam_cost::resolve_turn_cost(&usage, cost_vendor, model)?;
             Some(ProgressCostContribution {
                 cost_usd: cost,
+                is_priced: true,
                 vendor: Some(vendor),
                 sid,
             })

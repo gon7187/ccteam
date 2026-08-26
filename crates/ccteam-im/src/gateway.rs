@@ -9987,8 +9987,18 @@ impl Gateway {
         let cost_24h = self
             .progress_projection
             .as_ref()
-            .map(|projection| projection.project_snapshot(&s.project).cost.cost_24h_usd)
-            .map(|cost| format!("💰 Расход проекта 24ч: ${cost:.2}"))
+            .map(|projection| {
+                let snapshot = projection.project_snapshot(&s.project);
+                let usd = if snapshot.cost_24h_priced {
+                    format!("${:.2}", snapshot.cost.cost_24h_usd)
+                } else {
+                    "$—".to_string()
+                };
+                format!(
+                    "💰 Расход проекта 24ч: {usd} · {} токенов",
+                    format_token_volume(snapshot.tokens_24h)
+                )
+            })
             .unwrap_or_else(|| "💰 Расход проекта 24ч: нет данных".to_string());
         im_views::render_status(&StatusView {
             sid: s.id.clone(),
@@ -14742,6 +14752,16 @@ fn format_account_usage(u: &AccountUsage) -> Option<String> {
         parts.push(sub.to_string());
     }
     Some(parts.join(" · "))
+}
+
+fn format_token_volume(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn humanize_dur(d: std::time::Duration) -> String {
@@ -23867,6 +23887,7 @@ mod tests {
                 "session_id": "s1",
                 "vendor": "claude",
                 "cost_usd": 1.25,
+                "usage": {"input_tokens": 12_000_000, "output_tokens": 1_100_000},
                 "ts": chrono::Utc::now().to_rfc3339(),
             }),
         )
@@ -23877,8 +23898,43 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("💰 Расход проекта 24ч: $1.25"),
+            out[0].contains("💰 Расход проекта 24ч: $1.25 · 13.1M токенов"),
             "project ledger cost missing: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_status_shows_unknown_cost_and_known_token_volume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        ccteam_core::progress::append_event(
+            &paths.progress_jsonl("alpha"),
+            &serde_json::json!({
+                "event": ccteam_harness::execution::progress_bridge::CHAT_TURN_COMPLETED,
+                "sid": "s1",
+                "turn_id": "turn-1",
+                "vendor": "claude",
+                "model": "claude-fable-5",
+                "usage": {"output_tokens": 1_234},
+                "ts": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .unwrap();
+
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            out[0].contains("💰 Расход проекта 24ч: $— · 1.2k токенов"),
+            "unknown cost must remain unknown while tokens stay visible: {out:?}"
         );
     }
 
@@ -23961,6 +24017,13 @@ mod tests {
         assert!(s.contains("лимит 46%"), "{s}");
         assert!(s.ends_with("· max"), "{s}");
         assert_eq!(format_account_usage(&AccountUsage::default()), None);
+    }
+
+    #[test]
+    fn format_token_volume_uses_one_decimal_k_and_m_units() {
+        assert_eq!(format_token_volume(999), "999");
+        assert_eq!(format_token_volume(1_234), "1.2k");
+        assert_eq!(format_token_volume(13_100_000), "13.1M");
     }
 
     /// `/status` running-task block — background workflows (`local_workflow`)
