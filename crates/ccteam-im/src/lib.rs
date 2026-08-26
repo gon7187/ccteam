@@ -76,6 +76,7 @@ pub mod router;
 pub mod sanitize;
 pub mod scheduled;
 mod session_catalog;
+#[cfg_attr(not(feature = "telegram"), allow(dead_code))]
 pub(crate) mod telegram_html;
 pub mod three_layer_sec;
 pub mod transport;

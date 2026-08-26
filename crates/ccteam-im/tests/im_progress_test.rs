@@ -231,11 +231,22 @@ async fn run_scripted(script: Vec<ThreadEvent>) -> Arc<MockChannel> {
     std::fs::create_dir_all(&projects_root).unwrap();
 
     let mock = Arc::new(MockChannel::new());
+    run_scripted_on(mock.clone(), "chat-1", script, projects_root).await;
+    drop(home);
+    mock
+}
+
+async fn run_scripted_on(
+    mock: Arc<MockChannel>,
+    chat_id: &str,
+    script: Vec<ThreadEvent>,
+    projects_root: std::path::PathBuf,
+) {
     for (id, content) in [("m-1", "/new claude helper"), ("m-2", "trigger turn")] {
         mock.push(ccteam_im::transport::ChannelMessage {
             id: id.into(),
             sender: "alice".into(),
-            reply_target: "chat-1".into(),
+            reply_target: chat_id.into(),
             content: content.into(),
             channel: "telegram".into(),
             timestamp: 0,
@@ -271,9 +282,6 @@ async fn run_scripted(script: Vec<ThreadEvent>) -> Arc<MockChannel> {
     })
     .await
     .unwrap();
-    // keep `home` alive until the daemon finished
-    drop(home);
-    mock
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -446,6 +454,85 @@ async fn codex_streaming_delta_not_sent_as_answer() {
         1,
         "final answer not delivered exactly once: {outbox:?}"
     );
+    std::env::remove_var("CCTEAM_IM_PROGRESS");
+    std::env::remove_var("CCTEAM_IM_PROGRESS_THROTTLE_MS");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_telegram_progress_uses_drafts_and_final_message() {
+    let _g = env_lock();
+    std::env::set_var("CCTEAM_IM_PROGRESS", "on");
+    std::env::set_var("CCTEAM_IM_PROGRESS_THROTTLE_MS", "0");
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+    let mock = Arc::new(
+        MockChannel::new()
+            .with_name("telegram")
+            .with_rich_support()
+            .with_draft_support(),
+    );
+    run_scripted_on(
+        mock.clone(),
+        "123",
+        vec![
+            tool_started("t1", "Bash", serde_json::json!({"command": "ls"})),
+            answer("a1", "done"),
+        ],
+        projects_root,
+    )
+    .await;
+
+    let drafts = mock.drafts().await;
+    let outbox = mock.outbox().await;
+    assert!(!drafts.is_empty(), "private progress must use drafts");
+    assert!(drafts.iter().all(|(_, id, body)| {
+        *id > 0 && body.starts_with("<tg-thinking>Thinking...</tg-thinking>")
+    }));
+    assert!(mock.edits().await.is_empty(), "draft mode must not edit");
+    assert!(outbox.iter().any(|m| m.content.starts_with("done")));
+    assert!(outbox.iter().any(|m| m
+        .rich_markdown
+        .as_deref()
+        .is_some_and(|m| m.starts_with("done"))));
+    drop(home);
+    std::env::remove_var("CCTEAM_IM_PROGRESS");
+    std::env::remove_var("CCTEAM_IM_PROGRESS_THROTTLE_MS");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_telegram_draft_failure_falls_back_to_edit() {
+    let _g = env_lock();
+    std::env::set_var("CCTEAM_IM_PROGRESS", "on");
+    std::env::set_var("CCTEAM_IM_PROGRESS_THROTTLE_MS", "0");
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+    let mock = Arc::new(
+        MockChannel::new()
+            .with_name("telegram")
+            .with_rich_support()
+            .failing_drafts(),
+    );
+    run_scripted_on(
+        mock.clone(),
+        "123",
+        vec![
+            tool_started("t1", "Bash", serde_json::json!({"command": "ls"})),
+            answer("a1", "done"),
+        ],
+        projects_root,
+    )
+    .await;
+
+    assert!(!mock.drafts().await.is_empty());
+    assert!(
+        !mock.edits().await.is_empty(),
+        "failed draft must use edit fallback"
+    );
+    drop(home);
     std::env::remove_var("CCTEAM_IM_PROGRESS");
     std::env::remove_var("CCTEAM_IM_PROGRESS_THROTTLE_MS");
 }

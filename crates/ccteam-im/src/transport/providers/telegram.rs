@@ -24,13 +24,14 @@ use crate::latency::now_unix_ms;
 use crate::telegram_html::render_markdown;
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, ButtonStyle, Channel,
-    ChannelAttachment, ChannelMessage, ChoiceReply, CommandSpec, MessageOption, OutboundFile,
-    OutboundFileKind, RejectedSenderNotifier, RejectedSenderProbe, ReplyKeyboard, SendMessage,
+    ChannelAttachment, ChannelMessage, ChoiceReply, CommandSpec, EphemeralDelivery, MessageOption,
+    OutboundFile, OutboundFileKind, RejectedSenderNotifier, RejectedSenderProbe, ReplyKeyboard,
+    SendMessage,
 };
 
 /// `getUpdates` long-poll seconds.
 const POLL_TIMEOUT_SECS: u64 = 25;
-const ALLOWED_UPDATE_TYPES: &str = r#"["message","callback_query"]"#;
+const ALLOWED_UPDATE_TYPES: &str = r#"["message","callback_query","stopped_message_generation"]"#;
 
 /// Conservative per-message ceiling in **UTF-16 code units**. Telegram's
 /// hard `sendMessage` limit is 4096 UTF-16 units; we reserve headroom for
@@ -66,6 +67,8 @@ pub struct TelegramChannel {
     /// already logged for a rich→classic fallback, so a noisy failure mode
     /// logs once (debug) instead of once per message.
     rich_fallback_logged: Mutex<std::collections::HashSet<String>>,
+    /// Failure kinds already logged for an ephemeral→legacy fallback.
+    ephemeral_fallback_logged: Mutex<std::collections::HashSet<String>>,
     /// TG-GATE-V2 W7a — consecutive rich-message failures (send + edit
     /// share one counter — both hit the same Bot API surface). Any success
     /// resets it to 0 (a transient blip must not trip the breaker).
@@ -117,6 +120,7 @@ impl TelegramChannel {
             unknown_bot_mention_warned: std::sync::atomic::AtomicBool::new(false),
             name: "telegram".to_string(),
             rich_fallback_logged: Mutex::new(std::collections::HashSet::new()),
+            ephemeral_fallback_logged: Mutex::new(std::collections::HashSet::new()),
             rich_failures: std::sync::atomic::AtomicU32::new(0),
             rich_disabled: std::sync::atomic::AtomicBool::new(false),
             rich_probe_counter: std::sync::atomic::AtomicU32::new(0),
@@ -312,21 +316,18 @@ impl TelegramChannel {
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
         cb: TgCallbackQuery,
     ) {
-        let _ = self
-            .http
-            .post(self.api_url("answerCallbackQuery"))
-            .json(&serde_json::json!({ "callback_query_id": cb.id }))
-            .send()
-            .await;
-        let Some(data) = cb.data else {
+        let Some(data) = cb.data.as_ref().cloned() else {
+            let _ = self.answer_callback(&cb.id).await;
             return;
         };
-        let Some(msg) = cb.message else {
+        let Some(msg) = cb.message.as_ref() else {
+            let _ = self.answer_callback(&cb.id).await;
             return;
         };
         let chat_id = msg.chat.id.to_string();
         if !self.chat_allowed(&chat_id) {
             self.reject_chat(&chat_id, msg.message_id, msg.date).await;
+            let _ = self.answer_callback(&cb.id).await;
             return;
         }
         let sender = cb
@@ -335,6 +336,12 @@ impl TelegramChannel {
             .and_then(|u| u.username.clone())
             .or_else(|| cb.from.as_ref().map(|u| u.id.to_string()))
             .unwrap_or_else(|| "anonymous".to_string());
+        // Telegram callback-id validity after answerCallbackQuery is unverified
+        // for ephemeral group sends. Confirm this on a live group; if the id is
+        // consumed, send the ephemeral response first and answer immediately
+        // afterwards in this same handler, synchronously, with no timer.
+        let callback_ephemeral = callback_ephemeral_context(&cb, msg);
+        let _ = self.answer_callback(&cb.id).await;
         let payload = ChannelMessage {
             id: callback_message_id(msg.message_id),
             sender,
@@ -344,9 +351,51 @@ impl TelegramChannel {
             timestamp: (now_unix_ms() / 1000) as u64,
             thread_ts: None,
             attachments: Vec::new(),
-            selection: Some(ChoiceReply { data }),
+            selection: Some(ChoiceReply {
+                data,
+                callback_ephemeral,
+            }),
         };
         let _ = tx.send(payload).await;
+    }
+
+    async fn handle_stopped_message_generation(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        update_id: i64,
+        stopped: TgMessageGenerationStopped,
+    ) {
+        if stopped.chat.id <= 0 {
+            tracing::debug!(
+                update_id,
+                chat_id = stopped.chat.id,
+                "telegram: stopped draft update ignored outside a private chat"
+            );
+            return;
+        }
+        let chat_id = stopped.chat.id.to_string();
+        if !self.chat_allowed(&chat_id) {
+            self.reject_chat(&chat_id, update_id, (now_unix_ms() / 1000) as i64)
+                .await;
+            return;
+        }
+        let _ = tx
+            .send(ChannelMessage {
+                id: format!("tg-stop-{update_id}"),
+                sender: chat_id.clone(),
+                reply_target: chat_id,
+                content: format!(
+                    "{}{}",
+                    crate::transport::STOPPED_DRAFT_PREFIX,
+                    stopped.draft_id
+                ),
+                channel: self.name.clone(),
+                timestamp: (now_unix_ms() / 1000) as u64,
+                thread_ts: stopped.message_thread_id.map(|id| id.to_string()),
+                attachments: Vec::new(),
+                selection: None,
+            })
+            .await;
     }
 
     /// POST a `setMessageReaction` body (the shared transport for both
@@ -530,6 +579,17 @@ impl TelegramChannel {
         count % RICH_HALF_OPEN_PROBE_EVERY != 0
     }
 
+    async fn log_ephemeral_fallback_once(&self, reason: &str) {
+        if self
+            .ephemeral_fallback_logged
+            .lock()
+            .await
+            .insert(reason.to_string())
+        {
+            tracing::warn!(channel = %self.name, reason, "telegram ephemeral response failed; falling back");
+        }
+    }
+
     /// Record one rich attempt's outcome. A success resets the consecutive
     /// failure streak AND (TG-GATE-V2 W9 N5) reopens the breaker if it was
     /// tripped — a half-open probe succeeding IS the recovery signal; the
@@ -579,9 +639,16 @@ impl TelegramChannel {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            if message.callback_ephemeral.is_some() {
+                self.log_ephemeral_fallback_once(&format!("http_{}", status.as_u16()))
+                    .await;
+            }
             return Err(format!("http_{}", status.as_u16()));
         }
         if body_reports_failure(&text) {
+            if message.callback_ephemeral.is_some() {
+                self.log_ephemeral_fallback_once("ok_false").await;
+            }
             return Err("ok_false".to_string());
         }
         Ok(extract_message_id(&text))
@@ -645,6 +712,13 @@ impl TelegramChannel {
         if payload.formatted {
             body["parse_mode"] = serde_json::json!("HTML");
         }
+        if let Some(ephemeral) = message.callback_ephemeral.as_ref() {
+            body["ephemeral_message_parameters"] = serde_json::json!({
+                "receiver_user_id": ephemeral.receiver_user_id,
+                "callback_query_id": ephemeral.callback_query_id,
+                "replace_callback_query_message": ephemeral.replace_callback_query_message,
+            });
+        }
         if include_buttons {
             if let Some(keyboard) = reply_markup_json(message) {
                 body["reply_markup"] = keyboard;
@@ -668,6 +742,10 @@ impl TelegramChannel {
         }
         let send_http_ms = t0.elapsed().as_millis() as u64;
         if !status.is_success() {
+            if message.callback_ephemeral.is_some() {
+                self.log_ephemeral_fallback_once(&format!("http_{}", status.as_u16()))
+                    .await;
+            }
             tracing::warn!(
                 event = "latency",
                 stage = "tg.egress",
@@ -689,6 +767,9 @@ impl TelegramChannel {
         // (`body_reports_failure`); the classic path had no equivalent, so a
         // degraded-server-side 200 read as delivered.
         if body_reports_failure(&resp_text) {
+            if message.callback_ephemeral.is_some() {
+                self.log_ephemeral_fallback_once("ok_false").await;
+            }
             anyhow::bail!(
                 "telegram sendMessage {} → 200 with ok:false: {}",
                 message.recipient,
@@ -706,6 +787,62 @@ impl TelegramChannel {
             "latency tg.egress"
         );
         Ok(id)
+    }
+
+    async fn post_ephemeral_body(
+        &self,
+        method: &str,
+        body: serde_json::Value,
+    ) -> EphemeralDelivery {
+        let response = match self
+            .http
+            .post(self.api_url(method))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => return EphemeralDelivery::Unknown(anyhow::Error::new(err)),
+        };
+        let status = response.status();
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(err) => return EphemeralDelivery::Unknown(anyhow::Error::new(err)),
+        };
+        if status.is_server_error() {
+            return EphemeralDelivery::Unknown(anyhow::anyhow!(
+                "telegram {method} returned {status}: {text}"
+            ));
+        }
+        if !status.is_success() || body_reports_failure(&text) {
+            return EphemeralDelivery::Rejected(anyhow::anyhow!(
+                "telegram {method} returned {status}: {text}"
+            ));
+        }
+        EphemeralDelivery::Delivered(extract_message_id(&text))
+    }
+
+    fn ephemeral_classic_body(&self, message: &SendMessage) -> serde_json::Value {
+        let payload = text_payload(message.rich_markdown.as_deref().unwrap_or(&message.content));
+        let mut body = serde_json::json!({
+            "chat_id": message.recipient,
+            "text": payload.text,
+            "reply_to_message_id": message.thread_ts.as_ref().and_then(|s| s.parse::<i64>().ok()),
+        });
+        if payload.formatted {
+            body["parse_mode"] = serde_json::json!("HTML");
+        }
+        if let Some(ephemeral) = message.callback_ephemeral.as_ref() {
+            body["ephemeral_message_parameters"] = serde_json::json!({
+                "receiver_user_id": ephemeral.receiver_user_id,
+                "callback_query_id": ephemeral.callback_query_id,
+                "replace_callback_query_message": ephemeral.replace_callback_query_message,
+            });
+        }
+        if let Some(keyboard) = reply_markup_json(message) {
+            body["reply_markup"] = keyboard;
+        }
+        body
     }
 
     /// The classic `editMessageText` path (HTML → plain retry), unchanged
@@ -816,6 +953,16 @@ struct TgUpdate {
     // the gateway has no edit/reconciliation contract.
     #[serde(default)]
     edited_message: Option<Value>,
+    #[serde(default)]
+    stopped_message_generation: Option<TgMessageGenerationStopped>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgMessageGenerationStopped {
+    chat: TgChat,
+    #[serde(default)]
+    message_thread_id: Option<i64>,
+    draft_id: i64,
 }
 
 /// An inline-keyboard button click (v0.8.5 D3).
@@ -833,6 +980,8 @@ struct TgCallbackQuery {
 #[derive(Debug, Deserialize)]
 struct TgMessage {
     message_id: i64,
+    #[serde(default)]
+    ephemeral_message_id: Option<i64>,
     date: i64,
     chat: TgChat,
     #[serde(default)]
@@ -860,6 +1009,8 @@ struct TgMessage {
 #[derive(Debug, Deserialize)]
 struct TgChat {
     id: i64,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -867,6 +1018,25 @@ struct TgUser {
     id: i64,
     #[serde(default)]
     username: Option<String>,
+}
+
+fn callback_ephemeral_context(
+    callback: &TgCallbackQuery,
+    message: &TgMessage,
+) -> Option<crate::transport::CallbackEphemeral> {
+    matches!(message.chat.kind.as_deref(), Some("group" | "supergroup"))
+        .then(|| {
+            callback
+                .from
+                .as_ref()
+                .map(|user| crate::transport::CallbackEphemeral {
+                    callback_query_id: callback.id.clone(),
+                    receiver_user_id: user.id,
+                    replace_callback_query_message: message.ephemeral_message_id.is_none(),
+                    ephemeral_message_id: message.ephemeral_message_id,
+                })
+        })
+        .flatten()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1588,7 +1758,7 @@ fn button_rows_to_tg_html(rows: &[Vec<MessageOption>]) -> String {
         }
         out.push_str("<tg-button-row>");
         for opt in row {
-            out.push_str("<tg-button type=\"callback_data\" callback_data=\"");
+            out.push_str("<tg-button type=\"callback_data\" data=\"");
             out.push_str(&escape_tg_button_attr(&opt.data));
             out.push('"');
             if let Some(style) = button_style_str(opt.style) {
@@ -1608,6 +1778,9 @@ fn button_rows_to_tg_html(rows: &[Vec<MessageOption>]) -> String {
 /// Rich Message body budget after accounting for the optional button block
 /// appended by [`build_rich_send_body`].
 pub(crate) fn rich_markdown_budget(message: &SendMessage) -> usize {
+    if message.inline_buttons {
+        return MAX_RICH_MARKDOWN_BYTES;
+    }
     let buttons_html = button_rows_to_tg_html(&combined_button_rows(message));
     let overhead = if buttons_html.is_empty() {
         0
@@ -1623,7 +1796,11 @@ pub(crate) fn rich_markdown_budget(message: &SendMessage) -> usize {
 /// parameter (see research doc §3).
 fn build_rich_send_body(message: &SendMessage, markdown: &str) -> serde_json::Value {
     let rows = combined_button_rows(message);
-    let buttons_html = button_rows_to_tg_html(&rows);
+    let buttons_html = if message.inline_buttons {
+        String::new()
+    } else {
+        button_rows_to_tg_html(&rows)
+    };
     let full_markdown = if buttons_html.is_empty() {
         markdown.to_string()
     } else {
@@ -1640,12 +1817,42 @@ fn build_rich_send_body(message: &SendMessage, markdown: &str) -> serde_json::Va
     {
         body["reply_parameters"] = serde_json::json!({ "message_id": rt });
     }
+    if let Some(ephemeral) = message.callback_ephemeral.as_ref() {
+        body["ephemeral_message_parameters"] = serde_json::json!({
+            "receiver_user_id": ephemeral.receiver_user_id,
+            "callback_query_id": ephemeral.callback_query_id,
+            "replace_callback_query_message": ephemeral.replace_callback_query_message,
+        });
+    }
     if rows.is_empty() {
         if let Some(reply_keyboard) = message.reply_keyboard.as_ref() {
             body["reply_markup"] = reply_keyboard_json(reply_keyboard);
         }
     }
     body
+}
+
+fn build_rich_draft_body(chat_id: i64, draft_id: i64, markdown: &str) -> serde_json::Value {
+    serde_json::json!({
+        "chat_id": chat_id,
+        "draft_id": draft_id,
+        "rich_message": { "markdown": markdown },
+        "can_stop": true,
+        "keep_on_stop": true,
+    })
+}
+
+fn build_ephemeral_edit_body(
+    chat_id: &str,
+    callback: &crate::transport::CallbackEphemeral,
+    content: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "chat_id": chat_id,
+        "receiver_user_id": callback.receiver_user_id,
+        "ephemeral_message_id": callback.ephemeral_message_id,
+        "text": content,
+    })
 }
 
 /// Build the `editMessageText` request body using `rich_message` (Bot API
@@ -1746,6 +1953,40 @@ impl Channel for TelegramChannel {
         true
     }
 
+    async fn send_draft(
+        &self,
+        recipient: &str,
+        draft_id: i64,
+        markdown: &str,
+    ) -> anyhow::Result<()> {
+        let chat_id = recipient
+            .parse::<i64>()
+            .with_context(|| format!("telegram draft: invalid chat id {recipient}"))?;
+        if chat_id <= 0 {
+            anyhow::bail!("telegram draft: chat id must be a private chat");
+        }
+        if draft_id == 0 {
+            anyhow::bail!("telegram draft: draft id must be non-zero");
+        }
+        let resp = self
+            .http
+            .post(self.api_url("sendRichMessageDraft"))
+            .json(&build_rich_draft_body(chat_id, draft_id, markdown))
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("telegram sendRichMessageDraft {chat_id}#{draft_id} → {status}: {text}");
+        }
+        if body_reports_failure(&text) {
+            anyhow::bail!(
+                "telegram sendRichMessageDraft {chat_id}#{draft_id} → 200 with ok:false: {text}"
+            );
+        }
+        Ok(())
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         // V0.8.4 P2b — files go via sendPhoto/sendDocument (multipart);
         // the caption rides the first attachment. Rich Messages / buttons
@@ -1803,6 +2044,80 @@ impl Channel for TelegramChannel {
         self.send_classic(message).await
     }
 
+    async fn send_ephemeral(&self, message: &SendMessage) -> EphemeralDelivery {
+        if let Some(markdown) = message.rich_markdown.as_deref() {
+            match self
+                .post_ephemeral_body("sendRichMessage", build_rich_send_body(message, markdown))
+                .await
+            {
+                EphemeralDelivery::Delivered(id) => return EphemeralDelivery::Delivered(id),
+                EphemeralDelivery::Unknown(err) => {
+                    self.log_ephemeral_fallback_once("rich_unknown").await;
+                    return EphemeralDelivery::Unknown(err);
+                }
+                EphemeralDelivery::Rejected(err) => {
+                    self.log_ephemeral_fallback_once("rich_rejected").await;
+                    drop(err);
+                }
+            }
+        }
+        match self
+            .post_ephemeral_body("sendMessage", self.ephemeral_classic_body(message))
+            .await
+        {
+            EphemeralDelivery::Unknown(err) => {
+                self.log_ephemeral_fallback_once("classic_unknown").await;
+                EphemeralDelivery::Unknown(err)
+            }
+            EphemeralDelivery::Rejected(err) => {
+                self.log_ephemeral_fallback_once("classic_rejected").await;
+                EphemeralDelivery::Rejected(err)
+            }
+            delivered => delivered,
+        }
+    }
+
+    async fn answer_callback(&self, callback_query_id: &str) -> anyhow::Result<()> {
+        self.http
+            .post(self.api_url("answerCallbackQuery"))
+            .json(&serde_json::json!({ "callback_query_id": callback_query_id }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    async fn edit_ephemeral_message(
+        &self,
+        chat_id: &str,
+        callback: &crate::transport::CallbackEphemeral,
+        content: &str,
+        _button_rows: &[Vec<MessageOption>],
+    ) -> EphemeralDelivery {
+        let Some(_) = callback.ephemeral_message_id else {
+            return EphemeralDelivery::Rejected(anyhow::anyhow!(
+                "telegram ephemeral edit missing ephemeral_message_id"
+            ));
+        };
+        match self
+            .post_ephemeral_body(
+                "editEphemeralMessageText",
+                build_ephemeral_edit_body(chat_id, callback, content),
+            )
+            .await
+        {
+            EphemeralDelivery::Unknown(err) => {
+                self.log_ephemeral_fallback_once("edit_unknown").await;
+                EphemeralDelivery::Unknown(err)
+            }
+            EphemeralDelivery::Rejected(err) => {
+                self.log_ephemeral_fallback_once("edit_rejected").await;
+                EphemeralDelivery::Rejected(err)
+            }
+            delivered => delivered,
+        }
+    }
+
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         loop {
             if tx.is_closed() {
@@ -1849,6 +2164,11 @@ impl Channel for TelegramChannel {
                 }
                 if let Some(cb) = upd.callback_query {
                     self.handle_callback_query(&tx, cb).await;
+                    continue;
+                }
+                if let Some(stopped) = upd.stopped_message_generation {
+                    self.handle_stopped_message_generation(&tx, upd.update_id, stopped)
+                        .await;
                     continue;
                 }
                 if upd.edited_message.is_some() {
@@ -2199,6 +2519,51 @@ mod tests {
         let ch = TelegramChannel::new("ABC".into(), vec![]);
         let url = ch.api_url("getMe");
         assert_eq!(url, "https://api.telegram.org/botABC/getMe");
+    }
+
+    #[tokio::test]
+    async fn stopped_generation_update_becomes_daemon_marker() {
+        let ch = TelegramChannel::new("t".into(), vec![]);
+        let update: TgUpdate = serde_json::from_value(serde_json::json!({
+            "update_id": 8,
+            "stopped_message_generation": {
+                "chat": {"id": 123},
+                "message_thread_id": 7,
+                "draft_id": 77
+            }
+        }))
+        .unwrap();
+        let stopped = update.stopped_message_generation.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        ch.handle_stopped_message_generation(&tx, update.update_id, stopped)
+            .await;
+
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.reply_target, "123");
+        assert_eq!(msg.thread_ts.as_deref(), Some("7"));
+        assert_eq!(
+            msg.content,
+            format!("{}77", crate::transport::STOPPED_DRAFT_PREFIX)
+        );
+    }
+
+    #[tokio::test]
+    async fn send_draft_posts_rich_message_draft_body() {
+        let (base, seen) = spawn_sequential_http(&[r#"{"ok":true}"#]);
+        let ch = TelegramChannel::new("t".into(), vec![]).with_api_base(base);
+        let markdown = "<tg-thinking>Thinking...</tg-thinking>\n\n▶️ s42 работает · 1с\n\n```Terminal\n🔧 команда: ls\n```";
+
+        ch.send_draft("123", 77, markdown).await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].0.contains("sendRichMessageDraft"), "{seen:?}");
+        let body: serde_json::Value = serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!(body["chat_id"], 123);
+        assert_eq!(body["draft_id"], 77);
+        assert_eq!(body["can_stop"], true);
+        assert_eq!(body["keep_on_stop"], true);
+        assert_eq!(body["rich_message"]["markdown"], markdown);
     }
 
     #[test]
@@ -2583,12 +2948,26 @@ mod tests {
         assert!(markdown.starts_with("**hello**"));
         assert!(markdown.contains("<tg-button-row>"));
         assert!(markdown.contains(r#"type="callback_data""#));
-        assert!(markdown.contains(r#"callback_data="cmd:/stop""#));
+        assert!(markdown.contains(r#" data="cmd:/stop""#));
         assert!(markdown.contains(r#"style="danger""#));
         assert!(markdown.contains(">⛔ Стоп</tg-button>"));
         // The second button has no style attribute at all.
-        assert!(markdown.contains(r#"callback_data="cmd:/new">✏️ Новая</tg-button>"#));
+        assert!(markdown.contains(r#" data="cmd:/new">✏️ Новая</tg-button>"#));
         assert!(markdown.contains("</tg-button-row>"));
+    }
+
+    #[test]
+    fn rich_inline_rows_are_not_appended_again() {
+        let row = vec![opt("cmd:/use s1", "💬 Переключиться", None)];
+        let inline = r#"<tg-button-row><tg-button type="callback_data" data="cmd:/use s1">💬 Переключиться</tg-button></tg-button-row>"#;
+        let message = SendMessage::new("s1", "42")
+            .with_rich_markdown(format!("s1\n{inline}"))
+            .with_button_rows(vec![row])
+            .with_inline_buttons(true);
+        let body = build_rich_send_body(&message, message.rich_markdown.as_deref().unwrap());
+        let markdown = body["rich_message"]["markdown"].as_str().unwrap();
+        assert_eq!(markdown.matches("<tg-button-row>").count(), 1);
+        assert_eq!(markdown.matches("data=\"cmd:/use s1\"").count(), 1);
     }
 
     #[test]
@@ -2596,6 +2975,136 @@ mod tests {
         let message = SendMessage::new("hello", "42").with_rich_markdown("hello");
         let body = build_rich_send_body(&message, "hello");
         assert_eq!(body["rich_message"]["markdown"], "hello");
+    }
+
+    #[test]
+    fn rich_send_body_carries_callback_ephemeral_parameters() {
+        let message = SendMessage::new("confirm", "-100")
+            .with_rich_markdown("confirm")
+            .with_callback_ephemeral("cb-42", 7);
+
+        assert_eq!(
+            build_rich_send_body(&message, "confirm")["ephemeral_message_parameters"],
+            serde_json::json!({
+                "receiver_user_id": 7,
+                "callback_query_id": "cb-42",
+                "replace_callback_query_message": true,
+            })
+        );
+    }
+
+    #[test]
+    fn ephemeral_edit_body_targets_the_ephemeral_id_space() {
+        let callback = crate::transport::CallbackEphemeral {
+            callback_query_id: "cb-42".to_string(),
+            receiver_user_id: 7,
+            replace_callback_query_message: false,
+            ephemeral_message_id: Some(99),
+        };
+        assert_eq!(
+            build_ephemeral_edit_body("-100", &callback, "done"),
+            serde_json::json!({
+                "chat_id": "-100",
+                "receiver_user_id": 7,
+                "ephemeral_message_id": 99,
+                "text": "done",
+            })
+        );
+    }
+
+    #[test]
+    fn private_callback_has_no_ephemeral_context() {
+        let callback: TgCallbackQuery = serde_json::from_value(serde_json::json!({
+            "id": "cb-1", "from": {"id": 7}
+        }))
+        .unwrap();
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1, "date": 0, "chat": {"id": 7, "type": "private"}
+        }))
+        .unwrap();
+        assert!(callback_ephemeral_context(&callback, &message).is_none());
+    }
+
+    #[tokio::test]
+    async fn private_callback_answers_immediately_before_forwarding() {
+        let (base, seen) = spawn_sequential_http(&[r#"{"ok":true,"result":true}"#]);
+        let channel = TelegramChannel::new("t".into(), vec![]).with_api_base(base);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        channel
+            .handle_callback_query(
+                &tx,
+                serde_json::from_value(serde_json::json!({
+                    "id": "cb-private",
+                    "from": {"id": 7},
+                    "data": "cmd:/status",
+                    "message": {
+                        "message_id": 1,
+                        "date": 0,
+                        "chat": {"id": 7, "type": "private"}
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let forwarded = rx.recv().await.expect("private callback forwarded");
+        assert!(forwarded
+            .selection
+            .and_then(|selection| selection.callback_ephemeral)
+            .is_none());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(seen.lock().unwrap()[0].0.contains("answerCallbackQuery"));
+    }
+
+    #[tokio::test]
+    async fn group_callback_answers_immediately_before_forwarding() {
+        let (base, seen) = spawn_sequential_http(&[r#"{"ok":true,"result":true}"#]);
+        let channel = TelegramChannel::new("t".into(), vec![]).with_api_base(base);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        channel
+            .handle_callback_query(
+                &tx,
+                serde_json::from_value(serde_json::json!({
+                    "id": "cb-group",
+                    "from": {"id": 7},
+                    "data": "cmd:/status",
+                    "message": {
+                        "message_id": 1,
+                        "date": 0,
+                        "chat": {"id": -100, "type": "group"}
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let forwarded = rx.recv().await.expect("group callback forwarded");
+        assert!(forwarded
+            .selection
+            .and_then(|selection| selection.callback_ephemeral)
+            .is_some());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].0.contains("answerCallbackQuery"));
+    }
+
+    #[test]
+    fn ephemeral_callback_keeps_its_separate_message_id() {
+        let callback: TgCallbackQuery = serde_json::from_value(serde_json::json!({
+            "id": "cb-1", "from": {"id": 7}
+        }))
+        .unwrap();
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "ephemeral_message_id": 99,
+            "date": 0,
+            "chat": {"id": -100, "type": "supergroup"}
+        }))
+        .unwrap();
+
+        let context = callback_ephemeral_context(&callback, &message).unwrap();
+        assert_eq!(context.ephemeral_message_id, Some(99));
+        assert!(!context.replace_callback_query_message);
     }
 
     #[test]
@@ -2820,7 +3329,8 @@ mod tests {
     #[test]
     fn rich_markdown_not_content_is_the_classic_fallback_source() {
         let message = SendMessage::new("s1 has no bold", "42")
-            .with_rich_markdown("**s1** has no bold, and neither does <script>&");
+            .with_rich_markdown("**s1** has no bold, and neither does <script>&")
+            .with_callback_ephemeral("cb-42", 7);
         let markdown = message.rich_markdown.as_deref().expect("set above");
 
         // The universal fallback field a non-Telegram channel would send
@@ -2908,11 +3418,15 @@ mod tests {
                     .to_string();
                 let body = String::from_utf8_lossy(&req[end..]).to_string();
                 seen_thread.lock().unwrap().push((request_line, body));
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    response.len(),
-                    response
-                );
+                let resp = if response.starts_with("HTTP/") {
+                    response.to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response.len(),
+                        response
+                    )
+                };
                 let _ = stream.write_all(resp.as_bytes());
                 let _ = stream.flush();
             }
@@ -2938,7 +3452,8 @@ mod tests {
         let mut ch = TelegramChannel::new("t".into(), vec![]);
         ch.api_base = base;
         let message = SendMessage::new("s1 has no bold", "42")
-            .with_rich_markdown("**s1** has no bold, and neither does <script>&");
+            .with_rich_markdown("**s1** has no bold, and neither does <script>&")
+            .with_callback_ephemeral("cb-42", 7);
 
         let id = ch.send(&message).await.unwrap();
         assert_eq!(id.as_deref(), Some("1"));
@@ -2959,6 +3474,9 @@ mod tests {
             "second call must be the classic fallback: {:?}",
             seen[1]
         );
+        for (_, body) in seen.iter() {
+            assert!(body.contains(r#""ephemeral_message_parameters":{"callback_query_id":"cb-42","receiver_user_id":7,"replace_callback_query_message":true}"#), "missing ephemeral callback context: {body}");
+        }
         let classic_body = &seen[1].1;
         assert!(
             classic_body.contains("<b>s1</b>"),
@@ -2971,6 +3489,106 @@ mod tests {
         assert!(
             classic_body.contains(r#""parse_mode":"HTML""#),
             "classic body must ask Telegram to parse the HTML: {classic_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_ephemeral_message_uses_its_own_endpoint_and_identifier() {
+        let (base, seen) = spawn_sequential_http(&[r#"{"ok":true,"result":true}"#]);
+        let mut ch = TelegramChannel::new("t".into(), vec![]);
+        ch.api_base = base;
+        let callback = crate::transport::CallbackEphemeral {
+            callback_query_id: "cb-42".to_string(),
+            receiver_user_id: 7,
+            replace_callback_query_message: false,
+            ephemeral_message_id: Some(99),
+        };
+
+        assert!(matches!(
+            ch.edit_ephemeral_message("-100", &callback, "done", &[])
+                .await,
+            EphemeralDelivery::Delivered(_)
+        ));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].0.contains("editEphemeralMessageText"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&seen[0].1).unwrap(),
+            serde_json::json!({
+                "chat_id": "-100",
+                "receiver_user_id": 7,
+                "ephemeral_message_id": 99,
+                "text": "done",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_ephemeral_rich_send_falls_back_to_classic_once() {
+        let (base, seen) = spawn_sequential_http(&[
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            r#"{"ok":true,"result":{"message_id":1}}"#,
+        ]);
+        let mut ch = TelegramChannel::new("t".into(), vec![]);
+        ch.api_base = base;
+        let message = SendMessage::new("confirm", "-100")
+            .with_rich_markdown("confirm")
+            .with_callback_ephemeral("cb-42", 7);
+
+        assert!(matches!(
+            ch.send_ephemeral(&message).await,
+            EphemeralDelivery::Delivered(_)
+        ));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].0.contains("sendRichMessage"));
+        assert!(seen[1].0.contains("sendMessage"));
+    }
+
+    #[tokio::test]
+    async fn unknown_ephemeral_rich_send_does_not_retry() {
+        let (base, seen) = spawn_sequential_http(&[
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        let mut ch = TelegramChannel::new("t".into(), vec![]);
+        ch.api_base = base;
+        let message = SendMessage::new("confirm", "-100")
+            .with_rich_markdown("confirm")
+            .with_callback_ephemeral("cb-42", 7);
+
+        assert!(matches!(
+            ch.send_ephemeral(&message).await,
+            EphemeralDelivery::Unknown(_)
+        ));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn classic_fallback_strips_inline_rows_and_keeps_the_keyboard() {
+        let (base, seen) = spawn_sequential_http(&[
+            r#"{"ok":false,"description":"rich messages unsupported"}"#,
+            r#"{"ok":true,"result":{"message_id":2}}"#,
+        ]);
+        let inline = r#"<tg-button-row><tg-button type="callback_data" data="cmd:/use s1">💬 Переключиться</tg-button></tg-button-row>"#;
+        let message = SendMessage::new("s1", "42")
+            .with_rich_markdown(format!("**s1**\n{inline}"))
+            .with_button_rows(vec![vec![opt("cmd:/use s1", "💬 Переключиться", None)]])
+            .with_inline_buttons(true);
+        let id = TelegramChannel::new("t".into(), vec![])
+            .with_api_base(base)
+            .send(&message)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("2"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        let body: serde_json::Value = serde_json::from_str(&seen[1].1).unwrap();
+        assert_eq!(body["text"], "<b>s1</b>\n");
+        assert!(!body["text"].as_str().unwrap().contains("tg-button"));
+        assert_eq!(
+            body["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            "cmd:/use s1"
         );
     }
 

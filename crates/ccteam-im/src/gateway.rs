@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::im_callbacks;
 use crate::im_views::{
     self, CommandView, DetachedSessionRow, ProjectRow, ProjectsView, RichReply, SessionRow,
-    SessionsView, StatusView,
+    SessionsView, StatusChild, StatusView,
 };
 use crate::pending::InteractionOrigin;
 use crate::transport::{ButtonStyle, ChannelAttachment, ChoiceReply, MessageOption, ReplyKeyboard};
@@ -942,6 +942,14 @@ pub enum GatewayEventKind {
         /// Platform message id of the message to edit (Telegram
         /// `message_id`, as a string).
         message_id: String,
+    },
+    /// Telegram-only private callback response. On delivery failure the daemon
+    /// performs the pre-ephemeral edit/send path recorded here.
+    EphemeralAnswer {
+        /// Callback that authorizes the one-shot response.
+        callback: crate::transport::CallbackEphemeral,
+        /// Existing confirmation prompt to edit if the ephemeral send fails.
+        fallback_edit_message_id: Option<String>,
     },
 }
 
@@ -3557,21 +3565,73 @@ impl Gateway {
             // `nav:use:<sid>` — with no pending-registry token), so it is
             // resolved here, before the token-keyed choice path.
             if let Some(nav) = reply.data.strip_prefix("nav:") {
-                return self
-                    .resolve_nav_selection(&chat, nav)
-                    .await
-                    .map(plain_replies);
+                let replies = match self.resolve_nav_selection(&chat, nav).await {
+                    Ok(replies) => plain_replies(replies),
+                    Err(error) => {
+                        return self.route_callback_error(
+                            &chat,
+                            reply.callback_ephemeral.as_ref(),
+                            message_id,
+                            error,
+                        )
+                    }
+                };
+                return Ok(self.route_callback_replies(
+                    &chat,
+                    reply.callback_ephemeral.as_ref(),
+                    message_id,
+                    replies,
+                ));
             }
             // TG-GATE-V2 W3 — `cmd:`/`cmd:?`/`cmd:noop` inline buttons route
             // through `handle_command`, not the token-keyed pending registry.
             match im_callbacks::parse(&reply.data) {
                 im_callbacks::CallbackAction::Choice { .. } => {}
-                action => return self.resolve_cmd_callback(&chat, action, message_id).await,
+                action => {
+                    let replies = match self
+                        .resolve_cmd_callback(
+                            &chat,
+                            action,
+                            message_id,
+                            reply.callback_ephemeral.as_ref(),
+                        )
+                        .await
+                    {
+                        Ok(replies) => replies,
+                        Err(error) => {
+                            return self.route_callback_error(
+                                &chat,
+                                reply.callback_ephemeral.as_ref(),
+                                message_id,
+                                error,
+                            )
+                        }
+                    };
+                    return Ok(self.route_callback_replies(
+                        &chat,
+                        reply.callback_ephemeral.as_ref(),
+                        message_id,
+                        replies,
+                    ));
+                }
             }
-            return self
-                .resolve_selection(&chat, &reply.data)
-                .await
-                .map(plain_replies);
+            let replies = match self.resolve_selection(&chat, &reply.data).await {
+                Ok(replies) => plain_replies(replies),
+                Err(error) => {
+                    return self.route_callback_error(
+                        &chat,
+                        reply.callback_ephemeral.as_ref(),
+                        message_id,
+                        error,
+                    )
+                }
+            };
+            return Ok(self.route_callback_replies(
+                &chat,
+                reply.callback_ephemeral.as_ref(),
+                message_id,
+                replies,
+            ));
         }
         // Pi extension input/editor dialogs are represented by an External
         // pending with no buttons. While one is tagged to this ccteam sid,
@@ -4619,6 +4679,7 @@ impl Gateway {
         chat: &ChatKey,
         content: String,
         button_rows: Vec<Vec<MessageOption>>,
+        callback: Option<&crate::transport::CallbackEphemeral>,
     ) {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4630,7 +4691,12 @@ impl Gateway {
             chat_id: chat.chat_id.clone(),
             thread_ts: None,
             content,
-            kind: GatewayEventKind::Answer,
+            kind: callback.map_or(GatewayEventKind::Answer, |callback| {
+                GatewayEventKind::EphemeralAnswer {
+                    callback: callback.clone(),
+                    fallback_edit_message_id: None,
+                }
+            }),
             attachments: Vec::new(),
             options: Vec::new(),
             button_rows,
@@ -4657,6 +4723,90 @@ impl Gateway {
             content,
             kind: GatewayEventKind::EditMessage {
                 message_id: platform_message_id,
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: None,
+            slug: None,
+        });
+    }
+
+    fn emit_confirmation_ephemeral(
+        &self,
+        chat: &ChatKey,
+        callback: crate::transport::CallbackEphemeral,
+        fallback_edit_message_id: String,
+        content: String,
+    ) {
+        self.emit_ephemeral_reply(chat, &callback, Some(fallback_edit_message_id), content);
+    }
+
+    fn route_callback_replies(
+        &self,
+        chat: &ChatKey,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+        message_id: &str,
+        replies: Vec<RichReply>,
+    ) -> Vec<RichReply> {
+        let Some(callback) = callback else {
+            return replies;
+        };
+        if replies.is_empty() {
+            return replies;
+        }
+        let content = replies
+            .into_iter()
+            .map(|reply| reply.plain)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.emit_ephemeral_reply(
+            chat,
+            callback,
+            telegram_callback_message_id(message_id),
+            content,
+        );
+        Vec::new()
+    }
+
+    fn route_callback_error(
+        &self,
+        chat: &ChatKey,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+        message_id: &str,
+        error: anyhow::Error,
+    ) -> Result<Vec<RichReply>> {
+        let Some(callback) = callback else {
+            return Err(error);
+        };
+        self.emit_ephemeral_reply(
+            chat,
+            callback,
+            telegram_callback_message_id(message_id),
+            error.to_string(),
+        );
+        Ok(Vec::new())
+    }
+
+    fn emit_ephemeral_reply(
+        &self,
+        chat: &ChatKey,
+        callback: &crate::transport::CallbackEphemeral,
+        fallback_edit_message_id: Option<String>,
+        content: String,
+    ) {
+        let event_id = fallback_edit_message_id
+            .as_deref()
+            .unwrap_or(&callback.callback_query_id);
+        self.emit_user_signal(GatewayEvent {
+            id: format!("gateway-ephemeral-confirm-{}-{event_id}", chat.chat_id),
+            channel: chat.channel.clone(),
+            chat_id: chat.chat_id.clone(),
+            thread_ts: None,
+            content,
+            kind: GatewayEventKind::EphemeralAnswer {
+                callback: callback.clone(),
+                fallback_edit_message_id,
             },
             attachments: Vec::new(),
             options: Vec::new(),
@@ -8558,6 +8708,7 @@ impl Gateway {
         chat: &ChatKey,
         action: im_callbacks::CallbackAction,
         message_id: &str,
+        callback: Option<&crate::transport::CallbackEphemeral>,
     ) -> Result<Vec<RichReply>> {
         match action {
             im_callbacks::CallbackAction::Choice { .. } => Ok(Vec::new()),
@@ -8571,7 +8722,7 @@ impl Gateway {
                 // one-per-row `options` the project/session pickers use.
                 let token = self.register_command_confirmation(chat.clone(), cmd.clone());
                 let rows = confirm_cmd_button_rows(&token);
-                self.emit_button_rows(chat, confirm_prompt_text(&cmd), rows);
+                self.emit_button_rows(chat, confirm_prompt_text(&cmd), rows, callback);
                 Ok(Vec::new())
             }
             im_callbacks::CallbackAction::Confirmed(token) => {
@@ -8579,7 +8730,7 @@ impl Gateway {
                     ConfirmationResolution::Command(cmd) => cmd,
                     ConfirmationResolution::Foreign => return Ok(Vec::new()),
                     ConfirmationResolution::Stale => {
-                        return Ok(vec![RichReply::plain("Подтверждение устарело")]);
+                        return Ok(self.emit_stale_confirmation(chat, callback, message_id));
                     }
                 };
                 // TG-GATE-V2 W8 — edit the confirmation message itself
@@ -8589,11 +8740,13 @@ impl Gateway {
                 // prior append-a-new-message behavior.
                 let mut replies = Vec::new();
                 let ack = format!("✅ {cmd}");
-                match telegram_callback_message_id(message_id) {
-                    Some(platform_message_id) => {
-                        self.emit_confirmation_edit(chat, platform_message_id, ack)
+                if callback.is_none() {
+                    match telegram_callback_message_id(message_id) {
+                        Some(platform_message_id) => {
+                            self.emit_confirmation_edit(chat, platform_message_id, ack)
+                        }
+                        None => replies.push(RichReply::plain(ack)),
                     }
-                    None => replies.push(RichReply::plain(ack)),
                 }
                 // `already_confirmed: true` — this tap WAS the yes/no
                 // answer; a bulk `/stop` must execute directly, not raise a
@@ -8608,11 +8761,20 @@ impl Gateway {
                 match self.take_command_confirmation(chat, &token) {
                     ConfirmationResolution::Foreign => Ok(Vec::new()),
                     ConfirmationResolution::Stale => {
-                        Ok(vec![RichReply::plain("Подтверждение устарело")])
+                        Ok(self.emit_stale_confirmation(chat, callback, message_id))
                     }
                     ConfirmationResolution::Command(_) => {
-                        match telegram_callback_message_id(message_id) {
-                            Some(platform_message_id) => {
+                        match (callback, telegram_callback_message_id(message_id)) {
+                            (Some(callback), Some(platform_message_id)) => {
+                                self.emit_confirmation_ephemeral(
+                                    chat,
+                                    callback.clone(),
+                                    platform_message_id,
+                                    "Отменено".to_string(),
+                                );
+                                Ok(Vec::new())
+                            }
+                            (None, Some(platform_message_id)) => {
                                 self.emit_confirmation_edit(
                                     chat,
                                     platform_message_id,
@@ -8620,7 +8782,7 @@ impl Gateway {
                                 );
                                 Ok(Vec::new())
                             }
-                            None => Ok(vec![RichReply::plain("Отменено")]),
+                            (_, None) => Ok(vec![RichReply::plain("Отменено")]),
                         }
                     }
                 }
@@ -8635,6 +8797,26 @@ impl Gateway {
                     None => Ok(vec![RichReply::plain("Неизвестная команда")]),
                 }
             }
+        }
+    }
+
+    fn emit_stale_confirmation(
+        &self,
+        chat: &ChatKey,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+        message_id: &str,
+    ) -> Vec<RichReply> {
+        match (callback, telegram_callback_message_id(message_id)) {
+            (Some(callback), Some(platform_message_id)) => {
+                self.emit_confirmation_ephemeral(
+                    chat,
+                    callback.clone(),
+                    platform_message_id,
+                    "Подтверждение устарело".to_string(),
+                );
+                Vec::new()
+            }
+            _ => vec![RichReply::plain("Подтверждение устарело")],
         }
     }
 
@@ -9909,11 +10091,14 @@ impl Gateway {
                     .session_title(child)
                     .and_then(|title| truncate_title(&title))
                     .unwrap_or_else(|| "—".to_string());
-                format!(
-                    "{} · {} · {child_model} · {} · {title}",
-                    child.id,
-                    vendor_str(child.vendor),
-                    activity_marker(activity)
+                (
+                    child.id.clone(),
+                    format!(
+                        "{} · {} · {child_model} · {} · {title}",
+                        child.id,
+                        vendor_str(child.vendor),
+                        activity_marker(activity)
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -9957,14 +10142,20 @@ impl Gateway {
             detail_lines.push("⚡️ Использование:".to_string());
             detail_lines.extend(usage_lines);
         }
+        let mut children = Vec::new();
         if !child_summary.is_empty() {
             detail_lines.push(String::new());
             detail_lines.push(format!("👥 Дочерние ({}):", child_summary.len()));
-            for (index, child) in child_summary.into_iter().enumerate() {
+            for (index, (sid, child)) in child_summary.into_iter().enumerate() {
                 if index > 0 {
                     detail_lines.push(String::new());
                 }
+                let detail_line_index = detail_lines.len();
                 detail_lines.push(format!("  • {child}"));
+                children.push(StatusChild {
+                    sid,
+                    detail_line_index,
+                });
             }
         }
         let same_project_sessions = visible
@@ -10032,10 +10223,7 @@ impl Gateway {
             detail_lines,
             cost_24h,
             resume,
-            child_stop_sids: direct_children
-                .iter()
-                .map(|child| child.id.clone())
-                .collect(),
+            children,
         })
     }
 
@@ -16869,7 +17057,10 @@ mod tests {
                 "",
                 "",
                 &[],
-                Some(&ChoiceReply { data }),
+                Some(&ChoiceReply {
+                    data,
+                    callback_ephemeral: None,
+                }),
             )
             .await
             .unwrap()
@@ -17325,6 +17516,7 @@ mod tests {
         /// v0.9 T2 — `close_thread` call count (stop path + discarded zombie
         /// resume both close).
         closes: AtomicUsize,
+        closes_notify: tokio::sync::Notify,
         close_failures_remaining: Arc<AtomicUsize>,
     }
 
@@ -17378,6 +17570,7 @@ mod tests {
                 title_surface: false,
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
+                closes_notify: tokio::sync::Notify::new(),
                 close_failures_remaining: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -17436,6 +17629,20 @@ mod tests {
         fn with_close_failures(self, count: usize) -> Self {
             self.close_failures_remaining.store(count, Ordering::SeqCst);
             self
+        }
+
+        async fn wait_for_closes(&self, expected: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let notified = self.closes_notify.notified();
+                    if self.closes.load(Ordering::SeqCst) >= expected {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("expected vendor close");
         }
     }
 
@@ -17663,6 +17870,7 @@ mod tests {
 
         async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
             self.closes.fetch_add(1, Ordering::SeqCst);
+            self.closes_notify.notify_waiters();
             let mut remaining = self.close_failures_remaining.load(Ordering::SeqCst);
             while remaining > 0 {
                 match self.close_failures_remaining.compare_exchange(
@@ -18617,6 +18825,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/stop children".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -18646,6 +18855,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: format!("cmd:!{confirm_token}"),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -18695,6 +18905,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: preview.options[1].data.clone(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -19021,6 +19232,7 @@ mod tests {
         assert_eq!(current.generation, newer_generation);
         assert_eq!(current.thread.identity, "newer-live-thread");
         drop(guard);
+        fake.wait_for_closes(1).await;
         assert!(
             fake.closes.load(Ordering::SeqCst) >= 1,
             "the discarded vendor result must be closed, got {} closes",
@@ -19566,8 +19778,9 @@ mod tests {
     /// enqueue→resume→drain path (same end state: turn lands, sid stable).
     #[tokio::test]
     async fn gateway_resumes_dead_session_on_next_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
 
         let sid = gateway
             .create_session_api(
@@ -20868,7 +21081,9 @@ mod tests {
         );
         let sessions = gateway.render_sessions(&tenant, true).await.plain;
         assert!(
-            sessions.contains(&format!("{child} | claude.— | 🟢 ожидание | —")),
+            sessions.contains(&format!(
+                "{child} | claude.— | 🟢 ожидание | delegated investiga…"
+            )),
             "the tenant's session list must include its delegated child: {sessions}"
         );
     }
@@ -22631,7 +22846,7 @@ mod tests {
         assert!(mock[0].contains("alpha |"));
     }
 
-    /// `/sessions` has `cmd:/use` buttons in its rich reply and a table fallback.
+    /// `/sessions` has inline stop/use buttons in its rich reply and a plain fallback.
     #[tokio::test]
     async fn telegram_sessions_delivers_switch_buttons() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -22647,16 +22862,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replies.len(), 1);
-        assert!(replies[0].markdown.contains("| **s1** |"));
-        assert_eq!(
-            replies[0]
-                .button_rows
-                .iter()
-                .flatten()
-                .map(|option| option.data.as_str())
-                .collect::<Vec<_>>(),
-            vec!["cmd:/use s1"],
-        );
+        assert!(replies[0]
+            .markdown
+            .contains("**s1** · claude/— · 🟢 ожидание"));
+        assert!(replies[0].markdown.contains("data=\"cmd:?/stop s1\""));
+        assert!(replies[0].markdown.contains("data=\"cmd:/use s1\""));
+        assert!(!replies[0].plain.contains("<tg-button-row>"));
 
         gateway
             .handle_text("mock", "chat-2", "bob", "/new claude reviewer")
@@ -22687,19 +22898,35 @@ mod tests {
             .unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let reply = gateway.render_sessions(&chat, false).await;
-        let options = reply.button_rows.into_iter().flatten().collect::<Vec<_>>();
-        assert_eq!(
-            options
-                .iter()
-                .map(|option| option.data.as_str())
-                .collect::<Vec<_>>(),
-            vec!["cmd:/use s2", "cmd:/use s1"]
-        );
-        assert_eq!(options[0].label, "▶ s2 claude");
-        assert_eq!(options[1].label, "s1 claude");
+        assert!(reply.markdown.contains("data=\"cmd:/use s2\""));
+        assert!(reply.markdown.contains("data=\"cmd:/use s1\""));
+        assert_eq!(reply.button_rows[2][0].data, "cmd:/sessions");
+        assert_eq!(reply.button_rows[2][1].data, "cmd:?/new");
+
+        let typed = gateway
+            .handle_text("telegram", "chat-1", "alice", "/use s1")
+            .await
+            .unwrap();
+        let via_button = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/use s1".to_string(),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(typed, vec!["Используется сессия s1\n↓ Статус → /status"]);
+        assert_eq!(via_button, vec!["Используется сессия s1"]);
     }
 
-    /// A verbose title is capped in the compact session switch button.
+    /// A verbose title is capped in the compact session table.
     #[tokio::test]
     async fn session_buttons_stay_compact_with_a_long_title() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -22713,10 +22940,14 @@ mod tests {
         gateway.rename_session("s1", long).await.unwrap();
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let reply = gateway.render_sessions(&chat, false).await;
-        let option = &reply.button_rows[0][0];
-        assert_eq!(option.label, "▶ s1 claude · A really re…");
-        assert_eq!(option.data, "cmd:/use s1");
-        assert!(option.data.len() <= 64);
+        assert!(reply.markdown.contains("A really really lon…"));
+        assert!(reply.markdown.contains("data=\"cmd:/use s1\""));
+        assert_eq!(reply.button_rows[1][1].data, "cmd:?/new");
+        assert!(reply
+            .button_rows
+            .iter()
+            .flatten()
+            .all(|button| button.data.len() <= 64));
     }
 
     /// `/sessions` renders the required compact Russian table.
@@ -22734,7 +22965,6 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert!(listing[0].contains("sid | vendor.model | статус | ctx"));
         assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | —"));
     }
 
@@ -22760,8 +22990,13 @@ mod tests {
         });
         assert_eq!(
             reply.button_rows.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![8, 1]
+            vec![2; 10]
         );
+        assert!(reply
+            .button_rows
+            .iter()
+            .flatten()
+            .all(|button| button.data.len() <= 64));
     }
 
     /// Tapping a picker button switches project / session through the SAME
@@ -22793,6 +23028,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "nav:cd:beta".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -22817,6 +23053,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "nav:use:s1".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -22839,6 +23076,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "nav:bogus".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -22870,6 +23108,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -22898,6 +23137,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/stop s1".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -22927,6 +23167,47 @@ mod tests {
         assert_eq!(no.id, "no");
         assert_eq!(no.style, Some(ButtonStyle::Danger));
         assert_eq!(no.data, format!("cmd:x{}", &yes.data[5..]));
+    }
+
+    #[tokio::test]
+    async fn cmd_confirmation_carries_group_callback_ephemeral_metadata() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-10",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/stop all".to_string(),
+                    callback_ephemeral: Some(crate::transport::CallbackEphemeral {
+                        callback_query_id: "cb-42".to_string(),
+                        receiver_user_id: 7,
+                        replace_callback_query_message: true,
+                        ephemeral_message_id: None,
+                    }),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+        match events.try_recv().expect("confirmation event").kind {
+            GatewayEventKind::EphemeralAnswer {
+                callback,
+                fallback_edit_message_id,
+            } => {
+                assert_eq!(callback.callback_query_id, "cb-42");
+                assert_eq!(callback.receiver_user_id, 7);
+                assert_eq!(fallback_edit_message_id, None);
+            }
+            other => panic!("expected EphemeralAnswer, got {other:?}"),
+        }
     }
 
     /// TG-GATE-V2 W9 — [`Gateway::evict_oldest_confirmations`] is the
@@ -23014,6 +23295,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23030,7 +23312,10 @@ mod tests {
                 "",
                 "",
                 &[],
-                Some(&ChoiceReply { data: yes.clone() }),
+                Some(&ChoiceReply {
+                    data: yes.clone(),
+                    callback_ephemeral: None,
+                }),
             )
             .await
             .unwrap();
@@ -23044,7 +23329,10 @@ mod tests {
                 "",
                 "",
                 &[],
-                Some(&ChoiceReply { data: yes }),
+                Some(&ChoiceReply {
+                    data: yes,
+                    callback_ephemeral: None,
+                }),
             )
             .await
             .unwrap();
@@ -23072,6 +23360,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23091,7 +23380,10 @@ mod tests {
                 "",
                 "",
                 &[],
-                Some(&ChoiceReply { data: cancel }),
+                Some(&ChoiceReply {
+                    data: cancel,
+                    callback_ephemeral: None,
+                }),
             )
             .await
             .unwrap();
@@ -23121,6 +23413,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23142,6 +23435,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: confirm_token,
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23159,6 +23453,133 @@ mod tests {
             GatewayEventKind::EditMessage { ref message_id } => assert_eq!(message_id, "777"),
             other => panic!("expected EditMessage, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn ephemeral_confirmation_delivers_command_outcome_without_public_reply() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+        let callback = crate::transport::CallbackEphemeral {
+            callback_query_id: "cb-stop".to_string(),
+            receiver_user_id: 7,
+            replace_callback_query_message: false,
+            ephemeral_message_id: Some(99),
+        };
+
+        gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/stop s1".to_string(),
+                    callback_ephemeral: Some(callback.clone()),
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = events.try_recv().expect("confirmation event");
+        let confirm_data = confirmation.button_rows[0][0].data.clone();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: confirm_data,
+                    callback_ephemeral: Some(callback),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            replies.is_empty(),
+            "ephemeral callback must not return a public reply"
+        );
+        let outcome = events.try_recv().expect("ephemeral outcome event");
+        assert_eq!(outcome.content, "Сессия s1 недоступна этому чату");
+        assert!(matches!(
+            outcome.kind,
+            GatewayEventKind::EphemeralAnswer { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirmed_ephemeral_command_error_routes_without_public_reply() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway
+            .handle_text("telegram", "-100", "7", "/new claude")
+            .await
+            .unwrap();
+
+        let blocker = proj.path().join("routing-blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        gateway.routing_path = Some(blocker.join("routing.json"));
+
+        let mut events = gateway.subscribe_events();
+        let callback = crate::transport::CallbackEphemeral {
+            callback_query_id: "cb-stop-error".to_string(),
+            receiver_user_id: 7,
+            replace_callback_query_message: false,
+            ephemeral_message_id: Some(99),
+        };
+        gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/stop s1".to_string(),
+                    callback_ephemeral: Some(callback.clone()),
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = events.try_recv().expect("confirmation event");
+        let confirm_data = confirmation.button_rows[0][0].data.clone();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: confirm_data,
+                    callback_ephemeral: Some(callback),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(replies.is_empty());
+        let outcome = events.try_recv().expect("ephemeral error event");
+        assert!(
+            outcome.content.contains("File exists"),
+            "{}",
+            outcome.content
+        );
+        assert!(matches!(
+            outcome.kind,
+            GatewayEventKind::EphemeralAnswer { .. }
+        ));
     }
 
     /// Same edit-in-place treatment for a cancellation tap.
@@ -23179,6 +23600,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23198,7 +23620,10 @@ mod tests {
                 "tg-cb-42",
                 "",
                 &[],
-                Some(&ChoiceReply { data: cancel_token }),
+                Some(&ChoiceReply {
+                    data: cancel_token,
+                    callback_ephemeral: None,
+                }),
             )
             .await
             .unwrap();
@@ -23232,6 +23657,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:!deadbeef".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23248,6 +23674,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23273,11 +23700,54 @@ mod tests {
                 "",
                 "",
                 &[],
-                Some(&ChoiceReply { data: cancel }),
+                Some(&ChoiceReply {
+                    data: cancel,
+                    callback_ephemeral: None,
+                }),
             )
             .await
             .unwrap();
         assert_eq!(expired, vec!["Подтверждение устарело"]);
+    }
+
+    #[tokio::test]
+    async fn stale_ephemeral_confirmation_emits_an_ephemeral_edit() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-99",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:!deadbeef".to_string(),
+                    callback_ephemeral: Some(crate::transport::CallbackEphemeral {
+                        callback_query_id: "cb-42".to_string(),
+                        receiver_user_id: 7,
+                        replace_callback_query_message: false,
+                        ephemeral_message_id: Some(99),
+                    }),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            replies.is_empty(),
+            "stale callback must not become public text"
+        );
+        match events.try_recv().expect("ephemeral stale event").kind {
+            GatewayEventKind::EphemeralAnswer { callback, .. } => {
+                assert_eq!(callback.ephemeral_message_id, Some(99));
+            }
+            other => panic!("expected EphemeralAnswer, got {other:?}"),
+        }
     }
 
     /// A `cmd:` command that isn't one of `GATEWAY_COMMANDS` (typo, or a
@@ -23299,6 +23769,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:/bogus-command".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23336,6 +23807,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:/status".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -23355,6 +23827,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "cmd:?/stop s1".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -25771,6 +26244,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "t1:1".into(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -27112,18 +27586,19 @@ mod tests {
             ]
         );
 
-        // The compact table stays terse while the switch button carries a
-        // capped title to disambiguate otherwise identical sessions.
+        // The compact table stays terse while its title cell disambiguates
+        // otherwise identical sessions.
         let listing = gateway
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | —"));
+        assert!(listing[0].contains("s1 | claude.— | 🟢 ожидание | my custom title"));
         let chat = ChatKey::new("mock", "chat-1", "alice");
-        assert_eq!(
-            gateway.render_sessions(&chat, false).await.button_rows[0][0].label,
-            "▶ s1 claude · my custom t…"
-        );
+        assert!(gateway
+            .render_sessions(&chat, false)
+            .await
+            .markdown
+            .contains("my custom title"));
 
         // A later plain message must NOT clobber the rename via auto-title.
         gateway
@@ -27388,6 +27863,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: format!("{token}:1"),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -27435,6 +27911,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: "hdead:0".to_string(),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -27662,6 +28139,7 @@ mod tests {
                 &[],
                 Some(&ChoiceReply {
                     data: format!("{token}:0"),
+                    callback_ephemeral: None,
                 }),
             )
             .await
@@ -28061,7 +28539,11 @@ mod tests {
     async fn delegation_watch_is_spent_by_the_dispatched_task_boundary() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().to_path_buf();
-        let gateway = delegation_gateway(&project_dir).await;
+        // This test drives delivery synchronously below. Starting the async
+        // notifier would race its startup reconcile against that manual path,
+        // an interleaving production never permits (the notifier reconciles
+        // before it starts draining live signals).
+        let gateway = delegation_gateway_without_notifier(&project_dir).await;
 
         let (parent_sid, child_sid) = {
             let mut gw = gateway.lock().await;
@@ -28324,7 +28806,6 @@ mod tests {
         gw.enable_project_creation(paths.clone());
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gw.set_event_sink(etx);
-        tokio::spawn(async move { while erx.recv().await.is_some() {} });
 
         let mk = |depth: u32| DelegationParent {
             sid: "sPARENT".into(),
@@ -28397,18 +28878,37 @@ mod tests {
         .unwrap_err();
         assert!(e3.to_string().contains("ceiling"), "delegated: {e3}");
 
-        // All three emitted a `delegation_denied` with the right reason.
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        let events =
-            ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha")).unwrap();
-        let reasons: Vec<&str> = events
-            .iter()
-            .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("delegation_denied"))
-            .filter_map(|e| e.get("reason").and_then(|v| v.as_str()))
-            .collect();
-        assert!(reasons.contains(&"depth"), "reasons: {reasons:?}");
-        assert!(reasons.contains(&"children"), "reasons: {reasons:?}");
-        assert!(reasons.contains(&"delegated"), "reasons: {reasons:?}");
+        // Broadcast is synchronous; the journal append intentionally is not.
+        // Observe the live contract instead of timing an unrelated write task.
+        let mut reasons = Vec::new();
+        while reasons.len() < 3 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), erx.recv())
+                .await
+                .expect("delegation guardrail event timed out")
+                .expect("delegation event channel stays open");
+            if let GatewayEventKind::Delegation {
+                relation,
+                reason: Some(reason),
+                ..
+            } = event.kind
+            {
+                if relation == "denied" {
+                    reasons.push(reason);
+                }
+            }
+        }
+        assert!(
+            reasons.iter().any(|reason| reason == "depth"),
+            "reasons: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|reason| reason == "children"),
+            "reasons: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|reason| reason == "delegated"),
+            "reasons: {reasons:?}"
+        );
     }
 
     /// The Ambient budget gate denies a spawn when the vendor's 24h project
@@ -28437,7 +28937,6 @@ mod tests {
         gw.enable_project_creation(paths.clone());
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gw.set_event_sink(etx);
-        tokio::spawn(async move { while erx.recv().await.is_some() {} });
 
         let e = gw
             .create_delegated_session(
@@ -28458,13 +28957,18 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("budget"), "budget: {e}");
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        let events =
-            ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha")).unwrap();
-        assert!(events.iter().any(|e| {
-            e.get("event").and_then(|v| v.as_str()) == Some("delegation_denied")
-                && e.get("reason").and_then(|v| v.as_str()) == Some("budget")
-        }));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), erx.recv())
+            .await
+            .expect("delegation budget event timed out")
+            .expect("delegation event channel stays open");
+        assert!(matches!(
+            event.kind,
+            GatewayEventKind::Delegation {
+                relation,
+                reason: Some(reason),
+                ..
+            } if relation == "denied" && reason == "budget"
+        ));
     }
 
     /// Chaos: a durable watch + a completed child turn on disk, loaded by a

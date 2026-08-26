@@ -15,7 +15,7 @@
 //! inbound IM message reached the harness layer.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -101,6 +101,8 @@ struct StubAdapter {
 struct GatewayAdapter {
     starts: AtomicUsize,
     submits: AtomicUsize,
+    close_calls: AtomicUsize,
+    suppress_answers: bool,
     /// How many times the gateway asked this session to rebuild its ccteam
     /// tool face — the first-activation priming must be exactly once per
     /// session, not once per turn.
@@ -166,15 +168,17 @@ impl HarnessAdapter for GatewayAdapter {
         };
         self.submitted_threads.lock().await.push(h.identity.clone());
         self.submitted_payloads.lock().await.push(text.clone());
-        self.events
-            .lock()
-            .await
-            .push_back(ThreadEvent::ItemCompleted {
-                item: ThreadItem {
-                    id: "gateway-msg-1".to_string(),
-                    details: ThreadItemDetails::AgentMessage(format!("gateway echo: {text}")),
-                },
-            });
+        if !self.suppress_answers {
+            self.events
+                .lock()
+                .await
+                .push_back(ThreadEvent::ItemCompleted {
+                    item: ThreadItem {
+                        id: "gateway-msg-1".to_string(),
+                        details: ThreadItemDetails::AgentMessage(format!("gateway echo: {text}")),
+                    },
+                });
+        }
         Ok(TurnId::new("gateway-turn"))
     }
 
@@ -227,6 +231,7 @@ impl HarnessAdapter for GatewayAdapter {
     }
 
     async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
+        self.close_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -242,6 +247,103 @@ impl HarnessAdapter for GatewayAdapter {
 
     async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
         Ok(ThreadStatus::default())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DraftStopChannel {
+    inner: Arc<MockChannel>,
+    inbox: Arc<tokio::sync::Mutex<VecDeque<ChannelMessage>>>,
+    stop_scheduled: Arc<AtomicBool>,
+}
+
+impl DraftStopChannel {
+    fn new() -> (Self, Arc<MockChannel>) {
+        let inner = Arc::new(
+            MockChannel::new()
+                .with_name("telegram")
+                .with_draft_support(),
+        );
+        let channel = Self {
+            inner: inner.clone(),
+            inbox: Arc::default(),
+            stop_scheduled: Arc::default(),
+        };
+        (channel, inner)
+    }
+
+    async fn push(&self, message: ChannelMessage) {
+        self.inbox.lock().await.push_back(message);
+    }
+}
+
+#[async_trait]
+impl Channel for DraftStopChannel {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        self.inner.send(message).await
+    }
+
+    async fn send_draft(
+        &self,
+        recipient: &str,
+        draft_id: i64,
+        markdown: &str,
+    ) -> anyhow::Result<()> {
+        let result = self.inner.send_draft(recipient, draft_id, markdown).await;
+        if result.is_ok() && !self.stop_scheduled.swap(true, Ordering::SeqCst) {
+            let inbox = self.inbox.clone();
+            let recipient = recipient.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                inbox.lock().await.push_back(ChannelMessage {
+                    id: "tg-stop-update".into(),
+                    sender: recipient.clone(),
+                    reply_target: recipient,
+                    content: format!("{}{}", ccteam_im::transport::STOPPED_DRAFT_PREFIX, draft_id),
+                    channel: "telegram".into(),
+                    timestamp: 0,
+                    thread_ts: None,
+                    attachments: Vec::new(),
+                    selection: None,
+                });
+            });
+        }
+        result
+    }
+
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        loop {
+            if tx.is_closed() {
+                return Ok(());
+            }
+            if let Some(message) = self.inbox.lock().await.pop_front() {
+                if tx.send(message).await.is_err() {
+                    return Ok(());
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    fn supports_rich_messages(&self) -> bool {
+        self.inner.supports_rich_messages()
+    }
+
+    async fn edit_message(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        content: &str,
+        button_rows: &[Vec<ccteam_im::transport::MessageOption>],
+    ) -> anyhow::Result<Option<String>> {
+        self.inner
+            .edit_message(recipient, message_id, content, button_rows)
+            .await
     }
 }
 
@@ -684,6 +786,95 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
             .iter()
             .any(|(_, state, content)| state == "sent" && content.starts_with(echo))
     }));
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_generation_update_dispatches_stop_for_draft_owner() {
+    let _g = env_lock();
+    std::env::set_var("CCTEAM_IM_PROGRESS", "on");
+    std::env::set_var("CCTEAM_IM_PROGRESS_THROTTLE_MS", "0");
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let (channel, inner) = DraftStopChannel::new();
+    for (id, content) in [("stop-1", "/new claude helper"), ("stop-2", "start turn")] {
+        channel
+            .push(ChannelMessage {
+                id: id.into(),
+                sender: "alice".into(),
+                reply_target: "123".into(),
+                content: content.into(),
+                channel: "telegram".into(),
+                timestamp: 0,
+                thread_ts: None,
+                attachments: Vec::new(),
+                selection: None,
+            })
+            .await;
+    }
+
+    let adapter = Arc::new(GatewayAdapter {
+        suppress_answers: true,
+        ..Default::default()
+    });
+    adapter
+        .events
+        .lock()
+        .await
+        .push_back(ThreadEvent::ItemStarted {
+            item: ThreadItem {
+                id: "draft-tool".into(),
+                details: ThreadItemDetails::ToolCall {
+                    name: "Bash".into(),
+                    args: serde_json::json!({"command": "long-running"}),
+                },
+            },
+        });
+    let adapter_factory: AdapterFactory = {
+        let cloned = adapter.clone();
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".into(),
+        Arc::new(channel) as Arc<dyn Channel + Send + Sync>,
+    );
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        max_runtime: Some(Duration::from_millis(900)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+        extra_channels: None,
+        ..Default::default()
+    };
+
+    run_daemon_with_shutdown(args, async {
+        futures::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        !inner.drafts().await.is_empty(),
+        "draft must be published first"
+    );
+    assert!(
+        inner
+            .outbox()
+            .await
+            .iter()
+            .any(|message| message.content.starts_with("▶️")),
+        "stopped draft must be preserved as a normal message before /stop"
+    );
+    assert!(
+        adapter.close_calls.load(Ordering::SeqCst) >= 1,
+        "stopped_message_generation must dispatch /stop to the owning session"
+    );
+    std::env::remove_var("CCTEAM_IM_PROGRESS");
+    std::env::remove_var("CCTEAM_IM_PROGRESS_THROTTLE_MS");
 }
 
 /// V0.8.4 P0 — a gateway reply that overflows the channel's

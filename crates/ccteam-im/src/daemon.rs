@@ -12,7 +12,10 @@ use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU8, Ordering},
+    Arc, Mutex as StdMutex, RwLock,
+};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -34,7 +37,7 @@ use crate::latency::now_unix_ms;
 use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
 #[cfg(feature = "telegram")]
 use crate::transport::providers::telegram::TelegramChannel;
-use crate::transport::{Channel, ChannelMessage, SendMessage};
+use crate::transport::{Channel, ChannelMessage, EphemeralDelivery, SendMessage};
 use crate::{list_bots, BotRegistration};
 
 /// V0.6.1 F132 — keyed map of live IM Channels, keyed by
@@ -47,6 +50,264 @@ use crate::{list_bots, BotRegistration};
 /// that demultiplexes messages back to the right Channel for
 /// admin-reply send-back.
 pub type ChannelMap = HashMap<String, Arc<dyn Channel + Send + Sync>>;
+
+type DraftRouteKey = (String, String, i64);
+
+const DRAFT_ROUTE_TTL: Duration = Duration::from_secs(60 * 60);
+const DRAFT_SEND_FLOOR: Duration = Duration::from_secs(2);
+const DEFAULT_DRAFT_KEEPALIVE: Duration = Duration::from_secs(10);
+const MIN_DRAFT_KEEPALIVE: Duration = Duration::from_secs(2);
+const MAX_DRAFT_KEEPALIVE: Duration = Duration::from_secs(25);
+const DRAFT_BREAKER_RETRY_TICKS: u8 = 3;
+const DRAFT_FINALIZATION_GRACE: Duration = Duration::from_millis(100);
+const DRAFT_FINALIZATION_TTL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone)]
+struct DraftRoute {
+    sid: String,
+    content: String,
+    updated_at: std::time::Instant,
+    stopped: Arc<AtomicBool>,
+}
+
+type DraftRoutes = Arc<StdMutex<HashMap<DraftRouteKey, DraftRoute>>>;
+#[derive(Default)]
+struct DraftFinalizationState {
+    by_status_key: HashMap<String, Arc<AtomicU8>>,
+    by_answer_seq: HashMap<(String, u64), String>,
+    pending_by_sid: HashMap<String, (u64, String)>,
+}
+
+type DraftFinalizations = Arc<StdMutex<DraftFinalizationState>>;
+
+const FINAL_PENDING: u8 = 0;
+const FINAL_ANSWER_IN_FLIGHT: u8 = 1;
+const FINAL_SENT: u8 = 2;
+const FINAL_CANCELLED: u8 = 3;
+const FINALIZING: u8 = 4;
+
+struct DraftKeepaliveState {
+    recipient: String,
+    draft_id: i64,
+    markdown: StdMutex<String>,
+    content: StdMutex<String>,
+    last_sent: StdMutex<tokio::time::Instant>,
+    send_lock: tokio::sync::Mutex<()>,
+    failed: AtomicBool,
+    stopped: Arc<AtomicBool>,
+}
+
+struct DraftKeepalive {
+    state: Arc<DraftKeepaliveState>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct DraftBreaker {
+    ticks_until_probe: u8,
+    probing: bool,
+}
+
+struct DraftCompletion {
+    recipient: String,
+    thread_ts: Option<String>,
+    sid: String,
+    status_key: String,
+    answer_seq: u64,
+    content: String,
+}
+
+fn draft_keepalive_interval() -> Duration {
+    let ms = std::env::var("CCTEAM_IM_DRAFT_KEEPALIVE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| {
+            value.clamp(
+                MIN_DRAFT_KEEPALIVE.as_millis() as u64,
+                MAX_DRAFT_KEEPALIVE.as_millis() as u64,
+            )
+        })
+        .unwrap_or(DEFAULT_DRAFT_KEEPALIVE.as_millis() as u64);
+    Duration::from_millis(ms)
+}
+
+fn tick_draft_breakers(breakers: &mut HashMap<String, DraftBreaker>) {
+    for breaker in breakers.values_mut() {
+        if !breaker.probing && breaker.ticks_until_probe > 0 {
+            breaker.ticks_until_probe -= 1;
+        }
+    }
+}
+
+fn draft_probe_allowed(breakers: &mut HashMap<String, DraftBreaker>, sid: &str) -> bool {
+    let Some(breaker) = breakers.get_mut(sid) else {
+        return true;
+    };
+    if breaker.probing || breaker.ticks_until_probe > 0 {
+        return false;
+    }
+    breaker.probing = true;
+    true
+}
+
+fn draft_succeeded(breakers: &mut HashMap<String, DraftBreaker>, sid: &str) {
+    breakers.remove(sid);
+}
+
+fn draft_failed(breakers: &mut HashMap<String, DraftBreaker>, sid: &str) {
+    breakers.insert(
+        sid.to_string(),
+        DraftBreaker {
+            ticks_until_probe: DRAFT_BREAKER_RETRY_TICKS,
+            probing: false,
+        },
+    );
+}
+
+fn prune_draft_routes(routes: &DraftRoutes) {
+    let now = std::time::Instant::now();
+    routes
+        .lock()
+        .unwrap()
+        .retain(|_, route| now.saturating_duration_since(route.updated_at) < DRAFT_ROUTE_TTL);
+}
+
+fn set_draft_route(
+    routes: &DraftRoutes,
+    channel: &str,
+    recipient: &str,
+    draft_id: i64,
+    sid: &str,
+    content: &str,
+    stopped: Arc<AtomicBool>,
+) {
+    if stopped.load(Ordering::Acquire) {
+        return;
+    }
+    prune_draft_routes(routes);
+    let key = (channel.to_string(), recipient.to_string(), draft_id);
+    let mut routes = routes.lock().unwrap();
+    if stopped.load(Ordering::Acquire)
+        || routes
+            .get(&key)
+            .is_some_and(|route| route.stopped.load(Ordering::Acquire))
+    {
+        return;
+    }
+    routes.insert(
+        key,
+        DraftRoute {
+            sid: sid.to_string(),
+            content: content.to_string(),
+            updated_at: std::time::Instant::now(),
+            stopped,
+        },
+    );
+}
+
+fn remove_draft_route(routes: &DraftRoutes, channel: &str, recipient: &str, draft_id: i64) {
+    let mut routes = routes.lock().unwrap();
+    if let Some(route) = routes.remove(&(channel.to_string(), recipient.to_string(), draft_id)) {
+        route.stopped.store(true, Ordering::Release);
+    }
+}
+
+fn stop_keepalive(keepalives: &mut HashMap<String, DraftKeepalive>, status_key: &str) {
+    if let Some(mut keepalive) = keepalives.remove(status_key) {
+        keepalive.state.stopped.store(true, Ordering::Release);
+        if let Some(task) = keepalive.task.take() {
+            task.abort();
+        }
+    }
+}
+
+async fn draft_keepalive_loop(
+    state: std::sync::Weak<DraftKeepaliveState>,
+    channel: Arc<dyn Channel + Send + Sync>,
+    draft_routes: DraftRoutes,
+    interval: Duration,
+    channel_name: String,
+    sid: String,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        if state.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let _send_lock = state.send_lock.lock().await;
+        if state.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        let last_sent = *state.last_sent.lock().unwrap();
+        if now.duration_since(last_sent) < DRAFT_SEND_FLOOR {
+            continue;
+        }
+        let markdown = state.markdown.lock().unwrap().clone();
+        match channel
+            .send_draft(&state.recipient, state.draft_id, &markdown)
+            .await
+        {
+            Ok(()) => {
+                *state.last_sent.lock().unwrap() = now;
+                let content = state.content.lock().unwrap().clone();
+                set_draft_route(
+                    &draft_routes,
+                    &channel_name,
+                    &state.recipient,
+                    state.draft_id,
+                    &sid,
+                    &content,
+                    state.stopped.clone(),
+                );
+            }
+            Err(error) => {
+                state.failed.store(true, Ordering::Release);
+                tracing::warn!(
+                    channel = %channel_name,
+                    sid = %sid,
+                    error = %error,
+                    "ccteam-im: draft keepalive failed; draft breaker opened"
+                );
+                return;
+            }
+        }
+    }
+}
+
+fn ensure_draft_keepalive(
+    keepalives: &mut HashMap<String, DraftKeepalive>,
+    status_key: &str,
+    channel: Arc<dyn Channel + Send + Sync>,
+    draft_routes: DraftRoutes,
+    channel_name: &str,
+    sid: &str,
+    interval: Duration,
+) {
+    let Some(keepalive) = keepalives.get_mut(status_key) else {
+        return;
+    };
+    if keepalive.task.is_some() {
+        return;
+    }
+    let state = Arc::downgrade(&keepalive.state);
+    let channel_name = channel_name.to_string();
+    let sid = sid.to_string();
+    keepalive.task = Some(tokio::spawn(draft_keepalive_loop(
+        state,
+        channel,
+        draft_routes,
+        interval,
+        channel_name,
+        sid,
+    )));
+}
 
 /// Builds the production [`HarnessAdapter`] for one bot's `vendor`.
 ///
@@ -423,6 +684,7 @@ where
     // not blip Telegram). `menu_specs` is captured once and re-published to
     // each rebuilt channel on reload.
     let shared_channels: Arc<RwLock<ChannelMap>> = Arc::new(RwLock::new(channels));
+    let draft_routes: DraftRoutes = Arc::new(StdMutex::new(HashMap::new()));
     let last_creds: Arc<StdMutex<Credentials>> = Arc::new(StdMutex::new(creds.clone()));
     // v0.8.20 F2 — track the last tenants.json bytes so a reload rebuilds only
     // the CHANGED scope: a tenant-only change must not blip the owner's live
@@ -591,9 +853,10 @@ where
         sec.clone(),
         gateway.clone(),
         restore_complete_rx,
+        draft_routes.clone(),
     );
     let gateway_event_consumer =
-        spawn_gateway_event_consumer(gateway_event_rx, shared_channels.clone());
+        spawn_gateway_event_consumer(gateway_event_rx, shared_channels.clone(), draft_routes);
 
     tracing::info!(
         channels = shared_channels.read().unwrap().len(),
@@ -1074,6 +1337,7 @@ fn tenants_fingerprint(args: &DaemonArgs) -> String {
 /// the tenant + replies return through THIS bot, not a colliding shared
 /// `"telegram"`). The global/admin bot keeps its bare platform name. Only
 /// tenants WITH IM creds get a channel.
+#[cfg(any(feature = "telegram", feature = "lark"))]
 fn build_tenant_channels(
     reg: &ccteam_core::tenants::TenantRegistry,
     probe_path: Option<&Path>,
@@ -1117,6 +1381,14 @@ fn build_tenant_channels(
         }
     }
     out
+}
+
+#[cfg(not(any(feature = "telegram", feature = "lark")))]
+fn build_tenant_channels(
+    _reg: &ccteam_core::tenants::TenantRegistry,
+    _probe_path: Option<&Path>,
+) -> Vec<(String, Arc<dyn Channel + Send + Sync>)> {
+    Vec::new()
 }
 
 fn build_gateway(
@@ -1236,7 +1508,7 @@ pub async fn refresh_telegram_command_menu(credentials_path: Option<&Path>) -> R
     #[cfg(not(feature = "telegram"))]
     {
         let _ = credentials_path;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(feature = "telegram")]
@@ -1330,6 +1602,7 @@ fn spawn_inbound_consumer(
     sec: Arc<Mutex<ThreeLayerSec>>,
     gateway: Arc<Mutex<Gateway>>,
     restore_complete: tokio::sync::watch::Receiver<bool>,
+    draft_routes: DraftRoutes,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -1372,13 +1645,25 @@ fn spawn_inbound_consumer(
             // the ACL is keyed by PLATFORM (fail-closed on unknown), so strip the
             // tenant suffix before the gate (reply routing still uses the full
             // channel name elsewhere).
+            let stopped_marker = msg
+                .content
+                .starts_with(crate::transport::STOPPED_DRAFT_PREFIX);
+            // This is an internal provider marker, not user prompt text. Run
+            // the ACL/rate checks on a stable placeholder, then route using
+            // the raw marker so sanitization cannot corrupt its draft id.
+            let security_payload = if stopped_marker {
+                "__ccteam_stopped_message_generation__"
+            } else {
+                &msg.content
+            };
             let outcome = sec.lock().await.evaluate(
                 crate::transport::platform_of(&msg.channel),
                 &msg.sender,
-                &msg.content,
+                security_payload,
             );
             let has_nontext_payload = msg.selection.is_some() || !msg.attachments.is_empty();
-            let Some(clean_payload) = sec_gate_payload(outcome.clone(), has_nontext_payload) else {
+            let Some(mut clean_payload) = sec_gate_payload(outcome.clone(), has_nontext_payload)
+            else {
                 tracing::warn!(
                     cid = %cid,
                     outcome = ?outcome,
@@ -1386,6 +1671,37 @@ fn spawn_inbound_consumer(
                 );
                 continue;
             };
+
+            let stop_payload = stopped_marker_payload(&msg.content, &clean_payload);
+            if let Some(stop_payload) = stop_payload {
+                let Some(route) = take_stopped_draft_route(
+                    &msg.channel,
+                    &msg.reply_target,
+                    stop_payload,
+                    &draft_routes,
+                ) else {
+                    send_stopped_draft_not_found(
+                        channel.as_ref(),
+                        &msg.reply_target,
+                        msg.thread_ts.clone(),
+                        &cid,
+                    )
+                    .await;
+                    continue;
+                };
+                if !route.content.is_empty() {
+                    let mut partial =
+                        SendMessage::new(route.content.clone(), msg.reply_target.clone())
+                            .in_thread(msg.thread_ts.clone());
+                    if channel.supports_rich_messages() {
+                        partial = partial.with_rich_markdown(route.content);
+                    }
+                    if let Err(error) = channel.send(&partial).await {
+                        tracing::warn!(cid = %cid, error = %error, "ccteam-im: failed to preserve stopped draft");
+                    }
+                }
+                clean_payload = format!("/stop {}", route.sid);
+            }
 
             let restore_incomplete = !*restore_complete.borrow();
             if clean_payload.split_whitespace().next() == Some("/sessions") && restore_incomplete {
@@ -1524,6 +1840,7 @@ async fn deliver_gateway_replies(
         Ok(replies) => {
             for (seq, reply) in replies.into_iter().enumerate() {
                 let button_rows = reply.button_rows.clone();
+                let inline_buttons = reply.inline_buttons;
                 let reply_keyboard = reply.reply_keyboard.clone();
                 let mut out = SendMessage::new(reply.plain, msg.reply_target.clone())
                     .in_thread(msg.thread_ts.clone());
@@ -1535,6 +1852,9 @@ async fn deliver_gateway_replies(
                 }
                 if !button_rows.is_empty() {
                     out = out.with_button_rows(button_rows);
+                }
+                if inline_buttons {
+                    out = out.with_inline_buttons(true);
                 }
                 if let Some(reply_keyboard) = reply_keyboard {
                     out = out.with_reply_keyboard(reply_keyboard);
@@ -1573,17 +1893,32 @@ struct StatusHandle {
     message_id: String,
     recipient: String,
     replacement_fallbacks: u8,
+    delivery: ProgressDelivery,
+    draft_id: Option<i64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressDelivery {
+    Edit,
+    Draft,
 }
 
 fn spawn_gateway_event_consumer(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
     channels: Arc<RwLock<ChannelMap>>,
+    draft_routes: DraftRoutes,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // One editable status message per `status_key` (a turn's progress
         // epoch). Bounded: entries are inserted on the first progress of a
         // turn and removed when the turn finalizes (`done`).
         let mut status_messages: HashMap<String, StatusHandle> = HashMap::new();
+        let mut draft_failures: HashMap<String, DraftBreaker> = HashMap::new();
+        let mut draft_keepalives: HashMap<String, DraftKeepalive> = HashMap::new();
+        let draft_finalizations: DraftFinalizations =
+            Arc::new(StdMutex::new(DraftFinalizationState::default()));
+        let mut next_finalization_seq = 0_u64;
+        let draft_keepalive_interval = draft_keepalive_interval();
         // 👀 ack reaction handle map (v0.8.19). Keyed `"{channel}:{message_id}"`;
         // the value is the provider's reaction handle (`Some(reaction_id)` for
         // Lark, `None` for Telegram which clears by message_id alone). An add
@@ -1638,12 +1973,45 @@ fn spawn_gateway_event_consumer(
                     if let Some(markdown) = rich_markdown {
                         out = out.with_rich_markdown(markdown);
                     }
-                    send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out).await;
+                    let finalization = evt.sid.as_deref().and_then(|sid| {
+                        let answer_seq = pending_answer_seq(&draft_finalizations, sid)?;
+                        take_answer_finalization(&draft_finalizations, sid, answer_seq)
+                    });
+                    if let Some((_, state)) = finalization.as_ref() {
+                        let _ = state.compare_exchange(
+                            FINAL_PENDING,
+                            FINAL_ANSWER_IN_FLIGHT,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                    }
+                    let sent =
+                        send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out)
+                            .await;
+                    if let Some(sid) = evt.sid.as_deref() {
+                        if sent {
+                            if let Some((status_key, state)) = finalization {
+                                remove_finalization(&draft_finalizations, sid, &status_key);
+                                state.store(FINAL_SENT, Ordering::Release);
+                            }
+                        } else if let Some((_, state)) = finalization {
+                            let _ = state.compare_exchange(
+                                FINAL_ANSWER_IN_FLIGHT,
+                                FINAL_PENDING,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
+                        }
+                    }
                 }
                 GatewayEventKind::Progress { status_key, done } => {
-                    deliver_progress(
+                    let keepalive_key = status_key.clone();
+                    let completion = deliver_progress(
                         channel.as_ref(),
                         &mut status_messages,
+                        &draft_routes,
+                        &mut draft_failures,
+                        &mut draft_keepalives,
                         status_key,
                         done,
                         &evt.channel,
@@ -1651,8 +2019,29 @@ fn spawn_gateway_event_consumer(
                         evt.thread_ts,
                         evt.content,
                         evt.button_rows,
+                        evt.sid.clone(),
                     )
                     .await;
+                    if let (Some(sid), Some(_)) =
+                        (evt.sid.as_deref(), status_messages.get(&keepalive_key))
+                    {
+                        ensure_draft_keepalive(
+                            &mut draft_keepalives,
+                            &keepalive_key,
+                            channel.clone(),
+                            draft_routes.clone(),
+                            &evt.channel,
+                            sid,
+                            draft_keepalive_interval,
+                        );
+                    }
+                    if let Some(mut completion) = completion {
+                        if evt.sid.is_some() {
+                            next_finalization_seq = next_finalization_seq.saturating_add(1);
+                            completion.answer_seq = next_finalization_seq;
+                        }
+                        schedule_draft_finalization(&draft_finalizations, completion, channel);
+                    }
                 }
                 // v0.8.19 — structured per-step activity is WEB-ONLY. IM's
                 // status is fully driven by the folded `Progress` event above,
@@ -1687,6 +2076,124 @@ fn spawn_gateway_event_consumer(
                             .with_button_rows(evt.button_rows);
                         send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out)
                             .await;
+                    }
+                }
+                GatewayEventKind::EphemeralAnswer {
+                    callback,
+                    fallback_edit_message_id,
+                } => {
+                    if callback.ephemeral_message_id.is_some() {
+                        match channel
+                            .edit_ephemeral_message(
+                                &evt.chat_id,
+                                &callback,
+                                &evt.content,
+                                &evt.button_rows,
+                            )
+                            .await
+                        {
+                            EphemeralDelivery::Delivered(_) => {}
+                            EphemeralDelivery::Unknown(err) => tracing::warn!(
+                                channel = %evt.channel,
+                                error = %err,
+                                "ccteam-im: ephemeral edit outcome unknown; suppressing duplicate fallback"
+                            ),
+                            EphemeralDelivery::Rejected(err) => {
+                                tracing::warn!(channel = %evt.channel, error = %err, "ccteam-im: ephemeral edit rejected; retrying as a new ephemeral message");
+                                let mut retry = callback.clone();
+                                retry.replace_callback_query_message = false;
+                                let mut out =
+                                    SendMessage::new(evt.content.clone(), evt.chat_id.clone())
+                                        .in_thread(evt.thread_ts.clone())
+                                        .with_button_rows(evt.button_rows.clone());
+                                out.callback_ephemeral = Some(retry);
+                                match channel.send_ephemeral(&out).await {
+                                    EphemeralDelivery::Delivered(_) => {}
+                                    EphemeralDelivery::Unknown(err) => tracing::warn!(
+                                        channel = %evt.channel,
+                                        error = %err,
+                                        "ccteam-im: ephemeral retry outcome unknown; suppressing plain fallback"
+                                    ),
+                                    EphemeralDelivery::Rejected(err) => {
+                                        tracing::warn!(channel = %evt.channel, error = %err, "ccteam-im: ephemeral retry rejected; falling back to a plain message");
+                                        let out = SendMessage::new(
+                                            evt.content.clone(),
+                                            evt.chat_id.clone(),
+                                        )
+                                        .in_thread(evt.thread_ts.clone())
+                                        .with_button_rows(evt.button_rows.clone());
+                                        send_gateway_outbound(
+                                            &evt.id,
+                                            0,
+                                            &evt.channel,
+                                            channel.as_ref(),
+                                            out,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    let mut out = SendMessage::new(evt.content.clone(), evt.chat_id.clone())
+                        .in_thread(evt.thread_ts.clone())
+                        .with_button_rows(evt.button_rows.clone())
+                        .with_callback_ephemeral(
+                            callback.callback_query_id.clone(),
+                            callback.receiver_user_id,
+                        );
+                    if channel.supports_rich_messages() {
+                        out = out.with_rich_markdown(evt.content.clone());
+                    }
+                    match channel.send_ephemeral(&out).await {
+                        EphemeralDelivery::Delivered(_) => {}
+                        EphemeralDelivery::Unknown(err) => tracing::warn!(
+                            channel = %evt.channel,
+                            error = %err,
+                            "ccteam-im: ephemeral send outcome unknown; suppressing duplicate fallback"
+                        ),
+                        EphemeralDelivery::Rejected(err) => {
+                            tracing::warn!(channel = %evt.channel, error = %err, "ccteam-im: ephemeral callback response rejected; using prior delivery path");
+                            if let Some(message_id) = fallback_edit_message_id {
+                                if let Err(edit_err) = channel
+                                    .edit_message(
+                                        &evt.chat_id,
+                                        &message_id,
+                                        &evt.content,
+                                        &evt.button_rows,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(channel = %evt.channel, message_id, error = %edit_err, "ccteam-im: confirmation edit failed, falling back to a new message");
+                                    let out =
+                                        SendMessage::new(evt.content.clone(), evt.chat_id.clone())
+                                            .in_thread(evt.thread_ts.clone())
+                                            .with_button_rows(evt.button_rows.clone());
+                                    send_gateway_outbound(
+                                        &evt.id,
+                                        0,
+                                        &evt.channel,
+                                        channel.as_ref(),
+                                        out,
+                                    )
+                                    .await;
+                                }
+                            } else {
+                                let out =
+                                    SendMessage::new(evt.content.clone(), evt.chat_id.clone())
+                                        .in_thread(evt.thread_ts.clone())
+                                        .with_button_rows(evt.button_rows.clone());
+                                send_gateway_outbound(
+                                    &evt.id,
+                                    0,
+                                    &evt.channel,
+                                    channel.as_ref(),
+                                    out,
+                                )
+                                .await;
+                            }
+                        }
                     }
                 }
                 // v0.8.19 — the 👀 ack reaction (IM-only; web/discord/slack keep
@@ -1738,6 +2245,9 @@ fn spawn_gateway_event_consumer(
 async fn deliver_progress(
     channel: &(dyn Channel + Send + Sync),
     status_messages: &mut HashMap<String, StatusHandle>,
+    draft_routes: &DraftRoutes,
+    draft_failures: &mut HashMap<String, DraftBreaker>,
+    draft_keepalives: &mut HashMap<String, DraftKeepalive>,
     status_key: String,
     done: bool,
     channel_name: &str,
@@ -1745,8 +2255,184 @@ async fn deliver_progress(
     thread_ts: Option<String>,
     content: String,
     button_rows: Vec<Vec<crate::transport::MessageOption>>,
-) {
+    sid: Option<String>,
+) -> Option<DraftCompletion> {
+    tick_draft_breakers(draft_failures);
+    let draft_sid = sid.as_deref().filter(|sid| {
+        is_private_telegram_chat(channel_name, &chat_id) && draft_probe_allowed(draft_failures, sid)
+    });
+    let draft_id = draft_sid.map(crate::progress::draft_id);
+
     if let Some(handle) = status_messages.get(&status_key).cloned() {
+        if handle.delivery == ProgressDelivery::Draft {
+            if done {
+                if let Some(draft_id) = handle.draft_id {
+                    remove_draft_route(draft_routes, channel_name, &handle.recipient, draft_id);
+                }
+                stop_keepalive(draft_keepalives, &status_key);
+                status_messages.remove(&status_key);
+                return sid.map(|sid| DraftCompletion {
+                    recipient: handle.recipient,
+                    thread_ts,
+                    sid,
+                    status_key,
+                    answer_seq: 0,
+                    content,
+                });
+            }
+
+            if let (Some(sid), Some(draft_id)) = (draft_sid, handle.draft_id) {
+                let state = draft_keepalives
+                    .get(&status_key)
+                    .map(|keepalive| keepalive.state.clone());
+                if let Some(state) = state {
+                    let _send_lock = state.send_lock.lock().await;
+                    if state.failed.load(Ordering::Acquire) {
+                        draft_failed(draft_failures, sid);
+                    } else {
+                        let markdown = crate::progress::draft_markdown(&content);
+                        *state.markdown.lock().unwrap() = markdown.clone();
+                        *state.content.lock().unwrap() = content.clone();
+                        let now = tokio::time::Instant::now();
+                        let due = now.duration_since(*state.last_sent.lock().unwrap())
+                            >= DRAFT_SEND_FLOOR;
+                        if !due {
+                            set_draft_route(
+                                draft_routes,
+                                channel_name,
+                                &handle.recipient,
+                                draft_id,
+                                sid,
+                                &content,
+                                state.stopped.clone(),
+                            );
+                            return None;
+                        }
+                        match channel
+                            .send_draft(&handle.recipient, draft_id, &markdown)
+                            .await
+                        {
+                            Ok(()) => {
+                                *state.last_sent.lock().unwrap() = now;
+                                draft_succeeded(draft_failures, sid);
+                                set_draft_route(
+                                    draft_routes,
+                                    channel_name,
+                                    &handle.recipient,
+                                    draft_id,
+                                    sid,
+                                    &content,
+                                    state.stopped.clone(),
+                                );
+                                return None;
+                            }
+                            Err(err) => {
+                                state.failed.store(true, Ordering::Release);
+                                draft_failed(draft_failures, sid);
+                                tracing::warn!(
+                                    channel = %channel_name,
+                                    status_key = %status_key,
+                                    sid = %sid,
+                                    error = %err,
+                                    "ccteam-im: progress draft failed; falling back to edit"
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    draft_failed(draft_failures, sid);
+                }
+            }
+            if let Some(draft_id) = handle.draft_id {
+                remove_draft_route(draft_routes, channel_name, &handle.recipient, draft_id);
+            }
+            stop_keepalive(draft_keepalives, &status_key);
+            let seed = SendMessage::new(content, handle.recipient.clone())
+                .in_thread(thread_ts)
+                .with_button_rows(button_rows);
+            match channel.send(&seed).await {
+                Ok(Some(message_id)) => {
+                    status_messages.insert(
+                        status_key,
+                        StatusHandle {
+                            message_id,
+                            recipient: handle.recipient,
+                            replacement_fallbacks: 0,
+                            delivery: ProgressDelivery::Edit,
+                            draft_id: None,
+                        },
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    channel = %channel_name,
+                    status_key = %status_key,
+                    error = %err,
+                    "ccteam-im: progress edit fallback seed failed"
+                ),
+            }
+            return None;
+        }
+
+        if !done {
+            if let (Some(sid), Some(draft_id)) = (draft_sid, draft_id) {
+                let markdown = crate::progress::draft_markdown(&content);
+                match channel.send_draft(&chat_id, draft_id, &markdown).await {
+                    Ok(()) => {
+                        let now = tokio::time::Instant::now();
+                        let stopped = Arc::new(AtomicBool::new(false));
+                        set_draft_route(
+                            draft_routes,
+                            channel_name,
+                            &chat_id,
+                            draft_id,
+                            sid,
+                            &content,
+                            stopped.clone(),
+                        );
+                        draft_keepalives.insert(
+                            status_key.clone(),
+                            DraftKeepalive {
+                                state: Arc::new(DraftKeepaliveState {
+                                    recipient: chat_id.clone(),
+                                    draft_id,
+                                    markdown: StdMutex::new(markdown),
+                                    content: StdMutex::new(content.clone()),
+                                    last_sent: StdMutex::new(now),
+                                    send_lock: tokio::sync::Mutex::new(()),
+                                    failed: AtomicBool::new(false),
+                                    stopped,
+                                }),
+                                task: None,
+                            },
+                        );
+                        draft_succeeded(draft_failures, sid);
+                        status_messages.insert(
+                            status_key,
+                            StatusHandle {
+                                message_id: String::new(),
+                                recipient: chat_id,
+                                replacement_fallbacks: 0,
+                                delivery: ProgressDelivery::Draft,
+                                draft_id: Some(draft_id),
+                            },
+                        );
+                        return None;
+                    }
+                    Err(err) => {
+                        draft_failed(draft_failures, sid);
+                        tracing::warn!(
+                            channel = %channel_name,
+                            status_key = %status_key,
+                            sid = %sid,
+                            error = %err,
+                            "ccteam-im: progress draft failed; falling back to edit"
+                        );
+                    }
+                }
+            }
+        }
+
         match channel
             .edit_message(
                 &handle.recipient,
@@ -1764,6 +2450,8 @@ async fn deliver_progress(
                             message_id: message_id.unwrap_or(handle.message_id),
                             recipient: handle.recipient,
                             replacement_fallbacks: 0,
+                            delivery: ProgressDelivery::Edit,
+                            draft_id: None,
                         },
                     );
                 }
@@ -1783,6 +2471,8 @@ async fn deliver_progress(
                             status_key.clone(),
                             StatusHandle {
                                 replacement_fallbacks,
+                                delivery: ProgressDelivery::Edit,
+                                draft_id: None,
                                 ..handle.clone()
                             },
                         );
@@ -1806,6 +2496,8 @@ async fn deliver_progress(
                                     message_id,
                                     recipient: handle.recipient,
                                     replacement_fallbacks,
+                                    delivery: ProgressDelivery::Edit,
+                                    draft_id: None,
                                 },
                             );
                         }
@@ -1821,8 +2513,68 @@ async fn deliver_progress(
         if done {
             status_messages.remove(&status_key);
         }
-        return;
+        return None;
     }
+
+    if let (Some(sid), Some(draft_id)) = (draft_sid, draft_id) {
+        if !done {
+            let markdown = crate::progress::draft_markdown(&content);
+            match channel.send_draft(&chat_id, draft_id, &markdown).await {
+                Ok(()) => {
+                    let now = tokio::time::Instant::now();
+                    let stopped = Arc::new(AtomicBool::new(false));
+                    set_draft_route(
+                        draft_routes,
+                        channel_name,
+                        &chat_id,
+                        draft_id,
+                        sid,
+                        &content,
+                        stopped.clone(),
+                    );
+                    draft_keepalives.insert(
+                        status_key.clone(),
+                        DraftKeepalive {
+                            state: Arc::new(DraftKeepaliveState {
+                                recipient: chat_id.clone(),
+                                draft_id,
+                                markdown: StdMutex::new(markdown),
+                                content: StdMutex::new(content.clone()),
+                                last_sent: StdMutex::new(now),
+                                send_lock: tokio::sync::Mutex::new(()),
+                                failed: AtomicBool::new(false),
+                                stopped,
+                            }),
+                            task: None,
+                        },
+                    );
+                    draft_succeeded(draft_failures, sid);
+                    status_messages.insert(
+                        status_key,
+                        StatusHandle {
+                            message_id: String::new(),
+                            recipient: chat_id,
+                            replacement_fallbacks: 0,
+                            delivery: ProgressDelivery::Draft,
+                            draft_id: Some(draft_id),
+                        },
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    draft_failed(draft_failures, sid);
+                    tracing::warn!(
+                        channel = %channel_name,
+                        status_key = %status_key,
+                        sid = %sid,
+                        error = %err,
+                        "ccteam-im: progress draft failed; falling back to edit"
+                    );
+                }
+            }
+        }
+    }
+
     // First progress for this turn — send a new status message (the seed).
     let seed = SendMessage::new(content, chat_id.clone())
         .in_thread(thread_ts.clone())
@@ -1835,6 +2587,8 @@ async fn deliver_progress(
                     message_id,
                     recipient: chat_id,
                     replacement_fallbacks: 0,
+                    delivery: ProgressDelivery::Edit,
+                    draft_id: None,
                 },
             );
         }
@@ -1847,6 +2601,231 @@ async fn deliver_progress(
                 "ccteam-im: progress seed send failed"
             );
         }
+    }
+    None
+}
+
+fn is_private_telegram_chat(channel_name: &str, chat_id: &str) -> bool {
+    crate::transport::platform_of(channel_name) == "telegram"
+        && chat_id.parse::<i64>().map(|id| id > 0).unwrap_or(false)
+}
+
+fn stopped_marker_payload<'a>(raw: &'a str, gated: &'a str) -> Option<&'a str> {
+    if raw.starts_with(crate::transport::STOPPED_DRAFT_PREFIX) {
+        Some(raw)
+    } else if gated.starts_with(crate::transport::STOPPED_DRAFT_PREFIX) {
+        Some(gated)
+    } else {
+        None
+    }
+}
+
+async fn send_stopped_draft_not_found(
+    channel: &(dyn Channel + Send + Sync),
+    recipient: &str,
+    thread_ts: Option<String>,
+    cid: &str,
+) {
+    let notice = SendMessage::new("сессия не найдена, /sessions", recipient).in_thread(thread_ts);
+    if let Err(error) = channel.send(&notice).await {
+        tracing::warn!(cid = %cid, error = %error, "ccteam-im: failed to report missing stopped draft");
+    }
+}
+
+#[cfg(test)]
+fn stopped_draft_command(
+    channel: &str,
+    chat_id: &str,
+    payload: &str,
+    draft_routes: &DraftRoutes,
+) -> Option<String> {
+    let draft_id = payload
+        .strip_prefix(crate::transport::STOPPED_DRAFT_PREFIX)?
+        .parse::<i64>()
+        .ok()?;
+    let key = (channel.to_string(), chat_id.to_string(), draft_id);
+    prune_draft_routes(draft_routes);
+    let route = draft_routes.lock().unwrap().get(&key).cloned()?;
+    Some(format!("/stop {}", route.sid))
+}
+
+fn take_stopped_draft_route(
+    channel: &str,
+    chat_id: &str,
+    payload: &str,
+    draft_routes: &DraftRoutes,
+) -> Option<DraftRoute> {
+    let draft_id = payload
+        .strip_prefix(crate::transport::STOPPED_DRAFT_PREFIX)?
+        .parse::<i64>()
+        .ok()?;
+    let key = (channel.to_string(), chat_id.to_string(), draft_id);
+    let mut routes = draft_routes.lock().unwrap();
+    let now = std::time::Instant::now();
+    routes.retain(|_, route| now.saturating_duration_since(route.updated_at) < DRAFT_ROUTE_TTL);
+    let route = routes.remove(&key)?;
+    route.stopped.store(true, Ordering::Release);
+    Some(route)
+}
+
+fn take_answer_finalization(
+    finalizations: &DraftFinalizations,
+    sid: &str,
+    answer_seq: u64,
+) -> Option<(String, Arc<AtomicU8>)> {
+    let mut entries = finalizations.lock().unwrap();
+    let (pending_seq, pending_key) = entries.pending_by_sid.get(sid)?.clone();
+    if pending_seq != answer_seq {
+        return None;
+    }
+    let key = entries
+        .by_answer_seq
+        .get(&(sid.to_string(), answer_seq))?
+        .clone();
+    if key != pending_key {
+        return None;
+    }
+    let state = entries.by_status_key.get(&key)?.clone();
+    match state.load(Ordering::Acquire) {
+        FINAL_PENDING | FINAL_ANSWER_IN_FLIGHT | FINALIZING => Some((key, state)),
+        FINAL_SENT | FINAL_CANCELLED => {
+            remove_finalization_key(&mut entries, sid, &key);
+            None
+        }
+        _ => None,
+    }
+}
+
+fn pending_answer_seq(finalizations: &DraftFinalizations, sid: &str) -> Option<u64> {
+    finalizations
+        .lock()
+        .unwrap()
+        .pending_by_sid
+        .get(sid)
+        .map(|(answer_seq, _)| *answer_seq)
+}
+
+fn remove_finalization_key(entries: &mut DraftFinalizationState, sid: &str, status_key: &str) {
+    entries.by_status_key.remove(status_key);
+    if entries
+        .pending_by_sid
+        .get(sid)
+        .is_some_and(|(_, pending_key)| pending_key == status_key)
+    {
+        entries.pending_by_sid.remove(sid);
+    }
+    entries
+        .by_answer_seq
+        .retain(|(mapped_sid, _), mapped_key| mapped_sid != sid || mapped_key != status_key);
+}
+
+fn remove_finalization(finalizations: &DraftFinalizations, sid: &str, status_key: &str) {
+    let mut entries = finalizations.lock().unwrap();
+    remove_finalization_key(&mut entries, sid, status_key);
+}
+
+fn schedule_draft_finalization(
+    finalizations: &DraftFinalizations,
+    completion: DraftCompletion,
+    channel: Arc<dyn Channel + Send + Sync>,
+) {
+    let state = Arc::new(AtomicU8::new(FINAL_PENDING));
+    let mut entries = finalizations.lock().unwrap();
+    entries
+        .by_status_key
+        .insert(completion.status_key.clone(), state.clone());
+    if completion.answer_seq > 0 {
+        if let Some((old_seq, _)) = entries.pending_by_sid.insert(
+            completion.sid.clone(),
+            (completion.answer_seq, completion.status_key.clone()),
+        ) {
+            entries
+                .by_answer_seq
+                .remove(&(completion.sid.clone(), old_seq));
+        }
+        entries.by_answer_seq.insert(
+            (completion.sid.clone(), completion.answer_seq),
+            completion.status_key.clone(),
+        );
+    }
+    drop(entries);
+    let sid = completion.sid.clone();
+    let status_key = completion.status_key.clone();
+    let finalizations = finalizations.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(DRAFT_FINALIZATION_GRACE).await;
+        loop {
+            match state.load(Ordering::Acquire) {
+                FINAL_SENT | FINAL_CANCELLED | FINALIZING => return,
+                FINAL_ANSWER_IN_FLIGHT => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                FINAL_PENDING => {
+                    if state
+                        .compare_exchange(
+                            FINAL_PENDING,
+                            FINALIZING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        send_completed_draft(channel, completion).await;
+                        let _ = state.compare_exchange(
+                            FINALIZING,
+                            FINAL_SENT,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                        let cleanup_finalizations = finalizations.clone();
+                        let cleanup_sid = sid.clone();
+                        let cleanup_status_key = status_key.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(DRAFT_FINALIZATION_TTL).await;
+                            remove_finalization(
+                                &cleanup_finalizations,
+                                &cleanup_sid,
+                                &cleanup_status_key,
+                            );
+                        });
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
+    });
+}
+
+async fn send_completed_draft(
+    channel: Arc<dyn Channel + Send + Sync>,
+    completion: DraftCompletion,
+) {
+    let mut rich = SendMessage::new(completion.content.clone(), completion.recipient.clone())
+        .in_thread(completion.thread_ts.clone());
+    if channel.supports_rich_messages() {
+        rich = rich.with_rich_markdown(completion.content.clone());
+        for attempt in 1..=2 {
+            match channel.send(&rich).await {
+                Ok(_) => return,
+                Err(error) => tracing::warn!(
+                    sid = %completion.sid,
+                    attempt,
+                    error = %error,
+                    "ccteam-im: draft final rich send failed"
+                ),
+            }
+        }
+    }
+
+    let classic =
+        SendMessage::new(completion.content, completion.recipient).in_thread(completion.thread_ts);
+    if let Err(error) = channel.send(&classic).await {
+        tracing::warn!(
+            sid = %completion.sid,
+            error = %error,
+            "ccteam-im: draft final classic fallback failed"
+        );
     }
 }
 
@@ -1894,7 +2873,7 @@ async fn send_gateway_outbound(
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     message: SendMessage,
-) {
+) -> bool {
     // Channel-neutral splitting (V0.8.4 P0 / B2): when the channel
     // declares a per-message ceiling and the content overflows it, fan
     // one logical reply into ordered sub-messages. `None` (most channels,
@@ -1941,14 +2920,13 @@ async fn send_gateway_outbound(
     if parts.len() <= 1 {
         // Unchanged single-message path: id = `{inbound_id}-{seq}`.
         let id = format!("{inbound_id}-{seq}");
-        queue_and_send_durable_part(id, inbound_id, channel_name, channel, message).await;
-        return;
+        return queue_and_send_durable_part(id, inbound_id, channel_name, channel, message).await;
     }
 
     // Multi-part: id prefix = `{inbound_id}-{seq}`, one durable row per
     // part. The complete partition is queued before the first send.
     let id_prefix = format!("{inbound_id}-{seq}");
-    send_split_parts(&id_prefix, inbound_id, channel_name, channel, parts).await;
+    send_split_parts(&id_prefix, inbound_id, channel_name, channel, parts).await
 }
 
 /// Queue a single durable outbound row, then attempt delivery. Returns
@@ -2030,7 +3008,7 @@ async fn send_queued_parts(
     channel: &(dyn Channel + Send + Sync),
     queued: Vec<(String, SendMessage)>,
     message: &SendMessage,
-) {
+) -> bool {
     let total = queued.len();
     let mut failed_parts: Vec<usize> = Vec::new();
     for (part_idx, (id, part_msg)) in queued.into_iter().enumerate() {
@@ -2064,6 +3042,7 @@ async fn send_queued_parts(
             );
         }
     }
+    failed_parts.is_empty()
 }
 
 /// Queue the complete partition, then send its rows serially.
@@ -2073,7 +3052,7 @@ async fn send_split_parts(
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     parts: Vec<SendMessage>,
-) {
+) -> bool {
     let queued = match queue_split_parts(id_prefix, inbound_id, channel_name, parts) {
         Ok(queued) => queued,
         Err(err) => {
@@ -2083,14 +3062,14 @@ async fn send_split_parts(
                 error = %err,
                 "ccteam-im: failed to durably queue split parts; dropping this send"
             );
-            return;
+            return false;
         }
     };
     let message = queued
         .first()
         .map(|(_, message)| message.clone())
         .expect("split partition must contain a row");
-    send_queued_parts(inbound_id, channel_name, channel, queued, &message).await;
+    send_queued_parts(inbound_id, channel_name, channel, queued, &message).await
 }
 
 /// Send a single already-queued durable row and append its terminal
@@ -2328,6 +3307,380 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stopped_draft_routes_to_owning_session_stop_command() {
+        let routes = Arc::new(StdMutex::new(HashMap::from([(
+            ("telegram".to_string(), "123".to_string(), 77_i64),
+            DraftRoute {
+                sid: "s42".to_string(),
+                content: "partial".to_string(),
+                updated_at: std::time::Instant::now(),
+                stopped: Arc::new(AtomicBool::new(false)),
+            },
+        )])));
+        let payload = format!("{}77", crate::transport::STOPPED_DRAFT_PREFIX);
+        assert_eq!(
+            stopped_draft_command("telegram", "123", &payload, &routes).as_deref(),
+            Some("/stop s42")
+        );
+        assert_eq!(
+            stopped_draft_command("telegram", "999", &payload, &routes),
+            None
+        );
+        assert_eq!(
+            stopped_marker_payload(&payload, "security-layer-rewrote-marker"),
+            Some(payload.as_str()),
+            "stop routing must use the raw provider marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_draft_without_route_reports_sessions() {
+        let channel = crate::transport::providers::mock::MockChannel::new();
+        send_stopped_draft_not_found(&channel, "123", None, "stop-missing").await;
+        let outbox = channel.outbox().await;
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].content, "сессия не найдена, /sessions");
+    }
+
+    #[test]
+    fn draft_breaker_allows_a_half_open_probe_after_three_ticks() {
+        let mut breakers = HashMap::new();
+        assert!(draft_probe_allowed(&mut breakers, "s42"));
+        draft_failed(&mut breakers, "s42");
+        assert!(!draft_probe_allowed(&mut breakers, "s42"));
+        for _ in 0..2 {
+            tick_draft_breakers(&mut breakers);
+            assert!(!draft_probe_allowed(&mut breakers, "s42"));
+        }
+        tick_draft_breakers(&mut breakers);
+        assert!(draft_probe_allowed(&mut breakers, "s42"));
+        assert!(!draft_probe_allowed(&mut breakers, "s42"));
+        draft_succeeded(&mut breakers, "s42");
+        assert!(draft_probe_allowed(&mut breakers, "s42"));
+    }
+
+    #[test]
+    fn stale_draft_routes_are_evicted_before_stop_lookup() {
+        let routes = Arc::new(StdMutex::new(HashMap::from([(
+            ("telegram".to_string(), "123".to_string(), 77_i64),
+            DraftRoute {
+                sid: "s42".to_string(),
+                content: "partial".to_string(),
+                updated_at: std::time::Instant::now() - DRAFT_ROUTE_TTL - Duration::from_secs(1),
+                stopped: Arc::new(AtomicBool::new(false)),
+            },
+        )])));
+        let payload = format!("{}77", crate::transport::STOPPED_DRAFT_PREFIX);
+        assert_eq!(
+            stopped_draft_command("telegram", "123", &payload, &routes),
+            None
+        );
+        assert!(routes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_draft_route_cannot_restart_keepalive() {
+        let mock = crate::transport::providers::mock::MockChannel::new()
+            .with_name("telegram")
+            .with_draft_support();
+        let routes = Arc::new(StdMutex::new(HashMap::new()));
+        let stopped = Arc::new(AtomicBool::new(false));
+        set_draft_route(
+            &routes,
+            "telegram",
+            "123",
+            77,
+            "s42",
+            "partial",
+            stopped.clone(),
+        );
+        let state = Arc::new(DraftKeepaliveState {
+            recipient: "123".to_string(),
+            draft_id: 77,
+            markdown: StdMutex::new("partial".to_string()),
+            content: StdMutex::new("partial".to_string()),
+            last_sent: StdMutex::new(tokio::time::Instant::now() - DRAFT_SEND_FLOOR),
+            send_lock: tokio::sync::Mutex::new(()),
+            failed: AtomicBool::new(false),
+            stopped: stopped.clone(),
+        });
+        let task = tokio::spawn(draft_keepalive_loop(
+            Arc::downgrade(&state),
+            Arc::new(mock.clone()),
+            routes.clone(),
+            Duration::from_secs(2),
+            "telegram".to_string(),
+            "s42".to_string(),
+        ));
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+
+        let payload = format!("{}77", crate::transport::STOPPED_DRAFT_PREFIX);
+        let route = take_stopped_draft_route("telegram", "123", &payload, &routes)
+            .expect("first stop consumes the draft route");
+        assert_eq!(route.content, "partial");
+        let before = mock.drafts().await.len();
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(mock.drafts().await.len(), before);
+        assert!(routes.lock().unwrap().is_empty());
+        assert!(take_stopped_draft_route("telegram", "123", &payload, &routes).is_none());
+        set_draft_route(&routes, "telegram", "123", 77, "s42", "partial", stopped);
+        assert!(routes.lock().unwrap().is_empty());
+        send_stopped_draft_not_found(&mock, "123", None, "second-stop").await;
+        let outbox = mock.outbox().await;
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].content, "сессия не найдена, /sessions");
+        task.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(start_paused = true)]
+    async fn draft_keepalive_refreshes_silent_session() {
+        let _g = env_lock();
+        std::env::set_var("CCTEAM_IM_DRAFT_KEEPALIVE_MS", "2000");
+        let mock = crate::transport::providers::mock::MockChannel::new()
+            .with_name("telegram")
+            .with_draft_support();
+        let mut channels = ChannelMap::new();
+        channels.insert("telegram".to_string(), Arc::new(mock.clone()));
+        let channels = Arc::new(RwLock::new(channels));
+        let routes = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let consumer = spawn_gateway_event_consumer(rx, channels, routes);
+
+        tx.send(GatewayEvent {
+            id: "progress-keepalive".to_string(),
+            channel: "telegram".to_string(),
+            chat_id: "123".to_string(),
+            thread_ts: None,
+            content: "▶️ s42 работает · 0с".to_string(),
+            kind: GatewayEventKind::Progress {
+                status_key: "s42-1".to_string(),
+                done: false,
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: Some("s42".to_string()),
+            slug: None,
+        })
+        .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let mut observed = 0;
+        let mut post_times = Vec::new();
+        let initial_drafts = mock.drafts().await;
+        while observed < initial_drafts.len() {
+            post_times.push(tokio::time::Instant::now());
+            observed += 1;
+        }
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::task::yield_now().await;
+            let drafts = mock.drafts().await;
+            while observed < drafts.len() {
+                post_times.push(tokio::time::Instant::now());
+                observed += 1;
+            }
+        }
+
+        let drafts = mock.drafts().await;
+        consumer.abort();
+        std::env::remove_var("CCTEAM_IM_DRAFT_KEEPALIVE_MS");
+
+        assert!(
+            drafts.len() >= 3,
+            "silent draft must be refreshed, got {} posts: {drafts:?}",
+            drafts.len()
+        );
+        assert!(drafts.windows(2).all(|pair| pair[0].1 == pair[1].1));
+        assert!(post_times
+            .windows(2)
+            .all(|pair| pair[1].duration_since(pair[0]) <= Duration::from_secs(25)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn draft_done_without_answer_sends_rich_final_card() {
+        let mock = crate::transport::providers::mock::MockChannel::new()
+            .with_name("telegram")
+            .with_rich_support()
+            .with_draft_support();
+        let mut channels = ChannelMap::new();
+        channels.insert("telegram".to_string(), Arc::new(mock.clone()));
+        let channels = Arc::new(RwLock::new(channels));
+        let routes = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let consumer = spawn_gateway_event_consumer(rx, channels, routes);
+        let event = |done: bool| GatewayEvent {
+            id: format!("progress-final-{done}"),
+            channel: "telegram".to_string(),
+            chat_id: "123".to_string(),
+            thread_ts: None,
+            content: if done {
+                "✅ готово · 1с · 1 инструмент · 0 файлов".to_string()
+            } else {
+                "▶️ s42 работает · 0с".to_string()
+            },
+            kind: GatewayEventKind::Progress {
+                status_key: "s42-1".to_string(),
+                done,
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: Some("s42".to_string()),
+            slug: None,
+        };
+        tx.send(event(false)).unwrap();
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tx.send(event(true)).unwrap();
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(DRAFT_FINALIZATION_GRACE).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        consumer.abort();
+
+        let outbox = mock.outbox().await;
+        assert_eq!(outbox.len(), 1, "tool-only turn needs one final card");
+        assert!(outbox[0].content.starts_with("✅ готово · "));
+        assert_eq!(
+            outbox[0].rich_markdown.as_deref(),
+            Some(outbox[0].content.as_str())
+        );
+        assert!(mock.edits().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn draft_final_rich_failure_retries_then_uses_classic_send() {
+        struct RichFailureChannel {
+            calls: Arc<StdMutex<Vec<bool>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for RichFailureChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+
+            fn supports_rich_messages(&self) -> bool {
+                true
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                let is_rich = message.rich_markdown.is_some();
+                self.calls.lock().unwrap().push(is_rich);
+                if is_rich {
+                    anyhow::bail!("telegram sendRichMessage → 400")
+                }
+                Ok(Some("classic-1".to_string()))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        send_completed_draft(
+            Arc::new(RichFailureChannel {
+                calls: calls.clone(),
+            }),
+            DraftCompletion {
+                recipient: "123".to_string(),
+                thread_ts: None,
+                sid: "s42".to_string(),
+                status_key: "s42-1".to_string(),
+                answer_seq: 0,
+                content: "✅ готово · 1с · 0 инструментов · 0 файлов".to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(*calls.lock().unwrap(), vec![true, true, false]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn draft_finalization_keeps_same_sid_turns_separate() {
+        let mock = crate::transport::providers::mock::MockChannel::new()
+            .with_name("telegram")
+            .with_rich_support();
+        let finalizations: DraftFinalizations =
+            Arc::new(StdMutex::new(DraftFinalizationState::default()));
+        for (epoch, content) in ["✅ готово · первый", "✅ готово · второй"]
+            .into_iter()
+            .enumerate()
+        {
+            schedule_draft_finalization(
+                &finalizations,
+                DraftCompletion {
+                    recipient: "123".to_string(),
+                    thread_ts: None,
+                    sid: "s42".to_string(),
+                    status_key: format!("s42-{epoch}"),
+                    answer_seq: 0,
+                    content: content.to_string(),
+                },
+                Arc::new(mock.clone()),
+            );
+        }
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(DRAFT_FINALIZATION_GRACE).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let outbox = mock.outbox().await;
+        assert_eq!(outbox.len(), 2, "same sid can have two distinct turns");
+        assert_eq!(outbox[0].content, "✅ готово · первый");
+        assert_eq!(outbox[1].content, "✅ готово · второй");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn draft_finalization_does_not_cross_tool_only_turns() {
+        let mock = crate::transport::providers::mock::MockChannel::new()
+            .with_name("telegram")
+            .with_rich_support();
+        let finalizations: DraftFinalizations =
+            Arc::new(StdMutex::new(DraftFinalizationState::default()));
+        for (seq, content) in [(1, "✅ готово · tool-only"), (2, "✅ готово · answer")].into_iter()
+        {
+            schedule_draft_finalization(
+                &finalizations,
+                DraftCompletion {
+                    recipient: "123".to_string(),
+                    thread_ts: None,
+                    sid: "s42".to_string(),
+                    status_key: format!("s42-{seq}"),
+                    answer_seq: seq,
+                    content: content.to_string(),
+                },
+                Arc::new(mock.clone()),
+            );
+        }
+
+        assert!(take_answer_finalization(&finalizations, "s42", 1).is_none());
+        let (status_key, _) = take_answer_finalization(&finalizations, "s42", 2)
+            .expect("the next Answer belongs to the latest completed turn");
+        assert_eq!(status_key, "s42-2");
+    }
+
     /// v0.8.19 — the daemon egress 👀-reaction handle-map round-trips. A
     /// `Reaction{on:true}` calls `add_reaction` and STORES the returned handle
     /// (here the stateful Lark `reaction_id` shape); the matching
@@ -2346,7 +3699,8 @@ mod tests {
         let channels = Arc::new(RwLock::new(channels));
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
-        let consumer = spawn_gateway_event_consumer(rx, channels);
+        let consumer =
+            spawn_gateway_event_consumer(rx, channels, Arc::new(StdMutex::new(HashMap::new())));
 
         let reaction_event = |on: bool| GatewayEvent {
             id: format!("gateway-reaction-{on}"),
@@ -2395,6 +3749,427 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ephemeral_answer_falls_back_to_new_ephemeral_then_plain_message() {
+        struct FailingEphemeralChannel {
+            sends: Arc<StdMutex<Vec<SendMessage>>>,
+            ephemeral_edits: Arc<StdMutex<Vec<i64>>>,
+            ordinary_edits: Arc<StdMutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for FailingEphemeralChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                self.sends.lock().unwrap().push(message.clone());
+                if message.callback_ephemeral.is_some() {
+                    anyhow::bail!("ephemeral send failed")
+                }
+                Ok(Some("plain-message".to_string()))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn edit_ephemeral_message(
+                &self,
+                _chat_id: &str,
+                callback: &crate::transport::CallbackEphemeral,
+                _content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> crate::transport::EphemeralDelivery {
+                self.ephemeral_edits
+                    .lock()
+                    .unwrap()
+                    .push(callback.ephemeral_message_id.unwrap());
+                crate::transport::EphemeralDelivery::Rejected(anyhow::anyhow!(
+                    "ephemeral edit failed"
+                ))
+            }
+
+            async fn edit_message(
+                &self,
+                _recipient: &str,
+                message_id: &str,
+                _content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> anyhow::Result<Option<String>> {
+                self.ordinary_edits
+                    .lock()
+                    .unwrap()
+                    .push(message_id.to_string());
+                anyhow::bail!("ordinary edit must not target an ephemeral message")
+            }
+        }
+
+        let channel = Arc::new(FailingEphemeralChannel {
+            sends: Arc::new(StdMutex::new(Vec::new())),
+            ephemeral_edits: Arc::new(StdMutex::new(Vec::new())),
+            ordinary_edits: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), channel.clone());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let consumer = spawn_gateway_event_consumer(
+            rx,
+            Arc::new(RwLock::new(channels)),
+            Arc::new(StdMutex::new(HashMap::new())),
+        );
+
+        tx.send(GatewayEvent {
+            id: "ephemeral-fallback".to_string(),
+            channel: "telegram".to_string(),
+            chat_id: "-100".to_string(),
+            thread_ts: None,
+            content: "cancelled".to_string(),
+            kind: GatewayEventKind::EphemeralAnswer {
+                callback: crate::transport::CallbackEphemeral {
+                    callback_query_id: "cb-1".to_string(),
+                    receiver_user_id: 7,
+                    replace_callback_query_message: false,
+                    ephemeral_message_id: Some(99),
+                },
+                fallback_edit_message_id: Some("ordinary-1".to_string()),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: None,
+            slug: None,
+        })
+        .unwrap();
+
+        for _ in 0..200 {
+            if channel.sends.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        consumer.abort();
+
+        assert_eq!(*channel.ephemeral_edits.lock().unwrap(), vec![99]);
+        assert!(channel.ordinary_edits.lock().unwrap().is_empty());
+        let sends = channel.sends.lock().unwrap();
+        assert_eq!(
+            sends.len(),
+            2,
+            "failed ephemeral retry must still reach plain fallback"
+        );
+        assert_eq!(
+            sends[0]
+                .callback_ephemeral
+                .as_ref()
+                .map(|callback| callback.replace_callback_query_message),
+            Some(false)
+        );
+        assert!(sends[1].callback_ephemeral.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_ephemeral_answer_edits_in_place_without_public_send() {
+        struct RecordingChannel {
+            sends: Arc<StdMutex<Vec<SendMessage>>>,
+            edits: Arc<StdMutex<Vec<i64>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for RecordingChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                self.sends.lock().unwrap().push(message.clone());
+                Ok(Some("public-message".to_string()))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn edit_ephemeral_message(
+                &self,
+                _chat_id: &str,
+                callback: &crate::transport::CallbackEphemeral,
+                _content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> crate::transport::EphemeralDelivery {
+                self.edits
+                    .lock()
+                    .unwrap()
+                    .push(callback.ephemeral_message_id.unwrap());
+                crate::transport::EphemeralDelivery::Delivered(None)
+            }
+        }
+
+        let channel = Arc::new(RecordingChannel {
+            sends: Arc::new(StdMutex::new(Vec::new())),
+            edits: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), channel.clone());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let consumer = spawn_gateway_event_consumer(
+            rx,
+            Arc::new(RwLock::new(channels)),
+            Arc::new(StdMutex::new(HashMap::new())),
+        );
+
+        tx.send(GatewayEvent {
+            id: "stale-ephemeral".to_string(),
+            channel: "telegram".to_string(),
+            chat_id: "-100".to_string(),
+            thread_ts: None,
+            content: "Подтверждение устарело".to_string(),
+            kind: GatewayEventKind::EphemeralAnswer {
+                callback: crate::transport::CallbackEphemeral {
+                    callback_query_id: "cb-1".to_string(),
+                    receiver_user_id: 7,
+                    replace_callback_query_message: false,
+                    ephemeral_message_id: Some(99),
+                },
+                fallback_edit_message_id: Some("ordinary-1".to_string()),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: None,
+            slug: None,
+        })
+        .unwrap();
+
+        for _ in 0..200 {
+            if !channel.edits.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        consumer.abort();
+
+        assert_eq!(*channel.edits.lock().unwrap(), vec![99]);
+        assert!(channel.sends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn confirmed_ephemeral_stop_error_edits_without_public_send() {
+        struct RecordingChannel {
+            sends: Arc<StdMutex<Vec<SendMessage>>>,
+            edits: Arc<StdMutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for RecordingChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                self.sends.lock().unwrap().push(message.clone());
+                Ok(Some("public-message".to_string()))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn edit_ephemeral_message(
+                &self,
+                _chat_id: &str,
+                _callback: &crate::transport::CallbackEphemeral,
+                content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> EphemeralDelivery {
+                self.edits.lock().unwrap().push(content.to_string());
+                EphemeralDelivery::Delivered(None)
+            }
+        }
+
+        let channel = Arc::new(RecordingChannel {
+            sends: Arc::new(StdMutex::new(Vec::new())),
+            edits: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), channel.clone());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let consumer = spawn_gateway_event_consumer(
+            rx,
+            Arc::new(RwLock::new(channels)),
+            Arc::new(StdMutex::new(HashMap::new())),
+        );
+
+        let fake = Arc::new(ClaudeStreamJsonAdapter::new());
+        let project = TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", project.path());
+        gateway
+            .handle_text("telegram", "-100", "7", "/new claude")
+            .await
+            .unwrap();
+        let blocker = project.path().join("routing-blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        gateway.enable_persistence(&blocker).unwrap();
+        let mut events = gateway.subscribe_events();
+        gateway.set_event_sink(tx);
+        let callback = crate::transport::CallbackEphemeral {
+            callback_query_id: "cb-stop".to_string(),
+            receiver_user_id: 7,
+            replace_callback_query_message: false,
+            ephemeral_message_id: Some(99),
+        };
+
+        gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&crate::transport::ChoiceReply {
+                    data: "cmd:?/stop s1".to_string(),
+                    callback_ephemeral: Some(callback.clone()),
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let confirm_data = confirmation.button_rows[0][0].data.clone();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&crate::transport::ChoiceReply {
+                    data: confirm_data,
+                    callback_ephemeral: Some(callback),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+
+        for _ in 0..100 {
+            if channel.edits.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        consumer.abort();
+
+        assert_eq!(
+            channel.edits.lock().unwrap().first().cloned(),
+            Some("Точно выполнить `/stop s1`?".to_string())
+        );
+        let edits = channel.edits.lock().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert!(edits[1].contains("directory"), "{}", edits[1]);
+        assert!(channel.sends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_ephemeral_edit_suppresses_all_follow_up_sends() {
+        struct UnknownChannel {
+            sends: Arc<StdMutex<Vec<SendMessage>>>,
+            processed: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for UnknownChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                self.sends.lock().unwrap().push(message.clone());
+                Ok(Some("must-not-send".to_string()))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn edit_ephemeral_message(
+                &self,
+                _chat_id: &str,
+                _callback: &crate::transport::CallbackEphemeral,
+                _content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> crate::transport::EphemeralDelivery {
+                self.processed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                crate::transport::EphemeralDelivery::Unknown(anyhow::anyhow!("connection reset"))
+            }
+        }
+
+        let channel = Arc::new(UnknownChannel {
+            sends: Arc::new(StdMutex::new(Vec::new())),
+            processed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), channel.clone());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let consumer = spawn_gateway_event_consumer(
+            rx,
+            Arc::new(RwLock::new(channels)),
+            Arc::new(StdMutex::new(HashMap::new())),
+        );
+
+        tx.send(GatewayEvent {
+            id: "unknown-ephemeral".to_string(),
+            channel: "telegram".to_string(),
+            chat_id: "-100".to_string(),
+            thread_ts: None,
+            content: "Отменено".to_string(),
+            kind: GatewayEventKind::EphemeralAnswer {
+                callback: crate::transport::CallbackEphemeral {
+                    callback_query_id: "cb-1".to_string(),
+                    receiver_user_id: 7,
+                    replace_callback_query_message: false,
+                    ephemeral_message_id: Some(99),
+                },
+                fallback_edit_message_id: Some("ordinary-1".to_string()),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: None,
+            slug: None,
+        })
+        .unwrap();
+
+        for _ in 0..200 {
+            if channel.processed.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        consumer.abort();
+
+        assert!(channel.sends.lock().unwrap().is_empty());
+    }
+
     /// TG-GATE-V2 W7a — a rich-capable channel's `Answer` event gets
     /// `rich_markdown` set to the SAME text as `content` (the agent's
     /// markdown answer); a non-rich channel's `Answer` gets no
@@ -2412,7 +4187,8 @@ mod tests {
         let channels = Arc::new(RwLock::new(channels));
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
-        let consumer = spawn_gateway_event_consumer(rx, channels);
+        let consumer =
+            spawn_gateway_event_consumer(rx, channels, Arc::new(StdMutex::new(HashMap::new())));
 
         let answer = |channel: &str| GatewayEvent {
             id: format!("answer-{channel}"),
@@ -2480,6 +4256,7 @@ mod tests {
             markdown: "**status**".into(),
             plain: "status".into(),
             button_rows: Vec::new(),
+            inline_buttons: false,
             reply_keyboard: None,
         };
         let rich = MockChannel::new().with_name("rich").with_rich_support();
@@ -2504,6 +4281,7 @@ mod tests {
             markdown: "**status**".into(),
             plain: "status".into(),
             button_rows: Vec::new(),
+            inline_buttons: false,
             reply_keyboard: None,
         };
         let plain = MockChannel::new().with_name("plain");
@@ -2566,10 +4344,16 @@ mod tests {
             edits: Arc::new(StdMutex::new(Vec::new())),
         };
         let mut statuses = HashMap::new();
+        let draft_routes = Arc::new(StdMutex::new(HashMap::new()));
+        let mut draft_failures = HashMap::new();
+        let mut draft_keepalives = HashMap::new();
         for content in ["seed", "one", "two", "three"] {
             deliver_progress(
                 &channel,
                 &mut statuses,
+                &draft_routes,
+                &mut draft_failures,
+                &mut draft_keepalives,
                 "status".to_string(),
                 false,
                 "progress-test",
@@ -2577,6 +4361,7 @@ mod tests {
                 None,
                 content.to_string(),
                 Vec::new(),
+                None,
             )
             .await;
         }
@@ -2633,9 +4418,15 @@ mod tests {
             edits: Arc::new(StdMutex::new(Vec::new())),
         };
         let mut statuses = HashMap::new();
+        let draft_routes = Arc::new(StdMutex::new(HashMap::new()));
+        let mut draft_failures = HashMap::new();
+        let mut draft_keepalives = HashMap::new();
         deliver_progress(
             &channel,
             &mut statuses,
+            &draft_routes,
+            &mut draft_failures,
+            &mut draft_keepalives,
             "status".to_string(),
             false,
             "progress-test",
@@ -2643,11 +4434,15 @@ mod tests {
             None,
             "seed".to_string(),
             Vec::new(),
+            None,
         )
         .await;
         deliver_progress(
             &channel,
             &mut statuses,
+            &draft_routes,
+            &mut draft_failures,
+            &mut draft_keepalives,
             "status".to_string(),
             false,
             "progress-test",
@@ -2655,6 +4450,7 @@ mod tests {
             None,
             "unchanged".to_string(),
             Vec::new(),
+            None,
         )
         .await;
 
@@ -2893,7 +4689,8 @@ mod tests {
         let channels = Arc::new(RwLock::new(channels));
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
-        let consumer = spawn_gateway_event_consumer(rx, channels);
+        let consumer =
+            spawn_gateway_event_consumer(rx, channels, Arc::new(StdMutex::new(HashMap::new())));
 
         let ev = |on: bool| GatewayEvent {
             id: format!("r-{on}"),

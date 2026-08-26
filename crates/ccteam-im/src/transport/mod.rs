@@ -21,6 +21,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod providers;
 
+/// Internal marker used to carry Telegram's draft-stop update through the
+/// channel-neutral inbound message until the daemon resolves its sid.
+pub const STOPPED_DRAFT_PREFIX: &str = "__ccteam_stopped_message_generation:";
+
 /// Kind of an inbound [`ChannelAttachment`] (V0.8.4 P2a).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -223,6 +227,7 @@ impl RejectedSenderProbe {
 /// probe and sends one static, actionable notice per sender for this channel
 /// listener's lifetime. Keeping both actions here prevents Telegram, Lark, and
 /// future providers from drifting back to a silent message black hole.
+#[cfg(any(feature = "telegram", feature = "lark"))]
 #[derive(Debug, Default)]
 pub(crate) struct RejectedSenderNotifier {
     probe_path: Option<std::path::PathBuf>,
@@ -233,10 +238,14 @@ pub(crate) struct RejectedSenderNotifier {
 /// bound. Normal personal bots have one or a handful of candidates; reaching
 /// this ceiling means the listener is under abuse, so it stays fail-closed and
 /// keeps writing setup probes but stops notifying new identities until reload.
+#[cfg(any(feature = "telegram", feature = "lark"))]
 const MAX_REJECTED_SENDERS_PER_LISTENER: usize = 1024;
+#[cfg(any(feature = "telegram", feature = "lark"))]
 const MAX_REJECTED_NOTICES_PER_MINUTE: usize = 20;
+#[cfg(any(feature = "telegram", feature = "lark"))]
 const REJECTED_NOTICE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
+#[cfg(any(feature = "telegram", feature = "lark"))]
 #[derive(Debug, Default)]
 struct RejectedSenderNoticeState {
     notified_senders: std::collections::HashSet<String>,
@@ -245,6 +254,7 @@ struct RejectedSenderNoticeState {
     rate_warning_emitted: bool,
 }
 
+#[cfg(any(feature = "telegram", feature = "lark"))]
 #[derive(Debug, PartialEq, Eq)]
 enum RejectedSenderNoticeDecision {
     Notify,
@@ -253,6 +263,7 @@ enum RejectedSenderNoticeDecision {
     RateLimited { emit_warning: bool },
 }
 
+#[cfg(any(feature = "telegram", feature = "lark"))]
 impl RejectedSenderNoticeState {
     fn admit(&mut self, sender_id: &str, now: std::time::Instant) -> RejectedSenderNoticeDecision {
         if self.notified_senders.contains(sender_id) {
@@ -279,6 +290,7 @@ impl RejectedSenderNoticeState {
     }
 }
 
+#[cfg(any(feature = "telegram", feature = "lark"))]
 impl RejectedSenderNotifier {
     pub(crate) fn with_probe_path(path: std::path::PathBuf) -> Self {
         Self {
@@ -366,6 +378,7 @@ impl RejectedSenderNotifier {
     }
 }
 
+#[cfg(any(feature = "telegram", feature = "lark"))]
 fn rejected_sender_notice(sender_id: &str) -> String {
     format!(
         "Этот IM-идентификатор ещё не привязан, сообщение не передано агенту.\nID для привязки: {sender_id}\nОткройте в аккаунте ccteam, которому принадлежит этот бот, «Настройки → Подключение», привяжите этот ID и повторите попытку."
@@ -506,6 +519,37 @@ pub enum ReplyKeyboard {
 pub struct ChoiceReply {
     /// The clicked option's opaque callback payload (`"{token}:{idx}"`).
     pub data: String,
+    /// Telegram callback context for a one-shot ephemeral reply. `None` for
+    /// ordinary button systems and Telegram private chats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_ephemeral: Option<CallbackEphemeral>,
+}
+
+/// Callback facts required by Telegram's one-shot ephemeral reply API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CallbackEphemeral {
+    /// Telegram callback query that triggered the response.
+    pub callback_query_id: String,
+    /// Telegram user who alone receives the response.
+    pub receiver_user_id: i64,
+    /// Whether Telegram may replace the callback's source message.
+    pub replace_callback_query_message: bool,
+    /// Source ephemeral message, when this callback came from one.
+    pub ephemeral_message_id: Option<i64>,
+}
+
+/// Outcome of a Telegram callback-bound ephemeral operation.
+///
+/// `Unknown` means the request may have reached Telegram despite the missing
+/// response, so retrying would duplicate user-visible output.
+#[derive(Debug)]
+pub enum EphemeralDelivery {
+    /// Telegram accepted the operation.
+    Delivered(Option<String>),
+    /// Telegram explicitly rejected the operation; a fallback is safe.
+    Rejected(anyhow::Error),
+    /// The request may have applied, so no follow-up send is safe.
+    Unknown(anyhow::Error),
 }
 
 /// Message to send through a channel.
@@ -547,9 +591,16 @@ pub struct SendMessage {
     /// numbered text list the same way `options` already does today.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub button_rows: Vec<Vec<MessageOption>>,
+    /// Rich markdown already contains the button rows; the classic fallback
+    /// still uses `button_rows` as its inline keyboard.
+    #[serde(default)]
+    pub inline_buttons: bool,
     /// Telegram reply keyboard request; unsupported channels ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_keyboard: Option<ReplyKeyboard>,
+    /// Telegram-only response to a group callback. Other channels ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_ephemeral: Option<CallbackEphemeral>,
 }
 
 impl SendMessage {
@@ -564,7 +615,9 @@ impl SendMessage {
             options: Vec::new(),
             rich_markdown: None,
             button_rows: Vec::new(),
+            inline_buttons: false,
             reply_keyboard: None,
+            callback_ephemeral: None,
         }
     }
 
@@ -598,9 +651,30 @@ impl SendMessage {
         self
     }
 
+    /// Builder-style: mark button rows already embedded in Rich markdown.
+    pub fn with_inline_buttons(mut self, inline_buttons: bool) -> Self {
+        self.inline_buttons = inline_buttons;
+        self
+    }
+
     /// Builder-style: attach a Telegram reply keyboard request.
     pub fn with_reply_keyboard(mut self, reply_keyboard: ReplyKeyboard) -> Self {
         self.reply_keyboard = Some(reply_keyboard);
+        self
+    }
+
+    /// Render this callback response only to the user who tapped the button.
+    pub fn with_callback_ephemeral(
+        mut self,
+        callback_query_id: impl Into<String>,
+        receiver_user_id: i64,
+    ) -> Self {
+        self.callback_ephemeral = Some(CallbackEphemeral {
+            callback_query_id: callback_query_id.into(),
+            receiver_user_id,
+            replace_callback_query_message: true,
+            ephemeral_message_id: None,
+        });
         self
     }
 }
@@ -640,10 +714,48 @@ pub trait Channel: Send + Sync {
         false
     }
 
+    /// Send or refresh a transient rich-message draft. Channels without a
+    /// native draft API keep the ordinary progress send/edit path.
+    async fn send_draft(
+        &self,
+        _recipient: &str,
+        _draft_id: i64,
+        _markdown: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("draft messages unsupported")
+    }
+
     /// Send a single message. Returns the platform-side message id
     /// when available (Slack `ts`, Discord message id, …) for echo
     /// suppression in the outbound tailer.
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>>;
+
+    /// Send a callback-bound ephemeral message. Providers without Telegram's
+    /// acknowledgement ambiguity treat a send error as an explicit rejection.
+    async fn send_ephemeral(&self, message: &SendMessage) -> EphemeralDelivery {
+        match self.send(message).await {
+            Ok(id) => EphemeralDelivery::Delivered(id),
+            Err(err) => EphemeralDelivery::Rejected(err),
+        }
+    }
+
+    /// Complete the client-side callback spinner. Telegram overrides this;
+    /// other channels have no equivalent operation.
+    async fn answer_callback(&self, _callback_query_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Edit a Telegram ephemeral message. Other transports deliberately do
+    /// not implement this separate identifier space.
+    async fn edit_ephemeral_message(
+        &self,
+        _chat_id: &str,
+        _callback: &CallbackEphemeral,
+        _content: &str,
+        _button_rows: &[Vec<MessageOption>],
+    ) -> EphemeralDelivery {
+        EphemeralDelivery::Rejected(anyhow::anyhow!("ephemeral message edits are unsupported"))
+    }
 
     /// Long-running inbound listener (see trait-level docs).
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
@@ -746,6 +858,7 @@ pub trait Channel: Send + Sync {
 
 /// Staging dir for downloaded inbound attachments (channel-scoped — the
 /// routing to a project/role happens later in the gateway).
+#[cfg(any(feature = "telegram", feature = "lark"))]
 pub(crate) fn inbound_staging_dir() -> std::path::PathBuf {
     crate::default_ccteam_root_public()
         .join("state")
@@ -802,6 +915,7 @@ pub fn next_project_upload_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "telegram", feature = "lark"))]
     use crate::transport::providers::mock::MockChannel;
 
     /// v0.8.20 F2 — the platform prefix is what platform-keyed logic (ACL,
@@ -870,6 +984,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any(feature = "telegram", feature = "lark"))]
     async fn rejected_sender_is_probed_each_time_but_notified_once() {
         let tmp = tempfile::tempdir().unwrap();
         let probe_path = tmp.path().join("rejected-senders.jsonl");
@@ -916,6 +1031,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "telegram", feature = "lark"))]
     fn rejected_sender_notice_state_is_rate_and_memory_bounded() {
         let mut state = RejectedSenderNoticeState::default();
         let now = std::time::Instant::now();

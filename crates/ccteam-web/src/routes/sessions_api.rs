@@ -2063,6 +2063,9 @@ pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
         // serializer ever runs, same as `Reaction` above — the arm exists
         // only for match exhaustiveness.
         GatewayEventKind::EditMessage { .. } => ("edit_message", false),
+        // Ephemeral callback replies are Telegram-only (`is_im_only_event`
+        // filters them out); the arm exists for match exhaustiveness.
+        GatewayEventKind::EphemeralAnswer { .. } => ("ephemeral_answer", false),
     };
     let mut payload = json!({
         "id": ev.id,

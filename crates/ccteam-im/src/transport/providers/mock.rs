@@ -21,6 +21,8 @@ type RecordedReaction = (String, String, String, Option<String>);
 /// button_rows)` (TG-GATE-V2 W5 added `button_rows`).
 type RecordedEdit = (String, String, Vec<Vec<MessageOption>>);
 
+type RecordedDraft = (String, i64, String);
+
 /// Test-only Channel. Cheap to clone (`Arc` inside) so a test can
 /// hand one copy to the daemon and keep another for assertions.
 #[derive(Debug, Clone, Default)]
@@ -64,6 +66,9 @@ pub struct MockChannel {
     /// gating in daemon.rs is testable through a real `MockChannel`. Default
     /// `false` (every other channel).
     rich: bool,
+    drafts: Arc<Mutex<Vec<RecordedDraft>>>,
+    draft_supported: bool,
+    draft_failure: bool,
 }
 
 impl MockChannel {
@@ -80,6 +85,9 @@ impl MockChannel {
             reaction_handle: None,
             reactions: Arc::default(),
             rich: false,
+            drafts: Arc::default(),
+            draft_supported: false,
+            draft_failure: false,
         }
     }
 
@@ -87,6 +95,20 @@ impl MockChannel {
     /// W7a), so a test can stand in for Telegram without a live Bot API.
     pub fn with_rich_support(mut self) -> Self {
         self.rich = true;
+        self
+    }
+
+    /// Make this test channel accept transient draft sends.
+    pub fn with_draft_support(mut self) -> Self {
+        self.draft_supported = true;
+        self.draft_failure = false;
+        self
+    }
+
+    /// Make every draft send fail after recording the attempted payload.
+    pub fn failing_drafts(mut self) -> Self {
+        self.draft_supported = true;
+        self.draft_failure = true;
         self
     }
 
@@ -147,6 +169,11 @@ impl MockChannel {
         self.edits.lock().await.clone()
     }
 
+    /// Snapshot attempted draft sends as `(recipient, draft_id, markdown)`.
+    pub async fn drafts(&self) -> Vec<RecordedDraft> {
+        self.drafts.lock().await.clone()
+    }
+
     /// Snapshot of every [`Channel::register_commands`] call's specs
     /// (v0.8.5 P1). One entry per call; empty until the daemon wires the
     /// menu at startup.
@@ -163,6 +190,25 @@ impl Channel for MockChannel {
 
     fn supports_rich_messages(&self) -> bool {
         self.rich
+    }
+
+    async fn send_draft(
+        &self,
+        recipient: &str,
+        draft_id: i64,
+        markdown: &str,
+    ) -> anyhow::Result<()> {
+        if !self.draft_supported {
+            anyhow::bail!("mock: draft messages unsupported");
+        }
+        self.drafts
+            .lock()
+            .await
+            .push((recipient.to_string(), draft_id, markdown.to_string()));
+        if self.draft_failure {
+            anyhow::bail!("mock: simulated draft failure");
+        }
+        Ok(())
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
