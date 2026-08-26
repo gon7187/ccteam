@@ -307,7 +307,7 @@ async fn progress_edits_one_status_message_not_spam() {
         .find(|content| content.starts_with("▶️"))
         .expect("terminal progress seed");
     assert!(status.contains("работает · "), "status: {status}");
-    assert!(status.contains("```text\n"), "status: {status}");
+    assert!(status.contains("```Terminal\n"), "status: {status}");
     // The answer is its own (new) message. It carries the v0.8.23 review
     // §3.2-5 context echo suffix on a focused answer, so match on a prefix.
     assert!(
