@@ -28538,7 +28538,11 @@ mod tests {
     async fn delegation_watch_is_spent_by_the_dispatched_task_boundary() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().to_path_buf();
-        let gateway = delegation_gateway(&project_dir).await;
+        // This test drives delivery synchronously below. Starting the async
+        // notifier would race its startup reconcile against that manual path,
+        // an interleaving production never permits (the notifier reconciles
+        // before it starts draining live signals).
+        let gateway = delegation_gateway_without_notifier(&project_dir).await;
 
         let (parent_sid, child_sid) = {
             let mut gw = gateway.lock().await;
