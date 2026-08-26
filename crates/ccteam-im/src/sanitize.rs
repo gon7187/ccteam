@@ -631,17 +631,20 @@ fn balance_fences(parts: Vec<String>) -> Vec<String> {
 #[derive(Debug, Clone)]
 struct FenceState {
     prefix: String,
+    quote_depth: usize,
     marker: crate::telegram_html::FenceMarker,
     info: String,
 }
 
 fn fence_line(line: &str) -> Option<FenceState> {
     let mut offset = 0;
+    let mut quote_depth = 0;
     loop {
         while line[offset..].starts_with(' ') {
             offset += 1;
         }
         if line[offset..].starts_with('>') {
+            quote_depth += 1;
             offset += 1;
             if line[offset..].starts_with(' ') {
                 offset += 1;
@@ -654,6 +657,7 @@ fn fence_line(line: &str) -> Option<FenceState> {
     let info = line[offset + marker.len..].trim().to_string();
     Some(FenceState {
         prefix: line[..offset].to_string(),
+        quote_depth,
         marker,
         info,
     })
@@ -663,9 +667,9 @@ fn is_fence_close(line: &str, opening: &FenceState) -> bool {
     let Some(candidate) = fence_line(line) else {
         return false;
     };
-    candidate.prefix == opening.prefix
+    candidate.quote_depth == opening.quote_depth
         && crate::telegram_html::is_fence_closer(
-            line[opening.prefix.len()..].trim_end_matches('\n'),
+            line[candidate.prefix.len()..].trim_end_matches('\n'),
             opening.marker,
         )
 }
@@ -951,7 +955,7 @@ mod tests {
 
     #[test]
     fn rich_split_reopens_nested_fence_in_quote() {
-        let markdown = format!("> ```rust\n{}> ```\n", "> value\n".repeat(80));
+        let markdown = format!("> ```rust\n{}>   ```\n", "> value\n".repeat(80));
         let parts = split_rich_markdown_numbered(&markdown, 180);
         assert!(parts.len() > 1);
         for part in &parts {

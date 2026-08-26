@@ -1886,10 +1886,11 @@ async fn send_gateway_outbound(
     // split that fallback internally if the row degrades to classic.
     let parts = match channel.max_message_len() {
         Some(_) if message.attachments.is_empty() && message.rich_markdown.is_some() => {
+            let rich_limit = crate::transport::providers::telegram::rich_markdown_budget(&message);
             crate::sanitize::split_rich_markdown_with_plain(
                 message.rich_markdown.as_deref().expect("checked above"),
                 &message.content,
-                30_000,
+                rich_limit,
             )
             .into_iter()
             .map(|(rich, plain)| {

@@ -37,6 +37,7 @@ const POLL_TIMEOUT_SECS: u64 = 25;
 /// gateway/daemon read it polymorphically via
 /// [`Channel::max_message_len`], keeping the split path channel-neutral.
 const MAX_MESSAGE_UTF16: usize = 3900;
+const MAX_RICH_MARKDOWN_BYTES: usize = 30_000;
 
 /// Telegram channel.
 pub struct TelegramChannel {
@@ -1124,6 +1125,18 @@ fn button_rows_to_tg_html(rows: &[Vec<MessageOption>]) -> String {
     out
 }
 
+/// Rich Message body budget after accounting for the optional button block
+/// appended by [`build_rich_send_body`].
+pub(crate) fn rich_markdown_budget(message: &SendMessage) -> usize {
+    let buttons_html = button_rows_to_tg_html(&combined_button_rows(message));
+    let overhead = if buttons_html.is_empty() {
+        0
+    } else {
+        2 + buttons_html.len()
+    };
+    MAX_RICH_MARKDOWN_BYTES.saturating_sub(overhead).max(1)
+}
+
 /// Build the `sendRichMessage` request body: `rich_message.markdown` =
 /// `markdown` with [`combined_button_rows`] appended as trailing
 /// `<tg-button-row>` blocks. No `parse_mode` — Rich Messages have no such
@@ -2087,6 +2100,24 @@ mod tests {
         let message = SendMessage::new("hello", "42").with_rich_markdown("hello");
         let body = build_rich_send_body(&message, "hello");
         assert_eq!(body["rich_message"]["markdown"], "hello");
+    }
+
+    #[test]
+    fn rich_markdown_budget_includes_button_block() {
+        let plain = SendMessage::new("hello", "42");
+        assert_eq!(rich_markdown_budget(&plain), MAX_RICH_MARKDOWN_BYTES);
+
+        let message = plain.with_button_rows(vec![vec![opt("cmd:/status", "Status", None)]]);
+        let budget = rich_markdown_budget(&message);
+        assert!(budget < MAX_RICH_MARKDOWN_BYTES);
+        let body = build_rich_send_body(&message, &"x".repeat(budget));
+        assert!(
+            body["rich_message"]["markdown"]
+                .as_str()
+                .expect("rich markdown")
+                .len()
+                <= MAX_RICH_MARKDOWN_BYTES
+        );
     }
 
     #[test]
