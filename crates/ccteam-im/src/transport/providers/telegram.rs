@@ -1300,10 +1300,7 @@ impl Channel for TelegramChannel {
             // (`**`/backticks/the `/status` `<blockquote>`) can push a
             // render over the ceiling even when `.content` comfortably
             // fits. So: use `markdown` ONLY when ITS rendered length also
-            // fits; otherwise fall through to the pre-existing
-            // `.content`-based path below (lossless split, bold lost —
-            // acceptable per review). No durable markdown splitter here —
-            // rejected as scope creep.
+            // fits; otherwise fall through to the row's plain content.
             if render_markdown(markdown).text_utf16_len <= MAX_MESSAGE_UTF16 {
                 return self.send_classic_part(message, markdown, true).await;
             }

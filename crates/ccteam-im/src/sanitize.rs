@@ -107,9 +107,8 @@ fn utf16_len(s: &str) -> usize {
 }
 
 /// Units reserved when a code fence straddles a split boundary, to hold
-/// the re-open (`` ```<info>\n ``) on the next part plus the close
-/// (`` \n``` ``) on this one. Comfortably covers info strings up to
-/// ~16 units (`typescript` = 10).
+/// the re-open (marker + info + newline) on the next part plus the close
+/// on this one. The final size is checked again after balancing.
 const FENCE_REOPEN_MARGIN: usize = 24;
 
 /// Split `text` into ordered chunks, each within `max_units` UTF-16 code
@@ -118,7 +117,7 @@ const FENCE_REOPEN_MARGIN: usize = 24;
 /// - **Lossless for plain text**: concatenating the parts reproduces the
 ///   original verbatim (no characters dropped, no separators consumed)
 ///   whenever no code fence crosses a boundary.
-/// - **Balanced fences**: a `` ``` `` block that crosses a split is
+/// - **Balanced fences**: a backtick or tilde fence block that crosses a split is
 ///   closed at the end of one part and re-opened (preserving the
 ///   language info string) at the start of the next, so every part is
 ///   valid Markdown on its own.
@@ -553,8 +552,8 @@ fn pick_cut(s: &str, budget: usize) -> usize {
 }
 
 /// Walk `parts` left-to-right; whenever a part ends inside an open code
-/// fence, append a closing `` ``` `` and re-open the fence (with its
-/// language info) at the head of the next part.
+/// fence, append a matching close and re-open it (with its language info)
+/// at the head of the next part.
 fn balance_fences(parts: Vec<String>) -> Vec<String> {
     let mut out = Vec::with_capacity(parts.len());
     let mut carry: Option<FenceState> = None;
@@ -579,10 +578,8 @@ fn balance_fences(parts: Vec<String>) -> Vec<String> {
     out
 }
 
-/// Whether `s` ends inside an open ```` ``` ```` fence, and (when open)
-/// the language info string of that fence. Only lines whose first
-/// non-whitespace run is ```` ``` ```` count as fence markers (standard
-/// Markdown), so inline back-ticks are ignored.
+/// Whether `s` ends inside an open backtick or tilde fence, including a
+/// fence nested in a blockquote. Inline backticks are ignored.
 #[derive(Debug, Clone)]
 struct FenceState {
     prefix: String,
@@ -635,7 +632,7 @@ fn fence_open_line(opening: &FenceState) -> String {
         if opening.info.is_empty() {
             String::new()
         } else {
-            format!("{}", opening.info)
+            opening.info.clone()
         }
     )
 }
@@ -901,6 +898,25 @@ mod tests {
                 .count();
             assert_eq!(fences % 2, 0, "unbalanced tilde fence: {part:?}");
             assert!(part.ends_with(&format!("({}/{total})", index + 1)));
+        }
+    }
+
+    #[test]
+    fn rich_split_reopens_nested_fence_in_quote() {
+        let markdown = format!("> ```rust\n{}> ```\n", "> value\n".repeat(80));
+        let parts = split_rich_markdown_numbered(&markdown, 180);
+        assert!(parts.len() > 1);
+        for part in &parts {
+            let fences = part
+                .lines()
+                .filter_map(|line| line.strip_prefix("> "))
+                .filter(|line| crate::telegram_html::is_fence_line(line))
+                .count();
+            assert_eq!(fences % 2, 0, "unbalanced quoted rich fence: {part:?}");
+            assert!(
+                part.contains("> ```rust"),
+                "language was not reopened: {part:?}"
+            );
         }
     }
 
