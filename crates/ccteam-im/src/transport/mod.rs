@@ -223,6 +223,7 @@ impl RejectedSenderProbe {
 /// probe and sends one static, actionable notice per sender for this channel
 /// listener's lifetime. Keeping both actions here prevents Telegram, Lark, and
 /// future providers from drifting back to a silent message black hole.
+#[cfg(any(feature = "telegram", feature = "lark"))]
 #[derive(Debug, Default)]
 pub(crate) struct RejectedSenderNotifier {
     probe_path: Option<std::path::PathBuf>,
@@ -233,10 +234,14 @@ pub(crate) struct RejectedSenderNotifier {
 /// bound. Normal personal bots have one or a handful of candidates; reaching
 /// this ceiling means the listener is under abuse, so it stays fail-closed and
 /// keeps writing setup probes but stops notifying new identities until reload.
+#[cfg(any(feature = "telegram", feature = "lark"))]
 const MAX_REJECTED_SENDERS_PER_LISTENER: usize = 1024;
+#[cfg(any(feature = "telegram", feature = "lark"))]
 const MAX_REJECTED_NOTICES_PER_MINUTE: usize = 20;
+#[cfg(any(feature = "telegram", feature = "lark"))]
 const REJECTED_NOTICE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
+#[cfg(any(feature = "telegram", feature = "lark"))]
 #[derive(Debug, Default)]
 struct RejectedSenderNoticeState {
     notified_senders: std::collections::HashSet<String>,
@@ -245,6 +250,7 @@ struct RejectedSenderNoticeState {
     rate_warning_emitted: bool,
 }
 
+#[cfg(any(feature = "telegram", feature = "lark"))]
 #[derive(Debug, PartialEq, Eq)]
 enum RejectedSenderNoticeDecision {
     Notify,
@@ -253,6 +259,7 @@ enum RejectedSenderNoticeDecision {
     RateLimited { emit_warning: bool },
 }
 
+#[cfg(any(feature = "telegram", feature = "lark"))]
 impl RejectedSenderNoticeState {
     fn admit(&mut self, sender_id: &str, now: std::time::Instant) -> RejectedSenderNoticeDecision {
         if self.notified_senders.contains(sender_id) {
@@ -279,6 +286,7 @@ impl RejectedSenderNoticeState {
     }
 }
 
+#[cfg(any(feature = "telegram", feature = "lark"))]
 impl RejectedSenderNotifier {
     pub(crate) fn with_probe_path(path: std::path::PathBuf) -> Self {
         Self {
@@ -366,6 +374,7 @@ impl RejectedSenderNotifier {
     }
 }
 
+#[cfg(any(feature = "telegram", feature = "lark"))]
 fn rejected_sender_notice(sender_id: &str) -> String {
     format!(
         "Этот IM-идентификатор ещё не привязан, сообщение не передано агенту.\nID для привязки: {sender_id}\nОткройте в аккаунте ccteam, которому принадлежит этот бот, «Настройки → Подключение», привяжите этот ID и повторите попытку."
@@ -779,6 +788,7 @@ pub trait Channel: Send + Sync {
 
 /// Staging dir for downloaded inbound attachments (channel-scoped — the
 /// routing to a project/role happens later in the gateway).
+#[cfg(any(feature = "telegram", feature = "lark"))]
 pub(crate) fn inbound_staging_dir() -> std::path::PathBuf {
     crate::default_ccteam_root_public()
         .join("state")
@@ -835,6 +845,7 @@ pub fn next_project_upload_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "telegram", feature = "lark"))]
     use crate::transport::providers::mock::MockChannel;
 
     /// v0.8.20 F2 — the platform prefix is what platform-keyed logic (ACL,
@@ -903,6 +914,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any(feature = "telegram", feature = "lark"))]
     async fn rejected_sender_is_probed_each_time_but_notified_once() {
         let tmp = tempfile::tempdir().unwrap();
         let probe_path = tmp.path().join("rejected-senders.jsonl");
@@ -949,6 +961,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "telegram", feature = "lark"))]
     fn rejected_sender_notice_state_is_rate_and_memory_bounded() {
         let mut state = RejectedSenderNoticeState::default();
         let now = std::time::Instant::now();
