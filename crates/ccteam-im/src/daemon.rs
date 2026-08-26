@@ -2563,18 +2563,16 @@ fn schedule_draft_finalization(
     channel: Arc<dyn Channel + Send + Sync>,
 ) {
     let state = Arc::new(AtomicU8::new(FINAL_PENDING));
-    finalizations
-        .lock()
-        .unwrap()
+    let mut entries = finalizations.lock().unwrap();
+    entries
         .by_status_key
         .insert(completion.status_key.clone(), state.clone());
-    finalizations
-        .lock()
-        .unwrap()
+    entries
         .by_sid
         .entry(completion.sid.clone())
         .or_default()
         .push_back(completion.status_key.clone());
+    drop(entries);
     let sid = completion.sid.clone();
     let status_key = completion.status_key.clone();
     let finalizations = finalizations.clone();
