@@ -67,6 +67,7 @@ struct DraftRoute {
     sid: String,
     content: String,
     updated_at: std::time::Instant,
+    stopped: Arc<AtomicBool>,
 }
 
 type DraftRoutes = Arc<StdMutex<HashMap<DraftRouteKey, DraftRoute>>>;
@@ -93,7 +94,7 @@ struct DraftKeepaliveState {
     last_sent: StdMutex<tokio::time::Instant>,
     send_lock: tokio::sync::Mutex<()>,
     failed: AtomicBool,
-    stopped: AtomicBool,
+    stopped: Arc<AtomicBool>,
 }
 
 struct DraftKeepalive {
@@ -178,23 +179,37 @@ fn set_draft_route(
     draft_id: i64,
     sid: &str,
     content: &str,
+    stopped: Arc<AtomicBool>,
 ) {
+    if stopped.load(Ordering::Acquire) {
+        return;
+    }
     prune_draft_routes(routes);
-    routes.lock().unwrap().insert(
-        (channel.to_string(), recipient.to_string(), draft_id),
+    let key = (channel.to_string(), recipient.to_string(), draft_id);
+    let mut routes = routes.lock().unwrap();
+    if stopped.load(Ordering::Acquire)
+        || routes
+            .get(&key)
+            .is_some_and(|route| route.stopped.load(Ordering::Acquire))
+    {
+        return;
+    }
+    routes.insert(
+        key,
         DraftRoute {
             sid: sid.to_string(),
             content: content.to_string(),
             updated_at: std::time::Instant::now(),
+            stopped,
         },
     );
 }
 
 fn remove_draft_route(routes: &DraftRoutes, channel: &str, recipient: &str, draft_id: i64) {
-    routes
-        .lock()
-        .unwrap()
-        .remove(&(channel.to_string(), recipient.to_string(), draft_id));
+    let mut routes = routes.lock().unwrap();
+    if let Some(route) = routes.remove(&(channel.to_string(), recipient.to_string(), draft_id)) {
+        route.stopped.store(true, Ordering::Release);
+    }
 }
 
 fn stop_keepalive(keepalives: &mut HashMap<String, DraftKeepalive>, status_key: &str) {
@@ -226,6 +241,9 @@ async fn draft_keepalive_loop(
             return;
         }
         let _send_lock = state.send_lock.lock().await;
+        if state.stopped.load(Ordering::Acquire) {
+            return;
+        }
         let now = tokio::time::Instant::now();
         let last_sent = *state.last_sent.lock().unwrap();
         if now.duration_since(last_sent) < DRAFT_SEND_FLOOR {
@@ -246,6 +264,7 @@ async fn draft_keepalive_loop(
                     state.draft_id,
                     &sid,
                     &content,
+                    state.stopped.clone(),
                 );
             }
             Err(error) => {
@@ -2285,6 +2304,7 @@ async fn deliver_progress(
                                 draft_id,
                                 sid,
                                 &content,
+                                state.stopped.clone(),
                             );
                             return None;
                         }
@@ -2302,6 +2322,7 @@ async fn deliver_progress(
                                     draft_id,
                                     sid,
                                     &content,
+                                    state.stopped.clone(),
                                 );
                                 return None;
                             }
@@ -2359,6 +2380,7 @@ async fn deliver_progress(
                 match channel.send_draft(&chat_id, draft_id, &markdown).await {
                     Ok(()) => {
                         let now = tokio::time::Instant::now();
+                        let stopped = Arc::new(AtomicBool::new(false));
                         set_draft_route(
                             draft_routes,
                             channel_name,
@@ -2366,6 +2388,7 @@ async fn deliver_progress(
                             draft_id,
                             sid,
                             &content,
+                            stopped.clone(),
                         );
                         draft_keepalives.insert(
                             status_key.clone(),
@@ -2378,7 +2401,7 @@ async fn deliver_progress(
                                     last_sent: StdMutex::new(now),
                                     send_lock: tokio::sync::Mutex::new(()),
                                     failed: AtomicBool::new(false),
-                                    stopped: AtomicBool::new(false),
+                                    stopped,
                                 }),
                                 task: None,
                             },
@@ -2499,6 +2522,7 @@ async fn deliver_progress(
             match channel.send_draft(&chat_id, draft_id, &markdown).await {
                 Ok(()) => {
                     let now = tokio::time::Instant::now();
+                    let stopped = Arc::new(AtomicBool::new(false));
                     set_draft_route(
                         draft_routes,
                         channel_name,
@@ -2506,6 +2530,7 @@ async fn deliver_progress(
                         draft_id,
                         sid,
                         &content,
+                        stopped.clone(),
                     );
                     draft_keepalives.insert(
                         status_key.clone(),
@@ -2518,7 +2543,7 @@ async fn deliver_progress(
                                 last_sent: StdMutex::new(now),
                                 send_lock: tokio::sync::Mutex::new(()),
                                 failed: AtomicBool::new(false),
-                                stopped: AtomicBool::new(false),
+                                stopped,
                             }),
                             task: None,
                         },
@@ -2634,11 +2659,13 @@ fn take_stopped_draft_route(
         .strip_prefix(crate::transport::STOPPED_DRAFT_PREFIX)?
         .parse::<i64>()
         .ok()?;
-    prune_draft_routes(draft_routes);
-    draft_routes
-        .lock()
-        .unwrap()
-        .remove(&(channel.to_string(), chat_id.to_string(), draft_id))
+    let key = (channel.to_string(), chat_id.to_string(), draft_id);
+    let mut routes = draft_routes.lock().unwrap();
+    let now = std::time::Instant::now();
+    routes.retain(|_, route| now.saturating_duration_since(route.updated_at) < DRAFT_ROUTE_TTL);
+    let route = routes.remove(&key)?;
+    route.stopped.store(true, Ordering::Release);
+    Some(route)
 }
 
 fn take_answer_finalization(
@@ -3288,6 +3315,7 @@ mod tests {
                 sid: "s42".to_string(),
                 content: "partial".to_string(),
                 updated_at: std::time::Instant::now(),
+                stopped: Arc::new(AtomicBool::new(false)),
             },
         )])));
         let payload = format!("{}77", crate::transport::STOPPED_DRAFT_PREFIX);
@@ -3340,6 +3368,7 @@ mod tests {
                 sid: "s42".to_string(),
                 content: "partial".to_string(),
                 updated_at: std::time::Instant::now() - DRAFT_ROUTE_TTL - Duration::from_secs(1),
+                stopped: Arc::new(AtomicBool::new(false)),
             },
         )])));
         let payload = format!("{}77", crate::transport::STOPPED_DRAFT_PREFIX);
@@ -3348,6 +3377,66 @@ mod tests {
             None
         );
         assert!(routes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_draft_route_cannot_restart_keepalive() {
+        let mock = crate::transport::providers::mock::MockChannel::new()
+            .with_name("telegram")
+            .with_draft_support();
+        let routes = Arc::new(StdMutex::new(HashMap::new()));
+        let stopped = Arc::new(AtomicBool::new(false));
+        set_draft_route(
+            &routes,
+            "telegram",
+            "123",
+            77,
+            "s42",
+            "partial",
+            stopped.clone(),
+        );
+        let state = Arc::new(DraftKeepaliveState {
+            recipient: "123".to_string(),
+            draft_id: 77,
+            markdown: StdMutex::new("partial".to_string()),
+            content: StdMutex::new("partial".to_string()),
+            last_sent: StdMutex::new(tokio::time::Instant::now() - DRAFT_SEND_FLOOR),
+            send_lock: tokio::sync::Mutex::new(()),
+            failed: AtomicBool::new(false),
+            stopped: stopped.clone(),
+        });
+        let task = tokio::spawn(draft_keepalive_loop(
+            Arc::downgrade(&state),
+            Arc::new(mock.clone()),
+            routes.clone(),
+            Duration::from_secs(2),
+            "telegram".to_string(),
+            "s42".to_string(),
+        ));
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+
+        let payload = format!("{}77", crate::transport::STOPPED_DRAFT_PREFIX);
+        let route = take_stopped_draft_route("telegram", "123", &payload, &routes)
+            .expect("first stop consumes the draft route");
+        assert_eq!(route.content, "partial");
+        let before = mock.drafts().await.len();
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(mock.drafts().await.len(), before);
+        assert!(routes.lock().unwrap().is_empty());
+        assert!(take_stopped_draft_route("telegram", "123", &payload, &routes).is_none());
+        set_draft_route(&routes, "telegram", "123", 77, "s42", "partial", stopped);
+        assert!(routes.lock().unwrap().is_empty());
+        send_stopped_draft_not_found(&mock, "123", None, "second-stop").await;
+        let outbox = mock.outbox().await;
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].content, "сессия не найдена, /sessions");
+        task.abort();
     }
 
     #[allow(clippy::await_holding_lock)]
