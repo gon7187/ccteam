@@ -131,7 +131,9 @@ impl SessionEventRing {
 pub(crate) fn is_im_only_event(ev: &GatewayEvent) -> bool {
     matches!(
         ev.kind,
-        GatewayEventKind::Reaction { .. } | GatewayEventKind::EditMessage { .. }
+        GatewayEventKind::Reaction { .. }
+            | GatewayEventKind::EditMessage { .. }
+            | GatewayEventKind::EphemeralAnswer { .. }
     )
 }
 
