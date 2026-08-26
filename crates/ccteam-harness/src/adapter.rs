@@ -1432,7 +1432,8 @@ pub trait HarnessAdapter: Send + Sync {
     /// Report ACCOUNT-level usage / rate-limits (5-hour + weekly windows + extra
     /// credits) for the IM `/status` operator dashboard. Unlike `thread_status`
     /// this is OPTIONAL (a default `None`): only adapters with a usage channel
-    /// implement it (Claude stream-json via the `get_usage` control_request).
+    /// implement it (Claude stream-json `get_usage` and Codex app-server
+    /// `account/rateLimits/updated`).
     /// It is account-, not session-, scoped — the gateway queries it once on any
     /// one live session.
     async fn account_usage(&self, _h: &ThreadHandle) -> Option<AccountUsage> {

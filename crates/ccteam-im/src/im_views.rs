@@ -55,7 +55,7 @@ pub struct StatusView {
     pub path: String,
     /// Session host.
     pub host: String,
-    /// Expandable low-priority facts, one line each.
+    /// Detail sections, one line each; empty strings separate sections.
     pub detail_lines: Vec<String>,
     /// Project-scoped trailing 24-hour cost from the progress ledger.
     pub cost_24h: String,
@@ -142,43 +142,51 @@ pub struct CommandView {
 /// Render the focused-session card.
 pub fn render_status(view: &StatusView) -> RichReply {
     let mut details = view.detail_lines.clone();
+    details.push(String::new());
     details.push(view.cost_24h.clone());
+    details.push(String::new());
+    details.push(format!("🔁 resume {}", view.resume));
     let markdown_details = details
         .iter()
         .map(|line| escape_status_markdown(line))
         .collect::<Vec<_>>()
         .join("\n");
-    let markdown_details = format!(
-        "{markdown_details}\n🔁 resume `{}`",
-        escape_code(&view.resume)
-    );
-    let plain_details = format!("{}\n🔁 resume {}", details.join("\n"), view.resume);
-    let markdown = format!(
-        "🧭 **{}** · {} · {}\n{} · {} · {} · ctx {}\n📁 `{}`\n🖥 host: {}\n<blockquote expandable>{}</blockquote>",
-        escape_status_markdown(&view.sid),
-        escape_status_markdown(&view.project),
-        escape_status_markdown(&view.vendor),
-        escape_status_markdown(&view.state),
-        escape_status_markdown(&view.model),
-        escape_status_markdown(&view.effort),
-        escape_status_markdown(&view.context),
-        escape_status_code(&view.path),
-        escape_status_markdown(&view.host),
-        markdown_details,
-    );
-    let plain = format!(
-        "🧭 {} · {} · {}\n{} · {} · {} · ctx {}\n📁 {}\n🖥 host: {}\n{}",
-        view.sid,
-        view.project,
-        view.vendor,
-        view.state,
-        view.model,
-        view.effort,
-        view.context,
-        view.path,
-        view.host,
-        plain_details,
-    );
+    let mut markdown_lines = vec![
+        format!(
+            "🧭 {} · {} · {}",
+            escape_status_markdown(&view.sid),
+            escape_status_markdown(&view.project),
+            escape_status_markdown(&view.vendor),
+        ),
+        format!(
+            "{} · {} · {} · ctx {}",
+            escape_status_markdown(&view.state),
+            escape_status_markdown(&view.model),
+            escape_status_markdown(&view.effort),
+            escape_status_markdown(&view.context),
+        ),
+        format!("📁 {}", escape_status_markdown(&view.path)),
+    ];
+    if view.host != "local" && !view.host.is_empty() {
+        markdown_lines.push(format!("🖥 host: {}", escape_status_markdown(&view.host)));
+    }
+    markdown_lines.push(String::new());
+    markdown_lines.push(markdown_details);
+    let markdown = markdown_lines.join("\n");
+    let mut plain_lines = vec![
+        format!("🧭 {} · {} · {}", view.sid, view.project, view.vendor),
+        format!(
+            "{} · {} · {} · ctx {}",
+            view.state, view.model, view.effort, view.context
+        ),
+        format!("📁 {}", view.path),
+    ];
+    if view.host != "local" && !view.host.is_empty() {
+        plain_lines.push(format!("🖥 host: {}", view.host));
+    }
+    plain_lines.push(String::new());
+    plain_lines.extend(details);
+    let plain = plain_lines.join("\n");
     let stop = command_button_styled(
         "⛔ Стоп",
         format!("?/stop {}", view.sid),
@@ -467,10 +475,6 @@ fn escape_code(value: &str) -> String {
     value.replace('`', "\\`").replace(['\r', '\n'], " ")
 }
 
-fn escape_status_code(value: &str) -> String {
-    escape_code(value).replace('<', "&lt;").replace('>', "&gt;")
-}
-
 fn escape_status_markdown(value: &str) -> String {
     escape_markdown(value)
         .replace('<', "&lt;")
@@ -481,7 +485,7 @@ fn escape_markdown(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
         match character {
-            '\\' | '*' | '_' | '`' | '|' => {
+            '\\' | '*' | '_' | '`' | '|' | '[' | ']' => {
                 escaped.push('\\');
                 escaped.push(character);
             }
@@ -515,10 +519,15 @@ mod tests {
             host: "local".into(),
             detail_lines: vec![
                 "Запущено: ожидает · Роль: reviewer".into(),
-                "🤖 Выполняется: workflow (1)".into(),
-                "⚡ Использование: 5h 17% (→19:00)".into(),
-                "👥 Дочерние (1):".into(),
+                "".into(),
+                "⚡️ Использование:".into(),
+                "CC: 5h 17% (19:00) · неделя 78% (06/29) · max".into(),
+                "".into(),
+                "👥 Дочерние (2):".into(),
                 "  • s56 · codex · gpt-5.6-terra · 🟡 работает · title".into(),
+                "".into(),
+                "  • s57 · codex · gpt-5.6-luna · 🟢 ожидание · other".into(),
+                "".into(),
                 "↓ Другие сессии проекта: 2 → /sessions".into(),
                 "↓ Все проекты: 3 → /projects".into(),
             ],
@@ -539,7 +548,7 @@ mod tests {
 
         assert_eq!(
             reply.markdown,
-            "🧭 **s42** · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 `/root/projects/ccteam`\n🖥 host: local\n<blockquote expandable>Запущено: ожидает · Роль: reviewer\n🤖 Выполняется: workflow (1)\n⚡ Использование: 5h 17% (→19:00)\n👥 Дочерние (1):\n  • s56 · codex · gpt-5.6-terra · 🟡 работает · title\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\n💰 Расход проекта 24ч: $1.23\n🔁 resume `123e4567-e89b-12d3-a456-426614174000`</blockquote>"
+            "🧭 s42 · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 /root/projects/ccteam\n\nЗапущено: ожидает · Роль: reviewer\n\n⚡️ Использование:\nCC: 5h 17% (19:00) · неделя 78% (06/29) · max\n\n👥 Дочерние (2):\n  • s56 · codex · gpt-5.6-terra · 🟡 работает · title\n\n  • s57 · codex · gpt-5.6-luna · 🟢 ожидание · other\n\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\n\n💰 Расход проекта 24ч: $1.23\n\n🔁 resume 123e4567-e89b-12d3-a456-426614174000"
         );
         assert_eq!(reply.plain.lines().next(), Some("🧭 s42 · ccteam · claude"));
         assert!(reply
@@ -561,7 +570,7 @@ mod tests {
             .iter()
             .flatten()
             .all(|button| button.data.len() <= 64));
-        assert_eq!(super::escape_markdown("x*y"), "x\\*y");
+        assert_eq!(super::escape_markdown("x*y[]"), "x\\*y\\[\\]");
     }
 
     #[test]
@@ -582,11 +591,35 @@ mod tests {
             child_stop_sids: Vec::new(),
         });
 
-        assert_eq!(reply.markdown.matches("</blockquote>").count(), 1);
+        assert!(!reply.markdown.contains("<blockquote"));
+        assert!(!reply.markdown.contains("</blockquote>"));
+        assert!(!reply.markdown.contains("🖥 host: local"));
         assert!(!reply.markdown.contains("<tg-button-row>"));
         assert!(reply
             .markdown
             .contains("&lt;/blockquote&gt;&lt;tg-button-row&gt;"));
+    }
+
+    #[test]
+    fn status_shows_non_local_host() {
+        let reply = render_status(&StatusView {
+            sid: "s1".into(),
+            project: "ccteam".into(),
+            vendor: "codex".into(),
+            state: "🟢 ожидание".into(),
+            model: "gpt-5.6-terra".into(),
+            effort: "medium".into(),
+            context: "23%".into(),
+            path: "/root/projects/ccteam".into(),
+            host: "edge".into(),
+            detail_lines: vec!["Запущено: ожидание · Роль: —".into()],
+            cost_24h: "💰 Расход проекта 24ч: $0.00".into(),
+            resume: "—".into(),
+            child_stop_sids: Vec::new(),
+        });
+
+        assert!(reply.markdown.contains("🖥 host: edge"));
+        assert!(reply.plain.contains("🖥 host: edge"));
     }
 
     #[test]

@@ -6348,12 +6348,13 @@ impl Gateway {
                                     (&evt, progress_path.as_ref())
                                 {
                                     let ev =
-                                        ccteam_core::progress::build_chat_turn_completed_event(
+                                        ccteam_core::progress::build_chat_turn_completed_event_with_vendor(
                                             &session.role,
                                             &session_id,
                                             "",
                                             &ccteam_harness::UnifiedTokenUsage::default(),
                                             None,
+                                            Some(vendor_str(session.vendor)),
                                         );
                                     if let Err(err) =
                                         ccteam_core::progress::append_event(ppath, &ev)
@@ -6384,12 +6385,13 @@ impl Gateway {
                                 Some(ppath),
                             ) = (turn_terminal_accounting(&evt), progress_path.as_ref())
                             {
-                                let ev = ccteam_core::progress::build_chat_turn_completed_event(
+                                let ev = ccteam_core::progress::build_chat_turn_completed_event_with_vendor(
                                     &session.role,
                                     &session_id,
                                     turn_id,
                                     usage,
                                     model,
+                                    Some(vendor_str(session.vendor)),
                                 );
                                 if let Err(err) =
                                     ccteam_core::progress::append_event(ppath, &ev)
@@ -9793,12 +9795,27 @@ impl Gateway {
         // Pull the focused session's live facts from its harness.
         let status = s.adapter.thread_status(&s.thread).await.ok();
         let running = s.adapter.running_tasks(&s.thread).await;
-        // Account usage belongs to a vendor account, not a session, but it is
-        // rendered here as an attribute of THIS session's card — borrowing
-        // another same-vendor session's snapshot when the focused one hasn't
-        // received its own would silently mislabel whose usage is shown.
-        // None renders as "—" below; no cross-session borrow.
-        let account = s.adapter.account_usage(&s.thread).await;
+        // Account usage belongs to a vendor account, not a session. Query one
+        // visible session per supported vendor and omit vendors with no real
+        // account-usage channel; never print a fabricated zero.
+        let usage_sources = [
+            (AgentVendor::Claude, "CC"),
+            (AgentVendor::Codex, "CX"),
+            (AgentVendor::Opencode, "OC"),
+        ]
+        .into_iter()
+        .filter_map(|(vendor, label)| {
+            visible
+                .iter()
+                .copied()
+                .find(|session| session.vendor == vendor)
+                .map(|session| (label, session))
+        })
+        .collect::<Vec<_>>();
+        let account_usages = join_all(usage_sources.iter().map(|(label, session)| async move {
+            (*label, session.adapter.account_usage(&session.thread).await)
+        }))
+        .await;
 
         // State: a turn in flight ⇒ 🔵 working; silent past the idle window ⇒
         // 🔴 stuck — EXCEPT a BLOCKING subagent is an AUTHORITATIVE "still
@@ -9903,13 +9920,16 @@ impl Gateway {
         let role = if s.role.is_empty() { "—" } else { &s.role };
         let resume = thread_vendor_uuid(&s.thread).unwrap_or_else(|| "—".to_string());
         let mut detail_lines = vec![format!("Запущено: {detail} · Роль: {role}")];
-        detail_lines.extend(
-            format_running_tasks(&running)
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string),
-        );
+        let running_task_lines = format_running_tasks(&running)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if !running_task_lines.is_empty() {
+            detail_lines.push(String::new());
+            detail_lines.extend(running_task_lines);
+        }
         if let Some(goal) = status.as_ref().and_then(|status| status.goal.as_ref()) {
             let condition = goal.condition.trim();
             if !condition.is_empty() {
@@ -9919,31 +9939,46 @@ impl Gateway {
                 } else {
                     condition.to_string()
                 };
+                detail_lines.push(String::new());
                 detail_lines.push(format!("{marker} {shown}"));
             }
         }
-        if let Some(usage) = account.as_ref() {
-            let usage = format_account_usage(usage);
-            if !usage.is_empty() {
-                detail_lines.push(usage);
-            }
+        let usage_lines = account_usages
+            .into_iter()
+            .filter_map(|(label, usage)| {
+                usage
+                    .as_ref()
+                    .and_then(format_account_usage)
+                    .map(|usage| format!("{label}: {usage}"))
+            })
+            .collect::<Vec<_>>();
+        if !usage_lines.is_empty() {
+            detail_lines.push(String::new());
+            detail_lines.push("⚡️ Использование:".to_string());
+            detail_lines.extend(usage_lines);
         }
         if !child_summary.is_empty() {
+            detail_lines.push(String::new());
             detail_lines.push(format!("👥 Дочерние ({}):", child_summary.len()));
-            detail_lines.extend(
-                child_summary
-                    .into_iter()
-                    .map(|child| format!("  • {child}")),
-            );
+            for (index, child) in child_summary.into_iter().enumerate() {
+                if index > 0 {
+                    detail_lines.push(String::new());
+                }
+                detail_lines.push(format!("  • {child}"));
+            }
         }
         let same_project_sessions = visible
             .iter()
             .filter(|other| other.project == s.project && other.id != s.id)
             .count();
         if same_project_sessions > 0 {
+            detail_lines.push(String::new());
             detail_lines.push(format!(
                 "↓ Другие сессии проекта: {same_project_sessions} → /sessions"
             ));
+        }
+        if same_project_sessions == 0 {
+            detail_lines.push(String::new());
         }
         detail_lines.push(format!(
             "↓ Все проекты: {} → /projects",
@@ -9952,8 +9987,18 @@ impl Gateway {
         let cost_24h = self
             .progress_projection
             .as_ref()
-            .map(|projection| projection.project_snapshot(&s.project).cost.cost_24h_usd)
-            .map(|cost| format!("💰 Расход проекта 24ч: ${cost:.2}"))
+            .map(|projection| {
+                let snapshot = projection.project_snapshot(&s.project);
+                let usd = if snapshot.cost_24h_priced {
+                    format!("${:.2}", snapshot.cost.cost_24h_usd)
+                } else {
+                    "$—".to_string()
+                };
+                format!(
+                    "💰 Расход проекта 24ч: {usd} · {} токенов",
+                    format_token_volume(snapshot.tokens_24h)
+                )
+            })
             .unwrap_or_else(|| "💰 Расход проекта 24ч: нет данных".to_string());
         im_views::render_status(&StatusView {
             sid: s.id.clone(),
@@ -14663,23 +14708,23 @@ fn format_running_tasks(running: &[RunningTask]) -> String {
     out
 }
 
-/// Render [`AccountUsage`] as the `/status` dashboard usage line:
-/// `⚡ Использование: 5h 17% (→19:00) · неделя 78%⚠ (→06/29) · лимит 46% · max`. Each field is
-/// omitted when the vendor didn't report it; an empty result = nothing to show.
-fn format_account_usage(u: &AccountUsage) -> String {
+/// Render the account-usage payload after its vendor label:
+/// `5h 17% (19:00) · неделя 78% (06/29) · max`. Each field is omitted when
+/// the vendor didn't report it; an empty result means no usage line.
+fn format_account_usage(u: &AccountUsage) -> Option<String> {
     // Short reset hint from an ISO-8601 `resets_at`: HH:MM for the 5-hour window,
     // MM/DD for the weekly. Empty when unparseable.
     fn reset_hm(iso: &Option<String>) -> String {
         iso.as_deref()
             .and_then(|s| s.split('T').nth(1))
-            .map(|t| format!(" (→{})", &t[..t.len().min(5)]))
+            .map(|t| format!(" ({})", &t[..t.len().min(5)]))
             .unwrap_or_default()
     }
     fn reset_md(iso: &Option<String>) -> String {
         iso.as_deref()
             .and_then(|s| s.split('T').next())
             .and_then(|d| d.get(5..)) // "06-29" from "2026-06-29"
-            .map(|md| format!(" (→{})", md.replace('-', "/")))
+            .map(|md| format!(" ({})", md.replace('-', "/")))
             .unwrap_or_default()
     }
     let mut parts: Vec<String> = Vec::new();
@@ -14701,12 +14746,22 @@ fn format_account_usage(u: &AccountUsage) -> String {
         parts.push(format!("лимит {p}%"));
     }
     if parts.is_empty() {
-        return String::new();
+        return None;
     }
     if let Some(sub) = u.subscription.as_deref() {
         parts.push(sub.to_string());
     }
-    format!("⚡ Использование: {}", parts.join(" · "))
+    Some(parts.join(" · "))
+}
+
+fn format_token_volume(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn humanize_dur(d: std::time::Duration) -> String {
@@ -23659,7 +23714,7 @@ mod tests {
         );
         ccteam_core::progress::append_event(&paths.progress_jsonl("alpha"), &progress).unwrap();
         fake.set_status(ThreadStatus {
-            model: Some("gpt-5.6-terra".into()),
+            model: Some("claude-opus-4-8[1m]".into()),
             ..Default::default()
         })
         .await;
@@ -23670,7 +23725,7 @@ mod tests {
             .unwrap();
         assert!(
             out[0].contains(
-                "👥 Дочерние (1):\n  • s2 · claude · gpt-5.6-terra · 🟡 работает · delegated investigation"
+                "👥 Дочерние (1):\n  • s2 · claude · opus-4-8[1m] · 🟡 работает · delegated investigation"
             ),
             "working child is visible from its root status: {out:?}"
         );
@@ -23801,7 +23856,7 @@ mod tests {
             .unwrap();
         assert!(
             out[0].contains(&format!(
-                "🧭 s1 · alpha · claude\n🟢 ожидание · — · — · ctx —\n📁 {}\n🖥 host: local",
+                "🧭 s1 · alpha · claude\n🟢 ожидание · — · — · ctx —\n📁 {}\n\n",
                 proj.path().display()
             )),
             "status card header changed: {out:?}"
@@ -23832,6 +23887,7 @@ mod tests {
                 "session_id": "s1",
                 "vendor": "claude",
                 "cost_usd": 1.25,
+                "usage": {"input_tokens": 12_000_000, "output_tokens": 1_100_000},
                 "ts": chrono::Utc::now().to_rfc3339(),
             }),
         )
@@ -23842,8 +23898,43 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("💰 Расход проекта 24ч: $1.25"),
+            out[0].contains("💰 Расход проекта 24ч: $1.25 · 13.1M токенов"),
             "project ledger cost missing: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_status_shows_unknown_cost_and_known_token_volume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        ccteam_core::progress::append_event(
+            &paths.progress_jsonl("alpha"),
+            &serde_json::json!({
+                "event": ccteam_harness::execution::progress_bridge::CHAT_TURN_COMPLETED,
+                "sid": "s1",
+                "turn_id": "turn-1",
+                "vendor": "claude",
+                "model": "claude-fable-5",
+                "usage": {"output_tokens": 1_234},
+                "ts": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .unwrap();
+
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            out[0].contains("💰 Расход проекта 24ч: $— · 1.2k токенов"),
+            "unknown cost must remain unknown while tokens stay visible: {out:?}"
         );
     }
 
@@ -23907,9 +23998,8 @@ mod tests {
         assert_eq!(out, vec!["Нет сессий — создайте через /new"]);
     }
 
-    /// v0.8.20 /status v2 ③ — the account-usage line renders 5h / weekly /
-    /// credits with reset hints, a ⚠ on a `warning` weekly, and the
-    /// subscription tail; an all-None usage renders the empty string.
+    /// /status account usage renders only vendor-reported windows, reset hints,
+    /// and the subscription tail; an all-None usage renders no line.
     #[test]
     fn format_account_usage_renders_windows_resets_and_warning() {
         let u = AccountUsage {
@@ -23921,12 +24011,19 @@ mod tests {
             weekly_severity: Some("warning".into()),
             credits_pct: Some(46),
         };
-        let s = format_account_usage(&u);
-        assert!(s.contains("5h 17% (→19:00)"), "{s}");
-        assert!(s.contains("неделя 78%⚠ (→06/29)"), "{s}");
+        let s = format_account_usage(&u).unwrap();
+        assert!(s.contains("5h 17% (19:00)"), "{s}");
+        assert!(s.contains("неделя 78%⚠ (06/29)"), "{s}");
         assert!(s.contains("лимит 46%"), "{s}");
         assert!(s.ends_with("· max"), "{s}");
-        assert_eq!(format_account_usage(&AccountUsage::default()), "");
+        assert_eq!(format_account_usage(&AccountUsage::default()), None);
+    }
+
+    #[test]
+    fn format_token_volume_uses_one_decimal_k_and_m_units() {
+        assert_eq!(format_token_volume(999), "999");
+        assert_eq!(format_token_volume(1_234), "1.2k");
+        assert_eq!(format_token_volume(13_100_000), "13.1M");
     }
 
     /// `/status` running-task block — background workflows (`local_workflow`)
