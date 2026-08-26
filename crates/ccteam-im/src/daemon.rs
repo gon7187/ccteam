@@ -3039,6 +3039,41 @@ mod tests {
         assert_eq!(outbox[0].content, "сессия не найдена, /sessions");
     }
 
+    #[test]
+    fn draft_breaker_allows_a_half_open_probe_after_three_ticks() {
+        let mut breakers = HashMap::new();
+        assert!(draft_probe_allowed(&mut breakers, "s42"));
+        draft_failed(&mut breakers, "s42");
+        assert!(!draft_probe_allowed(&mut breakers, "s42"));
+        for _ in 0..2 {
+            tick_draft_breakers(&mut breakers);
+            assert!(!draft_probe_allowed(&mut breakers, "s42"));
+        }
+        tick_draft_breakers(&mut breakers);
+        assert!(draft_probe_allowed(&mut breakers, "s42"));
+        assert!(!draft_probe_allowed(&mut breakers, "s42"));
+        draft_succeeded(&mut breakers, "s42");
+        assert!(draft_probe_allowed(&mut breakers, "s42"));
+    }
+
+    #[test]
+    fn stale_draft_routes_are_evicted_before_stop_lookup() {
+        let routes = Arc::new(StdMutex::new(HashMap::from([(
+            ("telegram".to_string(), "123".to_string(), 77_i64),
+            DraftRoute {
+                sid: "s42".to_string(),
+                content: "partial".to_string(),
+                updated_at: std::time::Instant::now() - DRAFT_ROUTE_TTL - Duration::from_secs(1),
+            },
+        )])));
+        let payload = format!("{}77", crate::transport::STOPPED_DRAFT_PREFIX);
+        assert_eq!(
+            stopped_draft_command("telegram", "123", &payload, &routes),
+            None
+        );
+        assert!(routes.lock().unwrap().is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn draft_keepalive_refreshes_silent_session() {
         let _g = env_lock();
