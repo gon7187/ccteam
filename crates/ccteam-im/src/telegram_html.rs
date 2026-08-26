@@ -33,7 +33,8 @@ pub fn render_markdown(input: &str) -> RenderedMarkdown {
         let raw_line = lines[index];
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
 
-        if let Some(opening) = fence_marker(line) {
+        if is_fence_line(line) {
+            let opening = fence_marker(line).expect("checked by is_fence_line");
             let language = fence_language(line, opening);
             let mut body = String::new();
             let mut closing = None;

@@ -1562,7 +1562,7 @@ async fn deliver_gateway_replies(
 struct StatusHandle {
     message_id: String,
     recipient: String,
-    fallback_logged: bool,
+    replacement_fallbacks: u8,
 }
 
 fn spawn_gateway_event_consumer(
@@ -1737,7 +1737,7 @@ async fn deliver_progress(
     button_rows: Vec<Vec<crate::transport::MessageOption>>,
 ) {
     if let Some(handle) = status_messages.get(&status_key).cloned() {
-        if let Err(err) = channel
+        match channel
             .edit_message(
                 &handle.recipient,
                 &handle.message_id,
@@ -1746,35 +1746,67 @@ async fn deliver_progress(
             )
             .await
         {
-            if !err.to_string().contains("message is not modified") {
-                if !handle.fallback_logged {
+            Ok(message_id) => {
+                if !done {
+                    status_messages.insert(
+                        status_key.clone(),
+                        StatusHandle {
+                            message_id: message_id.unwrap_or(handle.message_id),
+                            recipient: handle.recipient,
+                            replacement_fallbacks: 0,
+                        },
+                    );
+                }
+            }
+            Err(err) if !err.to_string().contains("message is not modified") => {
+                if handle.replacement_fallbacks >= 2 {
                     tracing::warn!(
                         channel = %channel_name,
                         status_key = %status_key,
                         error = %err,
-                        "ccteam-im: progress edit failed; sending replacement"
+                        "ccteam-im: progress edit failed; replacement cap reached"
                     );
-                }
-                let replacement = SendMessage::new(content, handle.recipient.clone())
-                    .in_thread(thread_ts)
-                    .with_button_rows(button_rows);
-                match channel.send(&replacement).await {
-                    Ok(Some(message_id)) if !done => {
+                } else {
+                    let replacement_fallbacks = handle.replacement_fallbacks + 1;
+                    if !done {
                         status_messages.insert(
                             status_key.clone(),
                             StatusHandle {
-                                message_id,
-                                recipient: handle.recipient,
-                                fallback_logged: true,
+                                replacement_fallbacks,
+                                ..handle.clone()
                             },
                         );
                     }
-                    Ok(_) => {}
-                    Err(send_err) => {
-                        tracing::warn!(channel = %channel_name, status_key = %status_key, error = %send_err, "ccteam-im: progress replacement send failed")
+                    if replacement_fallbacks == 1 {
+                        tracing::warn!(
+                            channel = %channel_name,
+                            status_key = %status_key,
+                            error = %err,
+                            "ccteam-im: progress edit failed; sending replacement"
+                        );
+                    }
+                    let replacement = SendMessage::new(content, handle.recipient.clone())
+                        .in_thread(thread_ts)
+                        .with_button_rows(button_rows);
+                    match channel.send(&replacement).await {
+                        Ok(Some(message_id)) if !done => {
+                            status_messages.insert(
+                                status_key.clone(),
+                                StatusHandle {
+                                    message_id,
+                                    recipient: handle.recipient,
+                                    replacement_fallbacks,
+                                },
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(send_err) => {
+                            tracing::warn!(channel = %channel_name, status_key = %status_key, error = %send_err, "ccteam-im: progress replacement send failed")
+                        }
                     }
                 }
             }
+            Err(_) => {}
         }
         if done {
             status_messages.remove(&status_key);
@@ -1792,7 +1824,7 @@ async fn deliver_progress(
                 StatusHandle {
                     message_id,
                     recipient: chat_id,
-                    fallback_logged: false,
+                    replacement_fallbacks: 0,
                 },
             );
         }
@@ -2468,6 +2500,73 @@ mod tests {
             out[0].rich_markdown, None,
             "a non-rich channel's command reply never carries rich_markdown"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn progress_stops_replacing_after_two_consecutive_edit_fallbacks() {
+        struct AlwaysFailingEditChannel {
+            sends: Arc<StdMutex<Vec<SendMessage>>>,
+            edits: Arc<StdMutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for AlwaysFailingEditChannel {
+            fn name(&self) -> &str {
+                "progress-test"
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                let mut sends = self.sends.lock().unwrap();
+                sends.push(message.clone());
+                Ok(Some(format!("message-{}", sends.len())))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn edit_message(
+                &self,
+                _recipient: &str,
+                message_id: &str,
+                _content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> anyhow::Result<Option<String>> {
+                self.edits.lock().unwrap().push(message_id.to_string());
+                anyhow::bail!("edit failed")
+            }
+        }
+
+        let channel = AlwaysFailingEditChannel {
+            sends: Arc::new(StdMutex::new(Vec::new())),
+            edits: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let mut statuses = HashMap::new();
+        for content in ["seed", "one", "two", "three"] {
+            deliver_progress(
+                &channel,
+                &mut statuses,
+                "status".to_string(),
+                false,
+                "progress-test",
+                "chat-1".to_string(),
+                None,
+                content.to_string(),
+                Vec::new(),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            channel.sends.lock().unwrap().len(),
+            3,
+            "seed + two replacements"
+        );
+        assert_eq!(channel.edits.lock().unwrap().len(), 3);
+        assert_eq!(statuses["status"].replacement_fallbacks, 2);
     }
 
     /// Persistent rich rejection must stay inside the transport contract:
