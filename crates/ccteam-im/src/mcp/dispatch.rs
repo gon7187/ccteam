@@ -6640,7 +6640,7 @@ mod session_tool_tests {
         assert_eq!(result.chars().count(), INLINE_RESULT_MAX_CHARS);
         assert!(result.starts_with("echo: HEAD"));
         assert!(result.ends_with("TAIL"));
-        assert!(result.contains("truncated"));
+        assert!(result.contains("сокращено"));
         assert!(result.contains("session_collect{sid:"));
     }
 
@@ -6931,7 +6931,7 @@ mod session_tool_tests {
         assert_eq!(result.chars().count(), INLINE_RESULT_MAX_CHARS);
         assert!(result.starts_with("echo: HEAD"));
         assert!(result.ends_with("TAIL"));
-        assert!(result.contains("truncated"));
+        assert!(result.contains("сокращено"));
 
         // timeout pending (child's answer is delayed past the wait).
         let tmp2 = tempfile::TempDir::new().unwrap();
@@ -7055,7 +7055,7 @@ mod session_tool_tests {
                 ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &principal)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|t| t.user.contains("[ccteam] delegated session"))
+                    .filter(|t| t.user.contains("[ccteam] делегированная сессия"))
                     .collect();
             if !notes.is_empty() {
                 break;
