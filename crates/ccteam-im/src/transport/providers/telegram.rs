@@ -1751,20 +1751,24 @@ mod tests {
 
     #[test]
     fn username_refresh_waits_a_minute_after_a_failed_attempt() {
-        let now = Instant::now();
-        assert!(username_refresh_due(false, None, now));
-        assert!(!username_refresh_due(false, Some(now), now));
+        let attempted_at = Instant::now();
+        assert!(username_refresh_due(false, None, attempted_at));
         assert!(!username_refresh_due(
             false,
-            now.checked_sub(Duration::from_secs(59)),
-            now
+            Some(attempted_at),
+            attempted_at
+        ));
+        assert!(!username_refresh_due(
+            false,
+            Some(attempted_at),
+            attempted_at + Duration::from_secs(59)
         ));
         assert!(username_refresh_due(
             false,
-            now.checked_sub(Duration::from_secs(60)),
-            now
+            Some(attempted_at),
+            attempted_at + Duration::from_secs(60)
         ));
-        assert!(!username_refresh_due(true, None, now));
+        assert!(!username_refresh_due(true, None, attempted_at));
     }
 
     #[test]
