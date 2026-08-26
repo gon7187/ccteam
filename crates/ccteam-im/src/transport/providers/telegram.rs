@@ -1035,34 +1035,6 @@ fn body_reports_failure(text: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// TG-GATE-V2 W9 — returned (wrapped in an `anyhow::Error`) by
-/// [`Channel::send`] when the rich attempt failed AND `content` overflows
-/// [`MAX_MESSAGE_UTF16`], so the classic single-message fallback can't carry
-/// it either. NOTHING is sent when this is returned — splitting a message
-/// into a durably-replayable set of parts requires the caller's OWN outbox
-/// (each part needs its own ledger row so a crash mid-split can't replay an
-/// already-delivered part, and a genuinely-failed part CAN be replayed on
-/// its own); that caller is `daemon.rs`'s `finish_durable_outbound_send`,
-/// which re-runs the ordinary non-rich split-and-send path
-/// (`rich_markdown` cleared → `Channel::max_message_len` →
-/// `crate::sanitize::split_for_channel`) for this message on catching it.
-/// Downcastable so that catch site can tell this apart from an ordinary
-/// send failure (which DOES get recorded `Failed` and retried whole on
-/// replay).
-#[derive(Debug, Default)]
-pub struct RichFallbackNeedsSplit;
-
-impl std::fmt::Display for RichFallbackNeedsSplit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "telegram: rich message failed and classic content overflows {MAX_MESSAGE_UTF16} UTF-16 units; needs a split send"
-        )
-    }
-}
-
-impl std::error::Error for RichFallbackNeedsSplit {}
-
 fn should_retry_plain(status: reqwest::StatusCode, response_text: &str) -> bool {
     let description = serde_json::from_str::<serde_json::Value>(response_text)
         .ok()
@@ -1258,6 +1230,25 @@ fn reply_markup_json(message: &SendMessage) -> Option<serde_json::Value> {
         .or_else(|| message.reply_keyboard.as_ref().map(reply_keyboard_json))
 }
 
+impl TelegramChannel {
+    async fn send_classic_split(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let parts = crate::sanitize::split_for_channel(&message.content, MAX_MESSAGE_UTF16);
+        let mut last = None;
+        for (index, content) in parts.into_iter().enumerate() {
+            let mut part = message.clone();
+            part.content = content;
+            part.rich_markdown = None;
+            if index > 0 {
+                part.button_rows.clear();
+                part.options.clear();
+                part.reply_keyboard = None;
+            }
+            last = self.send_classic(&part).await?;
+        }
+        Ok(last)
+    }
+}
+
 #[async_trait]
 impl Channel for TelegramChannel {
     fn name(&self) -> &str {
@@ -1322,10 +1313,7 @@ impl Channel for TelegramChannel {
             if render_markdown(markdown).text_utf16_len <= MAX_MESSAGE_UTF16 {
                 return self.send_classic_part(message, markdown, true).await;
             }
-            if message.content.encode_utf16().count() <= MAX_MESSAGE_UTF16 {
-                return self.send_classic(message).await;
-            }
-            return Err(RichFallbackNeedsSplit.into());
+            return self.send_classic_split(message).await;
         }
         self.send_classic(message).await
     }

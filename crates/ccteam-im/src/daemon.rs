@@ -32,9 +32,7 @@ use crate::gateway::{Gateway, GatewayEvent, GatewayEventKind};
 use crate::im_views::RichReply;
 use crate::latency::now_unix_ms;
 use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
-use crate::transport::providers::telegram::{
-    RichFallbackNeedsSplit as TelegramRichFallbackNeedsSplit, TelegramChannel,
-};
+use crate::transport::providers::telegram::TelegramChannel;
 use crate::transport::{Channel, ChannelMessage, SendMessage};
 use crate::{list_bots, BotRegistration};
 
@@ -2206,75 +2204,6 @@ async fn finish_durable_outbound_send(
             // fixes: marking the parent terminal BEFORE the parts existed
             // meant a crash in between made the parts unrecoverable (the
             // parent looked done, but nothing was actually queued yet).
-            if err
-                .downcast_ref::<TelegramRichFallbackNeedsSplit>()
-                .is_some()
-            {
-                let split_message = message.clone();
-                let limit = channel
-                    .max_message_len()
-                    .unwrap_or(split_message.content.encode_utf16().count().max(1));
-                let parts = if let Some(markdown) = split_message.rich_markdown.as_deref() {
-                    crate::sanitize::split_rich_markdown_numbered(markdown, limit.min(30_000))
-                } else {
-                    crate::sanitize::split_for_channel_numbered(&split_message.content, limit)
-                };
-                // Append propagates (`?` inside `queue_split_parts`): if
-                // durably queuing the parts fails, we must NOT mark this
-                // parent row terminal — that would claim the parts exist
-                // when they don't. Leave the parent's last-written state
-                // alone (still `Queued`/pending from before this call) so
-                // the whole original message gets retried from scratch on
-                // the next replay.
-                let queued = match queue_split_parts(
-                    &id,
-                    inbound_id,
-                    channel_name,
-                    parts,
-                    &split_message,
-                ) {
-                    Ok(queued) => queued,
-                    Err(append_err) => {
-                        tracing::warn!(
-                            inbound_id,
-                            channel = %channel_name,
-                            error = %append_err,
-                            "ccteam-im: failed to durably queue split parts; parent stays queued for whole-message retry"
-                        );
-                        return false;
-                    }
-                };
-                let part_ids: Vec<String> = queued.iter().map(|(pid, _)| pid.clone()).collect();
-                append_durable_outbound(DurableOutboundRow {
-                    ts_ms: now_unix_ms_u64(),
-                    id: id.clone(),
-                    inbound_id: inbound_id.to_string(),
-                    channel: channel_name.to_string(),
-                    state: DurableOutboundState::Sent,
-                    message: message.clone(),
-                    platform_message_id: None,
-                    error: Some(format!(
-                        "rich message too long for classic fallback; superseded by parts: {}",
-                        part_ids.join(", ")
-                    )),
-                    parent_id: parent_id.clone(),
-                    part_index,
-                    part_total,
-                });
-                // Boxed: this cycles back through `send_queued_parts` →
-                // `finish_durable_outbound_send`, and a recursive async fn
-                // call needs indirection to have a known size.
-                Box::pin(send_queued_parts(
-                    &id,
-                    inbound_id,
-                    channel_name,
-                    channel,
-                    queued,
-                    &split_message,
-                ))
-                .await;
-                return true;
-            }
             append_durable_outbound(DurableOutboundRow {
                 ts_ms: now_unix_ms_u64(),
                 id,
@@ -2905,7 +2834,7 @@ mod tests {
                 if message.rich_markdown.is_some()
                     && message.content.len() > self.inner.max_message_len().unwrap_or(usize::MAX)
                 {
-                    return Err(TelegramRichFallbackNeedsSplit.into());
+                    anyhow::bail!("mock: persistent rich rejection");
                 }
                 if message.content == self.fail_once_content
                     && !self
