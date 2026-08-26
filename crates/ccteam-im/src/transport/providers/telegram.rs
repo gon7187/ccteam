@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 use anyhow::Context as _;
@@ -841,6 +842,9 @@ struct TgMessage {
     document: Option<TgDocument>,
     #[serde(default)]
     caption: Option<String>,
+    // Bot API 10.3 — present for rich messages whose text is empty.
+    #[serde(default)]
+    rich_message: Option<RichMessage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -853,6 +857,257 @@ struct TgUser {
     id: i64,
     #[serde(default)]
     username: Option<String>,
+}
+
+/// Bot API 10.3's rich-message object. Fields are intentionally permissive:
+/// new block kinds must be ignored, not make the whole inbound update fail.
+#[derive(Debug, Deserialize)]
+struct RichMessage {
+    #[serde(default)]
+    blocks: Vec<RichBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RichBlock {
+    Object(Box<RichBlockObject>),
+    Unknown(Value),
+}
+
+#[derive(Debug, Deserialize)]
+struct RichBlockObject {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    text: Option<RichText>,
+    #[serde(default)]
+    blocks: Option<Vec<RichBlock>>,
+    #[serde(default)]
+    items: Option<Vec<RichBlockListItem>>,
+    #[serde(default)]
+    cells: Option<Vec<Vec<RichBlockTableCell>>>,
+    #[serde(default)]
+    summary: Option<RichText>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    caption: Option<Value>,
+    #[serde(default)]
+    credit: Option<RichText>,
+}
+
+/// RichText is string | array of RichText | typed object in Bot API 10.3.
+/// Keeping its payload as JSON lets unknown text variants be skipped safely.
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+struct RichText(Value);
+
+#[derive(Debug, Deserialize)]
+struct RichBlockListItem {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    blocks: Option<Vec<RichBlock>>,
+    #[serde(default)]
+    value: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RichBlockTableCell {
+    #[serde(default)]
+    text: Option<RichText>,
+}
+
+const KNOWN_RICH_TEXT_TYPES: &[&str] = &[
+    "bold",
+    "italic",
+    "underline",
+    "strikethrough",
+    "spoiler",
+    "date_time",
+    "text_mention",
+    "subscript",
+    "superscript",
+    "marked",
+    "code",
+    "custom_emoji",
+    "mathematical_expression",
+    "url",
+    "email_address",
+    "phone_number",
+    "bank_card_number",
+    "mention",
+    "hashtag",
+    "cashtag",
+    "bot_command",
+    "button",
+    "anchor",
+    "anchor_link",
+    "reference",
+    "reference_link",
+];
+
+fn rich_text_to_text(text: &RichText) -> String {
+    match &text.0 {
+        Value::String(value) => value.clone(),
+        Value::Array(runs) => runs
+            .iter()
+            .map(|run| rich_text_to_text(&RichText(run.clone())))
+            .collect(),
+        Value::Object(object) => {
+            let Some(kind) = object.get("type").and_then(Value::as_str) else {
+                return String::new();
+            };
+            if !KNOWN_RICH_TEXT_TYPES.contains(&kind) {
+                return String::new();
+            }
+            if kind == "custom_emoji" {
+                return object
+                    .get("alternative_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            if kind == "mathematical_expression" {
+                return object
+                    .get("expression")
+                    .and_then(Value::as_str)
+                    .map(|expression| format!("${expression}$"))
+                    .unwrap_or_default();
+            }
+            object
+                .get("text")
+                .map(|value| rich_text_to_text(&RichText(value.clone())))
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+fn nonempty_join(parts: impl IntoIterator<Item = String>) -> String {
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn rich_blocks_to_text(blocks: &[RichBlock]) -> String {
+    nonempty_join(blocks.iter().filter_map(rich_block_to_text))
+}
+
+fn rich_block_to_text(block: &RichBlock) -> Option<String> {
+    let block = match block {
+        RichBlock::Object(block) => block,
+        RichBlock::Unknown(value) => {
+            let _ = value;
+            return None;
+        }
+    };
+    match block.kind.as_str() {
+        "paragraph" | "footer" => block.text.as_ref().map(rich_text_to_text),
+        "heading" => block
+            .text
+            .as_ref()
+            .map(|text| format!("# {}", rich_text_to_text(text))),
+        "pre" => block.text.as_ref().map(|text| {
+            let language = block.language.as_deref().unwrap_or_default();
+            format!(
+                "```{language}\n{}\n```",
+                rich_text_to_text(text).trim_end_matches('\n')
+            )
+        }),
+        "list" => block.items.as_ref().map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let label = item.label.as_deref().unwrap_or_default();
+                    let nested = item
+                        .blocks
+                        .as_deref()
+                        .map(rich_blocks_to_text)
+                        .unwrap_or_default();
+                    let body = nonempty_join([label.to_string(), nested]);
+                    if body.is_empty() {
+                        return None;
+                    }
+                    let marker = item
+                        .value
+                        .map(|value| format!("{value}."))
+                        .unwrap_or_else(|| "-".to_string());
+                    let mut lines = body.lines();
+                    let first = format!("{marker} {}", lines.next().unwrap_or_default());
+                    let rest = lines.map(|line| format!("  {line}"));
+                    Some(
+                        std::iter::once(first)
+                            .chain(rest)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        "table" => block.cells.as_ref().map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let cells = row
+                        .iter()
+                        .map(|cell| {
+                            cell.text
+                                .as_ref()
+                                .map(rich_text_to_text)
+                                .unwrap_or_default()
+                        })
+                        .collect::<Vec<_>>();
+                    format!("| {} |", cells.join(" | "))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        "blockquote" => block.blocks.as_deref().map(|blocks| {
+            rich_blocks_to_text(blocks)
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        "expandable_blockquote" | "pullquote" => block.text.as_ref().map(|text| {
+            let mut content = rich_text_to_text(text);
+            if let Some(credit) = &block.credit {
+                let credit = rich_text_to_text(credit);
+                if !credit.is_empty() {
+                    content = nonempty_join([content, credit]);
+                }
+            }
+            content
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        "details" => block.summary.as_ref().map(|summary| {
+            nonempty_join([
+                rich_text_to_text(summary),
+                block
+                    .blocks
+                    .as_deref()
+                    .map(rich_blocks_to_text)
+                    .unwrap_or_default(),
+            ])
+        }),
+        "collage" | "slideshow" => block.caption.as_ref().map(|caption| {
+            caption
+                .get("text")
+                .map(|text| rich_text_to_text(&RichText(text.clone())))
+                .unwrap_or_default()
+        }),
+        _ => None,
+    }
+}
+
+fn rich_message_to_text(message: &RichMessage) -> String {
+    rich_blocks_to_text(&message.blocks)
 }
 
 /// One size of an inbound photo (Telegram sends an ascending-size array;
@@ -1397,13 +1652,14 @@ impl Channel for TelegramChannel {
                     let recv_ms = now_unix_ms();
                     let tg_date_ms = (m.date.max(0) as u128).saturating_mul(1000);
                     let tg_age_ms = recv_ms.saturating_sub(tg_date_ms);
-                    // V0.8.4 P2a — caption is the text for media messages.
+                    let own_username = self.cached_bot_username();
                     let content = m
                         .text
                         .clone()
-                        .or_else(|| m.caption.clone())
+                        .filter(|text| !text.is_empty())
+                        .or_else(|| m.caption.clone().filter(|caption| !caption.is_empty()))
+                        .or_else(|| m.rich_message.as_ref().map(rich_message_to_text))
                         .unwrap_or_default();
-                    let own_username = self.cached_bot_username();
                     let content = match strip_bot_mention(&content, own_username.as_deref()) {
                         Cow::Owned(normalized) => {
                             if own_username.is_none()
@@ -2596,4 +2852,64 @@ mod tests {
             assert!(numbered.ends_with(&format!("({}/{total})", i + 1)));
         }
     }
+
+    #[test]
+    fn rich_message_fixture_flattens_supported_blocks() {
+        let rich: RichMessage = serde_json::from_value(serde_json::json!({
+            "blocks": [
+                {"type": "paragraph", "text": ["Hello ", {"type": "bold", "text": "world"}]},
+                {"type": "heading", "size": 2, "text": "Title"},
+                {"type": "pre", "language": "rust", "text": "fn main() {}"},
+                {"type": "list", "items": [
+                    {"label": "one", "blocks": []},
+                    {"label": "two", "value": 2, "blocks": []}
+                ]},
+                {"type": "table", "cells": [
+                    [{"text": "Name"}, {"text": "Value"}],
+                    [{"text": "x"}, {"text": ["42", {"type": "code", "text": "!"}]}]
+                ]},
+                {"type": "blockquote", "blocks": [{"type": "paragraph", "text": "quoted"}]},
+                {"type": "details", "summary": "More", "blocks": [{"type": "paragraph", "text": "content"}]},
+                {"type": "future_block", "text": {"type": "future_text", "text": "ignored"}},
+                {"type": "paragraph", "text": [
+                    {"type": "custom_emoji", "alternative_text": "🙂"},
+                    {"type": "mathematical_expression", "expression": "x^2"}
+                ]}
+            ]
+        }))
+        .expect("saved Bot API fixture is valid");
+
+        assert_eq!(
+            rich_message_to_text(&rich),
+            "Hello world\n\n# Title\n\n```rust\nfn main() {}\n```\n\n- one\n2. two\n\n| Name | Value |\n| x | 42! |\n\n> quoted\n\nMore\n\ncontent\n\n🙂$x^2$"
+        );
+    }
+
+    #[test]
+    fn rich_message_fixture_skips_unknown_text_and_malformed_blocks() {
+        let rich: RichMessage = serde_json::from_value(serde_json::json!({
+            "blocks": [
+                {"type": "paragraph", "text": ["keep", {"type": "future_text", "text": "drop"}]},
+                {"type": "future_block", "blocks": "not-an-array"},
+                "not-a-block"
+            ]
+        }))
+        .expect("unknown rich blocks must not reject the message");
+
+        assert_eq!(rich_message_to_text(&rich), "keep");
+    }
+
+    #[test]
+    fn empty_message_text_uses_rich_message() {
+        let message: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "date": 0,
+            "chat": {"id": 5},
+            "text": "",
+            "rich_message": {"blocks": [{"type": "paragraph", "text": "rich"}]}
+        }))
+        .expect("rich message update is valid");
+        assert_eq!(rich_message_to_text(message.rich_message.as_ref().unwrap()), "rich");
+    }
+
 }
