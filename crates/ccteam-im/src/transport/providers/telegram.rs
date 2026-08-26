@@ -1712,11 +1712,12 @@ impl TelegramChannel {
     async fn send_classic_split(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         let parts = crate::sanitize::split_for_channel(&message.content, MAX_MESSAGE_UTF16);
         let mut last = None;
+        let total = parts.len();
         for (index, content) in parts.into_iter().enumerate() {
             let mut part = message.clone();
             part.content = content;
             part.rich_markdown = None;
-            if index > 0 {
+            if index + 1 < total {
                 part.button_rows.clear();
                 part.options.clear();
                 part.reply_keyboard = None;
@@ -3037,6 +3038,47 @@ mod tests {
                 "transport must not add nested numbering"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rich_fallback_long_plain_attaches_buttons_only_to_final_classic_chunk() {
+        let (base, seen) = spawn_sequential_http(&[
+            r#"{"ok":false,"description":"rich messages unsupported"}"#,
+            r#"{"ok":true,"result":{"message_id":1}}"#,
+            r#"{"ok":false,"description":"rich messages unsupported"}"#,
+            r#"{"ok":true,"result":{"message_id":2}}"#,
+            r#"{"ok":true,"result":{"message_id":3}}"#,
+        ]);
+        let mut ch = TelegramChannel::new("t".into(), vec![]);
+        ch.api_base = base;
+
+        // The daemon has already stripped buttons from every non-last outer
+        // part; the final outer part retains them for its final classic chunk.
+        let first_outer =
+            SendMessage::new("first outer", "42").with_rich_markdown("**first outer**");
+        let last_outer = SendMessage::new("😀".repeat(2000), "42")
+            .with_rich_markdown("**last outer**")
+            .with_button_rows(vec![vec![opt("last", "Last", None)]]);
+
+        ch.send(&first_outer).await.unwrap();
+        let last_id = ch.send(&last_outer).await.unwrap();
+        assert_eq!(last_id.as_deref(), Some("3"));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 5, "two rich rejects and three classic sends");
+        assert!(seen[0].0.contains("sendRichMessage"));
+        assert!(seen[2].0.contains("sendRichMessage"));
+        let classic_bodies = [
+            serde_json::from_str::<serde_json::Value>(&seen[1].1).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&seen[3].1).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&seen[4].1).unwrap(),
+        ];
+        assert!(classic_bodies[0].get("reply_markup").is_none());
+        assert!(classic_bodies[1].get("reply_markup").is_none());
+        assert_eq!(
+            classic_bodies[2]["reply_markup"]["inline_keyboard"][0][0]["callback_data"],
+            "last"
+        );
     }
 
     /// TG-GATE-V2 W9 (N6) — `body_reports_failure` now gates BOTH the
