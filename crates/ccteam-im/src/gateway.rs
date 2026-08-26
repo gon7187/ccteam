@@ -17516,6 +17516,7 @@ mod tests {
         /// v0.9 T2 — `close_thread` call count (stop path + discarded zombie
         /// resume both close).
         closes: AtomicUsize,
+        closes_notify: tokio::sync::Notify,
         close_failures_remaining: Arc<AtomicUsize>,
     }
 
@@ -17569,6 +17570,7 @@ mod tests {
                 title_surface: false,
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
+                closes_notify: tokio::sync::Notify::new(),
                 close_failures_remaining: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -17627,6 +17629,20 @@ mod tests {
         fn with_close_failures(self, count: usize) -> Self {
             self.close_failures_remaining.store(count, Ordering::SeqCst);
             self
+        }
+
+        async fn wait_for_closes(&self, expected: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let notified = self.closes_notify.notified();
+                    if self.closes.load(Ordering::SeqCst) >= expected {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("expected vendor close");
         }
     }
 
@@ -17854,6 +17870,7 @@ mod tests {
 
         async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
             self.closes.fetch_add(1, Ordering::SeqCst);
+            self.closes_notify.notify_waiters();
             let mut remaining = self.close_failures_remaining.load(Ordering::SeqCst);
             while remaining > 0 {
                 match self.close_failures_remaining.compare_exchange(
@@ -19215,6 +19232,7 @@ mod tests {
         assert_eq!(current.generation, newer_generation);
         assert_eq!(current.thread.identity, "newer-live-thread");
         drop(guard);
+        fake.wait_for_closes(1).await;
         assert!(
             fake.closes.load(Ordering::SeqCst) >= 1,
             "the discarded vendor result must be closed, got {} closes",
