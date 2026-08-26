@@ -3063,6 +3063,112 @@ mod tests {
         assert!(drafts.windows(2).all(|pair| pair[0].1 == pair[1].1));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn draft_done_without_answer_sends_rich_final_card() {
+        let mock = crate::transport::providers::mock::MockChannel::new()
+            .with_name("telegram")
+            .with_rich_support()
+            .with_draft_support();
+        let mut channels = ChannelMap::new();
+        channels.insert("telegram".to_string(), Arc::new(mock.clone()));
+        let channels = Arc::new(RwLock::new(channels));
+        let routes = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let consumer = spawn_gateway_event_consumer(rx, channels, routes);
+        let event = |done: bool| GatewayEvent {
+            id: format!("progress-final-{done}"),
+            channel: "telegram".to_string(),
+            chat_id: "123".to_string(),
+            thread_ts: None,
+            content: if done {
+                "✅ готово · 1с · 1 инструмент · 0 файлов".to_string()
+            } else {
+                "▶️ s42 работает · 0с".to_string()
+            },
+            kind: GatewayEventKind::Progress {
+                status_key: "s42-1".to_string(),
+                done,
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: Some("s42".to_string()),
+            slug: None,
+        };
+        tx.send(event(false)).unwrap();
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tx.send(event(true)).unwrap();
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(DRAFT_FINALIZATION_GRACE).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        consumer.abort();
+
+        let outbox = mock.outbox().await;
+        assert_eq!(outbox.len(), 1, "tool-only turn needs one final card");
+        assert!(outbox[0].content.starts_with("✅ готово · "));
+        assert_eq!(
+            outbox[0].rich_markdown.as_deref(),
+            Some(outbox[0].content.as_str())
+        );
+        assert!(mock.edits().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn draft_final_rich_failure_retries_then_uses_classic_send() {
+        struct RichFailureChannel {
+            calls: Arc<StdMutex<Vec<bool>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for RichFailureChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+
+            fn supports_rich_messages(&self) -> bool {
+                true
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                let is_rich = message.rich_markdown.is_some();
+                self.calls.lock().unwrap().push(is_rich);
+                if is_rich {
+                    anyhow::bail!("telegram sendRichMessage → 400")
+                }
+                Ok(Some("classic-1".to_string()))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        send_completed_draft(
+            Arc::new(RichFailureChannel {
+                calls: calls.clone(),
+            }),
+            DraftCompletion {
+                recipient: "123".to_string(),
+                thread_ts: None,
+                sid: "s42".to_string(),
+                content: "✅ готово · 1с · 0 инструментов · 0 файлов".to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(*calls.lock().unwrap(), vec![true, true, false]);
+    }
+
     /// v0.8.19 — the daemon egress 👀-reaction handle-map round-trips. A
     /// `Reaction{on:true}` calls `add_reaction` and STORES the returned handle
     /// (here the stateful Lark `reaction_id` shape); the matching
