@@ -2733,6 +2733,120 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn confirmed_ephemeral_stop_edits_outcome_without_public_send() {
+        struct RecordingChannel {
+            sends: Arc<StdMutex<Vec<SendMessage>>>,
+            edits: Arc<StdMutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for RecordingChannel {
+            fn name(&self) -> &str {
+                "telegram"
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+                self.sends.lock().unwrap().push(message.clone());
+                Ok(Some("public-message".to_string()))
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn edit_ephemeral_message(
+                &self,
+                _chat_id: &str,
+                _callback: &crate::transport::CallbackEphemeral,
+                content: &str,
+                _button_rows: &[Vec<crate::transport::MessageOption>],
+            ) -> EphemeralDelivery {
+                self.edits.lock().unwrap().push(content.to_string());
+                EphemeralDelivery::Delivered(None)
+            }
+        }
+
+        let channel = Arc::new(RecordingChannel {
+            sends: Arc::new(StdMutex::new(Vec::new())),
+            edits: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let mut channels: ChannelMap = HashMap::new();
+        channels.insert("telegram".to_string(), channel.clone());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let consumer = spawn_gateway_event_consumer(rx, Arc::new(RwLock::new(channels)));
+
+        let fake = Arc::new(ClaudeStreamJsonAdapter::new());
+        let project = TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", project.path());
+        let mut events = gateway.subscribe_events();
+        gateway.set_event_sink(tx);
+        let callback = crate::transport::CallbackEphemeral {
+            callback_query_id: "cb-stop".to_string(),
+            receiver_user_id: 7,
+            replace_callback_query_message: false,
+            ephemeral_message_id: Some(99),
+        };
+
+        gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&crate::transport::ChoiceReply {
+                    data: "cmd:?/stop s1".to_string(),
+                    callback_ephemeral: Some(callback.clone()),
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let confirm_data = confirmation.button_rows[0][0].data.clone();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&crate::transport::ChoiceReply {
+                    data: confirm_data,
+                    callback_ephemeral: Some(callback),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(replies.is_empty());
+
+        for _ in 0..100 {
+            if channel.edits.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        consumer.abort();
+
+        assert_eq!(
+            *channel.edits.lock().unwrap(),
+            vec![
+                "Точно выполнить `/stop s1`?".to_string(),
+                "Сессия s1 недоступна этому чату".to_string(),
+            ]
+        );
+        assert!(channel.sends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_ephemeral_edit_suppresses_all_follow_up_sends() {
         struct UnknownChannel {
             sends: Arc<StdMutex<Vec<SendMessage>>>,

@@ -3565,30 +3565,48 @@ impl Gateway {
             // `nav:use:<sid>` — with no pending-registry token), so it is
             // resolved here, before the token-keyed choice path.
             if let Some(nav) = reply.data.strip_prefix("nav:") {
-                return self
+                let replies = self
                     .resolve_nav_selection(&chat, nav)
                     .await
-                    .map(plain_replies);
+                    .map(plain_replies)?;
+                return Ok(self.route_callback_replies(
+                    &chat,
+                    reply.callback_ephemeral.as_ref(),
+                    message_id,
+                    replies,
+                ));
             }
             // TG-GATE-V2 W3 — `cmd:`/`cmd:?`/`cmd:noop` inline buttons route
             // through `handle_command`, not the token-keyed pending registry.
             match im_callbacks::parse(&reply.data) {
                 im_callbacks::CallbackAction::Choice { .. } => {}
                 action => {
-                    return self
+                    let replies = self
                         .resolve_cmd_callback(
                             &chat,
                             action,
                             message_id,
                             reply.callback_ephemeral.as_ref(),
                         )
-                        .await
+                        .await?;
+                    return Ok(self.route_callback_replies(
+                        &chat,
+                        reply.callback_ephemeral.as_ref(),
+                        message_id,
+                        replies,
+                    ));
                 }
             }
-            return self
+            let replies = self
                 .resolve_selection(&chat, &reply.data)
                 .await
-                .map(plain_replies);
+                .map(plain_replies)?;
+            return Ok(self.route_callback_replies(
+                &chat,
+                reply.callback_ephemeral.as_ref(),
+                message_id,
+                replies,
+            ));
         }
         // Pi extension input/editor dialogs are represented by an External
         // pending with no buttons. While one is tagged to this ccteam sid,
@@ -4696,18 +4714,55 @@ impl Gateway {
         fallback_edit_message_id: String,
         content: String,
     ) {
+        self.emit_ephemeral_reply(chat, &callback, Some(fallback_edit_message_id), content);
+    }
+
+    fn route_callback_replies(
+        &self,
+        chat: &ChatKey,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+        message_id: &str,
+        replies: Vec<RichReply>,
+    ) -> Vec<RichReply> {
+        let Some(callback) = callback else {
+            return replies;
+        };
+        if replies.is_empty() {
+            return replies;
+        }
+        let content = replies
+            .into_iter()
+            .map(|reply| reply.plain)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.emit_ephemeral_reply(
+            chat,
+            callback,
+            telegram_callback_message_id(message_id),
+            content,
+        );
+        Vec::new()
+    }
+
+    fn emit_ephemeral_reply(
+        &self,
+        chat: &ChatKey,
+        callback: &crate::transport::CallbackEphemeral,
+        fallback_edit_message_id: Option<String>,
+        content: String,
+    ) {
+        let event_id = fallback_edit_message_id
+            .as_deref()
+            .unwrap_or(&callback.callback_query_id);
         self.emit_user_signal(GatewayEvent {
-            id: format!(
-                "gateway-ephemeral-confirm-{}-{fallback_edit_message_id}",
-                chat.chat_id
-            ),
+            id: format!("gateway-ephemeral-confirm-{}-{event_id}", chat.chat_id),
             channel: chat.channel.clone(),
             chat_id: chat.chat_id.clone(),
             thread_ts: None,
             content,
             kind: GatewayEventKind::EphemeralAnswer {
-                callback,
-                fallback_edit_message_id: Some(fallback_edit_message_id),
+                callback: callback.clone(),
+                fallback_edit_message_id,
             },
             attachments: Vec::new(),
             options: Vec::new(),
@@ -8641,18 +8696,13 @@ impl Gateway {
                 // prior append-a-new-message behavior.
                 let mut replies = Vec::new();
                 let ack = format!("✅ {cmd}");
-                match (callback, telegram_callback_message_id(message_id)) {
-                    (Some(callback), Some(platform_message_id)) => self
-                        .emit_confirmation_ephemeral(
-                            chat,
-                            callback.clone(),
-                            platform_message_id,
-                            ack,
-                        ),
-                    (None, Some(platform_message_id)) => {
-                        self.emit_confirmation_edit(chat, platform_message_id, ack)
+                if callback.is_none() {
+                    match telegram_callback_message_id(message_id) {
+                        Some(platform_message_id) => {
+                            self.emit_confirmation_edit(chat, platform_message_id, ack)
+                        }
+                        None => replies.push(RichReply::plain(ack)),
                     }
-                    (_, None) => replies.push(RichReply::plain(ack)),
                 }
                 // `already_confirmed: true` — this tap WAS the yes/no
                 // answer; a bulk `/stop` must execute directly, not raise a
@@ -23312,6 +23362,65 @@ mod tests {
             GatewayEventKind::EditMessage { ref message_id } => assert_eq!(message_id, "777"),
             other => panic!("expected EditMessage, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn ephemeral_confirmation_delivers_command_outcome_without_public_reply() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+        let callback = crate::transport::CallbackEphemeral {
+            callback_query_id: "cb-stop".to_string(),
+            receiver_user_id: 7,
+            replace_callback_query_message: false,
+            ephemeral_message_id: Some(99),
+        };
+
+        gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:?/stop s1".to_string(),
+                    callback_ephemeral: Some(callback.clone()),
+                }),
+            )
+            .await
+            .unwrap();
+        let confirmation = events.try_recv().expect("confirmation event");
+        let confirm_data = confirmation.button_rows[0][0].data.clone();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "-100",
+                "7",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: confirm_data,
+                    callback_ephemeral: Some(callback),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            replies.is_empty(),
+            "ephemeral callback must not return a public reply"
+        );
+        let outcome = events.try_recv().expect("ephemeral outcome event");
+        assert_eq!(outcome.content, "Сессия s1 недоступна этому чату");
+        assert!(matches!(
+            outcome.kind,
+            GatewayEventKind::EphemeralAnswer { .. }
+        ));
     }
 
     /// Same edit-in-place treatment for a cancellation tap.
