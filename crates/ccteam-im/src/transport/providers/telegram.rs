@@ -842,6 +842,12 @@ struct TgMessage {
     document: Option<TgDocument>,
     #[serde(default)]
     caption: Option<String>,
+    // Bot API 10.3 — entities use UTF-16 offsets and are preferred for
+    // command normalization when Telegram supplied them.
+    #[serde(default)]
+    entities: Vec<TgEntity>,
+    #[serde(default)]
+    caption_entities: Vec<TgEntity>,
     // Bot API 10.3 — present for rich messages whose text is empty.
     #[serde(default)]
     rich_message: Option<RichMessage>,
@@ -857,6 +863,16 @@ struct TgUser {
     id: i64,
     #[serde(default)]
     username: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgEntity {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    offset: i64,
+    #[serde(default)]
+    length: i64,
 }
 
 /// Bot API 10.3's rich-message object. Fields are intentionally permissive:
@@ -1108,6 +1124,89 @@ fn rich_block_to_text(block: &RichBlock) -> Option<String> {
 
 fn rich_message_to_text(message: &RichMessage) -> String {
     rich_blocks_to_text(&message.blocks)
+}
+
+fn utf16_offset_to_byte(text: &str, offset: i64) -> Option<usize> {
+    if offset < 0 {
+        return None;
+    }
+    let offset = offset as usize;
+    let mut units = 0;
+    for (byte, character) in text.char_indices() {
+        if units == offset {
+            return Some(byte);
+        }
+        units += character.len_utf16();
+    }
+    (units == offset).then_some(text.len())
+}
+
+fn normalize_inbound_text<'a>(
+    text: &'a str,
+    entities: &[TgEntity],
+    own_username: Option<&str>,
+) -> Cow<'a, str> {
+    if entities.is_empty() {
+        return strip_bot_mention(text, own_username);
+    }
+    let Some(entity) = entities
+        .iter()
+        .find(|entity| entity.kind == "bot_command" && entity.offset == 0)
+    else {
+        return Cow::Borrowed(text);
+    };
+    let Some(start) = utf16_offset_to_byte(text, entity.offset) else {
+        return Cow::Borrowed(text);
+    };
+    let Some(end_units) = entity.offset.checked_add(entity.length) else {
+        return Cow::Borrowed(text);
+    };
+    let Some(end) = utf16_offset_to_byte(text, end_units) else {
+        return Cow::Borrowed(text);
+    };
+    let token = &text[start..end];
+    let Some((command, mention)) = token.split_once('@') else {
+        return Cow::Borrowed(text);
+    };
+    if !command.starts_with('/') || mention.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let matches_bot = own_username
+        .map(|username| mention.eq_ignore_ascii_case(username))
+        .unwrap_or_else(|| mention.to_ascii_lowercase().ends_with("bot"));
+    if !matches_bot {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(format!("{}{}{}", &text[..start], command, &text[end..]))
+}
+
+fn message_content<'a>(message: &'a TgMessage, own_username: Option<&str>) -> (Cow<'a, str>, bool) {
+    if let Some(text) = message.text.as_deref().filter(|text| !text.is_empty()) {
+        return (
+            normalize_inbound_text(text, &message.entities, own_username),
+            message.entities.is_empty(),
+        );
+    }
+    if let Some(caption) = message
+        .caption
+        .as_deref()
+        .filter(|caption| !caption.is_empty())
+    {
+        return (
+            normalize_inbound_text(caption, &message.caption_entities, own_username),
+            message.caption_entities.is_empty(),
+        );
+    }
+    (
+        Cow::Owned(
+            message
+                .rich_message
+                .as_ref()
+                .map(rich_message_to_text)
+                .unwrap_or_default(),
+        ),
+        false,
+    )
 }
 
 /// One size of an inbound photo (Telegram sends an ascending-size array;
@@ -1653,16 +1752,11 @@ impl Channel for TelegramChannel {
                     let tg_date_ms = (m.date.max(0) as u128).saturating_mul(1000);
                     let tg_age_ms = recv_ms.saturating_sub(tg_date_ms);
                     let own_username = self.cached_bot_username();
-                    let content = m
-                        .text
-                        .clone()
-                        .filter(|text| !text.is_empty())
-                        .or_else(|| m.caption.clone().filter(|caption| !caption.is_empty()))
-                        .or_else(|| m.rich_message.as_ref().map(rich_message_to_text))
-                        .unwrap_or_default();
-                    let content = match strip_bot_mention(&content, own_username.as_deref()) {
+                    let (content, used_heuristic) = message_content(&m, own_username.as_deref());
+                    let content = match content {
                         Cow::Owned(normalized) => {
-                            if own_username.is_none()
+                            if used_heuristic
+                                && own_username.is_none()
                                 && !self
                                     .unknown_bot_mention_warned
                                     .swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -1673,7 +1767,7 @@ impl Channel for TelegramChannel {
                             }
                             normalized
                         }
-                        Cow::Borrowed(_) => content,
+                        Cow::Borrowed(content) => content.to_string(),
                     };
                     let mut attachments = Vec::new();
                     let mut rejected_notice: Option<String> = None;
@@ -2900,7 +2994,37 @@ mod tests {
     }
 
     #[test]
-    fn empty_message_text_uses_rich_message() {
+    fn entity_command_normalization_uses_utf16_entity_span() {
+        let entities = vec![TgEntity {
+            kind: "bot_command".into(),
+            offset: 0,
+            length: "/go@MyBot".encode_utf16().count() as i64,
+        }];
+        assert_eq!(
+            normalize_inbound_text("/go@MyBot 😀", &entities, Some("mybot")),
+            "/go 😀"
+        );
+    }
+
+    #[test]
+    fn entity_command_path_does_not_use_heuristic_for_non_command_entities() {
+        let entities = vec![TgEntity {
+            kind: "mention".into(),
+            offset: 0,
+            length: 8,
+        }];
+        assert_eq!(
+            normalize_inbound_text("/go@MyBot", &entities, Some("mybot")),
+            "/go@MyBot"
+        );
+        assert_eq!(
+            normalize_inbound_text("/go@MyBot", &[], Some("mybot")),
+            "/go"
+        );
+    }
+
+    #[test]
+    fn empty_message_text_uses_rich_message_and_caption_entities_are_supported() {
         let message: TgMessage = serde_json::from_value(serde_json::json!({
             "message_id": 1,
             "date": 0,
@@ -2909,7 +3033,17 @@ mod tests {
             "rich_message": {"blocks": [{"type": "paragraph", "text": "rich"}]}
         }))
         .expect("rich message update is valid");
-        assert_eq!(rich_message_to_text(message.rich_message.as_ref().unwrap()), "rich");
+        assert_eq!(message_content(&message, Some("mybot")).0, "rich");
+
+        let caption: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 2,
+            "date": 0,
+            "chat": {"id": 5},
+            "caption": "/go@MyBot",
+            "caption_entities": [{"type": "bot_command", "offset": 0, "length": 9}]
+        }))
+        .expect("caption entity update is valid");
+        assert_eq!(message_content(&caption, Some("mybot")).0, "/go");
     }
 
 }
