@@ -2,14 +2,14 @@
 //!
 //! Lives at `<project>/.ccteam/experience.jsonl` (project-level, shared across
 //! sids). Each line is one JSON object: either a terminal-turn summary
-//! (`kind: "turn"`) or a human verdict (`kind: "verdict"` — written by a
-//! future task; type + serde defined here).
+//! (`kind: "turn"`) or a human verdict (`kind: "verdict"`).
 //!
 //! **Authority**: `turns.jsonl` + `progress.jsonl` remain the only state-of-
 //! truth sources. This file is a rebuildable projection for self-evolution /
 //! analytics. The live daemon's event pump is the sole online writer of
-//! `kind: "turn"` rows; `ccteam internal experience rebuild <slug>`
-//! regenerates them offline (disaster recovery).
+//! `kind: "turn"` rows; canonical verdicts live in `progress.jsonl`.
+//! `ccteam internal experience rebuild <slug>` regenerates both projections
+//! offline (disaster recovery).
 //!
 //! Append is atomic (POSIX `O_APPEND` + one `write_all`; record bodies fit
 //! under PIPE_BUF). Reads tolerate half-flushed / corrupt lines.
@@ -24,6 +24,8 @@ use ccteam_cost::UnifiedTokenUsage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+pub use super::progress_bridge::Verdict;
 
 /// Relative path of the project-level experience index.
 const EXPERIENCE_REL: &str = ".ccteam/experience.jsonl";
@@ -55,6 +57,8 @@ pub struct TurnExperience {
     /// for an unknown model — same honesty contract as status cost rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     /// First 12 hex of sha256(`.claude/agents/<role>.md`) at spawn.
@@ -90,14 +94,6 @@ pub struct VerdictExperience {
     pub verdict: Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<String>,
-}
-
-/// Accept or request a revision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Verdict {
-    Accept,
-    Revise,
 }
 
 /// Resolve `<project>/.ccteam/experience.jsonl`.
@@ -239,45 +235,48 @@ fn hex12(digest: impl AsRef<[u8]>) -> String {
 // ── rebuild (offline / disaster recovery) ────────────────────────────────────
 
 /// Regenerate all `kind: "turn"` records from `chat/<sid>/turns.jsonl` +
-/// `progress.jsonl` `chat_turn_completed` events (+ each sid's `meta.json` for
-/// role / vendor / fingerprints), **preserving** existing `kind: "verdict"`
-/// lines. Writes atomically (tmp + rename).
+/// retained `progress.jsonl` `chat_turn_completed` and `turn_verdict` events.
+/// Existing derived rows are ignored. Writes atomically (tmp + rename).
 ///
 /// **Offline / disaster use only** — a live daemon may still be appending
 /// concurrent turn rows; pre-v1.0 this is acceptable for recovery, not for
 /// concurrent online rebuild.
 ///
-/// Returns `(turns_written, verdicts_preserved)`.
+/// Returns `(turns_written, verdicts_written)`.
 pub fn rebuild_experience(
     project_dir: &Path,
     progress_path: Option<&Path>,
 ) -> Result<(usize, usize)> {
-    // Preserve verdicts from the current file (if any).
-    let existing = read_all_experience(project_dir).unwrap_or_default();
-    let verdicts: Vec<ExperienceRecord> = existing
-        .into_iter()
-        .filter(|r| matches!(r, ExperienceRecord::Verdict(_)))
-        .collect();
-    let verdicts_preserved = verdicts.len();
-
-    // Index progress chat_turn_completed by (sid, turn_id) for usage/model.
+    // Index retained progress events by (sid, turn_id). Later rows win.
     let mut progress_by_key: BTreeMap<(String, String), serde_json::Value> = BTreeMap::new();
+    let mut verdicts: Vec<ExperienceRecord> = Vec::new();
     if let Some(pp) = progress_path {
-        if let Ok(events) = read_progress_events(pp) {
-            for ev in events {
-                if ev.get("event").and_then(|v| v.as_str()) != Some("chat_turn_completed") {
-                    continue;
-                }
-                let Some(sid) = ev.get("sid").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let Some(turn_id) = ev.get("turn_id").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                progress_by_key.insert((sid.to_string(), turn_id.to_string()), ev);
+        for ev in read_retained_progress_events(pp)? {
+            if ev.get("event").and_then(|v| v.as_str()) != Some("chat_turn_completed") {
+                continue;
             }
+            let Some(sid) = ev.get("sid").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(turn_id) = ev.get("turn_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            progress_by_key.insert((sid.to_string(), turn_id.to_string()), ev);
         }
+        verdicts = super::progress_bridge::latest_turn_verdicts(pp)?
+            .into_values()
+            .map(|verdict| {
+                ExperienceRecord::Verdict(VerdictExperience {
+                    sid: verdict.sid,
+                    turn_id: verdict.turn_id,
+                    ts: verdict.ts,
+                    verdict: verdict.verdict,
+                    feedback: verdict.feedback,
+                })
+            })
+            .collect();
     }
+    let verdicts_written = verdicts.len();
 
     let mut turns: Vec<ExperienceRecord> = Vec::new();
     let chat_base = project_dir.join(".ccteam").join("chat");
@@ -295,28 +294,6 @@ pub fn rebuild_experience(
             .collect();
         sids.sort();
         for sid in sids {
-            let meta = super::session_meta::read_session_meta(project_dir, &sid).ok();
-            let role = meta.as_ref().map(|m| m.role.clone()).unwrap_or_default();
-            let vendor = meta
-                .as_ref()
-                .map(|m| vendor_label(m.vendor).to_string())
-                .unwrap_or_else(|| "claude".to_string());
-            let role_sha = meta.as_ref().and_then(|m| m.role_sha.clone()).or_else(|| {
-                if role.is_empty() {
-                    None
-                } else {
-                    role_fingerprint(project_dir, &role)
-                }
-            });
-            let skills_sha = meta
-                .as_ref()
-                .and_then(|m| m.skills_sha.clone())
-                .or_else(|| skills_fingerprint(project_dir));
-            let cost_vendor = meta
-                .as_ref()
-                .map(|m| m.vendor.cost_vendor())
-                .unwrap_or(ccteam_cost::Vendor::Claude);
-
             let Ok(turn_records) = super::turns_mirror::read_all_turns(project_dir, &sid) else {
                 continue;
             };
@@ -329,6 +306,8 @@ pub fn rebuild_experience(
             }
             for (turn_id, tr) in by_id {
                 let progress = progress_by_key.get(&(sid.clone(), turn_id.clone()));
+                let vendor = tr.vendor.clone();
+                let role = tr.role.clone();
                 let usage = progress
                     .and_then(|ev| ev.get("usage"))
                     .and_then(|u| serde_json::from_value::<UnifiedTokenUsage>(u.clone()).ok())
@@ -343,10 +322,31 @@ pub fn rebuild_experience(
                     .and_then(|ev| ev.get("model"))
                     .and_then(|m| m.as_str())
                     .map(str::to_string);
-                let cost_usd = usage.as_ref().and_then(|u| {
-                    let m = model.as_deref().unwrap_or("");
-                    ccteam_cost::resolve_turn_cost(u, cost_vendor, m)
+                let cost_usd = usage.as_ref().and_then(|usage| {
+                    cost_vendor_from_label(&vendor).and_then(|cost_vendor| {
+                        ccteam_cost::resolve_turn_cost(
+                            usage,
+                            cost_vendor,
+                            model.as_deref().unwrap_or(""),
+                        )
+                    })
                 });
+                let outcome = progress
+                    .and_then(|ev| ev.get("outcome"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned);
+                let duration_ms = progress
+                    .and_then(|ev| ev.get("duration_ms"))
+                    .and_then(|value| value.as_u64());
+                let role_sha = progress
+                    .and_then(|ev| ev.get("role_sha"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned);
+                let skills_sha = progress
+                    .and_then(|ev| ev.get("skills_sha"))
+                    .and_then(|value| {
+                        serde_json::from_value::<BTreeMap<String, String>>(value.clone()).ok()
+                    });
                 let tool_calls = tr.tool_calls.len() as u64;
                 turns.push(ExperienceRecord::Turn(TurnExperience {
                     sid: sid.clone(),
@@ -357,9 +357,10 @@ pub fn rebuild_experience(
                     role: role.clone(),
                     usage,
                     cost_usd,
-                    duration_ms: None,
-                    role_sha: role_sha.clone(),
-                    skills_sha: skills_sha.clone(),
+                    outcome,
+                    duration_ms,
+                    role_sha,
+                    skills_sha,
                     signals: TurnSignals {
                         tool_calls,
                         steered: false,
@@ -371,7 +372,7 @@ pub fn rebuild_experience(
     }
 
     let turns_written = turns.len();
-    // Stable order: turns (by sid, then ts) then preserved verdicts.
+    // Stable order: turns (by sid, then ts) then projected verdicts.
     turns.sort_by(|a, b| match (a, b) {
         (ExperienceRecord::Turn(x), ExperienceRecord::Turn(y)) => {
             x.sid.cmp(&y.sid).then_with(|| x.ts.cmp(&y.ts))
@@ -396,23 +397,27 @@ pub fn rebuild_experience(
     fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
 
-    Ok((turns_written, verdicts_preserved))
+    Ok((turns_written, verdicts_written))
 }
 
-fn vendor_label(v: crate::AgentVendor) -> &'static str {
-    match v {
-        crate::AgentVendor::Claude => "claude",
-        crate::AgentVendor::Codex => "codex",
-        crate::AgentVendor::Grok => "grok",
-        crate::AgentVendor::Opencode => "opencode",
-        crate::AgentVendor::Kimi => "kimi",
-        crate::AgentVendor::Pi => "pi",
-        crate::AgentVendor::Dsh => "dsh",
+fn cost_vendor_from_label(vendor: &str) -> Option<ccteam_cost::Vendor> {
+    match vendor {
+        "claude" => Some(ccteam_cost::Vendor::Claude),
+        "codex" => Some(ccteam_cost::Vendor::Codex),
+        "grok" => Some(ccteam_cost::Vendor::Grok),
+        "opencode" => Some(ccteam_cost::Vendor::Opencode),
+        "kimi" => Some(ccteam_cost::Vendor::Kimi),
+        "pi" => Some(ccteam_cost::Vendor::Pi),
+        "dsh" => Some(ccteam_cost::Vendor::Dsh),
+        _ => None,
     }
 }
 
-fn read_progress_events(path: &Path) -> Result<Vec<serde_json::Value>> {
-    super::fs_atomic::read_jsonl(path)
+fn read_retained_progress_events(path: &Path) -> Result<Vec<serde_json::Value>> {
+    let mut events =
+        super::fs_atomic::read_jsonl(&super::progress_bridge::progress_archive_path(path))?;
+    events.extend(super::fs_atomic::read_jsonl(path)?);
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -434,6 +439,7 @@ mod tests {
                 ..Default::default()
             }),
             cost_usd: Some(0.001),
+            outcome: Some("completed".into()),
             duration_ms: Some(100),
             role_sha: Some("ab12cd34ef56".into()),
             skills_sha: None,
@@ -456,6 +462,7 @@ mod tests {
                 assert_eq!(a.sid, b.sid);
                 assert_eq!(a.turn_id, b.turn_id);
                 assert_eq!(a.vendor, b.vendor);
+                assert_eq!(a.outcome, b.outcome);
                 assert_eq!(a.role_sha, b.role_sha);
                 assert_eq!(a.signals.tool_calls, b.signals.tool_calls);
             }
@@ -560,9 +567,9 @@ mod tests {
             managed_by: Default::default(),
             sid: "s1".into(),
             slug: "demo".into(),
-            vendor: crate::AgentVendor::Opencode,
+            vendor: crate::AgentVendor::Claude,
             protocol: crate::SessionProtocol::Acp,
-            role: String::new(),
+            role: "current-role".into(),
             permission_mode: crate::PermissionMode::Skip,
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
@@ -578,8 +585,11 @@ mod tests {
             turn_count: 1,
             cost_usd: None,
             tokens_total: None,
-            role_sha: None,
-            skills_sha: None,
+            role_sha: Some("current-role-sha".into()),
+            skills_sha: Some(BTreeMap::from([(
+                "current-skill".into(),
+                "current-skill-sha".into(),
+            )])),
             trigger: None,
             parent_sid: None,
             spawned_by_role: None,
@@ -593,7 +603,7 @@ mod tests {
                 turn_id: "turn-1".into(),
                 ts: now,
                 vendor: "opencode".into(),
-                role: String::new(),
+                role: "historical-role".into(),
                 user: "hi".into(),
                 assistant: "partial".into(),
                 usage: serde_json::to_value(UnifiedTokenUsage {
@@ -615,13 +625,21 @@ mod tests {
         assert_eq!(rebuild_experience(project, None).unwrap(), (1, 0));
         let record = read_all_experience(project).unwrap().remove(0);
         match record {
-            ExperienceRecord::Turn(turn) => assert_eq!(turn.cost_usd, Some(0.73)),
+            ExperienceRecord::Turn(turn) => {
+                assert_eq!(turn.cost_usd, Some(0.73));
+                assert_eq!(turn.vendor, "opencode");
+                assert_eq!(turn.role, "historical-role");
+                assert_eq!(turn.outcome, None);
+                assert_eq!(turn.duration_ms, None);
+                assert_eq!(turn.role_sha, None);
+                assert_eq!(turn.skills_sha, None);
+            }
             other => panic!("expected turn, got {other:?}"),
         }
     }
 
     #[test]
-    fn rebuild_preserves_verdicts_and_is_idempotent() {
+    fn rebuild_projects_completion_metadata_and_latest_canonical_verdict() {
         let tmp = TempDir::new().unwrap();
         let project = tmp.path();
         // Seed meta + turns for s1.
@@ -677,32 +695,85 @@ mod tests {
         )
         .unwrap();
 
-        // Manual verdict in the experience file.
+        let progress_path = project.join("progress.jsonl");
+        let completion =
+            super::super::progress_bridge::build_chat_turn_completed_event_with_metadata(
+                "cto",
+                "s1",
+                "s1-1",
+                &UnifiedTokenUsage::default(),
+                Some("claude-opus-4-8"),
+                Some("claude"),
+                &super::super::progress_bridge::ChatTurnCompletionMetadata {
+                    outcome: Some("completed".into()),
+                    duration_ms: Some(250),
+                    role_sha: Some("turn-role-sha".into()),
+                    skills_sha: Some(BTreeMap::from([(
+                        "research".into(),
+                        "turn-skill-sha".into(),
+                    )])),
+                },
+            );
+        super::super::progress_bridge::append_event(&progress_path, &completion).unwrap();
+        super::super::progress_bridge::append_turn_verdict_if_changed(
+            &progress_path,
+            &super::super::progress_bridge::TurnVerdict {
+                sid: "s1".into(),
+                turn_id: "s1-1".into(),
+                ts: now,
+                verdict: Verdict::Accept,
+                feedback: None,
+            },
+        )
+        .unwrap();
+        super::super::progress_bridge::append_turn_verdict_if_changed(
+            &progress_path,
+            &super::super::progress_bridge::TurnVerdict {
+                sid: "s1".into(),
+                turn_id: "s1-1".into(),
+                ts: now + chrono::Duration::seconds(1),
+                verdict: Verdict::Revise,
+                feedback: Some("try again".into()),
+            },
+        )
+        .unwrap();
+
+        // Stale derived data must never outrank canonical progress facts.
         append_experience(
             project,
             &ExperienceRecord::Verdict(VerdictExperience {
                 sid: "s1".into(),
                 turn_id: "s1-1".into(),
                 ts: now,
-                verdict: Verdict::Revise,
-                feedback: Some("try again".into()),
+                verdict: Verdict::Accept,
+                feedback: Some("stale".into()),
             }),
         )
         .unwrap();
 
-        let (n1, v1) = rebuild_experience(project, None).unwrap();
+        let (n1, v1) = rebuild_experience(project, Some(&progress_path)).unwrap();
         assert_eq!(n1, 1);
         assert_eq!(v1, 1);
         let recs = read_all_experience(project).unwrap();
         assert_eq!(recs.len(), 2);
-        assert!(matches!(&recs[0], ExperienceRecord::Turn(t) if t.turn_id == "s1-1"));
+        assert!(matches!(
+            &recs[0],
+            ExperienceRecord::Turn(t)
+                if t.turn_id == "s1-1"
+                    && t.outcome.as_deref() == Some("completed")
+                    && t.duration_ms == Some(250)
+                    && t.role_sha.as_deref() == Some("turn-role-sha")
+                    && t.skills_sha.as_ref().and_then(|skills| skills.get("research")).map(String::as_str) == Some("turn-skill-sha")
+        ));
         assert!(matches!(
             &recs[1],
-            ExperienceRecord::Verdict(v) if matches!(v.verdict, Verdict::Revise)
+            ExperienceRecord::Verdict(v)
+                if matches!(v.verdict, Verdict::Revise)
+                    && v.feedback.as_deref() == Some("try again")
         ));
 
         // Second rebuild is idempotent (same shape).
-        let (n2, v2) = rebuild_experience(project, None).unwrap();
+        let (n2, v2) = rebuild_experience(project, Some(&progress_path)).unwrap();
         assert_eq!((n2, v2), (n1, v1));
         let recs2 = read_all_experience(project).unwrap();
         assert_eq!(recs2.len(), recs.len());

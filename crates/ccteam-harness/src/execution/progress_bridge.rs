@@ -14,7 +14,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -35,6 +35,7 @@ pub const CHAT_SESSION_RESET: &str = "chat_session_reset";
 pub const CHAT_SESSION_STARTED: &str = "chat_session_started";
 pub const CHAT_TURN_USER_PROMPT: &str = "chat_turn_user_prompt";
 pub const CHAT_TURN_COMPLETED: &str = "chat_turn_completed";
+pub const TURN_VERDICT: &str = "turn_verdict";
 pub const CHAT_SESSION_RESET_WITH_RECOVERY: &str = "chat_session_reset_with_recovery";
 pub const CHAT_COMPACT_DONE: &str = "chat_compact_done";
 pub const CHAT_HOP_ESCALATE: &str = "chat_hop_escalate";
@@ -103,6 +104,7 @@ pub enum EventKind {
     ChatSessionStarted,
     ChatTurnUserPrompt,
     ChatTurnCompleted,
+    TurnVerdict,
     ChatSessionResetWithRecovery,
     ChatCompactDone,
     ChatHopEscalate,
@@ -143,6 +145,7 @@ impl EventKind {
         EventKind::ChatSessionStarted,
         EventKind::ChatTurnUserPrompt,
         EventKind::ChatTurnCompleted,
+        EventKind::TurnVerdict,
         EventKind::ChatSessionResetWithRecovery,
         EventKind::ChatCompactDone,
         EventKind::ChatHopEscalate,
@@ -183,6 +186,7 @@ impl EventKind {
             EventKind::ChatSessionStarted => CHAT_SESSION_STARTED,
             EventKind::ChatTurnUserPrompt => CHAT_TURN_USER_PROMPT,
             EventKind::ChatTurnCompleted => CHAT_TURN_COMPLETED,
+            EventKind::TurnVerdict => TURN_VERDICT,
             EventKind::ChatSessionResetWithRecovery => CHAT_SESSION_RESET_WITH_RECOVERY,
             EventKind::ChatCompactDone => CHAT_COMPACT_DONE,
             EventKind::ChatHopEscalate => CHAT_HOP_ESCALATE,
@@ -224,6 +228,7 @@ impl EventKind {
             CHAT_SESSION_STARTED => EventKind::ChatSessionStarted,
             CHAT_TURN_USER_PROMPT => EventKind::ChatTurnUserPrompt,
             CHAT_TURN_COMPLETED => EventKind::ChatTurnCompleted,
+            TURN_VERDICT => EventKind::TurnVerdict,
             CHAT_SESSION_RESET_WITH_RECOVERY => EventKind::ChatSessionResetWithRecovery,
             CHAT_COMPACT_DONE => EventKind::ChatCompactDone,
             CHAT_HOP_ESCALATE => EventKind::ChatHopEscalate,
@@ -277,6 +282,41 @@ pub enum EventClass {
     Telemetry,
 }
 
+/// Human verdict persisted as the canonical `turn_verdict` progress fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnVerdict {
+    pub sid: String,
+    pub turn_id: String,
+    pub ts: DateTime<Utc>,
+    pub verdict: Verdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
+}
+
+/// Accept the completed turn or request a revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Accept,
+    Revise,
+}
+
+/// Optional facts captured at the exact completion boundary.
+///
+/// Missing fields stay unknown; callers must not backfill them from current
+/// session state when projecting historical turns.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatTurnCompletionMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_sha: Option<BTreeMap<String, String>>,
+}
+
 /// Classify every schema-owned kind. Deliberately no wildcard: a new
 /// [`EventKind`] cannot compile until its persistence policy is chosen.
 pub const fn class(kind: EventKind) -> EventClass {
@@ -285,6 +325,7 @@ pub const fn class(kind: EventKind) -> EventClass {
         | EventKind::ChatSessionStarted
         | EventKind::ChatTurnUserPrompt
         | EventKind::ChatTurnCompleted
+        | EventKind::TurnVerdict
         | EventKind::ChatSessionResetWithRecovery
         | EventKind::ChatCompactDone
         | EventKind::ChatHopEscalate
@@ -641,6 +682,94 @@ pub fn append_event(path: &Path, event: &Value) -> Result<()> {
     append_event_at(path, event, Instant::now(), None)
 }
 
+/// Parse one canonical `turn_verdict` event. Other or malformed events are
+/// ignored so callers can scan mixed and torn progress journals safely.
+pub fn parse_turn_verdict_event(event: &Value) -> Option<TurnVerdict> {
+    if event_kind_name(event) != Some(TURN_VERDICT) {
+        return None;
+    }
+    let verdict = serde_json::from_value::<TurnVerdict>(event.clone()).ok()?;
+    if verdict.sid.trim().is_empty() || verdict.turn_id.trim().is_empty() {
+        return None;
+    }
+    Some(verdict)
+}
+
+/// Read the latest verdict for every `(sid, turn_id)` across the retained
+/// archive followed by the active progress journal.
+pub fn latest_turn_verdicts(path: &Path) -> Result<BTreeMap<(String, String), TurnVerdict>> {
+    if !path.exists() && !progress_archive_path(path).exists() {
+        return Ok(BTreeMap::new());
+    }
+    let lock_file = open_progress_lock(path)?;
+    let _lock = ProgressFileLock::lock(&lock_file)
+        .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
+    latest_turn_verdicts_locked(path)
+}
+
+/// Append a canonical verdict only when its semantic payload changed.
+///
+/// The stable journal lock covers both the read and append, so concurrent
+/// identical updates produce one row. `ts` is intentionally excluded from
+/// equality: retrying the same PUT later is still idempotent.
+pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Result<bool> {
+    if verdict.sid.trim().is_empty() || verdict.turn_id.trim().is_empty() {
+        anyhow::bail!("turn verdict requires non-empty sid and turn_id");
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+
+    let mut event = serde_json::to_value(verdict).context("serialize turn verdict")?;
+    event
+        .as_object_mut()
+        .expect("TurnVerdict serializes as an object")
+        .insert("event".into(), Value::String(TURN_VERDICT.into()));
+    let mut line = serde_json::to_vec(&event).context("serialize turn verdict event")?;
+    line.push(b'\n');
+    let byte_count = u64::try_from(line.len()).unwrap_or(u64::MAX);
+
+    let lock_file = open_progress_lock(path)?;
+    let lock = ProgressFileLock::lock(&lock_file)
+        .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
+    if !path.exists() && progress_archive_path(path).exists() {
+        recover_progress_checkpoint_locked(path)?;
+    }
+    let key = (verdict.sid.clone(), verdict.turn_id.clone());
+    if latest_turn_verdicts_locked(path)?
+        .get(&key)
+        .is_some_and(|latest| verdict_content_eq(latest, verdict))
+    {
+        drop(lock);
+        record_suppressed(TURN_VERDICT, false, byte_count);
+        return Ok(false);
+    }
+
+    let rotated = append_serialized_locked(path, &line)?;
+    drop(lock);
+    record_appended(TURN_VERDICT, false, byte_count);
+    if let Some(observer) = PERSIST_OBSERVER.get() {
+        observer(path, rotated);
+    }
+    Ok(true)
+}
+
+fn latest_turn_verdicts_locked(path: &Path) -> Result<BTreeMap<(String, String), TurnVerdict>> {
+    let mut latest = BTreeMap::new();
+    for journal_path in [progress_archive_path(path), path.to_path_buf()] {
+        for event in super::fs_atomic::read_jsonl::<Value>(&journal_path)? {
+            if let Some(verdict) = parse_turn_verdict_event(&event) {
+                latest.insert((verdict.sid.clone(), verdict.turn_id.clone()), verdict);
+            }
+        }
+    }
+    Ok(latest)
+}
+
+fn verdict_content_eq(left: &TurnVerdict, right: &TurnVerdict) -> bool {
+    left.verdict == right.verdict && left.feedback == right.feedback
+}
+
 fn append_event_at(
     path: &Path,
     event: &Value,
@@ -735,6 +864,10 @@ fn append_serialized(path: &Path, line: &[u8]) -> Result<bool> {
     let _lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
 
+    append_serialized_locked(path, line)
+}
+
+fn append_serialized_locked(path: &Path, line: &[u8]) -> Result<bool> {
     // A real crash in the rename -> checkpoint window leaves `.1` present and
     // active absent. Recover before accepting another row so an uncovered
     // archive can never survive until a later rotation replaces it.
@@ -1360,6 +1493,29 @@ pub fn build_chat_turn_completed_event_with_vendor(
     model: Option<&str>,
     vendor: Option<&str>,
 ) -> Value {
+    build_chat_turn_completed_event_with_metadata(
+        role,
+        sid,
+        turn_id,
+        usage,
+        model,
+        vendor,
+        &ChatTurnCompletionMetadata::default(),
+    )
+}
+
+/// Build a completed-turn row with facts captured at that exact turn
+/// boundary. The optional fields are additive; missing values are omitted.
+#[allow(clippy::too_many_arguments)]
+pub fn build_chat_turn_completed_event_with_metadata(
+    role: &str,
+    sid: &str,
+    turn_id: &str,
+    usage: &ccteam_cost::UnifiedTokenUsage,
+    model: Option<&str>,
+    vendor: Option<&str>,
+    metadata: &ChatTurnCompletionMetadata,
+) -> Value {
     let mut ev = json!({
         "event": CHAT_TURN_COMPLETED,
         "role": role,
@@ -1373,6 +1529,26 @@ pub fn build_chat_turn_completed_event_with_vendor(
     }
     if let Some(vendor) = vendor.filter(|v| !v.is_empty()) {
         ev["vendor"] = Value::String(vendor.to_string());
+    }
+    if let Some(outcome) = metadata
+        .outcome
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        ev["outcome"] = Value::String(outcome.to_string());
+    }
+    if let Some(duration_ms) = metadata.duration_ms {
+        ev["duration_ms"] = Value::from(duration_ms);
+    }
+    if let Some(role_sha) = metadata
+        .role_sha
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        ev["role_sha"] = Value::String(role_sha.to_string());
+    }
+    if let Some(skills_sha) = &metadata.skills_sha {
+        ev["skills_sha"] = serde_json::to_value(skills_sha).unwrap_or(Value::Null);
     }
     ev
 }
@@ -1827,6 +2003,20 @@ pub fn build_codex_rate_limit_event(snapshot: Value) -> Value {
 mod tests {
     use super::*;
 
+    fn sample_verdict(
+        verdict: Verdict,
+        feedback: Option<&str>,
+        ts: chrono::DateTime<Utc>,
+    ) -> TurnVerdict {
+        TurnVerdict {
+            sid: "s1".into(),
+            turn_id: "turn-1".into(),
+            ts,
+            verdict,
+            feedback: feedback.map(str::to_owned),
+        }
+    }
+
     fn read_rows(path: &Path) -> Vec<Value> {
         match std::fs::read_to_string(path) {
             Ok(body) => body
@@ -1899,6 +2089,129 @@ mod tests {
 
         assert_eq!(event["vendor"], "codex");
         assert_eq!(event["model"], "gpt-5.5");
+    }
+
+    #[test]
+    fn chat_turn_completed_metadata_is_additive_and_absent_stays_unknown() {
+        let usage = ccteam_cost::UnifiedTokenUsage::default();
+        let legacy = build_chat_turn_completed_event_with_vendor(
+            "worker",
+            "s1",
+            "turn-1",
+            &usage,
+            Some("gpt-5.5"),
+            Some("codex"),
+        );
+        for key in ["outcome", "duration_ms", "role_sha", "skills_sha"] {
+            assert!(legacy.get(key).is_none(), "{key} must remain unknown");
+        }
+
+        let metadata = ChatTurnCompletionMetadata {
+            outcome: Some("failed".into()),
+            duration_ms: Some(1_234),
+            role_sha: Some("abc123".into()),
+            skills_sha: Some(BTreeMap::from([("research".into(), "def456".into())])),
+        };
+        let enriched = build_chat_turn_completed_event_with_metadata(
+            "worker",
+            "s1",
+            "turn-1",
+            &usage,
+            Some("gpt-5.5"),
+            Some("codex"),
+            &metadata,
+        );
+
+        assert_eq!(enriched["outcome"], "failed");
+        assert_eq!(enriched["duration_ms"], 1_234);
+        assert_eq!(enriched["role_sha"], "abc123");
+        assert_eq!(enriched["skills_sha"]["research"], "def456");
+    }
+
+    #[test]
+    fn turn_verdict_writer_deduplicates_concurrent_identical_updates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let verdict = sample_verdict(Verdict::Accept, Some("good"), Utc::now());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+
+        let handles = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let verdict = verdict.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    append_turn_verdict_if_changed(&path, &verdict).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let appended = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|appended| *appended)
+            .count();
+
+        assert_eq!(appended, 1);
+        assert_eq!(read_rows(&path).len(), 1);
+        let duplicate_with_new_ts = sample_verdict(
+            Verdict::Accept,
+            Some("good"),
+            Utc::now() + chrono::Duration::seconds(1),
+        );
+        assert!(!append_turn_verdict_if_changed(&path, &duplicate_with_new_ts).unwrap());
+        assert_eq!(read_rows(&path).len(), 1);
+    }
+
+    #[test]
+    fn latest_turn_verdict_reads_archive_then_active_and_change_wins() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let archive = progress_archive_path(&path);
+        let accepted = sample_verdict(Verdict::Accept, None, Utc::now());
+        std::fs::write(
+            &archive,
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "event": TURN_VERDICT,
+                    "sid": accepted.sid,
+                    "turn_id": accepted.turn_id,
+                    "ts": accepted.ts,
+                    "verdict": accepted.verdict,
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert!(!append_turn_verdict_if_changed(&path, &accepted).unwrap());
+        let revised = sample_verdict(Verdict::Revise, Some("fix edge case"), Utc::now());
+        assert!(append_turn_verdict_if_changed(&path, &revised).unwrap());
+
+        let latest = latest_turn_verdicts(&path).unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest.get(&("s1".into(), "turn-1".into())), Some(&revised));
+        assert!(parse_turn_verdict_event(&json!({"event": "other"})).is_none());
+    }
+
+    #[test]
+    fn turn_verdict_rejects_an_empty_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let mut verdict = sample_verdict(Verdict::Accept, None, Utc::now());
+        verdict.sid.clear();
+
+        assert!(append_turn_verdict_if_changed(&path, &verdict).is_err());
+        assert!(read_rows(&path).is_empty());
+        assert!(parse_turn_verdict_event(&json!({
+            "event": TURN_VERDICT,
+            "sid": "",
+            "turn_id": "turn-1",
+            "ts": Utc::now(),
+            "verdict": "accept",
+        }))
+        .is_none());
     }
 
     #[test]
