@@ -2407,6 +2407,7 @@ mod tests {
         use ccteam_im::gateway::GatewayEventKind;
         GatewayEvent {
             id: "e1".into(),
+            cid: None,
             channel: "web".into(),
             chat_id: "web-api".into(),
             thread_ts: None,
@@ -3302,6 +3303,7 @@ mod tests {
         let app = test_app_with_gateway(tmp.path());
         let ans = |id: &str, sid: &str| GatewayEvent {
             id: id.to_string(),
+            cid: None,
             channel: "web".into(),
             chat_id: "web-api".into(),
             thread_ts: None,

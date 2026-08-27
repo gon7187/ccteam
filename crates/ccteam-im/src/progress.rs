@@ -30,9 +30,9 @@ use crate::gateway::{ActivityKind, ActivityStatus, SessionActivity};
 /// Phone-sized cap (chars) for a tool's argument preview.
 pub const PREVIEW_MAX: usize = 200;
 /// Recent tool/command lines shown in the terminal block.
-const MAX_DETAIL_LINES: usize = 12;
-/// Per-line terminal cap. At most twelve Unicode scalar lines can occupy no
-/// more than 2891 UTF-16 units including newlines, below Telegram's 3000 cap.
+const MAX_DETAIL_LINES: usize = 6;
+/// Per-line terminal cap. Six Unicode scalar lines stay comfortably below
+/// Telegram's 3000 UTF-16-unit cap.
 const MAX_OUTPUT_LINE_CHARS: usize = 120;
 
 /// Stable positive Bot API draft id derived from a session id.
@@ -435,7 +435,7 @@ impl ProgressFold {
     pub fn render(&self, sid: &str) -> String {
         let elapsed = render_elapsed(self.started_at.elapsed());
         if self.done {
-            return format!("✅ готово · {elapsed} · {}", self.done_summary());
+            return format!("✅ {sid} готово · {elapsed} · {}", self.done_summary());
         }
         let mut lines = vec![format!("▶️ {sid} работает · {elapsed}")];
         let summary = self.counts_summary();
@@ -677,7 +677,7 @@ mod tests {
         f.apply(&started_tool("t2", "Edit", json!({"file_path": "/a"})));
         f.mark_done();
         let rendered = f.render("s42");
-        assert!(rendered.starts_with("✅ готово · "));
+        assert!(rendered.starts_with("✅ s42 готово · "));
         assert!(rendered.contains("2 инструмента · 1 файл"));
     }
 
@@ -916,7 +916,7 @@ mod tests {
             .nth(1)
             .and_then(|body| body.split("\n```").next())
             .expect("fenced output block");
-        assert_eq!(block.lines().count(), MAX_DETAIL_LINES);
+        assert_eq!(block.lines().count(), 6);
     }
 
     #[test]
@@ -943,11 +943,11 @@ mod tests {
             .nth(1)
             .and_then(|body| body.split("\n```").next())
             .expect("fenced output block");
-        assert_eq!(block.lines().count(), 12);
+        assert_eq!(block.lines().count(), 6);
         assert!(block.lines().all(|line| line.chars().count() <= 120));
         assert!(block.encode_utf16().count() <= 3000);
         assert!(block.contains("line-13"));
-        assert!(!block.contains("line-0"));
+        assert!(!block.contains("line-7"));
         assert!(rendered.contains("🔧 команда ×14"));
 
         let html = crate::telegram_html::render_markdown(&rendered).html;

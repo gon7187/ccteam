@@ -701,6 +701,7 @@ mod tests {
     fn event_visible_admin_keeps_unattributed_but_not_a_tenants_project() {
         let mut ev = GatewayEvent {
             id: "e".into(),
+            cid: None,
             channel: String::new(),
             chat_id: String::new(),
             thread_ts: None,
@@ -737,6 +738,7 @@ mod tests {
     fn event_visible_tenant_fails_closed_on_missing_slug() {
         let ev = GatewayEvent {
             id: "e".into(),
+            cid: None,
             channel: String::new(),
             chat_id: String::new(),
             thread_ts: None,
@@ -759,6 +761,7 @@ mod tests {
     fn event_visible_tenant_matches_own_slug_only() {
         let mut ev = GatewayEvent {
             id: "e".into(),
+            cid: None,
             channel: String::new(),
             chat_id: String::new(),
             thread_ts: None,

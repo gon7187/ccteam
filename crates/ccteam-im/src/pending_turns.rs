@@ -35,6 +35,10 @@ pub struct PendingTurn {
     /// makes a human's queued question look like nobody asked it.
     #[serde(default)]
     pub internal: bool,
+    /// A delegated task completion must still reach the parent IM thread when
+    /// this row is drained after a resume or daemon restart.
+    #[serde(default)]
+    pub delegation_completion: bool,
 }
 
 fn pending_path(project_dir: &Path, sid: &str) -> PathBuf {
@@ -53,6 +57,7 @@ pub fn enqueue_pending_turn(
     origin: Option<String>,
     literal: bool,
     internal: bool,
+    delegation_completion: bool,
 ) -> Result<()> {
     let path = pending_path(project_dir, sid);
     if let Some(parent) = path.parent() {
@@ -64,6 +69,7 @@ pub fn enqueue_pending_turn(
         origin,
         literal,
         internal,
+        delegation_completion,
     };
     let mut f = OpenOptions::new()
         .create(true)
@@ -123,8 +129,26 @@ mod tests {
     #[test]
     fn enqueue_drain_fifo() {
         let tmp = TempDir::new().unwrap();
-        enqueue_pending_turn(tmp.path(), "s1", "first", Some("web".into()), false, false).unwrap();
-        enqueue_pending_turn(tmp.path(), "s1", "second", Some("web".into()), true, true).unwrap();
+        enqueue_pending_turn(
+            tmp.path(),
+            "s1",
+            "first",
+            Some("web".into()),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        enqueue_pending_turn(
+            tmp.path(),
+            "s1",
+            "second",
+            Some("web".into()),
+            true,
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(pending_turn_count(tmp.path(), "s1"), 2);
         let drained = drain_pending_turns(tmp.path(), "s1").unwrap();
         assert_eq!(drained.len(), 2);
@@ -141,5 +165,24 @@ mod tests {
     fn drain_missing_is_empty() {
         let tmp = TempDir::new().unwrap();
         assert!(drain_pending_turns(tmp.path(), "nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn delegation_completion_survives_file_backed_queue() {
+        let tmp = TempDir::new().unwrap();
+        let path = pending_path(tmp.path(), "s1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"text":"done","enqueued_at":"now","internal":true,"delegation_completion":true}"#,
+        )
+        .unwrap();
+
+        let turn = drain_pending_turns(tmp.path(), "s1")
+            .unwrap()
+            .pop_front()
+            .unwrap();
+        let serialized = serde_json::to_value(turn).unwrap();
+        assert_eq!(serialized["delegation_completion"], true);
     }
 }
