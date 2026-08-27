@@ -671,7 +671,10 @@ pub(crate) async fn handle_turn_verdict(
                 .into_response();
         }
     };
-    if !turns.iter().any(|turn| turn.turn_id == turn_id) {
+    if !turns
+        .iter()
+        .any(|turn| turn.turn_id == turn_id && turn.verdictable())
+    {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("unknown turn: {turn_id}")})),
@@ -834,12 +837,17 @@ fn collect_session_turns(
 ) -> anyhow::Result<SessionHistoryPage> {
     let path = turns_jsonl_path(project_dir, sid);
     let tail = ccteam_core::journal::tail_filter_map(&path, limit, before, |line| {
-        serde_json::from_slice::<TurnRecord>(line).ok()
+        serde_json::from_slice::<TurnRecord>(line)
+            .ok()
+            // Preserve the journal reader's corrupt-row accounting: an
+            // interim row is valid but intentionally invisible, not malformed.
+            .map(|turn| (!turn.interim()).then_some(turn))
     })?;
     Ok(SessionHistoryPage {
         events: tail
             .events
             .iter()
+            .flatten()
             .map(|turn| {
                 let verdict = verdicts.get(&(sid.to_string(), turn.turn_id.clone()));
                 turn_to_event(turn, verdict)

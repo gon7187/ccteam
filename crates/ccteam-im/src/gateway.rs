@@ -6425,6 +6425,12 @@ impl Gateway {
             // was written. `None` turn = no window open, so nothing to refresh.
             let mut heartbeat_turn: Option<(String, Instant)> = None;
             let mut heartbeat_last: Option<Instant> = None;
+            // Canonical vendor turn identity observed at `TurnStarted`. Error
+            // carries no id of its own, so this is the only honest join key for
+            // its terminal accounting. `last_accounted_terminal_turn_id`
+            // suppresses a cleanup boundary that arrives after a terminal Error.
+            let mut active_terminal_turn_id: Option<String> = None;
+            let mut last_accounted_terminal_turn_id: Option<String> = None;
 
             loop {
                 // Flush timer, armed only while a throttled update waits.
@@ -6625,6 +6631,8 @@ impl Gateway {
                         // same-turn Inject emits no second TurnStarted and thus
                         // preserves the original elapsed time.
                         if let ThreadEvent::TurnStarted { turn_id } = &evt {
+                            active_terminal_turn_id = Some(turn_id.clone());
+                            last_accounted_terminal_turn_id = None;
                             if let Ok(mut started) = session.turn_started_at.lock() {
                                 if started.is_none() {
                                     *started = Some(Instant::now());
@@ -6816,15 +6824,29 @@ impl Gateway {
                         // v0.9 T5 — BEFORE clearing, capture duration + signals
                         // and append one kind:turn experience record (derived
                         // index; failure never breaks the pump).
+                        let fallback_terminal_id =
+                            format!("{session_id}-{}", seq.saturating_add(1));
+                        let terminal_boundary = turn_terminal_accounting(
+                            &evt,
+                            active_terminal_turn_id.as_deref(),
+                            &fallback_terminal_id,
+                        );
+                        let duplicate_terminal = terminal_boundary.as_ref().is_some_and(|turn| {
+                            last_accounted_terminal_turn_id.as_deref()
+                                == Some(turn.turn_id.as_str())
+                        });
+                        let terminal_accounting = (!duplicate_terminal)
+                            .then_some(terminal_boundary)
+                            .flatten();
                         let mut terminal_completion_metadata = None;
-                        if let Some((turn_id, usage, model)) = turn_terminal_accounting(&evt) {
-                            let is_completed =
-                                matches!(&evt, ThreadEvent::TurnCompleted { .. });
-                            let terminal_outcome = if is_completed {
-                                "completed"
-                            } else {
-                                "failed"
-                            };
+                        if let Some(terminal) = terminal_accounting.as_ref() {
+                            last_accounted_terminal_turn_id = Some(terminal.turn_id.clone());
+                            if active_terminal_turn_id.as_deref()
+                                == Some(terminal.turn_id.as_str())
+                            {
+                                active_terminal_turn_id = None;
+                            }
+                            let is_completed = terminal.outcome == "completed";
                             let duration_ms = session
                                 .turn_started_at
                                 .lock()
@@ -6849,7 +6871,7 @@ impl Gateway {
                             }
                             terminal_completion_metadata = Some(
                                 ccteam_core::progress::ChatTurnCompletionMetadata {
-                                    outcome: Some(terminal_outcome.to_string()),
+                                    outcome: Some(terminal.outcome.to_string()),
                                     duration_ms,
                                     role_sha: pump_role_sha.clone(),
                                     skills_sha: pump_skills_sha.clone(),
@@ -6857,44 +6879,38 @@ impl Gateway {
                             );
 
                             if let Some(dir) = project_dir.as_ref() {
-                                let model_owned = model
+                                let model_owned = terminal
+                                    .model
+                                    .as_deref()
                                     .filter(|model| !model.is_empty())
                                     .map(str::to_string);
                                 let cost_usd = {
                                     let m = model_owned.as_deref().unwrap_or("");
                                     ccteam_cost::resolve_turn_cost(
-                                        usage,
+                                        &terminal.usage,
                                         session.vendor.cost_vendor(),
                                         m,
                                     )
                                 };
-                                // Prefer the adapter turn_id (joins chat_turn_completed);
-                                // synthesize `{sid}-{seq+1}` when empty (matches the
-                                // upcoming ANSWER-side turns writer id shape).
-                                let exp_turn_id = if turn_id.is_empty() {
-                                    format!("{session_id}-{}", seq.saturating_add(1))
-                                } else {
-                                    turn_id.to_string()
-                                };
-                                let usage_opt = if usage.total() == 0
-                                    && usage.reported_cost_usd.is_none()
+                                let usage_opt = if terminal.usage.total() == 0
+                                    && terminal.usage.reported_cost_usd.is_none()
                                     && model_owned.is_none()
                                 {
                                     None
                                 } else {
-                                    Some(*usage)
+                                    Some(terminal.usage)
                                 };
                                 let record = ccteam_harness::execution::experience::ExperienceRecord::Turn(
                                     ccteam_harness::execution::experience::TurnExperience {
                                         sid: session_id.clone(),
-                                        turn_id: exp_turn_id,
+                                        turn_id: terminal.turn_id.clone(),
                                         ts: chrono::Utc::now(),
                                         vendor: vendor_str(session.vendor).to_string(),
                                         model: model_owned,
                                         role: session.role.clone(),
                                         usage: usage_opt,
                                         cost_usd,
-                                        outcome: Some(terminal_outcome.to_string()),
+                                        outcome: Some(terminal.outcome.to_string()),
                                         duration_ms,
                                         role_sha: pump_role_sha.clone(),
                                         skills_sha: pump_skills_sha.clone(),
@@ -6914,11 +6930,52 @@ impl Gateway {
                                         "ccteam-im: failed to append experience.jsonl"
                                     );
                                 }
+
+                                // The message was mirrored provisionally when it
+                                // arrived so delegation ordering remained durable.
+                                // At the vendor boundary append one terminal row
+                                // under the adapter's canonical id. History hides
+                                // provisional rows and exposes this exact row to the
+                                // verdict API, Experience and progress joins.
+                                if is_completed {
+                                    let final_text = turn_last_answer
+                                        .as_ref()
+                                        .map(|(_, text)| text.clone())
+                                        .unwrap_or_default();
+                                    let record =
+                                        ccteam_harness::execution::turns_mirror::TurnRecord {
+                                            turn_id: terminal.turn_id.clone(),
+                                            ts: chrono::Utc::now(),
+                                            vendor: vendor_str(session.vendor).to_string(),
+                                            role: session.role.clone(),
+                                            user: String::new(),
+                                            assistant: final_text,
+                                            usage: serde_json::to_value(terminal.usage)
+                                                .unwrap_or(serde_json::Value::Null),
+                                            tool_calls: Vec::new(),
+                                            attachments: Vec::new(),
+                                            outcome: Some("completed".to_string()),
+                                            error_kind: None,
+                                            error: None,
+                                        };
+                                    match ccteam_harness::execution::turns_mirror::append_turn(
+                                        dir,
+                                        &session_id,
+                                        &record,
+                                    ) {
+                                        Ok(_) => turn_covered.push(terminal.turn_id.clone()),
+                                        Err(err) => tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "ccteam-im: failed to mirror canonical terminal turn"
+                                        ),
+                                    }
+                                }
                             }
 
                             if is_completed {
                                 let completed_origin =
-                                    take_turn_origin(&session, Some(turn_id));
+                                    take_turn_origin(&session, Some(&terminal.turn_id));
                                 let mirror_answer = mirror_last_answer.take();
                                 // v0.9.5 feedback fix — the vendor turn is DONE and
                                 // the child is idle: flush ONE boundary signal
@@ -6932,12 +6989,12 @@ impl Gateway {
                                 let covered = std::mem::take(&mut turn_covered);
                                 let notes = turn_notes;
                                 turn_notes = 0;
-                                if let (Some(dtx), Some((final_turn, final_text))) =
+                                if let (Some(dtx), Some((_provisional_turn, final_text))) =
                                     (delegation_tx.as_ref(), finished.as_ref())
                                 {
                                     let _ = dtx.send(crate::delegation::DelegationSignal {
                                         child_sid: session_id.clone(),
-                                        turn_id: final_turn.clone(),
+                                        turn_id: terminal.turn_id.clone(),
                                         tail: final_text.clone(),
                                         vendor: pump_vendor,
                                         host: pump_host.clone(),
@@ -6977,41 +7034,9 @@ impl Gateway {
                             if let Ok(mut act) = session.latest_activity.lock() {
                                 *act = None;
                             }
-                            // …and the SAME boundary has to reach the file, or
-                            // the durable truth outlives the in-memory one and a
-                            // dead session reads as forever-`working` to every
-                            // parent polling it. `TurnFailed` already lands a row
-                            // through the shared terminal accounting below;
-                            // `Error` is the third boundary and carries no
-                            // accounting at all, so it is absent from that
-                            // projection and needs its own close here. Zero usage
-                            // and no model → it contributes nothing to the ledger;
-                            // its only job is to end the busy window. Paneless
-                            // only: a terminal session's Stop hook closes its own.
-                            if !session.protocol.is_terminal() {
-                                if let (ThreadEvent::Error(_), Some(ppath)) =
-                                    (&evt, progress_path.as_ref())
-                                {
-                                    let ev =
-                                        ccteam_core::progress::build_chat_turn_completed_event_with_vendor(
-                                            &session.role,
-                                            &session_id,
-                                            "",
-                                            &ccteam_harness::UnifiedTokenUsage::default(),
-                                            None,
-                                            Some(vendor_str(session.vendor)),
-                                        );
-                                    if let Err(err) =
-                                        ccteam_core::progress::append_event(ppath, &ev)
-                                    {
-                                        tracing::warn!(
-                                            session = %session_id,
-                                            error = %err,
-                                            "paneless pump: failed to close the busy window on Error"
-                                        );
-                                    }
-                                }
-                            }
+                            // The shared terminal projection below persists the
+                            // same failed boundary, including `Error`, with its
+                            // canonical id and completion metadata.
                         }
                         // v0.8.11 E4 — for a paneless session (no hooks:
                         // stream-json AND acp), the pump mirrors each terminal
@@ -7025,10 +7050,8 @@ impl Gateway {
                         // acp path). Tmux sessions get this from their Stop
                         // hook → gate on protocol to avoid a double-write.
                         if !session.protocol.is_terminal() {
-                            if let (
-                                Some((turn_id, usage, model)),
-                                Some(ppath),
-                            ) = (turn_terminal_accounting(&evt), progress_path.as_ref())
+                            if let (Some(terminal), Some(ppath)) =
+                                (terminal_accounting.as_ref(), progress_path.as_ref())
                             {
                                 let metadata = terminal_completion_metadata
                                     .as_ref()
@@ -7037,9 +7060,9 @@ impl Gateway {
                                 let ev = ccteam_core::progress::build_chat_turn_completed_event_with_metadata(
                                     &session.role,
                                     &session_id,
-                                    turn_id,
-                                    usage,
-                                    model,
+                                    &terminal.turn_id,
+                                    &terminal.usage,
+                                    terminal.model.as_deref(),
                                     Some(vendor_str(session.vendor)),
                                     &metadata,
                                 );
@@ -7071,7 +7094,10 @@ impl Gateway {
                                 }
                             }
                         }
-                        if let Some(text) = async_event_text(&evt) {
+                        let event_text = (!duplicate_terminal)
+                            .then(|| async_event_text(&evt))
+                            .flatten();
+                        if let Some(text) = event_text {
                             let boundary_origin = match &evt {
                                 ThreadEvent::TurnFailed { turn_id, .. } => {
                                     Some(take_turn_origin(&session, Some(turn_id)))
@@ -7104,13 +7130,18 @@ impl Gateway {
                             // 数据源,缺它历史永远为空。`append_turn` 是 O_APPEND
                             // 原子单写(PIPE_BUF-atomic)、不持 gateway 锁,放热路
                             // 径安全;目录已按 sid 隔离,故 TurnRecord 不带
-                            // session_id 字段。turn_id 用 pump 内单调 `seq`(每条
-                            // ANSWER +1)+ sid 派生,稳定且可 grep,非随机。失败
-                            // 只 warn,绝不阻断回复投递。
+                            // session_id 字段。普通 assistant 行用 pump 内单调
+                            // `seq` 派生临时 id,并显式标为 interim;终态失败
+                            // 用 adapter 的 canonical id。失败只 warn,绝不阻断
+                            // 回复投递。
                             if let Some(dir) = project_dir.as_ref() {
                                 let failure = thread_event_failure(&evt);
+                                let record_turn_id = terminal_accounting
+                                    .as_ref()
+                                    .map(|terminal| terminal.turn_id.clone())
+                                    .unwrap_or_else(|| format!("{session_id}-{seq}"));
                                 let record = ccteam_harness::execution::turns_mirror::TurnRecord {
-                                    turn_id: format!("{session_id}-{seq}"),
+                                    turn_id: record_turn_id,
                                     ts: chrono::Utc::now(),
                                     vendor: vendor_str(session.vendor).to_string(),
                                     // 仅内容标签(state-SoT 的 role 维度在
@@ -7121,7 +7152,11 @@ impl Gateway {
                                     usage: serde_json::Value::Null,
                                     tool_calls: Vec::new(),
                                     attachments: Vec::new(),
-                                    outcome: failure.map(|_| "failed".to_string()),
+                                    outcome: Some(if failure.is_some() {
+                                        "failed".to_string()
+                                    } else {
+                                        "interim".to_string()
+                                    }),
                                     error_kind: failure.map(|err| err.kind.clone()),
                                     error: failure.map(|err| err.message.clone()),
                                 };
@@ -15661,26 +15696,61 @@ fn thread_event_failure(evt: &ThreadEvent) -> Option<&ccteam_harness::ThreadErro
     }
 }
 
-/// Accounting carried by a vendor turn's terminal boundary. Successful and
-/// failed turns deliberately share this projection so every paid token reaches
-/// the same existing `chat_turn_completed` ledger row without changing the
-/// progress schema.
+/// Owned accounting carried by one canonical vendor turn boundary. `Error`
+/// predates the structured `TurnFailed` event and carries no id/usage/model, so
+/// its identity comes from the preceding `TurnStarted` boundary.
+struct TerminalTurnAccounting {
+    turn_id: String,
+    usage: ccteam_harness::UnifiedTokenUsage,
+    model: Option<String>,
+    outcome: &'static str,
+}
+
 fn turn_terminal_accounting(
     evt: &ThreadEvent,
-) -> Option<(&str, &ccteam_harness::UnifiedTokenUsage, Option<&str>)> {
+    active_turn_id: Option<&str>,
+    fallback_turn_id: &str,
+) -> Option<TerminalTurnAccounting> {
     match evt {
         ThreadEvent::TurnCompleted {
             turn_id,
             usage,
             model,
-        }
-        | ThreadEvent::TurnFailed {
+        } => Some(TerminalTurnAccounting {
+            turn_id: canonical_terminal_turn_id(turn_id, fallback_turn_id),
+            usage: *usage,
+            model: model.clone(),
+            outcome: "completed",
+        }),
+        ThreadEvent::TurnFailed {
             turn_id,
+            err: _,
             usage,
             model,
-            ..
-        } => Some((turn_id, usage, model.as_deref())),
+        } => Some(TerminalTurnAccounting {
+            turn_id: canonical_terminal_turn_id(turn_id, fallback_turn_id),
+            usage: *usage,
+            model: model.clone(),
+            outcome: "failed",
+        }),
+        ThreadEvent::Error(_) => Some(TerminalTurnAccounting {
+            turn_id: active_turn_id
+                .filter(|turn_id| !turn_id.is_empty())
+                .unwrap_or(fallback_turn_id)
+                .to_string(),
+            usage: ccteam_harness::UnifiedTokenUsage::default(),
+            model: None,
+            outcome: "failed",
+        }),
         _ => None,
+    }
+}
+
+fn canonical_terminal_turn_id(turn_id: &str, fallback_turn_id: &str) -> String {
+    if turn_id.is_empty() {
+        fallback_turn_id.to_string()
+    } else {
+        turn_id.to_string()
     }
 }
 
@@ -18509,6 +18579,11 @@ mod tests {
         /// assistant answer/boundary. Models Codex `error{willRetry:false}` and
         /// ACP prompt-RPC errors after their harness translation.
         turn_failure: Option<String>,
+        /// Emit the legacy terminal `ThreadEvent::Error`, followed by a late
+        /// completion boundary when `emit_turn_boundary` is enabled. This
+        /// reproduces adapters that report a fatal transport/RPC error before
+        /// their terminal cleanup notification arrives.
+        thread_error: Option<String>,
         /// v0.8.19 — thread identities passed to `interrupt_turn`, in call
         /// order, so the `/interrupt` test can assert the gateway invoked the
         /// adapter's interrupt (not destroy).
@@ -18579,6 +18654,7 @@ mod tests {
                 emit_turn_boundary: false,
                 emit_turn_started: false,
                 turn_failure: None,
+                thread_error: None,
                 interrupts: Arc::new(Mutex::new(Vec::new())),
                 title_pushes: Arc::new(Mutex::new(Vec::new())),
                 title_surface: false,
@@ -18609,6 +18685,13 @@ mod tests {
 
         fn with_turn_failure(mut self, message: impl Into<String>) -> Self {
             self.turn_failure = Some(message.into());
+            self
+        }
+
+        fn with_thread_error_then_completion(mut self, message: impl Into<String>) -> Self {
+            self.thread_error = Some(message.into());
+            self.emit_turn_started = true;
+            self.emit_turn_boundary = true;
             self
         }
 
@@ -18752,7 +18835,25 @@ mod tests {
                     },
                 ));
             }
-            if let Some(message) = self.turn_failure.as_ref() {
+            if let Some(message) = self.thread_error.as_ref() {
+                self.events.lock().await.push_back((
+                    h.identity.clone(),
+                    ThreadEvent::Error(ccteam_harness::ThreadErrorEvent {
+                        kind: "transport".to_string(),
+                        message: message.clone(),
+                    }),
+                ));
+                if self.emit_turn_boundary {
+                    self.events.lock().await.push_back((
+                        h.identity.clone(),
+                        ThreadEvent::TurnCompleted {
+                            turn_id: turn_id.clone(),
+                            usage: ccteam_harness::UnifiedTokenUsage::default(),
+                            model: None,
+                        },
+                    ));
+                }
+            } else if let Some(message) = self.turn_failure.as_ref() {
                 self.events.lock().await.push_back((
                     h.identity.clone(),
                     ThreadEvent::TurnFailed {
@@ -22946,6 +23047,125 @@ mod tests {
             "the vendor-stamped turn model must survive into meta.json — it is what \
              the team view shows for this session after it leaves the live map"
         );
+    }
+
+    #[tokio::test]
+    async fn thread_error_accounts_one_enriched_failed_terminal_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let agents = project_dir.join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("reviewer.md"), b"review carefully").unwrap();
+        let skill = project_dir
+            .join(".claude")
+            .join("skills")
+            .join("failure-analysis");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), b"trace the failure").unwrap();
+
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_thread_error_then_completion("connection died"),
+        );
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let meta = read_session_meta(&project_dir, &sid).unwrap();
+        gateway
+            .submit_to_sid(&sid, "trigger transport error".into())
+            .await
+            .unwrap();
+
+        let progress = paths.progress_jsonl("alpha");
+        let mut experiences = Vec::new();
+        for _ in 0..200 {
+            experiences = ccteam_harness::execution::experience::read_all_experience(&project_dir)
+                .unwrap_or_default();
+            if !experiences.is_empty() {
+                // The scripted late completion is already queued directly
+                // behind Error; yield once so a forbidden second accounting
+                // boundary cannot hide behind the first row.
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                experiences =
+                    ccteam_harness::execution::experience::read_all_experience(&project_dir)
+                        .unwrap_or_default();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let terminal = experiences
+            .iter()
+            .filter_map(|record| match record {
+                ccteam_harness::execution::experience::ExperienceRecord::Turn(turn)
+                    if turn.sid == sid =>
+                {
+                    Some(turn)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "Error plus late completion accounts once"
+        );
+        let turn = terminal[0];
+        let canonical_id = format!("turn-alpha-reviewer-{sid}");
+        assert_eq!(turn.turn_id, canonical_id);
+        assert_eq!(turn.outcome.as_deref(), Some("failed"));
+        assert!(turn.duration_ms.is_some());
+        assert_eq!(turn.role_sha, meta.role_sha);
+        assert_eq!(turn.skills_sha, meta.skills_sha);
+
+        let completion_rows = ccteam_core::progress::read_all_events(&progress)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|event| {
+                event.get("event").and_then(serde_json::Value::as_str)
+                    == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+                    && event.get("sid").and_then(serde_json::Value::as_str) == Some(sid.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completion_rows.len(),
+            1,
+            "Error plus late completion writes one progress boundary"
+        );
+        assert_eq!(completion_rows[0]["turn_id"], canonical_id);
+        assert_eq!(completion_rows[0]["outcome"], "failed");
+        assert!(completion_rows[0]["duration_ms"].is_u64());
+        assert_eq!(completion_rows[0]["role_sha"], meta.role_sha.unwrap());
+        assert_eq!(
+            completion_rows[0]["skills_sha"],
+            serde_json::to_value(meta.skills_sha.unwrap()).unwrap()
+        );
+
+        let mirrored =
+            ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &sid).unwrap();
+        let failed = mirrored
+            .iter()
+            .filter(|record| record.outcome.as_deref() == Some("failed"))
+            .collect::<Vec<_>>();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].turn_id, canonical_id);
     }
 
     /// Startup restore can be slow (e.g. stream-json waits for `system:init`).

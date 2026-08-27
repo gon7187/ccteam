@@ -410,6 +410,11 @@ pub struct ProgressCheckpoint {
     pub cost_total_by_vendor: BTreeMap<String, f64>,
     /// Lifetime cost grouped by `sid` (falling back to legacy `session_id`).
     pub cost_total_by_sid: BTreeMap<String, f64>,
+    /// Latest canonical human verdict for each completed `(sid, turn_id)` that
+    /// has already rotated out of the retained journals. Nested string maps
+    /// keep the checkpoint JSON deterministic and object-key compatible.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub turn_verdicts: BTreeMap<String, BTreeMap<String, TurnVerdict>>,
     /// The current `.1` archive already included in these cumulative totals.
     pub coverage: Option<ArchiveCoverage>,
 }
@@ -424,6 +429,7 @@ impl Default for ProgressCheckpoint {
             cost_total_usd: 0.0,
             cost_total_by_vendor: BTreeMap::new(),
             cost_total_by_sid: BTreeMap::new(),
+            turn_verdicts: BTreeMap::new(),
             coverage: None,
         }
     }
@@ -698,12 +704,16 @@ pub fn parse_turn_verdict_event(event: &Value) -> Option<TurnVerdict> {
 /// Read the latest verdict for every `(sid, turn_id)` across the retained
 /// archive followed by the active progress journal.
 pub fn latest_turn_verdicts(path: &Path) -> Result<BTreeMap<(String, String), TurnVerdict>> {
-    if !path.exists() && !progress_archive_path(path).exists() {
+    if !path.exists()
+        && !progress_archive_path(path).exists()
+        && !progress_checkpoint_path(path).exists()
+    {
         return Ok(BTreeMap::new());
     }
     let lock_file = open_progress_lock(path)?;
     let _lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
+    recover_progress_checkpoint_locked(path)?;
     latest_turn_verdicts_locked(path)
 }
 
@@ -756,6 +766,13 @@ pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Res
 
 fn latest_turn_verdicts_locked(path: &Path) -> Result<BTreeMap<(String, String), TurnVerdict>> {
     let mut latest = BTreeMap::new();
+    if let Some(checkpoint) = read_progress_checkpoint(path)? {
+        for (sid, turns) in checkpoint.turn_verdicts {
+            for (turn_id, verdict) in turns {
+                latest.insert((sid.clone(), turn_id), verdict);
+            }
+        }
+    }
     for journal_path in [progress_archive_path(path), path.to_path_buf()] {
         for event in super::fs_atomic::read_jsonl::<Value>(&journal_path)? {
             if let Some(verdict) = parse_turn_verdict_event(&event) {
@@ -961,6 +978,12 @@ fn recover_progress_checkpoint_locked(active_path: &Path) -> Result<Option<Progr
 
     let mut next = checkpoint.take().unwrap_or_default();
     let summary = journal::scan_stream(&archive_path, |event| {
+        if let Some(verdict) = parse_turn_verdict_event(&event) {
+            next.turn_verdicts
+                .entry(verdict.sid.clone())
+                .or_default()
+                .insert(verdict.turn_id.clone(), verdict);
+        }
         if let Some(cost) = progress_cost_contribution(&event) {
             next.cost_total_usd += cost.cost_usd;
             if let Some(vendor) = cost.vendor {
