@@ -1158,13 +1158,16 @@ fn run_experience(cmd: ExperienceCommand) -> Result<()> {
                 anyhow::bail!("проект не найден: {slug} ({})", project_dir.display());
             }
             let progress = paths.progress_jsonl(&slug);
-            let progress_arg = progress.exists().then_some(progress.as_path());
+            let progress_arg = (progress.exists()
+                || ccteam_harness::execution::progress_bridge::progress_archive_path(&progress)
+                    .exists())
+            .then_some(progress.as_path());
             let (turns, verdicts) = ccteam_harness::execution::experience::rebuild_experience(
                 &project_dir,
                 progress_arg,
             )?;
             println!(
-                "Индекс опыта для {slug} пересобран: ответов {turns}, сохранено вердиктов {verdicts} → {}",
+                "Индекс опыта для {slug} пересобран: ответов {turns}, проецировано вердиктов {verdicts} → {}",
                 ccteam_harness::execution::experience::experience_jsonl_path(&project_dir)
                     .display()
             );

@@ -22,8 +22,8 @@ use ccteam_harness::{
     AgentVendor, ChoiceOption, ChoicePrompt, ChoiceSelection, DetachOutcome, Directive,
     DirectiveOutcome, EventAttachment, ExternalClaudeSession, HarnessAdapter, HarnessError,
     PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
-    SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource,
-    TitleSync, TurnDisposition, TurnInput, TurnRouting, UnobservedTurnCtx,
+    SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, ThreadStatus,
+    TitleSource, TitleSync, TurnDisposition, TurnInput, TurnRouting, UnobservedTurnCtx,
 };
 #[cfg(test)]
 use ccteam_harness::{read_session_meta, write_session_meta};
@@ -384,7 +384,46 @@ struct UnlockedTurnPlan {
     provisional_inject: bool,
     prior_steered: bool,
     prime_tool_surface: bool,
+    started_fresh: bool,
+    reaction: Option<UnlockedReaction>,
 }
+
+#[derive(Clone)]
+struct ImSubmitContext {
+    reply_to: ChatKey,
+    message_id: String,
+}
+
+#[derive(Clone)]
+struct UnlockedReaction {
+    reply_to: ChatKey,
+    message_id: String,
+    prior_message_id: Option<String>,
+}
+
+struct ImInboundSubmitPlan {
+    sid: String,
+    payload: String,
+    context: ImSubmitContext,
+    append_model_hint: bool,
+}
+
+#[derive(Default)]
+struct ImStatusProbeCache {
+    statuses: BTreeMap<String, ThreadStatus>,
+    running: BTreeMap<String, Vec<RunningTask>>,
+    account_usages: BTreeMap<&'static str, AccountUsage>,
+}
+
+#[derive(Clone)]
+struct ImStatusProbeTarget {
+    sid: String,
+    vendor: AgentVendor,
+    adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    thread: ThreadHandle,
+}
+
+const IM_STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// How often a paneless session's pump mirrors a mid-turn "still working"
 /// heartbeat into `progress.jsonl`.
@@ -1836,6 +1875,7 @@ enum EnsureSessionOutcome {
 struct SpawnClaims {
     per_chat: std::sync::Mutex<BTreeMap<ChatKey, Arc<tokio::sync::Mutex<()>>>>,
     per_sid: std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    per_turn: std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SpawnClaims {
@@ -1868,6 +1908,20 @@ impl SpawnClaims {
     async fn lock_for_sid(&self, sid: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let entry = {
             let mut map = self.per_sid.lock().unwrap();
+            Arc::clone(
+                map.entry(sid.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        entry.lock_owned().await
+    }
+
+    /// Serialize turn planning, reply-route mutation, submit, and rollback for
+    /// one sid. This is deliberately separate from the resume claim because a
+    /// submit may need to acquire the resume claim while holding this guard.
+    async fn lock_for_turn(&self, sid: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let entry = {
+            let mut map = self.per_turn.lock().unwrap();
             Arc::clone(
                 map.entry(sid.to_string())
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
@@ -3806,31 +3860,48 @@ impl Gateway {
         Ok(plain_replies(replies))
     }
 
-    /// v0.8.x (concurrency review §4.1 P1) — cheap, synchronous, read-only hot
-    /// path hint for `spawn_inbound_consumer`: true when this inbound message
-    /// MIGHT make [`Self::handle_message`] take a branch that spawns a
-    /// brand-new session thread (`ensure_current_session`'s implicit
-    /// first-message spawn — the common "new chat says hello" / "chat has no
-    /// session yet" case). Deliberately conservative in BOTH directions
-    /// because either wrong answer is safe, never a correctness bug: a
-    /// `false` that turns out to need a spawn just runs the ordinary inline
-    /// `handle_message` unchanged (today's behavior, holding the gateway lock
-    /// across the spawn); a `true` that turns out NOT to need one just falls
-    /// through inside [`Self::handle_message_shared`] to the same
-    /// `handle_message` call. So this never has to track `handle_message`'s
-    /// full branch tree exactly — it only needs to be right often enough to
-    /// unblock the common case (see the daemon's `spawn_inbound_consumer` for
-    /// how the two outcomes are used).
-    ///
-    /// A selection click, a recognized gateway command (`/new` `/role` `/use`
-    /// `/clear` …), and an `@mention` are all left on the slow/legacy inline
-    /// path in this pass — they have their OWN (rarer) spawning branches
-    /// (`/new`, `/use` cold-resume, `/clear` codex-recycle, an
-    /// `@mention`-to-a-template) that still hold the gateway lock across
-    /// their spawn, same as before this change (a documented, scoped
-    /// limitation — see the locking-protocol comment on
-    /// `spawn_inbound_consumer`).
-    pub fn inbound_may_spawn(
+    /// Read-only commands that may inspect the registry outside the per-chat
+    /// turn lane while a vendor submit is still in flight. A pending free-text
+    /// or numeric prompt wins over lexical command parsing, so those messages
+    /// remain in the ordered lane even when their text starts with `/status`.
+    pub async fn inbound_can_bypass_turn_lane(
+        gateway: &Arc<tokio::sync::Mutex<Gateway>>,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        text: &str,
+        has_selection: bool,
+    ) -> bool {
+        if has_selection
+            || !matches!(
+                text.split_whitespace().next(),
+                Some("/sessions" | "/status")
+            )
+        {
+            return false;
+        }
+        let chat = ChatKey::new(channel, chat_id, user_id);
+        let (sid, pending) = {
+            let guard = crate::latency::gateway_lock(gateway, "im.observe.classify").await;
+            let sid = guard.current_session.read().unwrap().get(&chat).cloned();
+            (sid, Arc::clone(&guard.pending))
+        };
+        let Some(sid) = sid else {
+            return true;
+        };
+        let mut pending = pending.lock().await;
+        pending.drain_expired(Instant::now());
+        let consumes_as_pending = pending
+            .pending_for_sid(&sid)
+            .is_some_and(|entry| entry.prompt.options.is_empty())
+            || numeric_choice(text).is_some_and(|_| pending.has(&pending_key(&chat, &sid)));
+        !consumes_as_pending
+    }
+
+    /// Whether an ordinary inbound message may need the implicit first-turn
+    /// spawn path. This is a read-only hint; the shared handler rechecks under
+    /// its per-chat claim before creating anything.
+    fn inbound_may_submit(
         &self,
         channel: &str,
         chat_id: &str,
@@ -3843,35 +3914,150 @@ impl Gateway {
             return false;
         }
         let chat = ChatKey::new(channel, chat_id, user_id);
-        if self.is_quick_template_interaction(&chat, text, !has_attachments) {
-            return false;
-        }
-        if self.has_current_session(channel, chat_id, user_id) {
-            return false;
-        }
-        if Self::is_gateway_command(text) {
-            return false;
-        }
-        if crate::router::parse_first_mention(text).is_some() {
+        if self.is_quick_template_interaction(&chat, text, !has_attachments)
+            || self.has_current_session(channel, chat_id, user_id)
+            || Self::is_gateway_command(text)
+            || crate::router::parse_first_mention(text).is_some()
+        {
             return false;
         }
         true
     }
 
-    /// v0.8.x (concurrency review §4.1 P1) — production entry point for the
-    /// daemon's inbound hot path (`spawn_inbound_consumer`) for a message
-    /// [`Self::inbound_may_spawn`] flagged as a candidate for the implicit
-    /// first-message spawn. LOCKING PROTOCOL: everything that reads/mutates
-    /// gateway state runs under a freshly (re-)acquired `gateway.lock().await`
-    /// guard held only across synchronous work; the slow
-    /// `adapter.start_thread` await (tmux/subprocess spawn, stream-json
-    /// `system:init`) runs with NO gateway lock held at all — the same shape
-    /// [`Self::resume_restored_sessions_shared`] already established. Two
-    /// concurrent inbound messages for the SAME chat that both observe "no
-    /// session yet" are serialized through [`SpawnClaims`] (a lock separate
-    /// from the gateway's own — the `PendingInteractions` house pattern) so
-    /// only ONE of them actually spawns; the other waits for the claim to
-    /// clear and then re-checks, finding the session the first one created.
+    /// Lock-narrowed IM `/sessions` + `/status`. `/sessions` is a pure cached
+    /// snapshot. `/status` probes vendor detail outside the registry lock and
+    /// caps every probe, so one wedged harness cannot head-of-line block the
+    /// daemon or leave the command spinning forever.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_observability_shared(
+        gateway: Arc<tokio::sync::Mutex<Gateway>>,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        text: &str,
+    ) -> Result<Vec<RichReply>> {
+        let chat = ChatKey::new(channel, chat_id, user_id);
+        let mut parts = text.split_whitespace();
+        match parts.next() {
+            Some("/sessions") => {
+                let all = parts.next() == Some("all");
+                let reply = crate::latency::gateway_lock(&gateway, "im.sessions.cached")
+                    .await
+                    .render_sessions_cached(&chat, all, &BTreeMap::new())
+                    .await;
+                Ok(vec![reply])
+            }
+            Some("/status") => {
+                let (targets, current_sid) = {
+                    let guard = crate::latency::gateway_lock(&gateway, "im.status.targets").await;
+                    let mut memo = ProjectPrincipalMemo::new();
+                    let targets = guard
+                        .sessions
+                        .values()
+                        .filter(|session| guard.chat_can_access_with(&chat, session, &mut memo))
+                        .map(|session| ImStatusProbeTarget {
+                            sid: session.id.clone(),
+                            vendor: session.vendor,
+                            adapter: Arc::clone(&session.adapter),
+                            thread: session.thread.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    let current_sid = guard
+                        .current_session
+                        .read()
+                        .ok()
+                        .and_then(|sessions| sessions.get(&chat).cloned());
+                    (targets, current_sid)
+                };
+                let status_targets = targets.clone();
+                let status_future = async move {
+                    join_all(status_targets.into_iter().map(|target| async move {
+                        let status = tokio::time::timeout(
+                            IM_STATUS_PROBE_TIMEOUT,
+                            target.adapter.thread_status(&target.thread),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                        (target.sid, status)
+                    }))
+                    .await
+                };
+                let running_target = current_sid
+                    .as_ref()
+                    .and_then(|sid| targets.iter().find(|target| &target.sid == sid))
+                    .cloned();
+                let running_future = async move {
+                    let Some(target) = running_target else {
+                        return None;
+                    };
+                    tokio::time::timeout(
+                        IM_STATUS_PROBE_TIMEOUT,
+                        target.adapter.running_tasks(&target.thread),
+                    )
+                    .await
+                    .ok()
+                    .map(|running| (target.sid, running))
+                };
+                let usage_targets = [
+                    (AgentVendor::Claude, "CC"),
+                    (AgentVendor::Codex, "CX"),
+                    (AgentVendor::Opencode, "OC"),
+                ]
+                .into_iter()
+                .filter_map(|(vendor, label)| {
+                    targets
+                        .iter()
+                        .find(|target| target.vendor == vendor)
+                        .cloned()
+                        .map(|target| (label, target))
+                })
+                .collect::<Vec<_>>();
+                let usage_future = async move {
+                    join_all(usage_targets.into_iter().map(|(label, target)| async move {
+                        let usage = tokio::time::timeout(
+                            IM_STATUS_PROBE_TIMEOUT,
+                            target.adapter.account_usage(&target.thread),
+                        )
+                        .await
+                        .ok()
+                        .flatten();
+                        (label, usage)
+                    }))
+                    .await
+                };
+                let (statuses, running, usages) =
+                    tokio::join!(status_future, running_future, usage_future);
+                let mut probes = ImStatusProbeCache::default();
+                probes.statuses.extend(
+                    statuses
+                        .into_iter()
+                        .filter_map(|(sid, status)| status.map(|status| (sid, status))),
+                );
+                if let Some((sid, running)) = running {
+                    probes.running.insert(sid, running);
+                }
+                probes.account_usages.extend(
+                    usages
+                        .into_iter()
+                        .filter_map(|(label, usage)| usage.map(|usage| (label, usage))),
+                );
+                let reply = crate::latency::gateway_lock(&gateway, "im.status.render")
+                    .await
+                    .render_status_cached(&chat, &probes);
+                Ok(vec![reply])
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Production entry point for inbound messages that may reach a vendor.
+    /// Routing mutations happen under short gateway locks; implicit spawn,
+    /// cold/dead resume, directive dispatch, and ordinary turn submission run
+    /// without the global gateway mutex. The per-chat claim preserves the
+    /// ordering of concurrent messages from one conversation while unrelated
+    /// commands (notably `/status` and `/sessions`) remain free to inspect the
+    /// gateway.
     // Same inbound per-field shape as `handle_message` plus the `Arc<Mutex<Gateway>>`
     // handle this "shared" variant needs to manage the lock itself — allow the
     // arg count for the same reason `handle_message` does.
@@ -3886,33 +4072,95 @@ impl Gateway {
         attachments: &[ChannelAttachment],
         selection: Option<&ChoiceReply>,
     ) -> Result<Vec<RichReply>> {
+        Self::handle_message_shared_with_ready(
+            gateway,
+            channel,
+            chat_id,
+            user_id,
+            message_id,
+            text,
+            attachments,
+            selection,
+            None,
+        )
+        .await
+    }
+
+    /// Daemon variant that signals once routing mutations are observable but
+    /// before an ordinary vendor submit begins. Read-only status commands can
+    /// wait for this point without waiting for the vendor response itself.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn handle_message_shared_with_ready(
+        gateway: Arc<tokio::sync::Mutex<Gateway>>,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        message_id: &str,
+        text: &str,
+        attachments: &[ChannelAttachment],
+        selection: Option<&ChoiceReply>,
+        mut ready: Option<tokio::sync::watch::Sender<bool>>,
+    ) -> Result<Vec<RichReply>> {
         let chat = ChatKey::new(channel, chat_id, user_id);
-        // Re-derive the "implicit spawn candidate" decision authoritatively
-        // (the daemon's `inbound_may_spawn` call is only a hint to decide
-        // inline-vs-background — this is the one that actually acts). Any
-        // other shape (selection / command / mention / already-has-a-session)
-        // falls straight through to the ordinary `handle_message` call below,
-        // unchanged.
-        let candidate_shape = selection.is_none()
-            && !Self::is_gateway_command(text)
-            && crate::router::parse_first_mention(text).is_none();
-        let candidate = if candidate_shape {
+        let claims = Arc::clone(
+            &crate::latency::gateway_lock(&gateway, "im.turn.claims")
+                .await
+                .spawn_claims,
+        );
+        let _claim = claims.lock_for(&chat).await;
+
+        if text.split_whitespace().next() == Some("/new") {
+            let args = text.split_whitespace().skip(1).collect::<Vec<_>>();
+            let NewSessionArgs {
+                vendor,
+                role,
+                permission_mode,
+                protocol,
+                tuning,
+            } = parse_new_command_args(&args)?;
+            let project = crate::latency::gateway_lock(&gateway, "im.new.project")
+                .await
+                .require_current_project(&chat)?;
+            let outcome = Self::create_session_for_reply_shared(
+                Arc::clone(&gateway),
+                project,
+                role,
+                vendor,
+                permission_mode,
+                protocol,
+                chat.clone(),
+                tuning,
+                GatewayDeadline::start(),
+            )
+            .await?;
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(true);
+            }
+            let mut receipt = Self::new_session_receipt(&StartOutcome {
+                id: outcome.sid,
+                permission_mode,
+            });
+            if channel != "web" {
+                append_next_hint(&mut receipt, NEXT_HINT_STATUS);
+            }
+            return Ok(vec![RichReply::plain(receipt)]);
+        }
+
+        // Re-derive the implicit-spawn decision authoritatively. Only the
+        // slow adapter start runs outside the gateway lock; the per-chat claim
+        // prevents duplicate sessions for racing first messages.
+        let candidate = {
             let g = crate::latency::gateway_lock(&gateway, "im.turn.candidate").await;
-            !g.is_quick_template_interaction(&chat, text, attachments.is_empty())
-                && !g.has_current_session(channel, chat_id, user_id)
-        } else {
-            false
+            g.inbound_may_submit(
+                channel,
+                chat_id,
+                user_id,
+                text,
+                selection.is_some(),
+                !attachments.is_empty(),
+            )
         };
         if candidate {
-            let claims = Arc::clone(
-                &crate::latency::gateway_lock(&gateway, "im.turn.spawn_claims")
-                    .await
-                    .spawn_claims,
-            );
-            // Hold the per-chat claim across plan+spawn+apply so a second
-            // concurrent "no session yet" message for this SAME chat waits
-            // here instead of racing to spawn a duplicate session.
-            let _claim = claims.lock_for(&chat).await;
             let outcome = {
                 let mut g = crate::latency::gateway_lock(&gateway, "im.turn.spawn_plan").await;
                 g.plan_ensure_current_session(&chat)?
@@ -3939,21 +4187,155 @@ impl Gateway {
                 };
                 let _ = sid;
             }
-            // `_claim` (and thus the per-chat single-flight) releases here,
-            // waking any waiter for this same chat.
         }
-        crate::latency::gateway_lock(&gateway, "im.turn.handle")
-            .await
-            .handle_message_rich(
-                channel,
-                chat_id,
-                user_id,
-                message_id,
-                text,
-                attachments,
-                selection,
-            )
-            .await
+
+        let submit = {
+            let mut guard = crate::latency::gateway_lock(&gateway, "im.turn.route").await;
+            guard
+                .plan_im_inbound_submit(
+                    channel,
+                    chat_id,
+                    user_id,
+                    message_id,
+                    text,
+                    attachments,
+                    selection,
+                )
+                .await?
+        };
+        let Some(submit) = submit else {
+            let result = crate::latency::gateway_lock(&gateway, "im.turn.handle")
+                .await
+                .handle_message_rich(
+                    channel,
+                    chat_id,
+                    user_id,
+                    message_id,
+                    text,
+                    attachments,
+                    selection,
+                )
+                .await;
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(true);
+            }
+            return result;
+        };
+
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(true);
+        }
+
+        let mut replies = Self::submit_im_to_sid_shared(
+            Arc::clone(&gateway),
+            &submit.sid,
+            submit.payload,
+            submit.context,
+            GatewayDeadline::start(),
+        )
+        .await?;
+        if submit.append_model_hint {
+            if let Some(last) = replies.last_mut() {
+                append_next_hint(last, NEXT_HINT_STATUS);
+            }
+        }
+        Ok(plain_replies(replies))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_im_inbound_submit(
+        &mut self,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        message_id: &str,
+        text: &str,
+        attachments: &[ChannelAttachment],
+        selection: Option<&ChoiceReply>,
+    ) -> Result<Option<ImInboundSubmitPlan>> {
+        if selection.is_some() {
+            return Ok(None);
+        }
+        let chat = ChatKey::new(channel, chat_id, user_id);
+
+        // These checks mirror the ordering in `handle_message_rich`: a pending
+        // editor or numbered choice consumes text before command/mention
+        // routing. Leave such messages on that canonical path.
+        let current_sid = { self.current_session.read().unwrap().get(&chat).cloned() };
+        if let Some(sid) = current_sid {
+            let mut pending = self.pending.lock().await;
+            pending.drain_expired(Instant::now());
+            if pending
+                .pending_for_sid(&sid)
+                .is_some_and(|entry| entry.prompt.options.is_empty())
+                || numeric_choice(text).is_some_and(|_| pending.has(&pending_key(&chat, &sid)))
+            {
+                return Ok(None);
+            }
+        }
+        if Self::is_gateway_command(text)
+            || self.is_quick_template_interaction(&chat, text, attachments.is_empty())
+        {
+            return Ok(None);
+        }
+
+        if let Some((handle, payload)) = crate::router::parse_first_mention(text) {
+            if let Some(sid) = self.session_by_handle(&chat, &handle) {
+                self.current_session
+                    .write()
+                    .unwrap()
+                    .insert(chat.clone(), sid.clone());
+                if payload.is_empty() && attachments.is_empty() {
+                    return Ok(None);
+                }
+                let payload =
+                    self.consume_quick_template_prefix(channel, &chat, &payload, attachments)?;
+                return Ok(Some(ImInboundSubmitPlan {
+                    sid,
+                    payload: wrap_inbound(
+                        channel,
+                        chat_id,
+                        user_id,
+                        message_id,
+                        &payload,
+                        attachments,
+                    ),
+                    context: ImSubmitContext {
+                        reply_to: chat,
+                        message_id: message_id.to_string(),
+                    },
+                    append_model_hint: false,
+                }));
+            }
+            if self.template_by_handle(&chat, &handle).is_some() {
+                return Ok(None);
+            }
+        }
+
+        if self.templates_for_chat(&chat).len() > 1 {
+            return Ok(None);
+        }
+        let Some(sid) = self.current_session.read().unwrap().get(&chat).cloned() else {
+            return Ok(None);
+        };
+        if text.trim() == "/clear"
+            && self
+                .sessions
+                .get(&sid)
+                .is_some_and(|session| session.vendor == AgentVendor::Codex)
+        {
+            return Ok(None);
+        }
+        let payload = self.consume_quick_template_prefix(channel, &chat, text, attachments)?;
+        Ok(Some(ImInboundSubmitPlan {
+            sid,
+            payload: wrap_inbound(channel, chat_id, user_id, message_id, &payload, attachments),
+            context: ImSubmitContext {
+                reply_to: chat,
+                message_id: message_id.to_string(),
+            },
+            append_model_hint: channel != "web" && text.split_whitespace().next() == Some("/model"),
+        }))
     }
 
     async fn handle_command(&mut self, chat: &ChatKey, text: &str) -> Result<Option<RichReply>> {
@@ -6434,9 +6816,15 @@ impl Gateway {
                         // v0.9 T5 — BEFORE clearing, capture duration + signals
                         // and append one kind:turn experience record (derived
                         // index; failure never breaks the pump).
+                        let mut terminal_completion_metadata = None;
                         if let Some((turn_id, usage, model)) = turn_terminal_accounting(&evt) {
                             let is_completed =
                                 matches!(&evt, ThreadEvent::TurnCompleted { .. });
+                            let terminal_outcome = if is_completed {
+                                "completed"
+                            } else {
+                                "failed"
+                            };
                             let duration_ms = session
                                 .turn_started_at
                                 .lock()
@@ -6459,6 +6847,14 @@ impl Gateway {
                             if let Ok(mut act) = session.latest_activity.lock() {
                                 *act = None;
                             }
+                            terminal_completion_metadata = Some(
+                                ccteam_core::progress::ChatTurnCompletionMetadata {
+                                    outcome: Some(terminal_outcome.to_string()),
+                                    duration_ms,
+                                    role_sha: pump_role_sha.clone(),
+                                    skills_sha: pump_skills_sha.clone(),
+                                },
+                            );
 
                             if let Some(dir) = project_dir.as_ref() {
                                 let model_owned = model
@@ -6498,6 +6894,7 @@ impl Gateway {
                                         role: session.role.clone(),
                                         usage: usage_opt,
                                         cost_usd,
+                                        outcome: Some(terminal_outcome.to_string()),
                                         duration_ms,
                                         role_sha: pump_role_sha.clone(),
                                         skills_sha: pump_skills_sha.clone(),
@@ -6633,13 +7030,18 @@ impl Gateway {
                                 Some(ppath),
                             ) = (turn_terminal_accounting(&evt), progress_path.as_ref())
                             {
-                                let ev = ccteam_core::progress::build_chat_turn_completed_event_with_vendor(
+                                let metadata = terminal_completion_metadata
+                                    .as_ref()
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let ev = ccteam_core::progress::build_chat_turn_completed_event_with_metadata(
                                     &session.role,
                                     &session_id,
                                     turn_id,
                                     usage,
                                     model,
                                     Some(vendor_str(session.vendor)),
+                                    &metadata,
                                 );
                                 if let Err(err) =
                                     ccteam_core::progress::append_event(ppath, &ev)
@@ -9803,6 +10205,26 @@ impl Gateway {
     }
 
     async fn render_sessions(&self, chat: &ChatKey, all: bool) -> RichReply {
+        let fetched = join_all(self.sessions.values().map(|session| async move {
+            (
+                session.id.clone(),
+                session.adapter.thread_status(&session.thread).await.ok(),
+            )
+        }))
+        .await;
+        let statuses = fetched
+            .into_iter()
+            .filter_map(|(sid, status)| status.map(|status| (sid, status)))
+            .collect::<BTreeMap<_, _>>();
+        self.render_sessions_cached(chat, all, &statuses).await
+    }
+
+    async fn render_sessions_cached(
+        &self,
+        chat: &ChatKey,
+        all: bool,
+        statuses: &BTreeMap<String, ThreadStatus>,
+    ) -> RichReply {
         // v0.8.18 ACL regression — a chat lists only sessions it owns.
         // (the web-global + same-project leaks are gone). Soft per-chat isolation.
         let mut memo = ProjectPrincipalMemo::new();
@@ -9968,26 +10390,24 @@ impl Gateway {
             // Statusless adapters (bg / default) report `ThreadStatus::default()`
             // (no model / no context). Per-session failures degrade to the bare
             // row (never break the listing).
-            let status = (s.adapter.thread_status(&s.thread).await).ok();
+            let status = statuses.get(&s.id);
             // Web rows stay the machine-parsed `sid:project:vendor:role` feed +
             // the full, shared `status_suffix()` (matches Codex /status;
             // `parse_sessions_reply` splits on exactly 4 colon fields).
             if is_web {
                 let base = format!("{}:{}:{}:{}", s.id, s.project, vendor_str(s.vendor), s.role);
-                web_rows.push(match status.as_ref().and_then(|st| st.status_suffix()) {
+                web_rows.push(match status.and_then(|st| st.status_suffix()) {
                     Some(sfx) => format!("{base} — {sfx}"),
                     None => base,
                 });
                 continue;
             }
             let model = status
-                .as_ref()
                 .and_then(|st| st.model.as_deref())
                 .filter(|model| !model.is_empty())
                 .map(|model| strip_vendor_prefix(vendor_str(s.vendor), model))
                 .unwrap_or("—");
             let context = status
-                .as_ref()
                 .and_then(|st| st.context.as_ref())
                 .and_then(|context| context.pct())
                 .map(|percent| format!("{percent:.0}%"))
@@ -10154,6 +10574,60 @@ impl Gateway {
     /// which a fleet listing does not pay).
     async fn render_status(&self, chat: &ChatKey) -> RichReply {
         let mut memo = ProjectPrincipalMemo::new();
+        let visible = self
+            .sessions
+            .values()
+            .filter(|session| self.chat_can_access_with(chat, session, &mut memo))
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    session.vendor,
+                    Arc::clone(&session.adapter),
+                    session.thread.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let current_sid = self
+            .current_session
+            .read()
+            .ok()
+            .and_then(|sessions| sessions.get(chat).cloned());
+        let statuses = join_all(visible.iter().map(|(sid, _, adapter, thread)| async move {
+            (sid.clone(), adapter.thread_status(thread).await.ok())
+        }))
+        .await;
+        let mut probes = ImStatusProbeCache::default();
+        probes.statuses.extend(
+            statuses
+                .into_iter()
+                .filter_map(|(sid, status)| status.map(|status| (sid, status))),
+        );
+        if let Some((sid, _, adapter, thread)) = current_sid
+            .as_ref()
+            .and_then(|sid| visible.iter().find(|(candidate, ..)| candidate == sid))
+        {
+            probes
+                .running
+                .insert(sid.clone(), adapter.running_tasks(thread).await);
+        }
+        for (vendor, label) in [
+            (AgentVendor::Claude, "CC"),
+            (AgentVendor::Codex, "CX"),
+            (AgentVendor::Opencode, "OC"),
+        ] {
+            if let Some((_, _, adapter, thread)) =
+                visible.iter().find(|(_, found, ..)| *found == vendor)
+            {
+                if let Some(usage) = adapter.account_usage(thread).await {
+                    probes.account_usages.insert(label, usage);
+                }
+            }
+        }
+        self.render_status_cached(chat, &probes)
+    }
+
+    fn render_status_cached(&self, chat: &ChatKey, probes: &ImStatusProbeCache) -> RichReply {
+        let mut memo = ProjectPrincipalMemo::new();
         let visible: Vec<&GatewaySession> = self
             .sessions
             .values()
@@ -10188,30 +10662,12 @@ impl Gateway {
             };
         };
 
-        // Pull the focused session's live facts from its harness.
-        let status = s.adapter.thread_status(&s.thread).await.ok();
-        let running = s.adapter.running_tasks(&s.thread).await;
-        // Account usage belongs to a vendor account, not a session. Query one
-        // visible session per supported vendor and omit vendors with no real
-        // account-usage channel; never print a fabricated zero.
-        let usage_sources = [
-            (AgentVendor::Claude, "CC"),
-            (AgentVendor::Codex, "CX"),
-            (AgentVendor::Opencode, "OC"),
-        ]
-        .into_iter()
-        .filter_map(|(vendor, label)| {
-            visible
-                .iter()
-                .copied()
-                .find(|session| session.vendor == vendor)
-                .map(|session| (label, session))
-        })
-        .collect::<Vec<_>>();
-        let account_usages = join_all(usage_sources.iter().map(|(label, session)| async move {
-            (*label, session.adapter.account_usage(&session.thread).await)
-        }))
-        .await;
+        let status = probes.statuses.get(&s.id);
+        let running = probes
+            .running
+            .get(&s.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
 
         // State: a turn in flight ⇒ 🔵 working; silent past the idle window ⇒
         // 🔴 stuck — EXCEPT a BLOCKING subagent is an AUTHORITATIVE "still
@@ -10247,17 +10703,14 @@ impl Gateway {
         };
 
         let model = status
-            .as_ref()
             .and_then(|st| st.model.as_deref())
             .filter(|m| !m.is_empty())
             .unwrap_or("—");
         let effort = status
-            .as_ref()
             .and_then(|st| st.effort.as_deref())
             .filter(|e| !e.is_empty())
             .unwrap_or("—");
         let ctx = match status
-            .as_ref()
             .and_then(|st| st.context.as_ref())
             .and_then(|c| c.pct())
         {
@@ -10281,25 +10734,19 @@ impl Gateway {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "—".to_string());
         let child_activity = self.session_activity_snapshot(&direct_children);
-        let child_statuses = join_all(
-            direct_children
-                .iter()
-                .map(|child| child.adapter.thread_status(&child.thread)),
-        )
-        .await;
         let child_summary = direct_children
             .iter()
-            .zip(child_statuses)
-            .map(|(child, status)| {
+            .map(|child| {
                 let activity = child_activity
                     .get(&child.id)
                     .map(String::as_str)
                     .unwrap_or("idle");
-                let child_model = status
-                    .ok()
-                    .and_then(|status| status.model)
+                let child_model = probes
+                    .statuses
+                    .get(&child.id)
+                    .and_then(|status| status.model.as_deref())
                     .filter(|model| !model.is_empty())
-                    .map(|model| strip_vendor_prefix(vendor_str(child.vendor), &model).to_string())
+                    .map(|model| strip_vendor_prefix(vendor_str(child.vendor), model).to_string())
                     .unwrap_or_else(|| "—".to_string());
                 let title = self
                     .session_title(child)
@@ -10319,7 +10766,7 @@ impl Gateway {
         let role = if s.role.is_empty() { "—" } else { &s.role };
         let resume = thread_vendor_uuid(&s.thread).unwrap_or_else(|| "—".to_string());
         let mut detail_lines = vec![format!("Запущено: {detail} · Роль: {role}")];
-        let running_task_lines = format_running_tasks(&running)
+        let running_task_lines = format_running_tasks(running)
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
@@ -10329,7 +10776,7 @@ impl Gateway {
             detail_lines.push(String::new());
             detail_lines.extend(running_task_lines);
         }
-        if let Some(goal) = status.as_ref().and_then(|status| status.goal.as_ref()) {
+        if let Some(goal) = status.and_then(|status| status.goal.as_ref()) {
             let condition = goal.condition.trim();
             if !condition.is_empty() {
                 let marker = if goal.met { "✅" } else { "🎯" };
@@ -10342,13 +10789,11 @@ impl Gateway {
                 detail_lines.push(format!("{marker} {shown}"));
             }
         }
-        let usage_lines = account_usages
-            .into_iter()
+        let usage_lines = probes
+            .account_usages
+            .iter()
             .filter_map(|(label, usage)| {
-                usage
-                    .as_ref()
-                    .and_then(format_account_usage)
-                    .map(|usage| format!("{label}: {usage}"))
+                format_account_usage(usage).map(|usage| format!("{label}: {usage}"))
             })
             .collect::<Vec<_>>();
         if !usage_lines.is_empty() {
@@ -11474,6 +11919,33 @@ impl Gateway {
         tuning: SpawnTuning,
         deadline: GatewayDeadline,
     ) -> Result<CreateSessionOutcome> {
+        let reply_to = ChatKey::new("web", &owner_id, &owner_id);
+        Self::create_session_for_reply_shared(
+            gateway,
+            project,
+            role,
+            vendor,
+            permission_mode,
+            protocol,
+            reply_to,
+            tuning,
+            deadline,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_session_for_reply_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        project: String,
+        role: String,
+        vendor: AgentVendor,
+        permission_mode: PermissionMode,
+        protocol: SessionProtocol,
+        reply_to: ChatKey,
+        tuning: SpawnTuning,
+        deadline: GatewayDeadline,
+    ) -> Result<CreateSessionOutcome> {
         let (host, wire_slug, root, proxy) = {
             let mut guard = deadline.lock(&gateway).await?;
             guard.ensure_project_loaded(&project);
@@ -11496,10 +11968,9 @@ impl Gateway {
         .await?;
         let plan = {
             let mut guard = deadline.lock(&gateway).await?;
-            let owner = ChatKey::new("web", &owner_id, &owner_id);
             let handle = role.clone();
             let mut plan = guard.plan_new_session(
-                owner,
+                reply_to,
                 project,
                 vendor,
                 role,
@@ -13009,6 +13480,68 @@ impl Gateway {
         origin: TurnOrigin,
         deadline: GatewayDeadline,
     ) -> Result<String> {
+        match Self::submit_to_sid_shared_result(
+            Arc::clone(&gateway),
+            sid,
+            text,
+            origin,
+            None,
+            deadline,
+        )
+        .await?
+        {
+            SubmitResult::Turn { id, .. } => Ok(id),
+            SubmitResult::Directive(replies) => {
+                let guard = gateway.lock().await;
+                for (index, reply) in replies.into_iter().enumerate() {
+                    guard.emit_sid_answer(sid, index, reply);
+                }
+                Ok(format!("directive:{sid}"))
+            }
+            SubmitResult::Queued { receipt, id } => {
+                gateway.lock().await.emit_sid_answer(sid, 0, receipt);
+                Ok(id)
+            }
+        }
+    }
+
+    async fn submit_im_to_sid_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        text: String,
+        context: ImSubmitContext,
+        deadline: GatewayDeadline,
+    ) -> Result<Vec<String>> {
+        match Self::submit_to_sid_shared_result(
+            gateway,
+            sid,
+            text,
+            TurnOrigin::User,
+            Some(context),
+            deadline,
+        )
+        .await?
+        {
+            SubmitResult::Directive(replies) => Ok(replies),
+            SubmitResult::Turn { drained, .. } => Ok(drained),
+            SubmitResult::Queued { receipt, .. } => Ok(vec![receipt]),
+        }
+    }
+
+    async fn submit_to_sid_shared_result(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        text: String,
+        origin: TurnOrigin,
+        context: Option<ImSubmitContext>,
+        deadline: GatewayDeadline,
+    ) -> Result<SubmitResult> {
+        let claims = Arc::clone(&deadline.lock(&gateway).await?.spawn_claims);
+        let _turn_claim =
+            tokio::time::timeout_at(deadline.expires_at.into(), claims.lock_for_turn(sid))
+                .await
+                .map_err(|_| GatewayRequestError::QueueDeadline)?;
+
         // Resolve the reply route and cold-resume an absent entry without
         // holding the registry over the vendor handshake.
         let absent_resume_identity = {
@@ -13016,8 +13549,10 @@ impl Gateway {
             if guard.sessions.contains_key(sid) {
                 None
             } else if let Ok((slug, _, meta)) = guard.find_meta_for_sid(sid) {
-                let reply = guard
-                    .tenant_project_owner_reply_target(&slug)
+                let reply = context
+                    .as_ref()
+                    .map(|context| context.reply_to.clone())
+                    .or_else(|| guard.tenant_project_owner_reply_target(&slug))
                     .or_else(|| {
                         ChatKey::from_identity(&meta.owner)
                             .map(|owner| reply_target_for_owner(&owner))
@@ -13043,11 +13578,14 @@ impl Gateway {
                     // tell the caller (receipt over the session's SSE, handle
                     // back to the API/MCP caller).
                     let guard = deadline.lock(&gateway).await?;
-                    let reply_to = ChatKey::from_identity(&identity).unwrap_or_else(web_api_chat);
+                    let reply_to = context
+                        .as_ref()
+                        .map(|context| context.reply_to.clone())
+                        .or_else(|| ChatKey::from_identity(&identity))
+                        .unwrap_or_else(web_api_chat);
                     let (receipt, id) =
                         guard.queue_behind_detached_body(sid, &text, &reply_to, false, origin)?;
-                    guard.emit_sid_answer(sid, 0, receipt);
-                    return Ok(id);
+                    return Ok(SubmitResult::Queued { receipt, id });
                 }
                 return Err(err);
             }
@@ -13069,14 +13607,11 @@ impl Gateway {
                 sid,
                 directive,
                 origin,
+                context.as_ref().map(|context| &context.reply_to),
                 deadline,
             )
             .await?;
-            let guard = gateway.lock().await;
-            for (index, reply) in replies.into_iter().enumerate() {
-                guard.emit_sid_answer(sid, index, reply);
-            }
-            return Ok(format!("directive:{sid}"));
+            return Ok(SubmitResult::Directive(replies));
         }
 
         let mut attempt = 0u8;
@@ -13097,20 +13632,48 @@ impl Gateway {
                     )
                     .await?;
                     let mut guard = deadline.lock(&gateway).await?;
-                    guard.plan_unlocked_turn(sid, text.clone(), origin)?
+                    guard.plan_unlocked_turn(sid, text.clone(), origin, context.as_ref())?
                 } else {
-                    guard.plan_unlocked_turn(sid, text.clone(), origin)?
+                    guard.plan_unlocked_turn(sid, text.clone(), origin, context.as_ref())?
                 }
             };
-            deadline.ensure_vendor_phase_can_start()?;
+            if let Err(error) = deadline.ensure_vendor_phase_can_start() {
+                Self::rollback_unlocked_turn(&gateway, &plan).await;
+                return Err(error);
+            }
             if plan.prime_tool_surface {
-                let _ = tokio::time::timeout(
+                match tokio::time::timeout(
                     TOOL_FACE_PRIME_TIMEOUT,
                     plan.session
                         .adapter
                         .rebuild_tool_surface(&plan.session.thread),
                 )
-                .await;
+                .await
+                {
+                    Ok(Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason })) => {
+                        tracing::debug!(session = %sid, %reason, "ccteam-im: tool face cannot be rebuilt in place");
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(session = %sid, error = %err, "ccteam-im: tool-face probe failed; the turn proceeds");
+                    }
+                    Err(_) => {
+                        tracing::warn!(session = %sid, "ccteam-im: tool-face probe timed out; the turn proceeds");
+                    }
+                }
+                match deadline.lock(&gateway).await {
+                    Ok(guard) => guard.assert_principal_reached_the_session(sid),
+                    Err(error) => {
+                        tracing::warn!(
+                            session = %sid,
+                            error = %error,
+                            "ccteam-im: tool-face principal assertion skipped after queue deadline"
+                        );
+                    }
+                }
+                if let Err(error) = deadline.ensure_vendor_phase_can_start() {
+                    Self::rollback_unlocked_turn(&gateway, &plan).await;
+                    return Err(error);
+                }
             }
             let submit_wait = gateway_submit_timeout_duration();
             let outcome = tokio::time::timeout(
@@ -13124,12 +13687,14 @@ impl Gateway {
             .await;
             let submitted = match outcome {
                 Err(_) => {
+                    Self::rollback_unlocked_turn(&gateway, &plan).await;
                     return Err(GatewayRequestError::VendorSubmitTimeout {
                         sid: sid.to_string(),
                     }
-                    .into())
+                    .into());
                 }
                 Ok(Err(HarnessError::ThreadDied(_detail))) if attempt == 1 => {
+                    Self::rollback_unlocked_turn(&gateway, &plan).await;
                     Self::resume_dead_session_shared_with_deadline(
                         Arc::clone(&gateway),
                         sid,
@@ -13139,13 +13704,17 @@ impl Gateway {
                     continue;
                 }
                 Ok(Err(HarnessError::ThreadDied(detail))) => {
+                    Self::rollback_unlocked_turn(&gateway, &plan).await;
                     return Err(GatewayRequestError::VendorChannelClosed {
                         sid: sid.to_string(),
                         detail,
                     }
-                    .into())
+                    .into());
                 }
-                Ok(Err(error)) => return Err(error.into()),
+                Ok(Err(error)) => {
+                    Self::rollback_unlocked_turn(&gateway, &plan).await;
+                    return Err(error.into());
+                }
                 Ok(Ok(submitted)) => submitted,
             };
             return Self::commit_unlocked_turn(gateway, plan, submitted).await;
@@ -13157,6 +13726,7 @@ impl Gateway {
         sid: &str,
         directive: Directive,
         origin: TurnOrigin,
+        reply_to: Option<&ChatKey>,
         deadline: GatewayDeadline,
     ) -> Result<Vec<String>> {
         let (chat, session, generation, start_visible_events, project_paths, event_sink, pending) = {
@@ -13166,9 +13736,11 @@ impl Gateway {
                 .get(sid)
                 .cloned()
                 .ok_or_else(|| anyhow!("Текущая сессия не найдена: {sid}"))?;
-            let chat = guard
-                .tenant_project_owner_reply_target(&session.project)
-                .unwrap_or_else(|| reply_target_for_owner(&session.owner));
+            let chat = reply_to.cloned().unwrap_or_else(|| {
+                guard
+                    .tenant_project_owner_reply_target(&session.project)
+                    .unwrap_or_else(|| reply_target_for_owner(&session.owner))
+            });
             if let Ok(mut target) = session.reply_to.lock() {
                 *target = chat.clone();
             }
@@ -13297,17 +13869,24 @@ impl Gateway {
         sid: &str,
         user_text: String,
         origin: TurnOrigin,
+        context: Option<&ImSubmitContext>,
     ) -> Result<UnlockedTurnPlan> {
         let session = self
             .sessions
             .get(sid)
             .cloned()
             .ok_or_else(|| anyhow!("current session missing: {sid}"))?;
-        let reply_to = self
-            .tenant_project_owner_reply_target(&session.project)
+        let project_dir = self
+            .projects
+            .get(&session.project)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project: {}", session.project))?;
+        let reply_to = context
+            .map(|context| context.reply_to.clone())
+            .or_else(|| self.tenant_project_owner_reply_target(&session.project))
             .unwrap_or_else(|| reply_target_for_owner(&session.owner));
         if let Ok(mut target) = session.reply_to.lock() {
-            *target = reply_to;
+            *target = reply_to.clone();
         }
         let was_in_flight = session
             .turn_started_at
@@ -13325,11 +13904,38 @@ impl Gateway {
         } else {
             session.steered_this_turn.store(true, Ordering::SeqCst);
         }
-        let project_dir = self
-            .projects
-            .get(&session.project)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown project: {}", session.project))?;
+        let reaction = context.and_then(|context| {
+            if context.reply_to.channel == "web" || context.message_id.is_empty() {
+                return None;
+            }
+            let prior_message_id = session
+                .pending_reaction
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.replace(context.message_id.clone()));
+            self.emit_user_signal(GatewayEvent {
+                id: format!("gateway-reaction-add-{sid}-{}", context.message_id),
+                cid: None,
+                channel: context.reply_to.channel.clone(),
+                chat_id: context.reply_to.chat_id.clone(),
+                thread_ts: None,
+                content: String::new(),
+                kind: GatewayEventKind::Reaction {
+                    message_id: context.message_id.clone(),
+                    on: true,
+                },
+                attachments: Vec::new(),
+                options: Vec::new(),
+                button_rows: Vec::new(),
+                sid: Some(sid.to_string()),
+                slug: Some(session.project.clone()),
+            });
+            Some(UnlockedReaction {
+                reply_to: reply_to.clone(),
+                message_id: context.message_id.clone(),
+                prior_message_id,
+            })
+        });
         Ok(UnlockedTurnPlan {
             generation: session.generation,
             start_visible_events: session.visible_events.load(Ordering::SeqCst),
@@ -13344,6 +13950,8 @@ impl Gateway {
             requested_routing,
             provisional_inject,
             prior_steered,
+            started_fresh: !was_in_flight,
+            reaction,
         })
     }
 
@@ -13351,34 +13959,39 @@ impl Gateway {
         gateway: Arc<tokio::sync::Mutex<Self>>,
         plan: UnlockedTurnPlan,
         mut submitted: ccteam_harness::TurnSubmission,
-    ) -> Result<String> {
-        {
+    ) -> Result<SubmitResult> {
+        let generation_matches = {
             let guard = gateway.lock().await;
-            let Some(current) = guard.sessions.get(&plan.session.id) else {
-                return Err(GatewayRequestError::SessionGenerationConflict(
-                    plan.session.id.clone(),
-                )
-                .into());
-            };
-            if current.generation != plan.generation {
-                return Err(GatewayRequestError::SessionGenerationConflict(
-                    plan.session.id.clone(),
-                )
-                .into());
-            }
-            if submitted.disposition == TurnDisposition::Started {
-                if let Ok(mut started) = current.turn_started_at.lock() {
-                    *started = Some(Instant::now());
+            if let Some(current) = guard
+                .sessions
+                .get(&plan.session.id)
+                .filter(|current| current.generation == plan.generation)
+            {
+                if submitted.disposition == TurnDisposition::Started {
+                    if let Ok(mut started) = current.turn_started_at.lock() {
+                        *started = Some(Instant::now());
+                    }
+                    current.steered_this_turn.store(false, Ordering::SeqCst);
+                } else if plan.provisional_inject
+                    && submitted.disposition == TurnDisposition::Queued
+                {
+                    current
+                        .steered_this_turn
+                        .store(plan.prior_steered, Ordering::SeqCst);
                 }
-                current.steered_this_turn.store(false, Ordering::SeqCst);
-            } else if plan.provisional_inject && submitted.disposition == TurnDisposition::Queued {
-                current
-                    .steered_this_turn
-                    .store(plan.prior_steered, Ordering::SeqCst);
+                if let Ok(mut origins) = current.turn_origins.lock() {
+                    origins.record(submitted.turn_id.0.clone(), plan.origin);
+                }
+                true
+            } else {
+                false
             }
-            if let Ok(mut origins) = current.turn_origins.lock() {
-                origins.record(submitted.turn_id.0.clone(), plan.origin);
-            };
+        };
+        if !generation_matches {
+            Self::rollback_unlocked_turn(&gateway, &plan).await;
+            return Err(
+                GatewayRequestError::SessionGenerationConflict(plan.session.id.clone()).into(),
+            );
         }
 
         Self::mirror_unlocked_user_turn(&plan, &submitted.input_id);
@@ -13392,12 +14005,100 @@ impl Gateway {
                     *watch = Some((submitted.turn_id.0.clone(), plan.start_visible_events));
                 }
             }
+            Ok(SubmitResult::Turn {
+                id: submitted.turn_id.0,
+                drained: Vec::new(),
+            })
         } else {
             let mut events = plan.session.adapter.events(&plan.session.thread);
             let wait = gateway_reply_wait_duration();
-            let _ = tokio::time::timeout(wait, events.next()).await;
+            let mut drained = Vec::new();
+            while let Ok(Some(event)) = tokio::time::timeout(wait, events.next()).await {
+                if let Some(text) = event_text(&event) {
+                    drained.push(text);
+                    break;
+                }
+            }
+            if drained.is_empty() {
+                drained.push(format!("Запуск отправлен: {}", submitted.turn_id.0));
+            }
+            Ok(SubmitResult::Turn {
+                id: submitted.turn_id.0,
+                drained,
+            })
         }
-        Ok(submitted.turn_id.0)
+    }
+
+    async fn rollback_unlocked_turn(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        plan: &UnlockedTurnPlan,
+    ) {
+        let guard = gateway.lock().await;
+        let Some(current) = guard
+            .sessions
+            .get(&plan.session.id)
+            .filter(|current| current.generation == plan.generation)
+        else {
+            return;
+        };
+        if plan.prime_tool_surface {
+            current.tool_face_primed.store(false, Ordering::SeqCst);
+        }
+        if plan.started_fresh {
+            if let Ok(mut started) = current.turn_started_at.lock() {
+                *started = None;
+            }
+            current
+                .steered_this_turn
+                .store(plan.prior_steered, Ordering::SeqCst);
+        } else {
+            let still_active = current
+                .turn_started_at
+                .lock()
+                .map(|started| started.is_some())
+                .unwrap_or(false);
+            if still_active {
+                current
+                    .steered_this_turn
+                    .store(plan.prior_steered, Ordering::SeqCst);
+            }
+        }
+        if let Some(reaction) = plan.reaction.as_ref() {
+            let restored = current
+                .pending_reaction
+                .lock()
+                .map(|mut pending| {
+                    if pending.as_deref() == Some(reaction.message_id.as_str()) {
+                        *pending = reaction.prior_message_id.clone();
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if restored {
+                guard.emit_user_signal(GatewayEvent {
+                    id: format!(
+                        "gateway-reaction-remove-{}-{}",
+                        plan.session.id, reaction.message_id
+                    ),
+                    cid: None,
+                    channel: reaction.reply_to.channel.clone(),
+                    chat_id: reaction.reply_to.chat_id.clone(),
+                    thread_ts: None,
+                    content: String::new(),
+                    kind: GatewayEventKind::Reaction {
+                        message_id: reaction.message_id.clone(),
+                        on: false,
+                    },
+                    attachments: Vec::new(),
+                    options: Vec::new(),
+                    button_rows: Vec::new(),
+                    sid: Some(plan.session.id.clone()),
+                    slug: Some(plan.session.project.clone()),
+                });
+            }
+        }
     }
 
     fn mirror_unlocked_user_turn(plan: &UnlockedTurnPlan, input_id: &str) {
@@ -16020,7 +16721,7 @@ mod tests {
         let template = CcteamConfig::default().im.quick_templates.remove(0);
 
         assert!(
-            !gateway.lock().await.inbound_may_spawn(
+            !gateway.lock().await.inbound_may_submit(
                 "telegram",
                 "chat-1",
                 "alice",
@@ -16053,7 +16754,7 @@ mod tests {
         assert_eq!(fake.starts.load(Ordering::SeqCst), 0);
 
         assert!(
-            gateway.lock().await.inbound_may_spawn(
+            gateway.lock().await.inbound_may_submit(
                 "telegram",
                 "chat-1",
                 "alice",
@@ -16138,7 +16839,7 @@ mod tests {
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
         let chat = ChatKey::new("telegram", "chat-1", "alice");
         let template = CcteamConfig::default().im.quick_templates.remove(0);
-        assert!(gateway.inbound_may_spawn(
+        assert!(gateway.inbound_may_submit(
             "telegram",
             "chat-1",
             "alice",
@@ -16315,24 +17016,27 @@ mod tests {
             )
             .await
             .unwrap();
-        gateway
-            .handle_message(
-                "telegram",
-                "chat-1",
-                "alice",
-                "tg-2",
-                "@codex do X",
-                &[],
-                None,
-            )
-            .await
-            .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-1",
+            "alice",
+            "tg-2",
+            "@codex do X",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             fake.submissions.lock().await[0].1,
             format!("{} do X", template.prefix)
         );
         assert!(!gateway
+            .lock()
+            .await
             .pending_prefix
             .contains_key(&ChatKey::new("telegram", "chat-1", "alice")));
     }
@@ -16344,7 +17048,7 @@ mod tests {
 
         let reply = gateway.render_quick_templates();
         assert!(reply.plain.contains(
-            "• 🎯 Командир\n  Сначала проверь доступных в этом проекте провайдеров, затем спланируй и разложи …"
+            "• 🎯 Командир\n  Сначала вызови status и используй только доступные в проекте vendor, модели"
         ));
     }
 
@@ -19439,6 +20143,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn observability_command_stays_ordered_when_a_free_text_prompt_is_pending() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha-observe-pending");
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(Arc::clone(&shared));
+        let sid = gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        assert_eq!(sid, vec!["Создана сессия s1\n↓ Статус → /status"]);
+
+        let token = "pobserve001";
+        let (tx, _rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        shared.lock().await.register(
+            token.to_string(),
+            ChoicePrompt {
+                token: token.to_string(),
+                title: "Describe the correction".to_string(),
+                options: Vec::new(),
+                multi: false,
+            },
+            InteractionOrigin::External { reply: tx },
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+        shared.lock().await.tag_sid(token, "s1".to_string());
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert!(
+            !Gateway::inbound_can_bypass_turn_lane(
+                &gateway, "telegram", "chat-1", "alice", "/status", false,
+            )
+            .await,
+            "free-text pending owns the message before slash-command parsing"
+        );
+    }
+
     /// v0.9 T2 — plan → spawn → apply round-trip matches the old monolithic
     /// resume: same sid, one extra start_thread, child revived, no new session.
     #[tokio::test]
@@ -20823,18 +21564,19 @@ mod tests {
             .handle_text("telegram", "chat-7", "alice", "/new claude reviewer")
             .await
             .unwrap();
-        gateway
-            .handle_message(
-                "telegram",
-                "chat-7",
-                "alice",
-                "tg-555",
-                "do a thing",
-                &[],
-                None,
-            )
-            .await
-            .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-7",
+            "alice",
+            "tg-555",
+            "do a thing",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
 
         // The pending msg_id is recorded the instant the turn is dispatched, and
         // the detached pump TAKEs it on the first event. Collect emitted events
@@ -20870,12 +21612,66 @@ mod tests {
 
         // Pending is cleared after the first event fired the clear (fires once).
         let pending = {
+            let gateway = gateway.lock().await;
             let s = gateway.sessions.values().next().expect("the session");
-            s.pending_reaction.lock().unwrap().clone()
+            let pending = s.pending_reaction.lock().unwrap().clone();
+            pending
         };
         assert!(
             pending.is_none(),
             "pending_reaction must be taken after the first event"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_im_submit_failure_rolls_back_working_state_and_reaction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        gateway
+            .handle_text("telegram", "chat-7", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        fake.submit_failures_remaining.store(1, Ordering::SeqCst);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        let error = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-7",
+            "alice",
+            "tg-failed",
+            "do a thing",
+            &[],
+            None,
+        )
+        .await
+        .expect_err("the scripted vendor rejection must surface");
+        assert!(error.to_string().contains("transient test failure"));
+
+        let guard = gateway.lock().await;
+        let session = guard.sessions.values().next().expect("the session");
+        assert!(session.turn_started_at.lock().unwrap().is_none());
+        assert!(session.pending_reaction.lock().unwrap().is_none());
+        assert!(
+            !session.tool_face_primed.load(Ordering::SeqCst),
+            "a rejected turn must retry first-activation diagnostics next time"
+        );
+        drop(guard);
+        let reactions = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event.kind {
+                GatewayEventKind::Reaction { message_id, on } => Some((message_id, on)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reactions,
+            vec![
+                ("tg-failed".to_string(), true),
+                ("tg-failed".to_string(), false)
+            ]
         );
     }
 
@@ -21972,6 +22768,8 @@ mod tests {
                 assert_eq!(t.role, "reviewer");
                 assert_eq!(t.role_sha, meta.role_sha);
                 assert_eq!(t.skills_sha, meta.skills_sha);
+                assert_eq!(t.outcome.as_deref(), Some("completed"));
+                assert!(t.duration_ms.is_some(), "live completion records duration");
                 // FakeAdapter emits usage + claude-sonnet-4-6 → priceable.
                 assert!(t.usage.is_some(), "stream-json TurnCompleted carries usage");
                 assert_eq!(t.model.as_deref(), Some("claude-sonnet-4-6"));
@@ -22022,22 +22820,32 @@ mod tests {
         // The detached pump appends chat_turn_completed (carrying the sid) once
         // the FakeAdapter's TurnCompleted flows through. Poll the progress file.
         let progress = paths.progress_jsonl("alpha");
-        let mut found = false;
+        let mut completed = None;
         for _ in 0..100 {
-            if let Ok(body) = std::fs::read_to_string(&progress) {
-                if body.contains(ccteam_core::progress::CHAT_TURN_COMPLETED)
-                    && body.contains(&format!("\"{sid}\""))
-                {
-                    found = true;
-                    break;
-                }
+            completed = ccteam_core::progress::read_all_events(&progress)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|event| {
+                    event.get("event").and_then(serde_json::Value::as_str)
+                        == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+                        && event.get("sid").and_then(serde_json::Value::as_str)
+                            == Some(sid.as_str())
+                });
+            if completed.is_some() {
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        let completed = completed.unwrap_or_else(|| {
+            panic!(
+                "stream-json pump must mirror a chat_turn_completed carrying the sid to {}",
+                progress.display()
+            )
+        });
+        assert_eq!(completed["outcome"], "completed");
         assert!(
-            found,
-            "stream-json pump must mirror a chat_turn_completed carrying the sid to {}",
-            progress.display()
+            completed.get("duration_ms").is_some(),
+            "live completion must carry exact-boundary duration: {completed:#?}"
         );
     }
 
@@ -22098,6 +22906,8 @@ mod tests {
         assert_eq!(usage.total(), 1_500);
         assert_eq!(usage.reported_cost_usd, Some(0.42));
         assert_eq!(ledger_row["model"].as_str(), Some("vendor-reported-model"));
+        assert_eq!(ledger_row["outcome"].as_str(), Some("failed"));
+        assert!(ledger_row.get("duration_ms").is_some());
 
         let mut experience = None;
         let mut meta = None;
@@ -22126,6 +22936,7 @@ mod tests {
         let experience = experience.expect("failed terminal event must append experience row");
         assert_eq!(experience.usage.map(|value| value.total()), Some(1_500));
         assert_eq!(experience.cost_usd, Some(0.42));
+        assert_eq!(experience.outcome.as_deref(), Some("failed"));
         let meta = meta.expect("failed terminal event must refresh token/cost meta");
         assert_eq!(meta.tokens_total, Some(1_500));
         assert_eq!(meta.cost_usd, Some(0.42));
@@ -26700,22 +27511,24 @@ mod tests {
         assert!(prompt[0].contains("1) Model A"));
         assert!(prompt[0].contains("2) Model B"));
 
-        // Telegram callback for option index 1 (`Model B`).
-        gateway
-            .handle_message(
-                "mock",
-                "chat-1",
-                "alice",
-                "",
-                "",
-                &[],
-                Some(&ChoiceReply {
-                    data: "t1:1".into(),
-                    callback_ephemeral: None,
-                }),
-            )
-            .await
-            .unwrap();
+        // Telegram callback for option index 1 (`Model B`) through the shared
+        // daemon entry point.
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        Gateway::handle_message_shared(
+            gateway,
+            "mock",
+            "chat-1",
+            "alice",
+            "",
+            "",
+            &[],
+            Some(&ChoiceReply {
+                data: "t1:1".into(),
+                callback_ephemeral: None,
+            }),
+        )
+        .await
+        .unwrap();
 
         // The directive re-entered with the resolved real option id.
         let dirs = fake.directives.lock().await;
@@ -26762,11 +27575,19 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/personality")
             .await
             .unwrap();
-        // Reply "2" → the second option.
-        gateway
-            .handle_text("mock", "chat-1", "alice", "2")
-            .await
-            .unwrap();
+        // Reply "2" → the second option through the shared daemon entry.
+        Gateway::handle_message_shared(
+            Arc::new(tokio::sync::Mutex::new(gateway)),
+            "mock",
+            "chat-1",
+            "alice",
+            "",
+            "2",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
         let dirs = fake.directives.lock().await;
         assert_eq!(
             dirs.last().unwrap().1.choice,

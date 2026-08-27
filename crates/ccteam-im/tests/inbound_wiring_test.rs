@@ -110,6 +110,13 @@ struct GatewayAdapter {
     submitted_threads: tokio::sync::Mutex<Vec<String>>,
     submitted_payloads: tokio::sync::Mutex<Vec<String>>,
     events: Arc<tokio::sync::Mutex<VecDeque<ThreadEvent>>>,
+    start_gate: Option<Arc<tokio::sync::Semaphore>>,
+    start_entered: AtomicBool,
+    submit_gate: Option<Arc<tokio::sync::Semaphore>>,
+    submit_entered: AtomicBool,
+    submit_completed: AtomicBool,
+    status_gate: Option<Arc<tokio::sync::Semaphore>>,
+    status_entered: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -147,6 +154,10 @@ impl HarnessAdapter for GatewayAdapter {
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
+        self.start_entered.store(true, Ordering::SeqCst);
+        if let Some(gate) = &self.start_gate {
+            let _permit = gate.acquire().await.expect("start gate must remain open");
+        }
         Ok(ThreadHandle {
             vendor: AgentVendor::Claude,
             mode: ExecutionMode::Chat,
@@ -168,6 +179,11 @@ impl HarnessAdapter for GatewayAdapter {
         };
         self.submitted_threads.lock().await.push(h.identity.clone());
         self.submitted_payloads.lock().await.push(text.clone());
+        self.submit_entered.store(true, Ordering::SeqCst);
+        if let Some(gate) = &self.submit_gate {
+            let _permit = gate.acquire().await.expect("submit gate must remain open");
+        }
+        self.submit_completed.store(true, Ordering::SeqCst);
         if !self.suppress_answers {
             self.events
                 .lock()
@@ -246,6 +262,10 @@ impl HarnessAdapter for GatewayAdapter {
     }
 
     async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        self.status_entered.store(true, Ordering::SeqCst);
+        if let Some(gate) = &self.status_gate {
+            let _permit = gate.acquire().await.expect("status gate must remain open");
+        }
         Ok(ThreadStatus::default())
     }
 }
@@ -790,7 +810,487 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stopped_generation_update_dispatches_stop_for_draft_owner() {
+async fn sessions_command_is_not_blocked_by_an_active_submit() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    for (id, content, timestamp) in [
+        ("responsive-1", "/new claude helper", 0),
+        ("responsive-2", "slow task", 1),
+        ("responsive-3", "/sessions", 2),
+    ] {
+        mock.push(ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: content.into(),
+            channel: "telegram".into(),
+            timestamp,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+        })
+        .await;
+    }
+
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let adapter = Arc::new(GatewayAdapter {
+        suppress_answers: true,
+        submit_gate: Some(Arc::clone(&gate)),
+        ..Default::default()
+    });
+    let adapter_factory: AdapterFactory = {
+        let cloned = Arc::clone(&adapter);
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        max_runtime: Some(Duration::from_secs(2)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+        extra_channels: None,
+        ..Default::default()
+    };
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(async move {
+        run_daemon_with_shutdown(args, async {
+            let _ = stop_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while !adapter.submit_entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the task must reach the vendor submit");
+
+    let status_arrived = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if mock
+                .outbox()
+                .await
+                .iter()
+                .any(|message| message.content.starts_with("Сессии ·"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+
+    gate.add_permits(1);
+    let _ = stop_tx.send(());
+    daemon.await.unwrap();
+    assert!(
+        status_arrived,
+        "/sessions was head-of-line blocked behind an unrelated submit"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_command_is_not_blocked_by_an_unrelated_slow_new() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let (live_channel, mock) = DraftStopChannel::new();
+    live_channel
+        .push(ChannelMessage {
+            id: "new-hol-1".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "/new claude helper".into(),
+            channel: "telegram".into(),
+            timestamp: 0,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+        })
+        .await;
+
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        Arc::new(live_channel.clone()) as Arc<dyn Channel + Send + Sync>,
+    );
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let adapter = Arc::new(GatewayAdapter {
+        suppress_answers: true,
+        start_gate: Some(Arc::clone(&gate)),
+        ..Default::default()
+    });
+    let adapter_factory: AdapterFactory = {
+        let cloned = Arc::clone(&adapter);
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        max_runtime: Some(Duration::from_secs(2)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+        extra_channels: None,
+        ..Default::default()
+    };
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(async move {
+        run_daemon_with_shutdown(args, async {
+            let _ = stop_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while !adapter.start_entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("/new must reach the slow vendor start");
+    live_channel
+        .push(ChannelMessage {
+            id: "new-hol-2".into(),
+            sender: "alice".into(),
+            reply_target: "chat-2".into(),
+            content: "/sessions".into(),
+            channel: "telegram".into(),
+            timestamp: 1,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+        })
+        .await;
+    let status_arrived = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if mock
+                .outbox()
+                .await
+                .iter()
+                .any(|message| message.recipient == "chat-2")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+
+    gate.add_permits(1);
+    let _ = stop_tx.send(());
+    daemon.await.unwrap();
+    assert!(
+        status_arrived,
+        "/sessions was blocked by an unrelated slow /new"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_command_is_not_blocked_by_an_unrelated_slow_status_probe() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let (live_channel, mock) = DraftStopChannel::new();
+    live_channel
+        .push(ChannelMessage {
+            id: "status-hol-1".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "/new claude helper".into(),
+            channel: "telegram".into(),
+            timestamp: 0,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+        })
+        .await;
+
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        Arc::new(live_channel.clone()) as Arc<dyn Channel + Send + Sync>,
+    );
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let adapter = Arc::new(GatewayAdapter {
+        suppress_answers: true,
+        status_gate: Some(Arc::clone(&gate)),
+        ..Default::default()
+    });
+    let adapter_factory: AdapterFactory = {
+        let cloned = Arc::clone(&adapter);
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        max_runtime: Some(Duration::from_secs(2)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+        extra_channels: None,
+        ..Default::default()
+    };
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(async move {
+        run_daemon_with_shutdown(args, async {
+            let _ = stop_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while adapter.starts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial /new must create the session");
+    live_channel
+        .push(ChannelMessage {
+            id: "status-hol-2".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "/status".into(),
+            channel: "telegram".into(),
+            timestamp: 1,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+        })
+        .await;
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while !adapter.status_entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("/status must reach the slow vendor probe");
+    live_channel
+        .push(ChannelMessage {
+            id: "status-hol-3".into(),
+            sender: "alice".into(),
+            reply_target: "chat-2".into(),
+            content: "/sessions".into(),
+            channel: "telegram".into(),
+            timestamp: 2,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+        })
+        .await;
+    let sessions_arrived = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if mock
+                .outbox()
+                .await
+                .iter()
+                .any(|message| message.recipient == "chat-2")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+
+    gate.add_permits(1);
+    let _ = stop_tx.send(());
+    daemon.await.unwrap();
+    assert!(
+        sessions_arrived,
+        "/sessions was blocked by an unrelated slow /status probe"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn later_new_command_cannot_overtake_an_accepted_turn() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    for (id, content, timestamp) in [
+        ("fifo-1", "/new claude helper", 0),
+        ("fifo-2", "slow task", 1),
+        ("fifo-3", "/new claude reviewer", 2),
+    ] {
+        mock.push(ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: content.into(),
+            channel: "telegram".into(),
+            timestamp,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+        })
+        .await;
+    }
+
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock as Arc<dyn Channel + Send + Sync>,
+    );
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let adapter = Arc::new(GatewayAdapter {
+        suppress_answers: true,
+        submit_gate: Some(Arc::clone(&gate)),
+        ..Default::default()
+    });
+    let adapter_factory: AdapterFactory = {
+        let cloned = Arc::clone(&adapter);
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        max_runtime: Some(Duration::from_secs(2)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+        extra_channels: None,
+        ..Default::default()
+    };
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(async move {
+        run_daemon_with_shutdown(args, async {
+            let _ = stop_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while !adapter.submit_entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first turn must reach the vendor");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        adapter.starts.load(Ordering::SeqCst),
+        1,
+        "a later /new overtook the accepted turn in the same chat"
+    );
+
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while adapter.starts.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the queued /new must run after the turn submit finishes");
+    let _ = stop_tx.send(());
+    daemon.await.unwrap();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_shutdown_aborts_an_inflight_inbound_submit() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    for (id, content, timestamp) in [
+        ("shutdown-1", "/new claude helper", 0),
+        ("shutdown-2", "slow task", 1),
+    ] {
+        mock.push(ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: content.into(),
+            channel: "telegram".into(),
+            timestamp,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+        })
+        .await;
+    }
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock as Arc<dyn Channel + Send + Sync>,
+    );
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let adapter = Arc::new(GatewayAdapter {
+        suppress_answers: true,
+        submit_gate: Some(Arc::clone(&gate)),
+        ..Default::default()
+    });
+    let adapter_factory: AdapterFactory = {
+        let cloned = Arc::clone(&adapter);
+        Arc::new(move |_, _| cloned.clone() as Arc<dyn HarnessAdapter + Send + Sync>)
+    };
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        max_runtime: Some(Duration::from_secs(2)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+        extra_channels: None,
+        ..Default::default()
+    };
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(async move {
+        run_daemon_with_shutdown(args, async {
+            let _ = stop_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while !adapter.submit_entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the turn must reach the vendor before shutdown");
+    let _ = stop_tx.send(());
+    daemon.await.unwrap();
+
+    gate.add_permits(1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !adapter.submit_completed.load(Ordering::SeqCst),
+        "the inbound submit task outlived daemon shutdown"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_progress_does_not_create_a_stoppable_draft_route() {
     let _g = env_lock();
     std::env::set_var("CCTEAM_IM_PROGRESS", "on");
     std::env::set_var("CCTEAM_IM_PROGRESS_THROTTLE_MS", "0");
@@ -858,8 +1358,8 @@ async fn stopped_generation_update_dispatches_stop_for_draft_owner() {
     .unwrap();
 
     assert!(
-        !inner.drafts().await.is_empty(),
-        "draft must be published first"
+        inner.drafts().await.is_empty(),
+        "progress must use ordinary messages, not Telegram Rich Draft"
     );
     assert!(
         inner
@@ -867,11 +1367,12 @@ async fn stopped_generation_update_dispatches_stop_for_draft_owner() {
             .await
             .iter()
             .any(|message| message.content.starts_with("▶️")),
-        "stopped draft must be preserved as a normal message before /stop"
+        "progress must be published as an ordinary message"
     );
-    assert!(
-        adapter.close_calls.load(Ordering::SeqCst) >= 1,
-        "stopped_message_generation must dispatch /stop to the owning session"
+    assert_eq!(
+        adapter.close_calls.load(Ordering::SeqCst),
+        0,
+        "without a Rich Draft there is no provider stop callback to dispatch"
     );
     std::env::remove_var("CCTEAM_IM_PROGRESS");
     std::env::remove_var("CCTEAM_IM_PROGRESS_THROTTLE_MS");
