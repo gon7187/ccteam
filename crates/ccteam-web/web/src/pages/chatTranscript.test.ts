@@ -13,6 +13,7 @@ import {
   foldActivity,
   emptyFold,
   historyToRows,
+  mergeAuthoritativeTurnMetadata,
   loadRows,
   renderFold,
   rowsKeyFor,
@@ -316,6 +317,82 @@ describe("chatTranscript historyToRows", () => {
     expect(rows[2]).toMatchObject({ kind: "assistant", content: "just a reply" });
   });
 
+  it("keeps the completed turn id and authoritative verdict on its assistant row", () => {
+    const events: SessionHistoryEvent[] = [
+      {
+        turn_id: "t-reviewed",
+        ts: "2026-08-28T00:00:00Z",
+        role: "reviewer",
+        user: "review this",
+        assistant: "done",
+        verdict: {
+          verdict: "revise",
+          feedback: "Cover the failure path",
+          ts: "2026-08-28T00:01:00Z",
+        },
+      },
+    ];
+
+    expect(historyToRows(events)[1]).toMatchObject({
+      kind: "assistant",
+      turnId: "t-reviewed",
+      verdict: {
+        verdict: "revise",
+        feedback: "Cover the failure path",
+        ts: "2026-08-28T00:01:00Z",
+      },
+    });
+  });
+
+  it("adds authoritative turn metadata to a live answer without dropping transient rows", () => {
+    const live: TranscriptRow[] = [
+      { id: "activity", kind: "activity", content: "working" },
+      { id: "live", kind: "assistant", content: "done" },
+      { id: "system", kind: "system", content: "kept" },
+    ];
+    const events: SessionHistoryEvent[] = [
+      {
+        turn_id: "t-reviewed",
+        ts: "2026-08-28T00:00:00Z",
+        role: "reviewer",
+        user: "review this",
+        assistant: "done",
+        verdict: {
+          verdict: "accept",
+          feedback: null,
+          ts: "2026-08-28T00:01:00Z",
+        },
+      },
+    ];
+
+    expect(mergeAuthoritativeTurnMetadata(live, events)).toEqual([
+      live[0],
+      {
+        ...live[1],
+        turnId: "t-reviewed",
+        ts: "2026-08-28T00:00:00Z",
+        verdict: events[0]?.verdict,
+      },
+      live[2],
+    ]);
+  });
+
+  it("matches repeated identical live answers from newest to oldest", () => {
+    const rows: TranscriptRow[] = [
+      { id: "live-1", kind: "assistant", content: "same" },
+      { id: "live-2", kind: "assistant", content: "same" },
+    ];
+    const events: SessionHistoryEvent[] = [
+      { turn_id: "t1", ts: "one", role: "", user: "", assistant: "same" },
+      { turn_id: "t2", ts: "two", role: "", user: "", assistant: "same" },
+    ];
+
+    expect(mergeAuthoritativeTurnMetadata(rows, events).map((row) => row.turnId)).toEqual([
+      "t1",
+      "t2",
+    ]);
+  });
+
   it("flows the turn ts onto both rows of the turn (WEB-TS-1)", () => {
     const events: SessionHistoryEvent[] = [
       { turn_id: "t1", ts: "2026-06-06T00:00:00Z", role: "cto", user: "hi", assistant: "hello" },
@@ -343,6 +420,7 @@ describe("chatTranscript historyToRows", () => {
         kind: "assistant",
         content: "",
         ts: "2026-08-02T00:00:00Z",
+        turnId: "t-file",
         attachments: [
           { id: "1780000000000-chart.png", name: "chart.png", kind: "image", size: 42 },
         ],

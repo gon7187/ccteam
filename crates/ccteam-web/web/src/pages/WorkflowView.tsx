@@ -16,6 +16,7 @@ import {
 import { useProjectsStore } from "../hooks/useProjectsStore";
 import { makeT, tr, type Lang } from "../lib/i18n";
 import { toastBus } from "../lib/toastBus";
+import EvolutionPanel from "./EvolutionPanel";
 import MarketplaceView from "./MarketplaceView";
 
 type TabId = "skills" | "roles" | "market" | "mcp" | "evolution";
@@ -478,51 +479,12 @@ export default function WorkflowView({
                 t("evolve"),
                 tr(
                   lang,
-                  "v0.9 经验底座:每个 turn 落 turn record,role / skill 指纹随使用进化,后续 spawn 自动携带 —— 团队越用越懂你的项目。本版只读。",
-                  "v0.9 experience substrate: every turn writes a turn record; role / skill fingerprints evolve with use. Read-only this version.",
-                  "Основа опыта v0.9: каждый turn сохраняется как запись, отпечатки ролей и навыков меняются с использованием, а следующие spawn получают их автоматически — команда всё лучше понимает ваш проект. В этой версии только чтение.",
+                  "人工评价闭合反馈循环:接受/需修改会被记录,并按 role / skill 指纹版本展示。只有你确认后才会请求 agent 提出改进;不会自动修改任何内容。",
+                  "Human verdicts close the feedback loop: accepted/revised results are recorded by role and skill fingerprint revision. Improve asks the agent for a proposal only after your confirmation. Nothing changes automatically.",
+                  "Оценки человека замыкают обратную связь: принятое и отправленное на доработку учитывается по ревизиям отпечатков ролей и навыков. Улучшение запрашивает у агента только предложение и только после вашего подтверждения. Ничего не меняется автоматически.",
                 ),
               )}
-              {!evolution || evolution.empty ? (
-                !loading ? (
-                  <p style={{ fontSize: 13, color: "var(--text-faint)" }} data-testid="evolution-empty">
-                    {tr(lang, "尚无 experience 数据(诚实空态)。", "No experience data yet (honest empty state).", "Данных об опыте пока нет (честное пустое состояние).")}
-                  </p>
-                ) : null
-              ) : (
-                <>
-                  <div className="stat-grid">
-                    <div className="stat">
-                      <span className="k">{tr(lang, "turn records", "turn records", "записи ходов")}</span>
-                      <span className="v">{evolution.turn_records}</span>
-                      <span className="k" data-testid="evolution-7d">
-                        {tr(lang, "近 7 天", "last 7 days", "за последние 7 дней")} +{evolution.turn_records_7d} ·{" "}
-                        {tr(lang, "verdicts", "verdicts", "вердиктов")} {evolution.verdict_records}
-                      </span>
-                    </div>
-                    <div className="stat">
-                      <span className="k">{tr(lang, "role 指纹", "role fingerprints", "отпечатки ролей")}</span>
-                      <span className="v">{evolution.roles.length}</span>
-                      <span className="k">{evolution.roles.map((b) => b.id).join(" · ") || "—"}</span>
-                    </div>
-                    <div className="stat">
-                      <span className="k">{tr(lang, "skill 指纹", "skill fingerprints", "отпечатки навыков")}</span>
-                      <span className="v">{evolution.skills.length}</span>
-                      <span className="k">{evolution.skills.map((b) => b.id).join(" · ") || "—"}</span>
-                    </div>
-                  </div>
-                  <div className="flow-rows">
-                    {[...evolution.roles, ...evolution.skills].map((b) =>
-                      flowRow(
-                        `${b.kind}:${b.id}`,
-                        `turns=${b.turn_count}${b.sha ? ` · ${b.sha.slice(0, 10)}` : ""}`,
-                        <span className="badge ok">{tr(lang, "只读", "read-only", "только чтение")}</span>,
-                        `${b.kind}-${b.id}-${b.sha}`,
-                      ),
-                    )}
-                  </div>
-                </>
-              )}
+              <EvolutionPanel lang={lang} evolution={evolution} loading={loading} />
             </>
           ) : null}
 

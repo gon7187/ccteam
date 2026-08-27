@@ -14,7 +14,11 @@ import type {
   SessionEvent,
   SessionEventOption,
 } from "../hooks/useSessionEvents";
-import type { OutboundAttachmentRef, SessionHistoryEvent } from "../lib/sessionsApi";
+import type {
+  OutboundAttachmentRef,
+  SessionHistoryEvent,
+  TurnVerdictRecord,
+} from "../lib/sessionsApi";
 
 export type RowKind = "user" | "assistant" | "tool" | "system" | "approval" | "activity";
 
@@ -35,6 +39,11 @@ export interface TranscriptRow {
   /** Project asset references only; rendering constructs a fixed same-origin
    * URL from `id` and never accepts a URL or byte payload from this state. */
   attachments?: OutboundAttachmentRef[];
+  /** Completed mirrored assistant turn identity. Live-only rows omit it until
+   * the authoritative history refresh lands. */
+  turnId?: string;
+  /** Latest human verdict from authoritative history. */
+  verdict?: TurnVerdictRecord;
   /** Approval-only: the options to render as buttons (`{label, id}`). */
   options?: SessionEventOption[];
   /** Approval-only: the pending-resolution token the resolve POST carries
@@ -284,10 +293,75 @@ export function historyToRows(events: SessionHistoryEvent[]): TranscriptRow[] {
         content: ev.assistant,
         ts: ev.ts,
         attachments: ev.attachments,
+        turnId: ev.turn_id,
+        ...(ev.verdict ? { verdict: ev.verdict } : {}),
       });
     }
   }
   return rows;
+}
+
+function assistantSignature(row: TranscriptRow): string {
+  return JSON.stringify([
+    row.content,
+    (row.attachments ?? []).map((attachment) => attachment.id),
+  ]);
+}
+
+/** Overlay authoritative turn identities and persisted verdicts onto live
+ * assistant rows without replacing transient activity/system rows. Live SSE
+ * answers intentionally have no canonical turn id; a history refresh after
+ * completion supplies it. Matching runs newest-first so repeated identical
+ * answers bind to the correct latest turn. */
+export function mergeAuthoritativeTurnMetadata(
+  rows: TranscriptRow[],
+  events: SessionHistoryEvent[],
+): TranscriptRow[] {
+  const authoritative = historyToRows(events).filter(
+    (row): row is TranscriptRow & { turnId: string } =>
+      row.kind === "assistant" && typeof row.turnId === "string",
+  );
+  if (authoritative.length === 0) return rows;
+
+  const byTurnId = new Map(authoritative.map((row) => [row.turnId, row]));
+  const claimed = new Set<string>();
+  let changed = false;
+  const next = rows.map((row) => {
+    if (row.kind !== "assistant" || !row.turnId) return row;
+    claimed.add(row.turnId);
+    const source = byTurnId.get(row.turnId);
+    if (!source) return row;
+    const verdict = source.verdict ?? row.verdict;
+    const ts = row.ts ?? source.ts;
+    if (verdict === row.verdict && ts === row.ts) return row;
+    changed = true;
+    return { ...row, ts, ...(verdict ? { verdict } : {}) };
+  });
+
+  let authoritativeCursor = authoritative.length - 1;
+  for (let index = next.length - 1; index >= 0; index -= 1) {
+    const row = next[index];
+    if (!row || row.kind !== "assistant" || row.turnId) continue;
+    const signature = assistantSignature(row);
+    for (let candidateIndex = authoritativeCursor; candidateIndex >= 0; candidateIndex -= 1) {
+      const source = authoritative[candidateIndex];
+      if (!source || claimed.has(source.turnId) || assistantSignature(source) !== signature) {
+        continue;
+      }
+      next[index] = {
+        ...row,
+        turnId: source.turnId,
+        ts: row.ts ?? source.ts,
+        ...(source.verdict ? { verdict: source.verdict } : {}),
+      };
+      claimed.add(source.turnId);
+      authoritativeCursor = candidateIndex - 1;
+      changed = true;
+      break;
+    }
+  }
+
+  return changed ? next : rows;
 }
 
 /** Load a sid's persisted transcript from localStorage. Returns `[]` on

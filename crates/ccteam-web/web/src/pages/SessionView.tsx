@@ -37,22 +37,27 @@ import {
   cancelScheduled,
   interruptSession as apiInterruptSession,
   projectUploadUrl,
+  putTurnVerdict,
   resolveApproval as apiResolveApproval,
   submitTurn,
   type OutboundAttachmentRef,
   type SessionView as SessionSummary,
   type ScheduledItem,
+  type TurnVerdict,
+  type TurnVerdictRecord,
 } from "../lib/sessionsApi";
 import {
   appendEvent,
   appendRow,
   historyToRows,
   loadRows,
+  mergeAuthoritativeTurnMetadata,
   nextRowId,
   saveRows,
   type TranscriptRow,
 } from "./chatTranscript";
 import { railSessionLabel } from "./railHelpers";
+import TurnVerdictControls from "./TurnVerdictControls";
 
 function formatAttachmentSize(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -162,9 +167,47 @@ export default function SessionView({
   const [pendingTitle, setPendingTitle] = useState<string | null>(null);
   const [busyMark, setBusyMark] = useState<number | null>(null);
   const [rows, setRows] = useState<TranscriptRow[]>(() => loadRows(sid));
+  const verdictPendingRef = useRef(new Set<string>());
+  const verdictMutationVersionRef = useRef(new Map<string, number>());
+  const [verdictBusy, setVerdictBusy] = useState<Record<string, boolean>>({});
 
   const { events, lastError, gatewayUnavailable, connectionEpoch } =
     useSessionEvents(sid);
+
+  const preserveNewerVerdicts = useCallback(
+    (
+      candidate: TranscriptRow[],
+      current: TranscriptRow[],
+      requestedVersions: ReadonlyMap<string, number>,
+    ): TranscriptRow[] => {
+      const currentByTurnId = new Map(
+        current
+          .filter(
+            (row): row is TranscriptRow & { turnId: string } =>
+              row.kind === "assistant" && typeof row.turnId === "string",
+          )
+          .map((row) => [row.turnId, row]),
+      );
+      return candidate.map((row) => {
+        if (row.kind !== "assistant" || !row.turnId) return row;
+        const currentRow = currentByTurnId.get(row.turnId);
+        if (!currentRow) return row;
+        const requestedVersion = requestedVersions.get(row.turnId) ?? 0;
+        const currentVersion = verdictMutationVersionRef.current.get(row.turnId) ?? 0;
+        if (
+          !verdictPendingRef.current.has(row.turnId) &&
+          currentVersion <= requestedVersion
+        ) {
+          return row;
+        }
+        const protectedRow = { ...row };
+        if (currentRow.verdict) protectedRow.verdict = currentRow.verdict;
+        else delete protectedRow.verdict;
+        return protectedRow;
+      });
+    },
+    [],
+  );
 
   // The SSE buffer survives reconnects. Keep both the fold cursor and a live
   // view of its current length so an authoritative history reseed can install
@@ -186,11 +229,14 @@ export default function SessionView({
   useEffect(() => {
     let cancelled = false;
     const request = ++historyRequestRef.current;
+    const verdictVersions = new Map(verdictMutationVersionRef.current);
     getHistory(sid)
       .then((h) => {
         if (cancelled || request !== historyRequestRef.current) return;
         const seeded = historyToRows(h.events);
-        if (seeded.length > 0) setRows(seeded);
+        if (seeded.length > 0) {
+          setRows((current) => preserveNewerVerdicts(seeded, current, verdictVersions));
+        }
         setHistoryPage({
           hasMore: h.has_more === true,
           nextBefore: h.next_before ?? null,
@@ -203,7 +249,7 @@ export default function SessionView({
     return () => {
       cancelled = true;
     };
-  }, [sid]);
+  }, [sid, preserveNewerVerdicts]);
 
   // The first successful open races the mount seed above, so epoch 1 needs no
   // second fetch. Every later open follows a real disconnect: the server's
@@ -213,11 +259,13 @@ export default function SessionView({
     if (connectionEpoch <= 1) return;
     let cancelled = false;
     const request = ++historyRequestRef.current;
+    const verdictVersions = new Map(verdictMutationVersionRef.current);
     getHistory(sid)
       .then((h) => {
         if (cancelled || request !== historyRequestRef.current) return;
         foldedRef.current = eventsRef.current.length;
-        setRows(historyToRows(h.events));
+        const seeded = historyToRows(h.events);
+        setRows((current) => preserveNewerVerdicts(seeded, current, verdictVersions));
         setHistoryPage({
           hasMore: h.has_more === true,
           nextBefore: h.next_before ?? null,
@@ -230,18 +278,24 @@ export default function SessionView({
     return () => {
       cancelled = true;
     };
-  }, [sid, connectionEpoch]);
+  }, [sid, connectionEpoch, preserveNewerVerdicts]);
 
   const loadEarlier = useCallback(() => {
     if (!historyPage.hasMore || !historyPage.nextBefore || historyPage.loadingEarlier) return;
     const before = historyPage.nextBefore;
     const request = historyRequestRef.current;
+    const verdictVersions = new Map(verdictMutationVersionRef.current);
     setHistoryPage((current) => ({ ...current, loadingEarlier: true }));
     getHistory(sid, { before })
       .then((history) => {
         if (request !== historyRequestRef.current) return;
         const earlier = historyToRows(history.events);
-        if (earlier.length > 0) setRows((current) => [...earlier, ...current]);
+        if (earlier.length > 0) {
+          setRows((current) => [
+            ...preserveNewerVerdicts(earlier, current, verdictVersions),
+            ...current,
+          ]);
+        }
         setHistoryPage({
           hasMore: history.has_more === true,
           nextBefore: history.next_before ?? null,
@@ -252,7 +306,7 @@ export default function SessionView({
         if (request !== historyRequestRef.current) return;
         setHistoryPage((current) => ({ ...current, loadingEarlier: false }));
       });
-  }, [sid, historyPage]);
+  }, [sid, historyPage, preserveNewerVerdicts]);
 
   // ---- live SSE → append into this sid's transcript ------------------------
   useEffect(() => {
@@ -279,6 +333,39 @@ export default function SessionView({
   const [ctxPct, setCtxPct] = useState<number | null>(null);
   const doneCount = events.reduce((n, ev) => (ev.done ? n + 1 : n), 0);
   const busy = busyMark !== null && doneCount === busyMark;
+  const latestAnswer = (() => {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      if (events[index]?.kind === "answer") return events[index];
+    }
+    return undefined;
+  })();
+  const refreshedAnswerRef = useRef(latestAnswer);
+  useEffect(() => {
+    if (!latestAnswer || latestAnswer === refreshedAnswerRef.current) {
+      refreshedAnswerRef.current = latestAnswer;
+      return;
+    }
+    refreshedAnswerRef.current = latestAnswer;
+    let cancelled = false;
+    const verdictVersions = new Map(verdictMutationVersionRef.current);
+    getHistory(sid)
+      .then((history) => {
+        if (cancelled) return;
+        setRows((current) =>
+          preserveNewerVerdicts(
+            mergeAuthoritativeTurnMetadata(current, history.events),
+            current,
+            verdictVersions,
+          ),
+        );
+      })
+      .catch(() => {
+        /* best-effort — the next reconnect/history open can supply turn ids */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sid, latestAnswer, preserveNewerVerdicts]);
   useEffect(() => {
     let cancelled = false;
     getSessionStatus(sid)
@@ -374,6 +461,100 @@ export default function SessionView({
       });
     },
     [sid, pushRow, doneCount],
+  );
+
+  const setRowVerdict = useCallback(
+    (turnId: string, verdict: TurnVerdictRecord | undefined) => {
+      setRows((current) =>
+        current.map((row) => {
+          if (row.kind !== "assistant" || row.turnId !== turnId) return row;
+          const next = { ...row };
+          if (verdict) next.verdict = verdict;
+          else delete next.verdict;
+          return next;
+        }),
+      );
+    },
+    [],
+  );
+
+  const saveTurnVerdict = useCallback(
+    (row: TranscriptRow, verdict: TurnVerdict, feedback?: string) => {
+      const turnId = row.turnId;
+      if (!turnId || verdictPendingRef.current.has(turnId)) return;
+      verdictMutationVersionRef.current.set(
+        turnId,
+        (verdictMutationVersionRef.current.get(turnId) ?? 0) + 1,
+      );
+      verdictPendingRef.current.add(turnId);
+      setVerdictBusy((current) => ({ ...current, [turnId]: true }));
+
+      const previous = row.verdict;
+      const optimistic: TurnVerdictRecord = {
+        verdict,
+        feedback: verdict === "revise" ? (feedback ?? null) : null,
+        ts: new Date().toISOString(),
+      };
+      setRowVerdict(turnId, optimistic);
+
+      putTurnVerdict(sid, turnId, {
+        verdict,
+        ...(verdict === "revise" ? { feedback } : {}),
+      })
+        .then((response) => {
+          verdictMutationVersionRef.current.set(
+            turnId,
+            (verdictMutationVersionRef.current.get(turnId) ?? 0) + 1,
+          );
+          setRowVerdict(turnId, {
+            verdict: response.verdict,
+            feedback: response.feedback,
+            ts: optimistic.ts,
+          });
+        })
+        .catch((error) => {
+          verdictMutationVersionRef.current.set(
+            turnId,
+            (verdictMutationVersionRef.current.get(turnId) ?? 0) + 1,
+          );
+          setRowVerdict(turnId, previous);
+          const detail = error instanceof Error ? error.message : "unknown";
+          pushRow({
+            kind: "system",
+            content: tr(
+              lang,
+              `保存 turn ${turnId} 的评价失败:${detail}`,
+              `Failed to save feedback for turn ${turnId}: ${detail}`,
+              `Не удалось сохранить оценку хода ${turnId}: ${detail}`,
+            ),
+          });
+        })
+        .finally(() => {
+          verdictPendingRef.current.delete(turnId);
+          setVerdictBusy((current) => {
+            const next = { ...current };
+            delete next[turnId];
+            return next;
+          });
+        });
+    },
+    [lang, pushRow, setRowVerdict, sid],
+  );
+
+  const requestImprovement = useCallback(
+    (row: TranscriptRow, feedback: string) => {
+      if (!row.turnId) return;
+      submitText(
+        [
+          `Human feedback for completed turn ${row.turnId}:`,
+          feedback,
+          "",
+          "Propose concrete role, skill, or instruction changes that would prevent this issue.",
+          "Do not apply, edit, install, or persist any change. Wait for explicit user approval of a specific proposal in a later message.",
+        ].join("\n"),
+      );
+    },
+    [submitText],
   );
 
   // ---- resolve a HITL approval prompt (gateway pending machinery) ----------
@@ -664,6 +845,15 @@ export default function SessionView({
                         <OutboundAttachments
                           project={session?.project}
                           attachments={row.attachments}
+                        />
+                        <TurnVerdictControls
+                          lang={lang}
+                          row={row}
+                          busy={row.turnId ? verdictBusy[row.turnId] === true : false}
+                          onVerdict={(verdict, feedback) =>
+                            saveTurnVerdict(row, verdict, feedback)
+                          }
+                          onImprove={(feedback) => requestImprovement(row, feedback)}
                         />
                       </div>
                       <RowTime ts={row.ts} lang={lang} />

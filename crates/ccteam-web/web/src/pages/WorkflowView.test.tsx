@@ -48,6 +48,15 @@ describe("WorkflowView", () => {
     expect(html).not.toContain("仅 admin");
   });
 
+  it("describes Evolution as human-gated feedback, never automatic learning", () => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    const html = renderToString(<WorkflowView tab="evolution" lang="en" />);
+    expect(html).toContain("Human verdicts close the feedback loop");
+    expect(html).toContain("Nothing changes automatically");
+    expect(html).not.toContain("Read-only this version");
+    expect(html).not.toContain("next spawns receive");
+  });
+
 });
 
 describe("workflowApi urls", () => {

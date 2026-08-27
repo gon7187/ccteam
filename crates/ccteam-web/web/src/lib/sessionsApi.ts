@@ -78,8 +78,32 @@ export interface SessionHistoryEvent {
   role: string;
   user: string;
   assistant: string;
+  /** Latest human verdict for this completed turn. Absent on older daemons
+   * and unrated turns. */
+  verdict?: TurnVerdictRecord;
   /** Reference metadata only — never bytes, base64, daemon paths, or URLs. */
   attachments?: OutboundAttachmentRef[];
+}
+
+export type TurnVerdict = "accept" | "revise";
+
+export interface TurnVerdictRecord {
+  verdict: TurnVerdict;
+  feedback?: string | null;
+  ts: string;
+}
+
+export interface PutTurnVerdictForm {
+  verdict: TurnVerdict;
+  feedback?: string | null;
+}
+
+export interface PutTurnVerdictResponse {
+  sid: string;
+  turn_id: string;
+  verdict: TurnVerdict;
+  feedback: string | null;
+  changed: boolean;
 }
 
 export interface SessionHistory {
@@ -178,6 +202,10 @@ export function sessionUrl(sid: string): string {
   return `/api/v1/sessions/${encodeURIComponent(sid)}`;
 }
 
+export function turnVerdictUrl(sid: string, turnId: string): string {
+  return `${sessionUrl(sid)}/turns/${encodeURIComponent(turnId)}/verdict`;
+}
+
 async function getJson<T>(url: string, options: ReadRequestOptions = {}): Promise<T> {
   let res: Response;
   const headers = options.background
@@ -205,6 +233,26 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
   try {
     res = await fetch(url, {
       method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    throw new Error(
+      `network: ${e instanceof Error ? e.message : "connection failed"}`,
+    );
+  }
+  if (res.status === 401) throw new Error("UNAUTHENTICATED");
+  if (res.status === 404) throw new Error("NOT_FOUND");
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return (await res.json()) as T;
+}
+
+async function putJson<T>(url: string, body: unknown): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "PUT",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(body),
@@ -317,6 +365,16 @@ export function submitTurn(
   const body =
     attachments && attachments.length > 0 ? { text, attachments } : { text };
   return postJson<{ accepted: boolean }>(`${sessionUrl(sid)}/turn`, body);
+}
+
+/** Store the latest human verdict for one completed assistant turn. The
+ * server validates that revise feedback is non-empty and bounded. */
+export function putTurnVerdict(
+  sid: string,
+  turnId: string,
+  form: PutTurnVerdictForm,
+): Promise<PutTurnVerdictResponse> {
+  return putJson<PutTurnVerdictResponse>(turnVerdictUrl(sid, turnId), form);
 }
 
 /** Queue rows for one session, already ordered by `send_at` server-side. */
