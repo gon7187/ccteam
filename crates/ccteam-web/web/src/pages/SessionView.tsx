@@ -283,7 +283,7 @@ export default function SessionView({
   const loadEarlier = useCallback(() => {
     if (!historyPage.hasMore || !historyPage.nextBefore || historyPage.loadingEarlier) return;
     const before = historyPage.nextBefore;
-    const request = historyRequestRef.current;
+    const request = ++historyRequestRef.current;
     const verdictVersions = new Map(verdictMutationVersionRef.current);
     setHistoryPage((current) => ({ ...current, loadingEarlier: true }));
     getHistory(sid, { before })
@@ -347,10 +347,11 @@ export default function SessionView({
     }
     refreshedAnswerRef.current = latestAnswer;
     let cancelled = false;
+    const request = ++historyRequestRef.current;
     const verdictVersions = new Map(verdictMutationVersionRef.current);
     getHistory(sid)
       .then((history) => {
-        if (cancelled) return;
+        if (cancelled || request !== historyRequestRef.current) return;
         setRows((current) =>
           preserveNewerVerdicts(
             mergeAuthoritativeTurnMetadata(current, history.events),

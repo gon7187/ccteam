@@ -525,6 +525,117 @@ describe("SessionView human verdict flow", () => {
     }
   });
 
+  it("keeps the live answer metadata when older mount and reconnect history resolve last", async () => {
+    let resolveInitial: (value: unknown) => void = () => {};
+    let resolveReconnect: (value: unknown) => void = () => {};
+    const initialHistory = new Promise((resolve) => {
+      resolveInitial = resolve;
+    });
+    const reconnectHistory = new Promise((resolve) => {
+      resolveReconnect = resolve;
+    });
+    const freshHistory = {
+      sid: "s9",
+      events: [
+        {
+          turn_id: "t-live",
+          ts: "2026-08-28T01:00:00Z",
+          role: "reviewer",
+          user: "review this",
+          assistant: "fresh live answer",
+          verdict: {
+            verdict: "accept" as const,
+            feedback: null,
+            ts: "2026-08-28T01:01:00Z",
+          },
+        },
+      ],
+    };
+    const staleHistory = {
+      sid: "s9",
+      events: [
+        {
+          turn_id: "t-stale",
+          ts: "2026-08-28T00:00:00Z",
+          role: "reviewer",
+          user: "old task",
+          assistant: "stale answer",
+          verdict: {
+            verdict: "revise" as const,
+            feedback: "old feedback",
+            ts: "2026-08-28T00:01:00Z",
+          },
+        },
+      ],
+    };
+    const history = vi
+      .fn()
+      .mockReturnValueOnce(initialHistory)
+      .mockReturnValueOnce(reconnectHistory)
+      .mockResolvedValueOnce(freshHistory);
+    const stream = {
+      events: [] as SessionEvent[],
+      connected: true,
+      connectionEpoch: 1,
+      lastError: null,
+      gatewayUnavailable: false,
+    };
+
+    try {
+      const { renderView } = await mountVerdictView({ history, stream });
+      renderView();
+      expect(history).toHaveBeenCalledTimes(1);
+
+      stream.connectionEpoch = 2;
+      renderView();
+      expect(history).toHaveBeenCalledTimes(2);
+
+      stream.events = [
+        { id: "final-progress", kind: "progress", content: "done", done: true },
+      ];
+      renderView();
+      stream.events = [
+        ...stream.events,
+        {
+          id: "live-answer",
+          kind: "answer",
+          content: "fresh live answer",
+          done: false,
+        },
+      ];
+      renderView();
+      await flushPromises();
+
+      let tree = renderView();
+      let row = findVerdictControls(tree)?.props.row as {
+        content?: string;
+        turnId?: string;
+        verdict?: { verdict: string };
+      };
+      expect(history).toHaveBeenCalledTimes(3);
+      expect(row.content).toBe("fresh live answer");
+      expect(row.turnId).toBe("t-live");
+      expect(row.verdict?.verdict).toBe("accept");
+
+      resolveInitial(staleHistory);
+      resolveReconnect(staleHistory);
+      await flushPromises();
+      tree = renderView();
+      row = findVerdictControls(tree)?.props.row as {
+        content?: string;
+        turnId?: string;
+        verdict?: { verdict: string };
+      };
+
+      expect(collectElementText(tree)).not.toContain("stale answer");
+      expect(row.content).toBe("fresh live answer");
+      expect(row.turnId).toBe("t-live");
+      expect(row.verdict?.verdict).toBe("accept");
+    } finally {
+      unmountVerdictView();
+    }
+  });
+
   it("does not let an older history request overwrite a verdict committed by PUT", async () => {
     let resolveStaleHistory: (value: unknown) => void = () => {};
     const staleHistory = new Promise((resolve) => {

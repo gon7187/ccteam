@@ -72,21 +72,42 @@ describe("EvolutionPanel", () => {
     expect(ru).toContain("без оценки");
   });
 
-  it("keeps unknown duration and cost visibly unknown on an older partial payload", () => {
-    const partial: EvolutionSummary = {
+  it("keeps optional, null, and invalid analytics counts unknown while preserving numeric zero", () => {
+    const partial = {
       slug: "old",
-      turn_records: 2,
+      turn_records: 0,
       verdict_records: 0,
-      turn_records_7d: 2,
-      roles: [{ kind: "role", id: "", sha: "", turn_count: 2 }],
+      turn_records_7d: null,
+      accepted_turns: 0,
+      revised_turns: null,
+      unrated_turns: Number.POSITIVE_INFINITY,
+      failed_turns: 1.5,
+      outcome_unknown_turns: "3",
+      priced_turns: 0,
+      unpriced_turns: -1,
+      roles: [
+        {
+          kind: "role",
+          id: "",
+          sha: "",
+          accepted_turns: 0,
+          revised_turns: null,
+          unrated_turns: Number.NaN,
+        },
+      ],
       skills: [],
       empty: false,
-    };
+    } as unknown as EvolutionSummary;
     const html = renderToString(
       <EvolutionPanel lang="en" evolution={partial} loading={false} />,
     ).replace(/<!-- -->/g, "");
 
-    expect(html).toContain("0 accepted · 0 revised · 0 unrated");
+    expect(html).toContain("0 accepted · — revised · — unrated");
+    expect(html).toContain("— completed · — failed · — unknown");
+    expect(html).toContain("0 priced · — unpriced");
+    expect(html).toContain("last 7 days +—");
+    expect(html).toContain("0 turn records");
+    expect(html).toContain("turns=—");
     expect(html).toContain('data-testid="evolution-duration"');
     expect(html).toContain(">—<");
     expect(html).not.toContain("0 ms");

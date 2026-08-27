@@ -82,7 +82,7 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
     expect(applyPlaybook("nope", "zh")).toBeNull();
   });
 
-  it("the commander prefill carries the full roster, dual gate, and Codex fallback", () => {
+  it("the commander prefill carries the full roster, dual gate, and capability-only Codex fallback", () => {
     const prompt = I18N.ru.tplCommanderP;
     for (const role of ["Opus", "Luna", "Terra", "Sonnet", "Sol", "Fable", "Haiku"]) {
       expect(prompt, role).toContain(role);
@@ -91,6 +91,20 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
     expect(prompt).toContain("максимальн");
     expect(prompt).toContain("status");
     expect(prompt).toContain("Codex");
+    expect(prompt).toContain("session_spawn / session_dispatch");
+    expect(prompt).toContain("только если");
+    expect(prompt).toContain("явно недоступны");
+    expect(prompt).toContain("не повторяй");
+    for (const guard of ["ACL", "глубины делегирования", "бюджета", "цикла"]) {
+      expect(prompt).toContain(guard);
+    }
+    for (const [lang, required] of [
+      ["zh", ["session_spawn / session_dispatch", "仅当", "明确报告为不可用", "不要重试", "委派深度"]],
+      ["ru", ["session_spawn / session_dispatch", "только если", "явно недоступны", "не повторяй", "глубины делегирования"]],
+      ["en", ["session_spawn / session_dispatch", "only when", "explicitly unavailable", "Do not retry", "delegation-depth"]],
+    ] as const) {
+      for (const phrase of required) expect(I18N[lang].tplCommanderP).toContain(phrase);
+    }
   });
 
   it("builds the Commander fallback from the installed Codex catalog", () => {
@@ -139,9 +153,16 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
       "NOT_FOUND",
       "network: connection failed",
       "HTTP 403: project is not visible",
+      "HTTP 500: model opus is unavailable",
       "会话启动失败: internal state corrupt",
       "vendor is not authenticated",
       "unauthorized: model opus is not available for this subscription",
+      "network failure: model opus is unavailable",
+      "request timed out while creating the session",
+      "quota exceeded: model opus is unavailable",
+      "budget guard rejected spawn: model opus is unavailable",
+      "delegation depth limit reached: model opus is unavailable",
+      "delegation cycle detected: model opus is unavailable",
     ]) {
       expect(
         isCommanderBootstrapCapabilityError(

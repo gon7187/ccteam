@@ -300,11 +300,100 @@ describe("HomeView (landing page)", () => {
     expect(submit).toHaveBeenCalledWith("s42", prompt, []);
   });
 
+  it("starts Commander directly on the best confirmed Codex posture when Claude is absent", async () => {
+    const createSession = vi.fn().mockResolvedValue({ sid: "s43" });
+    const submit = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      createAndSubmitHomeTurn(
+        {
+          slug: "ccteam",
+          // This is the generic host-normalized posture HomeView currently
+          // derives before the Commander policy gets a say.
+          options: {
+            role: "",
+            vendor: "codex",
+            permission_mode: "skip",
+            protocol: "stream-json",
+          },
+          text: "task",
+          attachments: [],
+          commander: true,
+          installedVendors: ["codex"],
+          catalog: {
+            codex: {
+              models: [{ id: "gpt-5.6-codex", efforts: ["low", "high", "xhigh"] }],
+              efforts: ["low", "medium", "high", "xhigh"],
+            },
+          },
+        },
+        { createSession, submitTurn: submit },
+      ),
+    ).resolves.toBe("s43");
+
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(createSession).toHaveBeenCalledWith("ccteam", {
+      role: "",
+      vendor: "codex",
+      permission_mode: "skip",
+      protocol: "stream-json",
+      model: "gpt-5.6-codex",
+      effort: "xhigh",
+    });
+    expect(submit).toHaveBeenCalledWith("s43", "task", []);
+  });
+
+  it("retains the unavailable Commander error instead of launching an unrelated Grok lead", async () => {
+    const unavailable = new Error("Claude executable not found");
+    const createSession = vi.fn().mockRejectedValue(unavailable);
+    const submit = vi.fn();
+
+    await expect(
+      createAndSubmitHomeTurn(
+        {
+          slug: "ccteam",
+          // Generic host normalization would otherwise turn Commander into
+          // Grok merely because Grok is the first installed vendor.
+          options: {
+            role: "",
+            vendor: "grok",
+            permission_mode: "skip",
+            protocol: "acp",
+          },
+          text: "task",
+          attachments: [],
+          commander: true,
+          installedVendors: ["grok"],
+          catalog: {},
+        },
+        { createSession, submitTurn: submit },
+      ),
+    ).rejects.toBe(unavailable);
+
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(createSession).toHaveBeenCalledWith("ccteam", {
+      role: "",
+      vendor: "claude",
+      permission_mode: "skip",
+      protocol: "stream-json",
+      model: "opus",
+      effort: "max",
+    });
+    expect(submit).not.toHaveBeenCalled();
+  });
+
   it("does not blindly retry Commander auth, network, ACL, or general failures", async () => {
     for (const message of [
       "UNAUTHENTICATED",
       "network: connection failed",
+      "network failure: model opus is unavailable",
       "HTTP 403: project is not visible",
+      "HTTP 500: model opus is unavailable",
+      "request timed out while creating the session",
+      "quota exceeded: model opus is unavailable",
+      "budget guard rejected spawn: model opus is unavailable",
+      "delegation depth limit reached: model opus is unavailable",
+      "delegation cycle detected: model opus is unavailable",
       "会话启动失败: internal state corrupt",
     ]) {
       const createSession = vi.fn().mockRejectedValue(new Error(message));
@@ -323,9 +412,9 @@ describe("HomeView (landing page)", () => {
             },
             text: "task",
             attachments: [],
-            commander: true,
-            installedVendors: ["codex"],
-            catalog: {},
+          commander: true,
+          installedVendors: ["claude", "codex"],
+          catalog: {},
           },
           { createSession, submitTurn: submit },
         ),

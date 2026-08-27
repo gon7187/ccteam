@@ -114,7 +114,11 @@ export function isCommanderBootstrapCapabilityError(
   if (
     /(?:^|\b)(?:UNAUTHENTICATED|FORBIDDEN|NOT_FOUND)(?:\b|$)/i.test(message)
     || /\bHTTP\s+(?:401|403|404)\b/i.test(message)
+    || /\bHTTP\s+5\d\d\b/i.test(message)
     || /\b(?:authentication|authorization|unauthorized|not authenticated|access denied|permission denied|credentials?|api key|subscription|rate.?limit|quota|budget|timed?\s*out|timeout)\b/i.test(message)
+    || /\b(?:ACL|guards?|guardrails?|delegation[ _-]?depth|depth[ _-]?limit|maximum[ _-]?depth|delegation[ _-]?cycle|cycles?|cyclic|child(?:ren)?[ _-]?limit)\b/i.test(message)
+    || /\b(?:network|failed to fetch|fetch failed|connection[ _-]?(?:failed|refused|reset)|ECONN\w*|internal(?: server| state)? error|service unavailable)\b/i.test(message)
+    || /\bproject\b[^\n]{0,80}\bnot visible\b/i.test(message)
     || /^network:/i.test(message.trim())
   ) {
     return false;
@@ -166,21 +170,49 @@ export async function createAndSubmitHomeTurn(
   input: HomeTurnLaunchInput,
   deps: HomeTurnLaunchDeps,
 ): Promise<string> {
+  // Commander owns its bootstrap posture before HomeView's generic host
+  // normalization: a host proven to lack Claude may use the best confirmed
+  // Codex posture, but an unrelated installed vendor must never become the
+  // Commander merely because it is first in the host menu.
+  let initialOptions = input.options;
+  if (input.commander) {
+    const claudeConfirmedAbsent =
+      input.installedVendors !== null && !input.installedVendors.includes("claude");
+    const codex = claudeConfirmedAbsent
+      ? bestCommanderCodexPosture(input.installedVendors, input.catalog)
+      : null;
+    initialOptions = codex
+      ? {
+          ...input.options,
+          vendor: codex.vendor,
+          protocol: "stream-json",
+          model: codex.model,
+          effort: codex.effort,
+        }
+      : {
+          ...input.options,
+          vendor: "claude",
+          protocol: "stream-json",
+          model: "opus",
+          effort: "max",
+        };
+  }
+
   let created: { sid: string };
   try {
-    created = await deps.createSession(input.slug, input.options);
+    created = await deps.createSession(input.slug, initialOptions);
   } catch (error) {
     const fallback = input.commander
       && isCommanderBootstrapCapabilityError(
         error,
-        input.options,
+        initialOptions,
         input.installedVendors,
       )
       ? bestCommanderCodexPosture(input.installedVendors, input.catalog)
       : null;
     if (!fallback) throw error;
     created = await deps.createSession(input.slug, {
-      ...input.options,
+      ...initialOptions,
       vendor: fallback.vendor,
       protocol: "stream-json",
       model: fallback.model,

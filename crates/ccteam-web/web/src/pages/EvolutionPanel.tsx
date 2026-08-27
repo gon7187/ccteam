@@ -5,10 +5,10 @@ import type {
   EvolutionSummary,
 } from "../lib/workflowApi";
 
-function count(value: number | null | undefined): number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-    ? Math.floor(value)
-    : 0;
+function count(value: unknown): string {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? String(value)
+    : "—";
 }
 
 function duration(value: number | null | undefined): string {
