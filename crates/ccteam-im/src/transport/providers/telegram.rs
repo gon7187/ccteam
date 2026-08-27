@@ -1898,8 +1898,7 @@ fn build_rich_draft_body(chat_id: i64, draft_id: i64, markdown: &str) -> serde_j
         "chat_id": chat_id,
         "draft_id": draft_id,
         "rich_message": { "markdown": markdown },
-        "can_stop": true,
-        "keep_on_stop": true,
+        "can_stop": false,
     })
 }
 
@@ -2622,8 +2621,8 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&seen[0].1).unwrap();
         assert_eq!(body["chat_id"], 123);
         assert_eq!(body["draft_id"], 77);
-        assert_eq!(body["can_stop"], true);
-        assert_eq!(body["keep_on_stop"], true);
+        assert_eq!(body["can_stop"], false);
+        assert!(body.get("keep_on_stop").is_none());
         assert_eq!(body["rich_message"]["markdown"], markdown);
     }
 

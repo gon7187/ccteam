@@ -184,6 +184,17 @@ fn classify_detached_termination(result: Result<bool>) -> Result<()> {
 enum TurnOrigin {
     User,
     Internal,
+    DelegationCompletion,
+}
+
+impl TurnOrigin {
+    fn is_internal(self) -> bool {
+        self != Self::User
+    }
+
+    fn reaches_im_out_of_focus(self) -> bool {
+        self != Self::Internal
+    }
 }
 
 /// Who asked for a session's turns, in the two shapes the delivery paths need.
@@ -383,6 +394,28 @@ struct UnlockedTurnPlan {
 /// the pump's hot path — one per minute leaves a 5× margin without turning
 /// every streamed token into a disk write and a file lock.
 const TURN_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const DELEGATION_NOTIFY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const DELEGATION_NOTIFY_MAX_ATTEMPTS: u8 = 3;
+
+fn delegation_notify_error_is_retryable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<HarnessError>().is_some_and(|error| {
+        matches!(
+            error,
+            HarnessError::SpawnFailed(_)
+                | HarnessError::SubmitFailed(_)
+                | HarnessError::ThreadDied(_)
+        )
+    }) || error
+        .downcast_ref::<GatewayRequestError>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                GatewayRequestError::QueueDeadline
+                    | GatewayRequestError::SessionResumeFailed(_)
+                    | GatewayRequestError::VendorChannelClosed { .. }
+            )
+        })
+}
 
 /// Snapshot used by the pure live-capacity eviction selector.
 ///
@@ -2954,7 +2987,7 @@ impl Gateway {
         text: &str,
         reply_to: &ChatKey,
         literal: bool,
-        internal: bool,
+        origin: TurnOrigin,
     ) -> Result<(String, String)> {
         let Some(detached) = self.detached.get(sid) else {
             return Err(anyhow!("Сессия {sid} не отсоединена"));
@@ -2965,7 +2998,8 @@ impl Gateway {
             text,
             Some(reply_to.channel.clone()),
             literal,
-            internal,
+            origin.is_internal(),
+            origin == TurnOrigin::DelegationCompletion,
         )?;
         let queued = crate::pending_turns::pending_turn_count(&detached.cwd, sid);
         let since = detached.since.to_rfc3339();
@@ -5845,7 +5879,9 @@ impl Gateway {
             // v0.10.1 — the queue carries who asked (`internal`); the drain used
             // to relabel every row internal, which made a human's queued
             // question look unasked-for on the delivery side.
-            let origin = if turn.internal {
+            let origin = if turn.delegation_completion {
+                TurnOrigin::DelegationCompletion
+            } else if turn.internal {
                 TurnOrigin::Internal
             } else {
                 TurnOrigin::User
@@ -6836,23 +6872,15 @@ impl Gateway {
                                     &text,
                                 )
                             };
-                            // v0.10.1 — a shared IM thread needs an ADDRESSEE,
-                            // not just a label. An answer to an INTERNAL turn (a
-                            // delegation completion notification, a drained
-                            // internal turn) was asked for by ccteam, not by
-                            // anyone in this chat; when the session is also not
-                            // the chat's focus, the prefix above was never
-                            // isolation — the human just got a second speaker in
-                            // their thread, answering a question they never
-                            // asked. Keep it in the record (turns.jsonl, above)
-                            // and on the SSE fan-out (web console, inline
-                            // `wait_seconds` subscriber); drop only the IM leg.
-                            // The web console is exempt for the same reason the
-                            // context echo above skips it: every session has its
-                            // own tab there, so nothing is being talked over.
+                            // A shared IM thread needs an addressee, not just a
+                            // label. Generic internal answers stay record/SSE
+                            // only outside focus; delegated task completion is
+                            // explicitly addressed to the dispatcher and must
+                            // reach IM. Web has one tab per session, so it never
+                            // suppresses either origin.
                             let has_addressee = is_focused
                                 || channel == "web"
-                                || latest_turn_origin(&session) == TurnOrigin::User;
+                                || latest_turn_origin(&session).reaches_im_out_of_focus();
                             let answer = GatewayEvent {
                                 id: format!("gateway-event-{session_id}-{seq}"),
                                 cid: None,
@@ -8249,7 +8277,7 @@ impl Gateway {
                     &payload,
                     chat,
                     literal_user_text,
-                    origin == TurnOrigin::Internal,
+                    origin,
                 )?;
                 return Ok(SubmitResult::Queued { receipt, id });
             }
@@ -8287,7 +8315,8 @@ impl Gateway {
                 payload.clone(),
                 Some(channel),
                 literal_user_text,
-                origin == TurnOrigin::Internal,
+                origin.is_internal(),
+                origin == TurnOrigin::DelegationCompletion,
             )?;
             self.resume_dead_session(session_id).await?;
             let drained_ids = self.drain_and_dispatch_pending_turns(session_id).await;
@@ -12366,7 +12395,8 @@ impl Gateway {
     /// watch) when the
     /// child's project can't be resolved. `parent_sid` is the DISPATCHER's
     /// principal (usually the spawner, but not necessarily).
-    pub fn arm_delegation_watch(
+    #[cfg(test)]
+    fn arm_delegation_watch(
         &mut self,
         child_sid: &str,
         parent_sid: &str,
@@ -12657,13 +12687,22 @@ impl Gateway {
     /// (c) records the turn in `notified_turns` so it is delivered AT-MOST-once,
     /// and (d) v0.10.1 — SPENDS the watch: this boundary is the end of the
     /// dispatched task, and one dispatch subscribes to exactly one task. A
-    /// parent that no longer exists drops the watch (+ a warn); a watch re-armed
-    /// mid-delivery (generation changed) is left alone — it belongs to the next
-    /// task.
+    /// Rejected parent submissions are retried briefly without duplicating the
+    /// completion event; failure retains the durable watch for startup
+    /// reconciliation. The same per-child claim as dispatch/watch registration
+    /// serializes the whole delivery, so a new task cannot re-arm between the
+    /// generation check and the parent submit.
     async fn deliver_delegation_signal_shared(
         gateway: Arc<tokio::sync::Mutex<Self>>,
         signal: crate::delegation::DelegationSignal,
     ) {
+        let claims = Arc::clone(
+            &crate::latency::gateway_lock(&gateway, "notifier.claims")
+                .await
+                .spawn_claims,
+        );
+        let claim_key = ChatKey::new("delegation-watch", &signal.child_sid, &signal.child_sid);
+        let _claim = claims.lock_for(&claim_key).await;
         let Some(plan) = crate::latency::gateway_lock(&gateway, "notifier.plan")
             .await
             .plan_delegation_delivery(signal)
@@ -12686,35 +12725,62 @@ impl Gateway {
         // notification turn is submitted.
         plan.emitter.emit(completed).await;
         if let Some(text) = plan.notification.as_ref() {
-            match Self::submit_to_sid_shared(
-                Arc::clone(&gateway),
-                &plan.mirror.parent_sid,
-                text.clone(),
-                GatewayDeadline::start(),
-            )
-            .await
-            {
-                Ok(_) => {
-                    plan.emitter
-                        .emit(DelegationProgressRecord {
-                            slug: plan.mirror.slug.clone(),
-                            event: ccteam_harness::execution::progress_bridge::DELEGATION_NOTIFIED
-                                .to_string(),
-                            parent_sid: plan.mirror.parent_sid.clone(),
-                            child_sid: child.clone(),
-                            vendor: plan.signal.vendor,
-                            host: plan.signal.host.clone(),
-                            turn: Some(plan.signal.turn_id.clone()),
-                            title: plan.mirror.title.clone(),
-                            reason: None,
-                        })
-                        .await;
+            let mut attempt = 1;
+            loop {
+                if attempt > 1 {
+                    let still_current =
+                        crate::latency::gateway_lock(&gateway, "notifier.retry_generation")
+                            .await
+                            .delegations
+                            .get(&child)
+                            .is_some_and(|current| current.generation == plan.mirror.generation);
+                    if !still_current {
+                        tracing::warn!(%child,
+                            "ccteam-im: delegation watch changed before retry; abandoning stale notification");
+                        return;
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(parent = %plan.mirror.parent_sid, %child, %error,
-                        "ccteam-im: delegation notify failed; dropping watch");
-                    Self::disarm_delegation_watch_shared(Arc::clone(&gateway), &child).await;
-                    return;
+                match Self::submit_to_sid_shared_with_origin(
+                    Arc::clone(&gateway),
+                    &plan.mirror.parent_sid,
+                    text.clone(),
+                    TurnOrigin::DelegationCompletion,
+                    GatewayDeadline::start(),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        plan.emitter
+                            .emit(DelegationProgressRecord {
+                                slug: plan.mirror.slug.clone(),
+                                event:
+                                    ccteam_harness::execution::progress_bridge::DELEGATION_NOTIFIED
+                                        .to_string(),
+                                parent_sid: plan.mirror.parent_sid.clone(),
+                                child_sid: child.clone(),
+                                vendor: plan.signal.vendor,
+                                host: plan.signal.host.clone(),
+                                turn: Some(plan.signal.turn_id.clone()),
+                                title: plan.mirror.title.clone(),
+                                reason: None,
+                            })
+                            .await;
+                        break;
+                    }
+                    Err(error)
+                        if attempt < DELEGATION_NOTIFY_MAX_ATTEMPTS
+                            && delegation_notify_error_is_retryable(&error) =>
+                    {
+                        tracing::warn!(parent = %plan.mirror.parent_sid, %child, %error, attempt,
+                            "ccteam-im: delegation notify failed; retrying");
+                        attempt += 1;
+                        tokio::time::sleep(DELEGATION_NOTIFY_RETRY_DELAY).await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(parent = %plan.mirror.parent_sid, %child, %error, attempt,
+                            "ccteam-im: delegation notify failed; retaining watch for startup reconcile");
+                        return;
+                    }
                 }
             }
         }
@@ -12978,13 +13044,8 @@ impl Gateway {
                     // back to the API/MCP caller).
                     let guard = deadline.lock(&gateway).await?;
                     let reply_to = ChatKey::from_identity(&identity).unwrap_or_else(web_api_chat);
-                    let (receipt, id) = guard.queue_behind_detached_body(
-                        sid,
-                        &text,
-                        &reply_to,
-                        false,
-                        origin == TurnOrigin::Internal,
-                    )?;
+                    let (receipt, id) =
+                        guard.queue_behind_detached_body(sid, &text, &reply_to, false, origin)?;
                     guard.emit_sid_answer(sid, 0, receipt);
                     return Ok(id);
                 }
@@ -14698,7 +14759,7 @@ fn mirror_internal_web_answer(
     seq: u64,
     text: &str,
 ) {
-    if origin != TurnOrigin::Internal || reply_to.channel != "web" || session.parent_sid.is_some() {
+    if !origin.is_internal() || reply_to.channel != "web" || session.parent_sid.is_some() {
         return;
     }
     // `session.owner` is authoritative: ownership is settled once at spawn
@@ -17766,6 +17827,7 @@ mod tests {
         closes: AtomicUsize,
         closes_notify: tokio::sync::Notify,
         close_failures_remaining: Arc<AtomicUsize>,
+        submit_failures_remaining: Arc<AtomicUsize>,
     }
 
     impl Default for FakeAdapter {
@@ -17820,6 +17882,7 @@ mod tests {
                 closes: AtomicUsize::new(0),
                 closes_notify: tokio::sync::Notify::new(),
                 close_failures_remaining: Arc::new(AtomicUsize::new(0)),
+                submit_failures_remaining: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -17947,6 +18010,17 @@ mod tests {
             h: &ThreadHandle,
             input: TurnInput,
         ) -> Result<TurnId, HarnessError> {
+            if self
+                .submit_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(HarnessError::SubmitFailed(
+                    "transient test failure".to_string(),
+                ));
+            }
             // Model a stream-json child that has exited: a dead session's submit
             // returns the recoverable ThreadDied WITHOUT delivering (so the
             // gateway resumes + retries, and no double-submit is recorded). A
@@ -19974,6 +20048,7 @@ mod tests {
             Some("web".into()),
             false,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -20975,15 +21050,11 @@ mod tests {
         );
     }
 
-    /// v0.10.1 (issue #184) — a shared IM thread needs an ADDRESSEE. An answer
-    /// to a ccteam-authored turn (a delegation completion notification) from a
-    /// session that is NOT the chat's focus reaches nobody who asked: the `[sid
-    /// …]` prefix labelled the second speaker, it never stopped him talking.
-    /// The record (turns.jsonl) and the SSE fan-out still get it; only the IM
-    /// leg is dropped — and a human's own question to that same out-of-focus
-    /// session is answered exactly as before.
+    /// A shared IM thread needs an addressee: generic internal answers stay
+    /// record-only outside focus, while a delegated task completion must still
+    /// reach the human who dispatched it. Human-authored turns remain visible.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn out_of_focus_internal_answer_stays_out_of_the_im_thread() {
+    async fn out_of_focus_im_delivery_keeps_completion_but_drops_generic_internal_answer() {
         let tmp = tempfile::TempDir::new().unwrap();
         // A FRESH fake per spawn: one shared `events_notify` could wake the
         // wrong session's pump (test-double race, see `delegation_gateway`).
@@ -21007,12 +21078,9 @@ mod tests {
             .await
             .unwrap();
 
-        // A completion notification wakes the out-of-focus s1.
+        // Generic ccteam maintenance wakes the out-of-focus s1.
         gateway
-            .submit_to_sid(
-                "s1",
-                "[ccteam] delegated session s9 completed turn s9-1".into(),
-            )
+            .submit_to_sid("s1", "[ccteam] internal maintenance".into())
             .await
             .unwrap();
         let seen = recv_answer(&mut broadcast).await;
@@ -21036,11 +21104,81 @@ mod tests {
             "an out-of-focus answer to an internal turn must not reach the IM thread: {leaked:?}"
         );
 
-        // Same session, same lack of focus — but now a human asked.
+        // A real delegated boundary targets the dispatcher even while another
+        // session owns the shared chat focus.
+        gateway.arm_delegation_watch(
+            "s2",
+            "s1",
+            ccteam_harness::NotifyMode::Final,
+            Some("reporting task".into()),
+            Some("s2-1".into()),
+        );
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            crate::delegation::DelegationSignal {
+                child_sid: "s2".into(),
+                turn_id: "s2-1".into(),
+                tail: "report ready".into(),
+                vendor: AgentVendor::Claude,
+                host: "local".into(),
+                boundary: true,
+                vendor_error: false,
+                interim_notes: 0,
+                covered_turns: vec!["s2-1".into()],
+            },
+        )
+        .await;
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let ev = sink.recv().await.expect("sink open");
+                if matches!(ev.kind, GatewayEventKind::Answer) {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("delegation completion reaches the dispatcher's IM thread");
+        assert_eq!(delivered.sid.as_deref(), Some("s1"));
+        assert!(delivered.content.contains("report ready"), "{delivered:?}");
+
+        crate::pending_turns::enqueue_pending_turn(
+            tmp.path(),
+            "s1",
+            "[ccteam] queued completion",
+            Some("mock".into()),
+            false,
+            true,
+            true,
+        )
+        .unwrap();
         gateway
-            .submit_web_sid("s1", "are you still there?".into(), false)
+            .lock()
             .await
-            .unwrap();
+            .drain_and_dispatch_pending_turns("s1")
+            .await;
+        let queued = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let ev = sink.recv().await.expect("sink open");
+                if matches!(ev.kind, GatewayEventKind::Answer) {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("queued delegation completion keeps its IM delivery origin");
+        assert!(queued.content.contains("queued completion"), "{queued:?}");
+
+        // Same session, same lack of focus — but now a human asked.
+        Gateway::submit_web_sid_shared(
+            Arc::clone(&gateway),
+            "s1",
+            "are you still there?".into(),
+            false,
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
         let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let ev = sink.recv().await.expect("sink open");
@@ -28530,6 +28668,227 @@ mod tests {
                 as Arc<dyn HarnessAdapter + Send + Sync>
         });
         delegation_gateway_with_factory(project_dir, factory, false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegation_submit_failure_retries_without_daemon_restart() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let remaining = Arc::new(AtomicUsize::new(1));
+        let factory_remaining = Arc::clone(&remaining);
+        let factory: crate::daemon::AdapterFactory = Arc::new(move |vendor, _protocol| {
+            Arc::new(FakeAdapter {
+                submit_failures_remaining: Arc::clone(&factory_remaining),
+                ..FakeAdapter::new(vendor).with_turn_boundary()
+            }) as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        let gateway = delegation_gateway_with_factory(&project_dir, factory, true).await;
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (parent_sid, child_sid) = {
+            let mut gw = gateway.lock().await;
+            gw.enable_project_creation(paths.clone());
+            let parent = gw
+                .create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap()
+                .sid;
+            let child = gw
+                .create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap()
+                .sid;
+            assert!(gw.arm_delegation_watch(
+                &child,
+                &parent,
+                ccteam_harness::NotifyMode::Final,
+                Some("retry me".into()),
+                None,
+            ));
+            (parent, child)
+        };
+
+        let delivery = tokio::spawn(Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            crate::delegation::DelegationSignal {
+                child_sid: child_sid.clone(),
+                turn_id: format!("{child_sid}-1"),
+                tail: "done".into(),
+                vendor: AgentVendor::Claude,
+                host: "local".into(),
+                boundary: true,
+                vendor_error: false,
+                interim_notes: 0,
+                covered_turns: vec![format!("{child_sid}-1")],
+            },
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while remaining.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first parent submit fails");
+        assert!(
+            ccteam_harness::read_delegation_watch(&project_dir, &child_sid).is_some(),
+            "a transient parent-submit failure must keep the watch armed"
+        );
+        delivery.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if ccteam_notification_turns(&project_dir, &parent_sid).len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the in-process notifier retries a transient submit failure");
+        assert_eq!(
+            ccteam_notification_turns(&project_dir, &parent_sid).len(),
+            1,
+            "retry must produce exactly one parent notification"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ccteam_harness::read_delegation_watch(&project_dir, &child_sid).is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the successful retry spends the durable watch");
+        assert!(
+            ccteam_harness::read_delegation_watch(&project_dir, &child_sid).is_none(),
+            "the successful retry spends the durable watch"
+        );
+        let progress = ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha"))
+            .unwrap_or_default();
+        for event in [
+            ccteam_harness::execution::progress_bridge::DELEGATION_COMPLETED,
+            ccteam_harness::execution::progress_bridge::DELEGATION_NOTIFIED,
+        ] {
+            assert_eq!(
+                progress
+                    .iter()
+                    .filter(|record| {
+                        record.get("event").and_then(serde_json::Value::as_str) == Some(event)
+                            && record.get("child_sid").and_then(serde_json::Value::as_str)
+                                == Some(child_sid.as_str())
+                    })
+                    .count(),
+                1,
+                "retry must write exactly one {event}: {progress:#?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegation_delivery_serializes_rearm_until_old_notification_finishes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let remaining = Arc::new(AtomicUsize::new(1));
+        let factory_remaining = Arc::clone(&remaining);
+        let factory: crate::daemon::AdapterFactory = Arc::new(move |vendor, _protocol| {
+            Arc::new(FakeAdapter {
+                submit_failures_remaining: Arc::clone(&factory_remaining),
+                ..FakeAdapter::new(vendor).with_turn_boundary()
+            }) as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        let gateway = delegation_gateway_with_factory(&project_dir, factory, false).await;
+        let (old_parent, new_parent, child_sid) = {
+            let mut gw = gateway.lock().await;
+            let mut sids = Vec::new();
+            for _ in 0..3 {
+                sids.push(
+                    gw.create_session_api(
+                        "alpha".into(),
+                        String::new(),
+                        AgentVendor::Claude,
+                        PermissionMode::Skip,
+                    )
+                    .await
+                    .unwrap()
+                    .sid,
+                );
+            }
+            let old_parent = sids.remove(0);
+            let new_parent = sids.remove(0);
+            let child = sids.remove(0);
+            assert!(gw.arm_delegation_watch(
+                &child,
+                &old_parent,
+                ccteam_harness::NotifyMode::Final,
+                Some("old task".into()),
+                None,
+            ));
+            (old_parent, new_parent, child)
+        };
+
+        let delivery = tokio::spawn(Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            crate::delegation::DelegationSignal {
+                child_sid: child_sid.clone(),
+                turn_id: format!("{child_sid}-1"),
+                tail: "stale answer".into(),
+                vendor: AgentVendor::Claude,
+                host: "local".into(),
+                boundary: true,
+                vendor_error: false,
+                interim_notes: 0,
+                covered_turns: vec![format!("{child_sid}-1")],
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while remaining.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first parent submit fails");
+
+        let rearm_gateway = Arc::clone(&gateway);
+        let rearm_child = child_sid.clone();
+        let rearm_parent = new_parent.clone();
+        let rearm = tokio::spawn(async move {
+            Gateway::arm_delegation_watch_shared(
+                rearm_gateway,
+                &rearm_child,
+                &rearm_parent,
+                ccteam_harness::NotifyMode::Final,
+                Some("new task".into()),
+                None,
+                GatewayDeadline::start(),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !rearm.is_finished(),
+            "re-arm must wait while the old completion delivery owns the child claim"
+        );
+        delivery.await.unwrap();
+        assert!(rearm.await.unwrap().unwrap());
+
+        assert_eq!(
+            ccteam_notification_turns(&project_dir, &old_parent).len(),
+            1,
+            "the old completion is delivered before the new dispatch is armed"
+        );
+        let watch = ccteam_harness::read_delegation_watch(&project_dir, &child_sid).unwrap();
+        assert_eq!(watch.parent_sid, new_parent);
+        assert_eq!(watch.title.as_deref(), Some("new task"));
     }
 
     /// e2e: an Ambient spawn records the parent lineage + trigger + title; a
