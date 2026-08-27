@@ -56,6 +56,17 @@ pub struct Tail<T = Value> {
     pub has_more: bool,
 }
 
+/// Classification of one non-blank row in a typed tail scan.
+///
+/// `Skip` is a valid row hidden by the caller's view. It neither consumes the
+/// visible page budget nor increments corruption metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailDecision<T> {
+    Include(T),
+    Skip,
+    Corrupt,
+}
+
 impl<T> Default for Tail<T> {
     fn default() -> Self {
         Self {
@@ -99,7 +110,9 @@ pub struct Delta {
 /// Return the final parseable JSON row, skipping corrupt trailing rows.
 pub fn last_valid(path: &Path) -> Result<Option<Value>> {
     Ok(tail_filter_map_inner(path, 1, None, false, |line| {
-        serde_json::from_slice::<Value>(line).ok()
+        serde_json::from_slice::<Value>(line)
+            .map(TailDecision::Include)
+            .unwrap_or(TailDecision::Corrupt)
     })?
     .events
     .pop())
@@ -128,12 +141,32 @@ pub fn tail_filter_map<T, F>(
     path: &Path,
     n: usize,
     before: Option<u64>,
-    parse: F,
+    mut parse: F,
 ) -> Result<Tail<T>>
 where
     F: FnMut(&[u8]) -> Option<T>,
 {
-    tail_filter_map_inner(path, n, before, true, parse)
+    tail_filter_map_inner(path, n, before, true, |line| match parse(line) {
+        Some(value) => TailDecision::Include(value),
+        None => TailDecision::Corrupt,
+    })
+}
+
+/// Shared typed-tail primitive for views that intentionally hide valid rows.
+///
+/// The reader keeps scanning until it has `n + 1` *included* rows. Therefore
+/// `first_offset`, `has_more`, and the next cursor describe the visible view,
+/// not the number of physical JSONL records crossed.
+pub fn tail_classify_map<T, F>(
+    path: &Path,
+    n: usize,
+    before: Option<u64>,
+    classify: F,
+) -> Result<Tail<T>>
+where
+    F: FnMut(&[u8]) -> TailDecision<T>,
+{
+    tail_filter_map_inner(path, n, before, true, classify)
 }
 
 fn tail_filter_map_inner<T, F>(
@@ -144,7 +177,7 @@ fn tail_filter_map_inner<T, F>(
     mut parse: F,
 ) -> Result<Tail<T>>
 where
-    F: FnMut(&[u8]) -> Option<T>,
+    F: FnMut(&[u8]) -> TailDecision<T>,
 {
     if n == 0 {
         return Ok(Tail::default());
@@ -157,6 +190,7 @@ where
     let target = if probe_older { n.saturating_add(1) } else { n };
     let mut rows = Vec::with_capacity(target.min(1024));
     let mut corrupt_count = 0;
+    let mut records_parsed = 0_u64;
 
     while rows.len() < target {
         let Some((offset, raw)) = reader.next_line()? else {
@@ -167,13 +201,16 @@ where
             continue;
         }
         match parse(line) {
-            Some(value) => rows.push((offset, value)),
-            None => corrupt_count += 1,
+            TailDecision::Include(value) => {
+                records_parsed = records_parsed.saturating_add(1);
+                rows.push((offset, value));
+            }
+            TailDecision::Skip => records_parsed = records_parsed.saturating_add(1),
+            TailDecision::Corrupt => corrupt_count += 1,
         }
     }
 
-    let records_parsed = rows.len();
-    let has_more = probe_older && records_parsed > n;
+    let has_more = probe_older && rows.len() > n;
     if has_more {
         rows.truncate(n);
     }
@@ -181,7 +218,7 @@ where
     let first_offset = rows.first().map(|(offset, _)| *offset);
     let events = rows.into_iter().map(|(_, value)| value).collect();
 
-    record_metrics(reader.bytes_read, records_parsed as u64, corrupt_count);
+    record_metrics(reader.bytes_read, records_parsed, corrupt_count);
 
     Ok(Tail {
         events,
@@ -464,6 +501,54 @@ mod tests {
         let older = tail_valid_before(&path, 2, newest.first_offset).unwrap();
         assert_eq!(older.events.len(), 1);
         assert_eq!(older.events[0]["n"], 1);
+        assert!(!older.has_more);
+    }
+
+    #[test]
+    fn classified_tail_skips_valid_hidden_rows_without_spending_page_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns.jsonl");
+        let mut body = String::new();
+        for n in 0..125_u64 {
+            body.push_str(&format!("{{\"n\":{n},\"visible\":true}}\n"));
+            for _ in 0..3 {
+                body.push_str(&format!("{{\"n\":{n},\"visible\":false}}\n"));
+            }
+        }
+        body.push_str("not-json\n");
+        std::fs::write(&path, body).unwrap();
+
+        let newest = tail_classify_map(&path, 100, None, |line| {
+            let Ok(value) = serde_json::from_slice::<Value>(line) else {
+                return TailDecision::Corrupt;
+            };
+            if value["visible"].as_bool() == Some(true) {
+                TailDecision::Include(value)
+            } else {
+                TailDecision::Skip
+            }
+        })
+        .unwrap();
+        assert_eq!(newest.events.len(), 100);
+        assert_eq!(newest.events.first().unwrap()["n"], 25);
+        assert_eq!(newest.events.last().unwrap()["n"], 124);
+        assert_eq!(newest.corrupt_count, 1);
+        assert!(newest.has_more);
+
+        let older = tail_classify_map(&path, 100, newest.first_offset, |line| {
+            let Ok(value) = serde_json::from_slice::<Value>(line) else {
+                return TailDecision::Corrupt;
+            };
+            if value["visible"].as_bool() == Some(true) {
+                TailDecision::Include(value)
+            } else {
+                TailDecision::Skip
+            }
+        })
+        .unwrap();
+        assert_eq!(older.events.len(), 25);
+        assert_eq!(older.events.first().unwrap()["n"], 0);
+        assert_eq!(older.events.last().unwrap()["n"], 24);
         assert!(!older.has_more);
     }
 

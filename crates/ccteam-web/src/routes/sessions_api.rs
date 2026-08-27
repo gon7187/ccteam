@@ -836,18 +836,20 @@ fn collect_session_turns(
     verdicts: &std::collections::BTreeMap<(String, String), TurnVerdict>,
 ) -> anyhow::Result<SessionHistoryPage> {
     let path = turns_jsonl_path(project_dir, sid);
-    let tail = ccteam_core::journal::tail_filter_map(&path, limit, before, |line| {
-        serde_json::from_slice::<TurnRecord>(line)
-            .ok()
-            // Preserve the journal reader's corrupt-row accounting: an
-            // interim row is valid but intentionally invisible, not malformed.
-            .map(|turn| (!turn.interim()).then_some(turn))
+    let tail = ccteam_core::journal::tail_classify_map(&path, limit, before, |line| {
+        let Ok(turn) = serde_json::from_slice::<TurnRecord>(line) else {
+            return ccteam_core::journal::TailDecision::Corrupt;
+        };
+        if turn.interim() {
+            ccteam_core::journal::TailDecision::Skip
+        } else {
+            ccteam_core::journal::TailDecision::Include(turn)
+        }
     })?;
     Ok(SessionHistoryPage {
         events: tail
             .events
             .iter()
-            .flatten()
             .map(|turn| {
                 let verdict = verdicts.get(&(sid.to_string(), turn.turn_id.clone()));
                 turn_to_event(turn, verdict)
@@ -2532,6 +2534,80 @@ mod tests {
         assert_eq!(events[0]["assistant"], "LGTM");
         assert_eq!(events[1]["turn_id"], "t2");
         assert_eq!(events[1]["assistant"], "all green");
+    }
+
+    #[test]
+    fn collect_session_turns_paginates_visible_rows_across_interim_runs() {
+        use ccteam_harness::execution::turns_mirror::append_turn;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path();
+        let sid = "s1";
+        let mut expected = Vec::new();
+        for n in 0..61_u64 {
+            let mut row = TurnRecord {
+                turn_id: format!("turn-{n}"),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: "reviewer".into(),
+                user: format!("user-{n}"),
+                assistant: String::new(),
+                usage: serde_json::Value::Null,
+                tool_calls: vec![],
+                attachments: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
+            };
+            append_turn(project_dir, sid, &row).unwrap();
+            expected.push((row.turn_id.clone(), row.user.clone(), row.assistant.clone()));
+            for draft in 0..3 {
+                row.turn_id = format!("draft-{n}-{draft}");
+                row.user.clear();
+                row.assistant = format!("draft {draft}");
+                row.outcome = Some("interim".into());
+                append_turn(project_dir, sid, &row).unwrap();
+            }
+            row.turn_id = format!("turn-{n}");
+            row.assistant = format!("final-{n}");
+            row.outcome = Some("completed".into());
+            append_turn(project_dir, sid, &row).unwrap();
+            expected.push((row.turn_id.clone(), row.user.clone(), row.assistant.clone()));
+        }
+
+        let mut before = None;
+        let mut pages = Vec::new();
+        loop {
+            let page = collect_session_turns(
+                project_dir,
+                sid,
+                50,
+                before,
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+            pages.push(
+                page.events
+                    .iter()
+                    .map(|event| {
+                        (
+                            event["turn_id"].as_str().unwrap().to_string(),
+                            event["user"].as_str().unwrap().to_string(),
+                            event["assistant"].as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            if !page.has_more {
+                break;
+            }
+            before = Some(page.next_before.unwrap().parse().unwrap());
+        }
+        // Tail pages arrive newest-page first but preserve chronological order
+        // within each page. Reassemble globally for an exact no-gap check.
+        pages.reverse();
+        let actual = pages.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[test]

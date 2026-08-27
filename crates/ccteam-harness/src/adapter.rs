@@ -671,7 +671,10 @@ pub enum ThreadEvent {
     ItemCompleted {
         item: ThreadItem,
     },
-    Error(ThreadErrorEvent),
+    /// Nonterminal adapter/transport diagnostic. This never closes, fails, or
+    /// accounts a turn; terminal failures must use `TurnFailed` with an
+    /// explicit canonical turn id.
+    Diagnostic(ThreadErrorEvent),
 }
 
 /// v8.1 neutral event name. This is intentionally an alias for the
@@ -1173,7 +1176,7 @@ pub enum ThreadItemDetails {
     Error(String),
 }
 
-/// Error payload on [`ThreadEvent::TurnFailed`] / [`ThreadEvent::Error`].
+/// Error payload on [`ThreadEvent::TurnFailed`] / [`ThreadEvent::Diagnostic`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadErrorEvent {
     pub kind: String,

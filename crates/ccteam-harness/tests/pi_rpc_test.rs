@@ -392,6 +392,7 @@ async fn settled_terminal_routing_usage_context_and_directives() {
         ("multi", None),
         ("retry", None),
         ("tool-preamble", None),
+        ("extension-error", None),
         ("length", Some("max_tokens")),
         ("error", Some("vendor_error")),
         ("aborted", Some("aborted")),
@@ -421,6 +422,25 @@ async fn settled_terminal_routing_usage_context_and_directives() {
                 ThreadEvent::ItemCompleted { item }
                     if matches!(item.details, ThreadItemDetails::AgentMessage(_))
             )));
+        }
+        if message == "extension-error" {
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ThreadEvent::Diagnostic(error)
+                    if error.kind == "protocol"
+                        && error.message.contains("before_agent_start")
+            )));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        ThreadEvent::TurnCompleted { .. } | ThreadEvent::TurnFailed { .. }
+                    ))
+                    .count(),
+                1,
+                "extension diagnostic must not become a second terminal"
+            );
         }
     }
 

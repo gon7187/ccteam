@@ -297,12 +297,14 @@ pub fn rebuild_experience(
             let Ok(turn_records) = super::turns_mirror::read_all_turns(project_dir, &sid) else {
                 continue;
             };
-            // turns.jsonl may have user-only + assistant-only rows for the same
-            // turn_id; emit one experience row per distinct turn_id (prefer the
-            // last row which usually carries the assistant side).
+            // Only canonical terminal rows are rebuild authority. User-only,
+            // interim, and legacy rows without an explicit outcome are skipped:
+            // guessing their boundary would resurrect drafts as completed work.
             let mut by_id: BTreeMap<String, super::turns_mirror::TurnRecord> = BTreeMap::new();
             for tr in turn_records {
-                by_id.insert(tr.turn_id.clone(), tr);
+                if matches!(tr.outcome.as_deref(), Some("completed" | "failed")) {
+                    by_id.insert(tr.turn_id.clone(), tr);
+                }
             }
             for (turn_id, tr) in by_id {
                 let progress = progress_by_key.get(&(sid.clone(), turn_id.clone()));
@@ -334,7 +336,8 @@ pub fn rebuild_experience(
                 let outcome = progress
                     .and_then(|ev| ev.get("outcome"))
                     .and_then(|value| value.as_str())
-                    .map(str::to_owned);
+                    .map(str::to_owned)
+                    .or_else(|| tr.outcome.clone());
                 let duration_ms = progress
                     .and_then(|ev| ev.get("duration_ms"))
                     .and_then(|value| value.as_u64());
@@ -414,8 +417,12 @@ fn cost_vendor_from_label(vendor: &str) -> Option<ccteam_cost::Vendor> {
 }
 
 fn read_retained_progress_events(path: &Path) -> Result<Vec<serde_json::Value>> {
-    let mut events =
-        super::fs_atomic::read_jsonl(&super::progress_bridge::progress_archive_path(path))?;
+    let checkpoint = super::progress_bridge::load_or_recover_progress_checkpoint(path)?;
+    let mut events = checkpoint
+        .into_iter()
+        .flat_map(|checkpoint| checkpoint.terminal_turns.into_values())
+        .flat_map(|turns| turns.into_values())
+        .collect::<Vec<_>>();
     events.extend(super::fs_atomic::read_jsonl(path)?);
     Ok(events)
 }
@@ -629,7 +636,7 @@ mod tests {
                 assert_eq!(turn.cost_usd, Some(0.73));
                 assert_eq!(turn.vendor, "opencode");
                 assert_eq!(turn.role, "historical-role");
-                assert_eq!(turn.outcome, None);
+                assert_eq!(turn.outcome.as_deref(), Some("failed"));
                 assert_eq!(turn.duration_ms, None);
                 assert_eq!(turn.role_sha, None);
                 assert_eq!(turn.skills_sha, None);
@@ -688,7 +695,7 @@ mod tests {
                 usage: serde_json::Value::Null,
                 tool_calls: vec![],
                 attachments: vec![],
-                outcome: None,
+                outcome: Some("completed".into()),
                 error_kind: None,
                 error: None,
             },

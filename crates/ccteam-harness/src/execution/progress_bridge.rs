@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write as _};
+use std::io::{BufRead, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,8 @@ static PERSIST_OBSERVER: OnceLock<Box<PersistObserver>> = OnceLock::new();
 
 /// Default active progress journal size before single-level rotation.
 pub const DEFAULT_PROGRESS_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
-const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+const VERDICT_INDEX_SCHEMA_VERSION: u32 = 1;
 
 pub const CHAT_SESSION_RESET: &str = "chat_session_reset";
 pub const CHAT_SESSION_STARTED: &str = "chat_session_started";
@@ -415,6 +416,11 @@ pub struct ProgressCheckpoint {
     /// keep the checkpoint JSON deterministic and object-key compatible.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub turn_verdicts: BTreeMap<String, BTreeMap<String, TurnVerdict>>,
+    /// Latest terminal completion projection for every `(sid, turn_id)` that
+    /// has rotated away. Experience rebuild needs the historical model,
+    /// duration, role/skill hashes, usage, cost inputs, and outcome.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub terminal_turns: BTreeMap<String, BTreeMap<String, Value>>,
     /// The current `.1` archive already included in these cumulative totals.
     pub coverage: Option<ArchiveCoverage>,
 }
@@ -430,7 +436,38 @@ impl Default for ProgressCheckpoint {
             cost_total_by_vendor: BTreeMap::new(),
             cost_total_by_sid: BTreeMap::new(),
             turn_verdicts: BTreeMap::new(),
+            terminal_turns: BTreeMap::new(),
             coverage: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PendingVerdictIndexWrite {
+    verdict: TurnVerdict,
+    active_offset: u64,
+    line_len: u64,
+    line_sha256: String,
+}
+
+/// Small durable projection used by verdict GET/PUT. `progress.jsonl` remains
+/// authoritative; `pending` makes the two-file update crash-recoverable by
+/// verifying one exact bounded line at its recorded active-file offset.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ProgressVerdictIndex {
+    schema_version: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    verdicts: BTreeMap<String, BTreeMap<String, TurnVerdict>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending: Option<PendingVerdictIndexWrite>,
+}
+
+impl Default for ProgressVerdictIndex {
+    fn default() -> Self {
+        Self {
+            schema_version: VERDICT_INDEX_SCHEMA_VERSION,
+            verdicts: BTreeMap::new(),
+            pending: None,
         }
     }
 }
@@ -573,6 +610,11 @@ pub fn progress_checkpoint_path(active_path: &Path) -> PathBuf {
     progress_sibling_path(active_path, ".checkpoint.json")
 }
 
+/// Resolve the compact durable verdict projection for one progress journal.
+pub fn progress_verdict_index_path(active_path: &Path) -> PathBuf {
+    progress_sibling_path(active_path, ".verdicts.json")
+}
+
 /// Read a progress checkpoint without mutating or recovering it.
 pub fn read_progress_checkpoint(active_path: &Path) -> Result<Option<ProgressCheckpoint>> {
     let path = progress_checkpoint_path(active_path);
@@ -583,7 +625,7 @@ pub fn read_progress_checkpoint(active_path: &Path) -> Result<Option<ProgressChe
     };
     let checkpoint = serde_json::from_slice::<ProgressCheckpoint>(&bytes)
         .with_context(|| format!("parse {}", path.display()))?;
-    if checkpoint.schema_version != CHECKPOINT_SCHEMA_VERSION {
+    if !matches!(checkpoint.schema_version, 1 | CHECKPOINT_SCHEMA_VERSION) {
         anyhow::bail!(
             "unsupported progress checkpoint schema {} in {}",
             checkpoint.schema_version,
@@ -620,6 +662,7 @@ pub fn load_or_recover_progress_checkpoint(
     if !active_path.exists()
         && !progress_archive_path(active_path).exists()
         && !progress_checkpoint_path(active_path).exists()
+        && !progress_verdict_index_path(active_path).exists()
     {
         return Ok(None);
     }
@@ -629,7 +672,9 @@ pub fn load_or_recover_progress_checkpoint(
     let lock_file = open_progress_lock(active_path)?;
     let _lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(active_path).display()))?;
-    recover_progress_checkpoint_locked(active_path)
+    let checkpoint = recover_progress_checkpoint_locked(active_path)?;
+    ensure_verdict_index_locked(active_path, checkpoint.as_ref())?;
+    Ok(checkpoint)
 }
 
 /// Extract the one lifetime cost formula shared by projection and checkpoint
@@ -707,13 +752,17 @@ pub fn latest_turn_verdicts(path: &Path) -> Result<BTreeMap<(String, String), Tu
     if !path.exists()
         && !progress_archive_path(path).exists()
         && !progress_checkpoint_path(path).exists()
+        && !progress_verdict_index_path(path).exists()
     {
         return Ok(BTreeMap::new());
     }
     let lock_file = open_progress_lock(path)?;
     let _lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
-    recover_progress_checkpoint_locked(path)?;
+    if !progress_verdict_index_path(path).exists() {
+        let checkpoint = recover_progress_checkpoint_locked(path)?;
+        ensure_verdict_index_locked(path, checkpoint.as_ref())?;
+    }
     latest_turn_verdicts_locked(path)
 }
 
@@ -742,8 +791,16 @@ pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Res
     let lock_file = open_progress_lock(path)?;
     let lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
-    if !path.exists() && progress_archive_path(path).exists() {
-        recover_progress_checkpoint_locked(path)?;
+    if !progress_verdict_index_path(path).exists() {
+        if path.exists()
+            || progress_archive_path(path).exists()
+            || progress_checkpoint_path(path).exists()
+        {
+            let checkpoint = recover_progress_checkpoint_locked(path)?;
+            ensure_verdict_index_locked(path, checkpoint.as_ref())?;
+        } else {
+            write_verdict_index(path, &ProgressVerdictIndex::default())?;
+        }
     }
     let key = (verdict.sid.clone(), verdict.turn_id.clone());
     if latest_turn_verdicts_locked(path)?
@@ -755,7 +812,48 @@ pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Res
         return Ok(false);
     }
 
-    let rotated = append_serialized_locked(path, &line)?;
+    let current_size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    if current_size > 0 && current_size.saturating_add(byte_count) > progress_rotate_bytes() {
+        rotate_progress_locked(path)?;
+    }
+    let active_offset = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let mut index = read_verdict_index_locked(path)?.ok_or_else(|| {
+        anyhow::anyhow!("progress verdict index disappeared for {}", path.display())
+    })?;
+    index.pending = Some(PendingVerdictIndexWrite {
+        verdict: verdict.clone(),
+        active_offset,
+        line_len: byte_count,
+        line_sha256: hex_digest(Sha256::digest(&line).as_slice()),
+    });
+    write_verdict_index(path, &index)?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    file.write_all(&line)
+        .with_context(|| format!("write verdict event to {}", path.display()))?;
+    let size = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    drop(file);
+
+    index
+        .verdicts
+        .entry(verdict.sid.clone())
+        .or_default()
+        .insert(verdict.turn_id.clone(), verdict.clone());
+    index.pending = None;
+    write_verdict_index(path, &index)?;
+    let rotated = if size > progress_rotate_bytes() {
+        rotate_progress_locked(path)?;
+        true
+    } else {
+        current_size > 0 && current_size.saturating_add(byte_count) > progress_rotate_bytes()
+    };
     drop(lock);
     record_appended(TURN_VERDICT, false, byte_count);
     if let Some(observer) = PERSIST_OBSERVER.get() {
@@ -766,21 +864,100 @@ pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Res
 
 fn latest_turn_verdicts_locked(path: &Path) -> Result<BTreeMap<(String, String), TurnVerdict>> {
     let mut latest = BTreeMap::new();
-    if let Some(checkpoint) = read_progress_checkpoint(path)? {
-        for (sid, turns) in checkpoint.turn_verdicts {
-            for (turn_id, verdict) in turns {
-                latest.insert((sid.clone(), turn_id), verdict);
-            }
-        }
-    }
-    for journal_path in [progress_archive_path(path), path.to_path_buf()] {
-        for event in super::fs_atomic::read_jsonl::<Value>(&journal_path)? {
-            if let Some(verdict) = parse_turn_verdict_event(&event) {
-                latest.insert((verdict.sid.clone(), verdict.turn_id.clone()), verdict);
-            }
+    let Some(index) = read_verdict_index_locked(path)? else {
+        anyhow::bail!(
+            "progress verdict index missing for {}; run progress recovery before serving verdict reads",
+            path.display()
+        );
+    };
+    for (sid, turns) in index.verdicts {
+        for (turn_id, verdict) in turns {
+            latest.insert((sid.clone(), turn_id), verdict);
         }
     }
     Ok(latest)
+}
+
+fn read_verdict_index_locked(path: &Path) -> Result<Option<ProgressVerdictIndex>> {
+    let index_path = progress_verdict_index_path(path);
+    let bytes = match std::fs::read(&index_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", index_path.display())),
+    };
+    let mut index = serde_json::from_slice::<ProgressVerdictIndex>(&bytes)
+        .with_context(|| format!("parse {}", index_path.display()))?;
+    if index.schema_version != VERDICT_INDEX_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported progress verdict index schema {} in {}",
+            index.schema_version,
+            index_path.display()
+        );
+    }
+
+    let Some(pending) = index.pending.take() else {
+        return Ok(Some(index));
+    };
+    let line_len = usize::try_from(pending.line_len).context("verdict pending line too large")?;
+    let mut raw = vec![0_u8; line_len];
+    let committed = File::open(path)
+        .and_then(|mut file| {
+            file.seek(SeekFrom::Start(pending.active_offset))?;
+            file.read_exact(&mut raw)
+        })
+        .is_ok()
+        && hex_digest(Sha256::digest(&raw).as_slice()) == pending.line_sha256
+        && serde_json::from_slice::<Value>(trim_ascii_line(&raw))
+            .ok()
+            .and_then(|event| parse_turn_verdict_event(&event))
+            .is_some_and(|verdict| verdict == pending.verdict);
+    if committed {
+        index
+            .verdicts
+            .entry(pending.verdict.sid.clone())
+            .or_default()
+            .insert(pending.verdict.turn_id.clone(), pending.verdict);
+    }
+    write_verdict_index(path, &index)?;
+    Ok(Some(index))
+}
+
+fn trim_ascii_line(mut raw: &[u8]) -> &[u8] {
+    while raw.last().is_some_and(u8::is_ascii_whitespace) {
+        raw = &raw[..raw.len() - 1];
+    }
+    while raw.first().is_some_and(u8::is_ascii_whitespace) {
+        raw = &raw[1..];
+    }
+    raw
+}
+
+fn write_verdict_index(path: &Path, index: &ProgressVerdictIndex) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(index).context("serialize progress verdict index")?;
+    atomic_write_durable(&progress_verdict_index_path(path), &bytes)
+}
+
+fn ensure_verdict_index_locked(path: &Path, checkpoint: Option<&ProgressCheckpoint>) -> Result<()> {
+    if read_verdict_index_locked(path)?.is_some() {
+        return Ok(());
+    }
+
+    let mut index = ProgressVerdictIndex::default();
+    if let Some(checkpoint) = checkpoint {
+        index.verdicts = checkpoint.turn_verdicts.clone();
+    }
+    // Recovery folds the retained archive into the checkpoint first. Only the
+    // active journal remains to backfill, once, outside GET/PUT request paths.
+    journal::scan_stream(path, |event| {
+        if let Some(verdict) = parse_turn_verdict_event(&event) {
+            index
+                .verdicts
+                .entry(verdict.sid.clone())
+                .or_default()
+                .insert(verdict.turn_id.clone(), verdict);
+        }
+    })?;
+    write_verdict_index(path, &index)
 }
 
 fn verdict_content_eq(left: &TurnVerdict, right: &TurnVerdict) -> bool {
@@ -885,6 +1062,13 @@ fn append_serialized(path: &Path, line: &[u8]) -> Result<bool> {
 }
 
 fn append_serialized_locked(path: &Path, line: &[u8]) -> Result<bool> {
+    if !path.exists()
+        && !progress_archive_path(path).exists()
+        && !progress_checkpoint_path(path).exists()
+        && !progress_verdict_index_path(path).exists()
+    {
+        write_verdict_index(path, &ProgressVerdictIndex::default())?;
+    }
     // A real crash in the rename -> checkpoint window leaves `.1` present and
     // active absent. Recover before accepting another row so an uncovered
     // archive can never survive until a later rotation replaces it.
@@ -938,6 +1122,11 @@ fn open_progress_lock(active_path: &Path) -> Result<File> {
 }
 
 fn rotate_progress_locked(active_path: &Path) -> Result<()> {
+    // Upgrade/backfill the retained archive and materialize the verdict index
+    // before `.1` is replaced. In particular, a v1 checkpoint covered `.1`
+    // aggregates but carried no verdict/completion projection.
+    let checkpoint = recover_progress_checkpoint_locked(active_path)?;
+    ensure_verdict_index_locked(active_path, checkpoint.as_ref())?;
     let archive_path = progress_archive_path(active_path);
     match std::fs::remove_file(&archive_path) {
         Ok(()) => {}
@@ -966,7 +1155,38 @@ fn recover_progress_checkpoint_locked(active_path: &Path) -> Result<Option<Progr
     let archive_path = progress_archive_path(active_path);
     let archive = archive_coverage_for_path(&archive_path)?;
     let mut checkpoint = read_progress_checkpoint(active_path)?;
+
+    if checkpoint
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.schema_version == 1)
+    {
+        let mut upgraded = checkpoint.take().expect("checked above");
+        if upgraded.coverage.as_ref() == archive.as_ref() {
+            if archive.is_some() {
+                journal::scan_stream(&archive_path, |event| {
+                    fold_checkpoint_projection(&mut upgraded, event);
+                })?;
+            }
+            // This archive was already included in v1 lifetime aggregates.
+            // Backfill only the state projections or costs/counts double.
+            upgraded.schema_version = CHECKPOINT_SCHEMA_VERSION;
+            write_progress_checkpoint(active_path, &upgraded)?;
+            checkpoint = Some(upgraded);
+        } else {
+            // The current archive is new and will be folded normally below.
+            upgraded.schema_version = CHECKPOINT_SCHEMA_VERSION;
+            checkpoint = Some(upgraded);
+        }
+    }
+
     let Some(archive) = archive else {
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            if checkpoint.schema_version == CHECKPOINT_SCHEMA_VERSION
+                && !progress_checkpoint_path(active_path).exists()
+            {
+                write_progress_checkpoint(active_path, checkpoint)?;
+            }
+        }
         return Ok(checkpoint);
     };
     if checkpoint
@@ -978,12 +1198,7 @@ fn recover_progress_checkpoint_locked(active_path: &Path) -> Result<Option<Progr
 
     let mut next = checkpoint.take().unwrap_or_default();
     let summary = journal::scan_stream(&archive_path, |event| {
-        if let Some(verdict) = parse_turn_verdict_event(&event) {
-            next.turn_verdicts
-                .entry(verdict.sid.clone())
-                .or_default()
-                .insert(verdict.turn_id.clone(), verdict);
-        }
+        fold_checkpoint_projection(&mut next, event.clone());
         if let Some(cost) = progress_cost_contribution(&event) {
             next.cost_total_usd += cost.cost_usd;
             if let Some(vendor) = cost.vendor {
@@ -1002,9 +1217,37 @@ fn recover_progress_checkpoint_locked(active_path: &Path) -> Result<Option<Progr
         .corrupt_line_count
         .saturating_add(u64::try_from(summary.corrupt_count).unwrap_or(u64::MAX));
     next.rotation_sequence = next.rotation_sequence.saturating_add(1);
+    next.schema_version = CHECKPOINT_SCHEMA_VERSION;
     next.coverage = Some(archive);
     write_progress_checkpoint(active_path, &next)?;
     Ok(Some(next))
+}
+
+fn fold_checkpoint_projection(checkpoint: &mut ProgressCheckpoint, event: Value) {
+    if let Some(verdict) = parse_turn_verdict_event(&event) {
+        checkpoint
+            .turn_verdicts
+            .entry(verdict.sid.clone())
+            .or_default()
+            .insert(verdict.turn_id.clone(), verdict);
+    }
+    if event_kind_name(&event) == Some(CHAT_TURN_COMPLETED) {
+        if let (Some(sid), Some(turn_id)) = (
+            event.get("sid").and_then(Value::as_str).map(str::to_string),
+            event
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ) {
+            if !sid.is_empty() && !turn_id.is_empty() {
+                checkpoint
+                    .terminal_turns
+                    .entry(sid)
+                    .or_default()
+                    .insert(turn_id, event);
+            }
+        }
+    }
 }
 
 fn write_progress_checkpoint(active_path: &Path, checkpoint: &ProgressCheckpoint) -> Result<()> {
