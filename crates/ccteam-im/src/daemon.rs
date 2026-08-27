@@ -74,11 +74,23 @@ type DraftRoutes = Arc<StdMutex<HashMap<DraftRouteKey, DraftRoute>>>;
 
 /// Releases exactly one successor in a chat-local inbound FIFO even if the
 /// current task is aborted or panics.
-struct InboundLaneCompletion(Arc<tokio::sync::Notify>);
+struct InboundLaneCompletion(Option<Arc<tokio::sync::Notify>>);
+
+impl InboundLaneCompletion {
+    fn new(completion: Arc<tokio::sync::Notify>) -> Self {
+        Self(Some(completion))
+    }
+
+    fn release(&mut self) {
+        if let Some(completion) = self.0.take() {
+            completion.notify_one();
+        }
+    }
+}
 
 impl Drop for InboundLaneCompletion {
     fn drop(&mut self) {
-        self.0.notify_one();
+        self.release();
     }
 }
 
@@ -1805,7 +1817,7 @@ fn spawn_inbound_consumer(
                 let msg = msg.clone();
                 let cid = cid.clone();
                 tasks.spawn(async move {
-                    let _completion = InboundLaneCompletion(completion);
+                    let _completion = InboundLaneCompletion::new(completion);
                     if let Some(predecessor) = predecessor {
                         predecessor.notified().await;
                     }
@@ -1826,22 +1838,62 @@ fn spawn_inbound_consumer(
                 continue;
             }
 
+            // Lexical `/status` and `/sessions` are only candidates for the
+            // observability fast path. A preceding `/use` can make the same
+            // free-text command an answer to a pending choice. Reserve its
+            // FIFO slot now, then reclassify after the predecessor's routing
+            // mutation is visible. If it remains read-only, release the slot
+            // before the slow probes; otherwise hold it through normal inbound
+            // handling so no later stateful message can overtake it.
+            let predecessor = lane_tails.get(&lane_key).cloned();
+            let completion = Arc::new(tokio::sync::Notify::new());
+            lane_tails.insert(lane_key.clone(), Arc::clone(&completion));
+            let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+            observation_tails.insert(lane_key, ready_rx);
             let gateway = Arc::clone(&gateway);
             let channel = Arc::clone(&channel);
             let msg = msg.clone();
             let cid = cid.clone();
             tasks.spawn(async move {
-                if let Some(mut prior_observation) = prior_observation {
-                    let _ = prior_observation.wait_for(|ready| *ready).await;
-                }
-                let replies = Gateway::handle_observability_shared(
-                    gateway,
+                let mut completion = InboundLaneCompletion::new(completion);
+                let still_observability = Gateway::inbound_can_bypass_after_prior_routing(
+                    &gateway,
+                    prior_observation,
                     &msg.channel,
                     &msg.reply_target,
                     &msg.sender,
                     &clean_payload,
+                    msg.selection.is_some(),
                 )
                 .await;
+                let replies = if still_observability {
+                    let _ = ready_tx.send(true);
+                    completion.release();
+                    Gateway::handle_observability_shared(
+                        gateway,
+                        &msg.channel,
+                        &msg.reply_target,
+                        &msg.sender,
+                        &clean_payload,
+                    )
+                    .await
+                } else {
+                    if let Some(predecessor) = predecessor {
+                        predecessor.notified().await;
+                    }
+                    Gateway::handle_message_shared_with_ready(
+                        gateway,
+                        &msg.channel,
+                        &msg.reply_target,
+                        &msg.sender,
+                        &msg.id,
+                        &clean_payload,
+                        &msg.attachments,
+                        msg.selection.as_ref(),
+                        Some(ready_tx),
+                    )
+                    .await
+                };
                 deliver_gateway_replies(&cid, route_t0, &msg, channel.as_ref(), replies).await;
             });
         }

@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::VecDeque, sync::Mutex};
 
 use async_trait::async_trait;
 use ccteam_harness::{
@@ -14,7 +15,11 @@ use futures::stream::BoxStream;
 #[derive(Debug, Default)]
 struct DeadlineAdapter {
     submissions: AtomicUsize,
+    interrupts: AtomicUsize,
     stall_submit: AtomicBool,
+    emit_started_before_stall: AtomicBool,
+    events: Arc<Mutex<VecDeque<ThreadEvent>>>,
+    events_notify: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait]
@@ -48,6 +53,15 @@ impl HarnessAdapter for DeadlineAdapter {
         _routing: TurnRouting,
     ) -> Result<TurnSubmission, HarnessError> {
         let sequence = self.submissions.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.emit_started_before_stall.load(Ordering::SeqCst) {
+            self.events
+                .lock()
+                .unwrap()
+                .push_back(ThreadEvent::TurnStarted {
+                    turn_id: format!("turn-{sequence}"),
+                });
+            self.events_notify.notify_waiters();
+        }
         if self.stall_submit.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
@@ -57,7 +71,20 @@ impl HarnessAdapter for DeadlineAdapter {
     }
 
     fn events(&self, _handle: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
-        Box::pin(futures::stream::empty())
+        let events = Arc::clone(&self.events);
+        let notify = Arc::clone(&self.events_notify);
+        Box::pin(futures::stream::unfold((), move |_| {
+            let events = Arc::clone(&events);
+            let notify = Arc::clone(&notify);
+            async move {
+                loop {
+                    if let Some(event) = events.lock().unwrap().pop_front() {
+                        return Some((event, ()));
+                    }
+                    notify.notified().await;
+                }
+            }
+        }))
     }
 
     fn event_attachment(&self) -> EventAttachment {
@@ -80,6 +107,11 @@ impl HarnessAdapter for DeadlineAdapter {
     }
 
     async fn close_thread(&self, _handle: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn interrupt_turn(&self, _handle: &ThreadHandle) -> Result<(), HarnessError> {
+        self.interrupts.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -186,20 +218,115 @@ async fn queue_and_vendor_deadlines_are_split_and_leave_gateway_healthy() {
     .expect_err("vendor timeout must be classified independently");
     assert_code(&vendor_error, "vendor_submit_timeout");
 
-    adapter.stall_submit.store(false, Ordering::SeqCst);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        assert_eq!(gateway.lock().await.session_views().len(), 1);
-        Gateway::submit_to_sid_shared(
-            Arc::clone(&gateway),
-            &created.sid,
-            "healthy-after-vendor".to_string(),
-            GatewayDeadline::start(),
-        )
-        .await
-    })
-    .await
-    .expect("status and normal turn recover after vendor timeout")
-    .expect("normal turn after vendor failure");
+    assert!(
+        gateway.lock().await.session_turn_in_flight(&created.sid),
+        "a dispatched request with a missing acknowledgement remains in flight"
+    );
+    let rendered = vendor_error.to_string();
+    assert!(rendered.contains("outcome is unknown"), "{rendered}");
+    assert!(rendered.contains("do not retry"), "{rendered}");
+    assert!(rendered.contains("/status"), "{rendered}");
 
-    assert_eq!(adapter.submissions.load(Ordering::SeqCst), 3);
+    adapter.stall_submit.store(false, Ordering::SeqCst);
+    let retry_error = Gateway::submit_to_sid_shared(
+        Arc::clone(&gateway),
+        &created.sid,
+        "blind-retry".to_string(),
+        GatewayDeadline::start(),
+    )
+    .await
+    .expect_err("an outcome-unknown turn must reject a blind second dispatch");
+    assert_code(&retry_error, "vendor_submit_timeout");
+    assert_eq!(retry_error.to_string(), rendered);
+
+    assert_eq!(adapter.submissions.load(Ordering::SeqCst), 2);
+
+    let interrupted = Gateway::submit_to_sid_shared(
+        Arc::clone(&gateway),
+        &created.sid,
+        "/interrupt".to_string(),
+        GatewayDeadline::start(),
+    )
+    .await
+    .expect("emergency interrupt bypasses the blind user-payload guard");
+    assert_eq!(interrupted, format!("directive:{}", created.sid));
+    assert_eq!(adapter.interrupts.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.submissions.load(Ordering::SeqCst), 2);
+
+    let status = tokio::time::timeout(
+        Duration::from_secs(1),
+        Gateway::handle_observability_shared(
+            Arc::clone(&gateway),
+            "web",
+            "web-api",
+            "web-api",
+            "/status",
+        ),
+    )
+    .await
+    .expect("outcome-unknown state never blocks reconciliation status")
+    .expect("status remains available");
+    assert_eq!(status.len(), 1);
+
+    let stopped = Gateway::handle_message_shared(
+        Arc::clone(&gateway),
+        "web",
+        "web-api",
+        "web-api",
+        "stop-after-unknown",
+        &format!("/stop {}", created.sid),
+        &[],
+        None,
+    )
+    .await
+    .expect("outcome-unknown state never blocks explicit stop");
+    assert!(stopped[0].plain.contains("остановлена"), "{stopped:?}");
+
+    let reconciled_adapter = Arc::new(DeadlineAdapter::default());
+    let reconciled_gateway = Arc::new(tokio::sync::Mutex::new(Gateway::new(
+        Arc::clone(&reconciled_adapter) as Arc<dyn HarnessAdapter + Send + Sync>,
+        "alpha",
+        &project,
+    )));
+    let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+    reconciled_gateway.lock().await.set_event_sink(events);
+    let reconciled = Gateway::create_session_api_tuned_shared(
+        Arc::clone(&reconciled_gateway),
+        "alpha".to_string(),
+        String::new(),
+        AgentVendor::Claude,
+        PermissionMode::Skip,
+        SessionProtocol::StreamJson,
+        "web-api".to_string(),
+        SpawnTuning::default(),
+        GatewayDeadline::start(),
+    )
+    .await
+    .expect("seed reconciled session");
+    reconciled_adapter
+        .emit_started_before_stall
+        .store(true, Ordering::SeqCst);
+    reconciled_adapter
+        .stall_submit
+        .store(true, Ordering::SeqCst);
+    Gateway::submit_to_sid_shared(
+        Arc::clone(&reconciled_gateway),
+        &reconciled.sid,
+        "started-before-ack".to_string(),
+        GatewayDeadline::start(),
+    )
+    .await
+    .expect_err("ack still times out after canonical start");
+    reconciled_adapter
+        .stall_submit
+        .store(false, Ordering::SeqCst);
+    Gateway::submit_to_sid_shared(
+        Arc::clone(&reconciled_gateway),
+        &reconciled.sid,
+        "follow-up-after-reconciliation".to_string(),
+        GatewayDeadline::start(),
+    )
+    .await
+    .expect("canonical TurnStarted wins the timeout race");
+    assert_eq!(reconciled_adapter.submissions.load(Ordering::SeqCst), 2);
 }
