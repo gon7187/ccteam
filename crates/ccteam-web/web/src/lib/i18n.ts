@@ -37,9 +37,13 @@ export const I18N: Record<Lang, Record<string, string>> = {
     convPh: "随心输入(Enter 发送,Shift+Enter 换行)",
     approve: "请求批准",
     quickStart: "快速开始",
-    tplCommanderT: "总控-工班",
-    tplCommanderD: "claude 总控规划拆解与验收;codex 干开发,grok 跑社区调研,完工自动回报",
-    tplCommanderP: "先用 status 确认本项目可用的 vendor,再把下面的任务规划拆解,用 session_spawn / session_dispatch 派工:开发交给 codex,社区/生态调研交给 grok;你负责总控、验收与汇总,完工通知会自动回到你这里。任务:",
+    tplCommanderT: "指挥官",
+    tplCommanderD: "Opus 统筹，Luna/Terra 执行，Sonnet/Fable/Haiku 支援，Opus + Sol 双重终审；缺失角色回退到 Codex",
+    tplCommanderP:
+      "先调用 status，只使用本项目可用的 vendor、模型和 effort 等级。你是指挥官，优先使用最高可用 effort 的 Claude Opus；只负责架构、拆解、分工、控制和验收，不做例行工作。如果当前会话不是 Opus，请创建独立的 Opus 指挥官并把任务交给它；Claude 或 Opus 不可用时，由 Codex 接管。\n\n" +
+      "团队：\n• Codex Luna，最高可用 effort：主力执行代码、研究、网络环境和其他实现；独立任务最多可并行启动 10 个 Luna。\n• Codex Terra，最高可用 effort：高级开发与研究，负责前端、视觉任务和复杂实现。\n• Claude Sonnet，最高可用 effort：文档、图谱和低成本通用任务。\n• Claude Fable，最高可用 effort：仅用于危急情况、争议决策和资深建议。\n• Claude Haiku：快速搜索、小型文档和短修复。\n\n" +
+      "最终门禁：创建两个独立的新会话——Claude Opus 和 Codex Sol，均使用各自最高可用 effort。只有两者批准同一修订时才通过；若意见不一致，把问题退回执行者，修复后重新进行两次评审。\n\n" +
+      "如果所需 vendor、模型或 effort 不可用，或 spawn 被拒绝，不要停工：改用 status 中 Codex 最佳可用模型及其最高 effort。不要猜测 wire token `max`，使用 vendor 实际声明的最高等级。完成通知会返回给你，由你汇总最终结果。\n\n任务:",
     tplAdvisorT: "主力-顾问",
     tplAdvisorD: "主力平推日常;卡壳时开一个 claude 顾问会话同仓会诊,主力照方执行",
     tplAdvisorP: "你是主力,直接推进下面的任务;遇到卡壳或拿不准的决策,用 session_spawn 在同一项目开一个 claude 顾问会话,带上上下文把问题讲清楚,拿到建议后仍由你落地执行。任务:",
@@ -501,9 +505,13 @@ search: "Поиск сессий",
   parentSession: "Родительская сессия",
   noParent: "Корневая сессия (без родителя)",
   newWsToast: "Новое рабочее пространство: запустите ccteam init в новом каталоге.",
-  tplCommanderT: "Командир и команды",
-  tplCommanderD: "claude планирует и принимает; codex разрабатывает, grok исследует — отчёты возвращаются",
-  tplCommanderP: "Сначала проверьте через status доступных в проекте vendor, затем разбейте задачу и делегируйте через session_spawn / session_dispatch: разработку — codex, исследование — grok. Вы отвечаете за планирование, приёмку и итог. Задача:",
+  tplCommanderT: "Командир",
+  tplCommanderD: "Opus руководит; Luna и Terra исполняют; Sonnet, Fable и Haiku помогают; Opus + Sol ставят двойной финальный гейт; отсутствующие роли уходят на Codex",
+  tplCommanderP:
+    "Сначала вызови status и используй только доступные в проекте vendor, модели и уровни effort. Ты — командир: предпочтительно Claude Opus с максимальным доступным effort. Занимайся архитектурой, декомпозицией, распределением, контролем и приёмкой; рутину не выполняй. Если текущая сессия не Opus, создай отдельного Opus-командира и передай ему задачу; если Claude или Opus недоступен — эту роль берёт Codex.\n\n" +
+    "Состав команды:\n• Codex Luna, максимальный доступный effort — основная рабочая лошадка: код, исследования, сетевое окружение и прочая реализация. Для независимых задач можно запустить до 10 Luna параллельно.\n• Codex Terra, максимальный доступный effort — старший разработчик и исследователь; фронтенд, визуальные задачи и сложная реализация.\n• Claude Sonnet, максимальный доступный effort — документация, граф и недорогие универсальные задачи.\n• Claude Fable, максимальный доступный effort — только критические ситуации, спорные решения и совет старшего.\n• Claude Haiku — быстрый поиск, мелкая документация и короткие правки.\n\n" +
+    "Финальный гейт: две независимые свежие сессии — Claude Opus и Codex Sol, обе с максимальным доступным effort. Решение принято только когда оба одобряют одну и ту же ревизию; при расхождении верни замечания исполнителю, исправь и повтори оба ревью.\n\n" +
+    "Если нужный vendor, модель или effort недоступны либо spawn отклонён, не останавливай работу: замени эту роль Codex с лучшей доступной моделью и максимальным уровнем effort из status. Не угадывай wire-токен max: используй верхнюю ступень, которую реально объявил vendor. Уведомления о завершении возвращаются тебе; ты собираешь итог.\n\nЗадача:",
   tplAdvisorT: "Исполнитель и советник", tplAdvisorD: "Основной исполнитель ведёт работу; при затруднениях советуется с claude в том же репозитории", tplAdvisorP: "Двигайте задачу сами. При затруднениях создайте через session_spawn сессию советника claude в том же проекте, передайте контекст и сами выполните рекомендацию. Задача:",
   tplCrossreviewT: "Перекрёстное ревью", tplCrossreviewD: "Один vendor пишет, другой независимо проверяет diff", tplCrossreviewP: "Передайте требование сессии codex; после завершения дайте diff другому vendor для независимого ревью корректности, безопасности и рисков регрессий. Требование:",
   tplBakeoffT: "Параллельный конкурс", tplBakeoffD: "Решите сложную задачу у 2–3 vendor параллельно и выберите лучшее", tplBakeoffP: "Отправьте задачу 2–3 новым сессиям разных vendor для независимого решения, затем сравните подходы и объедините лучший ответ. Задача:",
@@ -537,9 +545,13 @@ search: "Поиск сессий",
     convPh: "Type anything (Enter to send, Shift+Enter for newline)",
     approve: "Ask approval",
     quickStart: "Quick start",
-    tplCommanderT: "Commander + crews",
-    tplCommanderD: "claude plans, decomposes, accepts; codex builds, grok researches — reports flow back",
-    tplCommanderP: "Check status for the vendors available on this project first, then plan and decompose the task below and delegate via session_spawn / session_dispatch: development to codex, community/ecosystem research to grok. You own planning, acceptance, and the summary — completion notifications flow back to you. Task:",
+    tplCommanderT: "Commander",
+    tplCommanderD: "Opus commands; Luna and Terra execute; Sonnet, Fable, and Haiku support; Opus + Sol form the dual final gate; missing roles fall back to Codex",
+    tplCommanderP:
+      "Call status first and use only vendors, models, and effort levels available in this project. You are the commander, preferably Claude Opus at the highest available effort. Own architecture, decomposition, delegation, control, and acceptance; do no routine work. If the current session is not Opus, create a separate Opus commander and hand it the task; if Claude or Opus is unavailable, Codex takes command.\n\n" +
+      "Team:\n• Codex Luna, highest available effort — the main workhorse for code, research, network operations, and implementation. Up to 10 Luna sessions may run independent tasks in parallel.\n• Codex Terra, highest available effort — senior developer and researcher for frontend, visual work, and complex implementation.\n• Claude Sonnet, highest available effort — documentation, graphs, and cost-effective general work.\n• Claude Fable, highest available effort — only for critical situations, disputed decisions, and senior advice.\n• Claude Haiku — fast search, small documentation tasks, and quick fixes.\n\n" +
+      "Final gate: use two independent fresh sessions, Claude Opus and Codex Sol, both at their highest available effort. Accept only when both approve the same revision; on disagreement, return findings to the implementer, fix them, and repeat both reviews.\n\n" +
+      "If a required vendor, model, or effort is unavailable or spawn is rejected, keep working: replace that role with Codex using the best available model and highest effort reported by status. Never guess the wire token `max`; use the top level the vendor actually advertises. Completion notifications return to you; assemble the final result.\n\nTask:",
     tplAdvisorT: "Driver + advisor",
     tplAdvisorD: "A daily driver grinds the routine; when stuck, consult a claude advisor on the same repo",
     tplAdvisorP: "You are the driver: push the task below forward directly. When you get stuck or face an uncertain decision, session_spawn a claude advisor session on this same project, brief it with the context, then execute its advice yourself. Task:",

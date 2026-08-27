@@ -29,6 +29,7 @@ import { MemoryRouter } from "react-router-dom";
 
 import HomeView, { NewProjectFields } from "./HomeView";
 import type { HostSummary } from "../lib/hostsApi";
+import { createAndSubmitHomeTurn } from "../lib/playbooks";
 
 function render() {
   return renderToString(
@@ -159,7 +160,7 @@ describe("HomeView (landing page)", () => {
     for (const id of ["commander", "advisor", "crossreview", "bakeoff", "triangulate", "pyramid"]) {
       expect(html).toContain(`data-testid="tpl-${id}"`);
     }
-    expect(html).toContain("总控-工班");
+    expect(html).toContain("指挥官");
     expect(html).toContain("主力-顾问");
     expect(html).toContain("交叉互审");
     expect(html).toContain("并行竞标");
@@ -183,14 +184,15 @@ describe("HomeView (landing page)", () => {
     for (const vendor of ["claude", "codex", "grok", "kimi", "opencode"]) {
       expect(grid).toContain(`data-vendor="${vendor}"`);
     }
-    // The 总控-工班 flagship fields the claude brain + codex/grok crews.
+    // The commander fields the Claude brain + Codex crews.
     const commander = grid.slice(
       grid.indexOf('data-testid="tpl-commander"'),
       grid.indexOf('data-testid="tpl-advisor"'),
     );
-    for (const vendor of ["claude", "codex", "grok"]) {
+    for (const vendor of ["claude", "codex"]) {
       expect(commander).toContain(`data-vendor="${vendor}"`);
     }
+    expect(commander).not.toContain('data-vendor="grok"');
     // 金字塔用工 leads cheap (kimi/opencode) and escalates to claude.
     const pyramid = grid.slice(grid.indexOf('data-testid="tpl-pyramid"'));
     for (const vendor of ["kimi", "opencode", "claude"]) {
@@ -211,7 +213,7 @@ describe("HomeView (landing page)", () => {
       </MemoryRouter>,
     );
     expect(html).toContain("Quick start");
-    expect(html).toContain("Commander + crews");
+    expect(html).toContain("Commander");
     expect(html).toContain("Driver + advisor");
     expect(html).toContain("Cross review");
     expect(html).toContain("Pyramid staffing");
@@ -234,5 +236,132 @@ describe("HomeView (landing page)", () => {
     );
     expect(html).toContain('data-testid="home-view"');
     expect(html).toContain('data-testid="tpl-commander"');
+  });
+
+  it("retries a failed Commander bootstrap once through the best installed Codex posture", async () => {
+    const createSession = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("会话启动失败: invalid reasoning effort `max`"))
+      .mockResolvedValueOnce({ sid: "s42" });
+    const submit = vi.fn().mockResolvedValue(undefined);
+    const prompt = "Commander prompt with the user's concrete task";
+
+    await expect(
+      createAndSubmitHomeTurn(
+        {
+          slug: "ccteam",
+          options: {
+            role: "",
+            vendor: "claude",
+            permission_mode: "skip",
+            protocol: "stream-json",
+            model: "opus",
+            effort: "max",
+          },
+          text: prompt,
+          attachments: [],
+          commander: true,
+          installedVendors: ["claude", "codex"],
+          catalog: {
+            codex: {
+              models: [{ id: "gpt-5.6-codex", efforts: ["low", "high", "xhigh"] }],
+              efforts: ["low", "medium", "high", "xhigh"],
+            },
+          },
+        },
+        { createSession, submitTurn: submit },
+      ),
+    ).resolves.toBe("s42");
+
+    expect(createSession).toHaveBeenCalledTimes(2);
+    expect(createSession.mock.calls[0]).toEqual([
+      "ccteam",
+      {
+        role: "",
+        vendor: "claude",
+        permission_mode: "skip",
+        protocol: "stream-json",
+        model: "opus",
+        effort: "max",
+      },
+    ]);
+    expect(createSession.mock.calls[1]).toEqual([
+      "ccteam",
+      {
+        role: "",
+        vendor: "codex",
+        permission_mode: "skip",
+        protocol: "stream-json",
+        model: "gpt-5.6-codex",
+        effort: "xhigh",
+      },
+    ]);
+    expect(submit).toHaveBeenCalledOnce();
+    expect(submit).toHaveBeenCalledWith("s42", prompt, []);
+  });
+
+  it("does not blindly retry Commander auth, network, ACL, or general failures", async () => {
+    for (const message of [
+      "UNAUTHENTICATED",
+      "network: connection failed",
+      "HTTP 403: project is not visible",
+      "会话启动失败: internal state corrupt",
+    ]) {
+      const createSession = vi.fn().mockRejectedValue(new Error(message));
+      const submit = vi.fn();
+      await expect(
+        createAndSubmitHomeTurn(
+          {
+            slug: "ccteam",
+            options: {
+              role: "",
+              vendor: "claude",
+              permission_mode: "skip",
+              protocol: "stream-json",
+              model: "opus",
+              effort: "max",
+            },
+            text: "task",
+            attachments: [],
+            commander: true,
+            installedVendors: ["codex"],
+            catalog: {},
+          },
+          { createSession, submitTurn: submit },
+        ),
+      ).rejects.toThrow(message);
+      expect(createSession).toHaveBeenCalledOnce();
+      expect(submit).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not retry the fallback create itself", async () => {
+    const createSession = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("invalid model `opus`"))
+      .mockRejectedValueOnce(new Error("codex start failed"));
+    const submit = vi.fn();
+    await expect(
+      createAndSubmitHomeTurn(
+        {
+          slug: "ccteam",
+          options: {
+            role: "",
+            vendor: "claude",
+            protocol: "stream-json",
+            model: "opus",
+            effort: "max",
+          },
+          text: "task",
+          attachments: [],
+          commander: true,
+          installedVendors: ["claude", "codex"],
+          catalog: {},
+        },
+        { createSession, submitTurn: submit },
+      ),
+    ).rejects.toThrow("codex start failed");
+    expect(createSession).toHaveBeenCalledTimes(2);
+    expect(submit).not.toHaveBeenCalled();
   });
 });

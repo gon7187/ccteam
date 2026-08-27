@@ -8,7 +8,13 @@
 
 import { describe, expect, it } from "vitest";
 
-import { applyPlaybook, playbookFromState, PLAYBOOKS } from "./playbooks";
+import {
+  applyPlaybook,
+  bestCommanderCodexPosture,
+  isCommanderBootstrapCapabilityError,
+  playbookFromState,
+  PLAYBOOKS,
+} from "./playbooks";
 import { I18N } from "./i18n";
 import { VENDORS } from "./vendors";
 
@@ -60,7 +66,12 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
 
   it("applyPlaybook computes the composer patch: `<key>P` prefill + lead vendor", () => {
     const patch = applyPlaybook("commander", "zh");
-    expect(patch).toEqual({ text: I18N.zh.tplCommanderP, vendor: "claude" });
+    expect(patch).toEqual({
+      text: I18N.zh.tplCommanderP,
+      vendor: "claude",
+      model: "opus",
+      effort: "max",
+    });
     // The pyramid formation leads with the cheap harness, per the escalation
     // story; language picks the localized prefill.
     expect(applyPlaybook("pyramid", "en")).toEqual({
@@ -69,6 +80,87 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
     });
     // Unknown id → null (the handoff simply no-ops; nothing is invented).
     expect(applyPlaybook("nope", "zh")).toBeNull();
+  });
+
+  it("the commander prefill carries the full roster, dual gate, and Codex fallback", () => {
+    const prompt = I18N.ru.tplCommanderP;
+    for (const role of ["Opus", "Luna", "Terra", "Sonnet", "Sol", "Fable", "Haiku"]) {
+      expect(prompt, role).toContain(role);
+    }
+    expect(prompt).toContain("до 10");
+    expect(prompt).toContain("максимальн");
+    expect(prompt).toContain("status");
+    expect(prompt).toContain("Codex");
+  });
+
+  it("builds the Commander fallback from the installed Codex catalog", () => {
+    expect(
+      bestCommanderCodexPosture(["claude", "codex"], {
+        codex: {
+          models: [
+            { id: "gpt-5.6-codex", efforts: ["low", "high", "xhigh"] },
+            { id: "gpt-5.5-codex", efforts: ["low", "high"] },
+          ],
+          efforts: ["low", "medium", "high", "xhigh"],
+        },
+      }),
+    ).toEqual({ vendor: "codex", model: "gpt-5.6-codex", effort: "xhigh" });
+
+    // No host proof means no speculative retry against a vendor that might
+    // be absent too. An observed model with no effort axis stays effortless.
+    expect(bestCommanderCodexPosture(null, {})).toBeNull();
+    expect(
+      bestCommanderCodexPosture(["codex"], {
+        codex: { models: [{ id: "gpt-no-effort", efforts: [] }], efforts: ["xhigh"] },
+      }),
+    ).toEqual({ vendor: "codex", model: "gpt-no-effort" });
+  });
+
+  it("recognizes only capability failures as Commander fallback candidates", () => {
+    const posture = { vendor: "claude", model: "opus", effort: "max" } as const;
+    expect(
+      isCommanderBootstrapCapabilityError(
+        new Error("会话启动失败: invalid reasoning effort `max`"),
+        posture,
+        ["claude", "codex"],
+      ),
+    ).toBe(true);
+    expect(
+      isCommanderBootstrapCapabilityError(
+        new Error("spawn failed: No such file or directory"),
+        posture,
+        ["codex"],
+      ),
+    ).toBe(true);
+
+    for (const message of [
+      "UNAUTHENTICATED",
+      "FORBIDDEN",
+      "NOT_FOUND",
+      "network: connection failed",
+      "HTTP 403: project is not visible",
+      "会话启动失败: internal state corrupt",
+      "vendor is not authenticated",
+      "unauthorized: model opus is not available for this subscription",
+    ]) {
+      expect(
+        isCommanderBootstrapCapabilityError(
+          new Error(message),
+          posture,
+          ["codex"],
+        ),
+        message,
+      ).toBe(false);
+    }
+
+    // A manual posture change is not Commander bootstrap anymore.
+    expect(
+      isCommanderBootstrapCapabilityError(
+        new Error("invalid model"),
+        { vendor: "codex", model: "gpt-5.6-codex", effort: "xhigh" },
+        ["codex"],
+      ),
+    ).toBe(false);
   });
 
   it("playbookFromState extracts only a string playbook id from router state", () => {

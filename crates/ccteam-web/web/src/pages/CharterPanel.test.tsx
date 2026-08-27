@@ -639,7 +639,7 @@ describe("PlaybookCards (编队起手 formations)", () => {
       expect(html).toContain(`data-testid="playbook-${pb.id}"`);
       expect(html).toContain(`data-testid="playbook-launch-${pb.id}"`);
     }
-    expect(html).toContain("总控-工班");
+    expect(html).toContain("指挥官");
     expect(html).toContain("金字塔用工");
     // Lineup chips span all five harnesses across the deck.
     for (const vendor of ["claude", "codex", "grok", "kimi", "opencode"]) {
@@ -669,7 +669,7 @@ describe("PlaybookCards (编队起手 formations)", () => {
       </MemoryRouter>,
     );
     expect(html).toContain("Formation playbooks");
-    expect(html).toContain("Commander + crews");
+    expect(html).toContain("Commander");
     expect(html).toContain("Pyramid staffing");
     expect(html).toContain("orchestration happens inside the session");
   });
