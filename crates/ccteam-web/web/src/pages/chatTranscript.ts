@@ -20,7 +20,14 @@ import type {
   TurnVerdictRecord,
 } from "../lib/sessionsApi";
 
-export type RowKind = "user" | "assistant" | "tool" | "system" | "approval" | "activity";
+export type RowKind =
+  | "user"
+  | "assistant"
+  | "tool"
+  | "system"
+  | "error"
+  | "approval"
+  | "activity";
 
 /** One rendered transcript row. `approval` rows carry the W2 ChoicePrompt
  *  options (`{label, id}`) so ChatConsole can render clickable
@@ -42,6 +49,10 @@ export interface TranscriptRow {
   /** Completed mirrored assistant turn identity. Live-only rows omit it until
    * the authoritative history refresh lands. */
   turnId?: string;
+  /** Canonical terminal result. Verdict UI is valid only for `completed`. */
+  outcome?: string;
+  /** Failure category retained for diagnostics without treating it as prose. */
+  errorKind?: string;
   /** Latest human verdict from authoritative history. */
   verdict?: TurnVerdictRecord;
   /** Approval-only: the options to render as buttons (`{label, id}`). */
@@ -286,6 +297,19 @@ export function historyToRows(events: SessionHistoryEvent[]): TranscriptRow[] {
     if (ev.user) {
       rows.push({ id: `${ev.turn_id}-u`, kind: "user", content: ev.user, ts: ev.ts });
     }
+    if (ev.outcome === "failed") {
+      const fallback = ev.error_kind ? `Turn failed (${ev.error_kind})` : "Turn failed";
+      rows.push({
+        id: `${ev.turn_id}-error`,
+        kind: "error",
+        content: ev.error?.trim() || ev.assistant || fallback,
+        ts: ev.ts,
+        turnId: ev.turn_id,
+        outcome: ev.outcome,
+        ...(ev.error_kind ? { errorKind: ev.error_kind } : {}),
+      });
+      continue;
+    }
     if (ev.assistant || (ev.attachments && ev.attachments.length > 0)) {
       rows.push({
         id: `${ev.turn_id}-a`,
@@ -294,7 +318,8 @@ export function historyToRows(events: SessionHistoryEvent[]): TranscriptRow[] {
         ts: ev.ts,
         attachments: ev.attachments,
         turnId: ev.turn_id,
-        ...(ev.verdict ? { verdict: ev.verdict } : {}),
+        ...(ev.outcome ? { outcome: ev.outcome } : {}),
+        ...(ev.outcome === "completed" && ev.verdict ? { verdict: ev.verdict } : {}),
       });
     }
   }
@@ -333,9 +358,10 @@ export function mergeAuthoritativeTurnMetadata(
     if (!source) return row;
     const verdict = source.verdict ?? row.verdict;
     const ts = row.ts ?? source.ts;
-    if (verdict === row.verdict && ts === row.ts) return row;
+    const outcome = source.outcome ?? row.outcome;
+    if (verdict === row.verdict && ts === row.ts && outcome === row.outcome) return row;
     changed = true;
-    return { ...row, ts, ...(verdict ? { verdict } : {}) };
+    return { ...row, ts, ...(outcome ? { outcome } : {}), ...(verdict ? { verdict } : {}) };
   });
 
   let authoritativeCursor = authoritative.length - 1;
@@ -352,6 +378,7 @@ export function mergeAuthoritativeTurnMetadata(
         ...row,
         turnId: source.turnId,
         ts: row.ts ?? source.ts,
+        ...(source.outcome ? { outcome: source.outcome } : {}),
         ...(source.verdict ? { verdict: source.verdict } : {}),
       };
       claimed.add(source.turnId);

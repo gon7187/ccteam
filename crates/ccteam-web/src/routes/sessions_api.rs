@@ -671,7 +671,10 @@ pub(crate) async fn handle_turn_verdict(
                 .into_response();
         }
     };
-    if !turns.iter().any(|turn| turn.turn_id == turn_id) {
+    if !turns
+        .iter()
+        .any(|turn| turn.turn_id == turn_id && turn.verdictable())
+    {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("unknown turn: {turn_id}")})),
@@ -833,8 +836,15 @@ fn collect_session_turns(
     verdicts: &std::collections::BTreeMap<(String, String), TurnVerdict>,
 ) -> anyhow::Result<SessionHistoryPage> {
     let path = turns_jsonl_path(project_dir, sid);
-    let tail = ccteam_core::journal::tail_filter_map(&path, limit, before, |line| {
-        serde_json::from_slice::<TurnRecord>(line).ok()
+    let tail = ccteam_core::journal::tail_classify_map(&path, limit, before, |line| {
+        let Ok(turn) = serde_json::from_slice::<TurnRecord>(line) else {
+            return ccteam_core::journal::TailDecision::Corrupt;
+        };
+        if turn.interim() {
+            ccteam_core::journal::TailDecision::Skip
+        } else {
+            ccteam_core::journal::TailDecision::Include(turn)
+        }
     })?;
     Ok(SessionHistoryPage {
         events: tail
@@ -865,7 +875,17 @@ fn turn_to_event(turn: &TurnRecord, verdict: Option<&TurnVerdict>) -> serde_json
         "role": turn.role,
         "user": turn.user,
         "assistant": turn.assistant,
+        // turns.jsonl is terminal-only. Success rows historically omitted the
+        // optional field, so absence means completed; explicit failures and
+        // other terminal outcomes remain verbatim.
+        "outcome": turn.outcome.as_deref().unwrap_or("completed"),
     });
+    if let Some(error_kind) = turn.error_kind.as_deref() {
+        event["error_kind"] = json!(error_kind);
+    }
+    if let Some(error) = turn.error.as_deref() {
+        event["error"] = json!(error);
+    }
     if !turn.attachments.is_empty() {
         event["attachments"] =
             serde_json::to_value(&turn.attachments).unwrap_or_else(|_| json!([]));
@@ -2517,6 +2537,80 @@ mod tests {
     }
 
     #[test]
+    fn collect_session_turns_paginates_visible_rows_across_interim_runs() {
+        use ccteam_harness::execution::turns_mirror::append_turn;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path();
+        let sid = "s1";
+        let mut expected = Vec::new();
+        for n in 0..61_u64 {
+            let mut row = TurnRecord {
+                turn_id: format!("turn-{n}"),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: "reviewer".into(),
+                user: format!("user-{n}"),
+                assistant: String::new(),
+                usage: serde_json::Value::Null,
+                tool_calls: vec![],
+                attachments: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
+            };
+            append_turn(project_dir, sid, &row).unwrap();
+            expected.push((row.turn_id.clone(), row.user.clone(), row.assistant.clone()));
+            for draft in 0..3 {
+                row.turn_id = format!("draft-{n}-{draft}");
+                row.user.clear();
+                row.assistant = format!("draft {draft}");
+                row.outcome = Some("interim".into());
+                append_turn(project_dir, sid, &row).unwrap();
+            }
+            row.turn_id = format!("turn-{n}");
+            row.assistant = format!("final-{n}");
+            row.outcome = Some("completed".into());
+            append_turn(project_dir, sid, &row).unwrap();
+            expected.push((row.turn_id.clone(), row.user.clone(), row.assistant.clone()));
+        }
+
+        let mut before = None;
+        let mut pages = Vec::new();
+        loop {
+            let page = collect_session_turns(
+                project_dir,
+                sid,
+                50,
+                before,
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+            pages.push(
+                page.events
+                    .iter()
+                    .map(|event| {
+                        (
+                            event["turn_id"].as_str().unwrap().to_string(),
+                            event["user"].as_str().unwrap().to_string(),
+                            event["assistant"].as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            if !page.has_more {
+                break;
+            }
+            before = Some(page.next_before.unwrap().parse().unwrap());
+        }
+        // Tail pages arrive newest-page first but preserve chronological order
+        // within each page. Reassemble globally for an exact no-gap check.
+        pages.reverse();
+        let actual = pages.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn collect_session_turns_two_same_role_sids_do_not_bleed() {
         // v0.8.8 F1 (acceptance d) — the BUG-3 root: two sessions of the SAME
         // role keep INDEPENDENT histories because the mirror is keyed by sid,
@@ -2603,9 +2697,33 @@ mod tests {
         assert_eq!(ev["role"], "cto");
         assert_eq!(ev["user"], "spawn a reviewer");
         assert_eq!(ev["assistant"], "done — s2");
+        assert_eq!(ev["outcome"], "completed");
         assert_eq!(ev["attachments"][0]["id"], "1780000000000-chart.png");
         assert_eq!(ev["attachments"][0]["kind"], "image");
         assert!(ev["attachments"][0].get("path").is_none());
+    }
+
+    #[test]
+    fn turn_to_event_carries_terminal_failure_metadata() {
+        let turn = TurnRecord {
+            turn_id: "t-failed".into(),
+            ts: chrono::Utc::now(),
+            vendor: "codex".into(),
+            role: "".into(),
+            user: "do the work".into(),
+            assistant: "".into(),
+            usage: serde_json::Value::Null,
+            tool_calls: vec![],
+            attachments: vec![],
+            outcome: Some("failed".into()),
+            error_kind: Some("server_overloaded".into()),
+            error: Some("provider is overloaded".into()),
+        };
+
+        let event = turn_to_event(&turn, None);
+        assert_eq!(event["outcome"], "failed");
+        assert_eq!(event["error_kind"], "server_overloaded");
+        assert_eq!(event["error"], "provider is overloaded");
     }
 
     /// Build a minimal [`GatewayEvent`] with the given `sid` for filter tests.

@@ -315,6 +315,21 @@ async fn evolution_joins_latest_canonical_verdicts_and_keeps_unknowns_honest() {
     assert_eq!(worker["total_cost_usd"], 0.0);
     assert!(worker["avg_duration_ms"].is_null());
 
+    let default_role = roles.iter().find(|row| row["id"] == "").unwrap();
+    assert_eq!(default_role["sha"], "unknown");
+    assert_eq!(default_role["turn_count"], 1);
+    assert_eq!(default_role["unrated_turns"], 1);
+    assert_eq!(default_role["outcome_unknown_turns"], 1);
+    assert_eq!(default_role["unpriced_turns"], 1);
+    assert_eq!(
+        roles
+            .iter()
+            .map(|row| row["turn_count"].as_u64().unwrap())
+            .sum::<u64>(),
+        body["turn_records"].as_u64().unwrap(),
+        "every turn belongs to exactly one role bucket, including roleless"
+    );
+
     let skills = body["skills"].as_array().unwrap();
     let research_a = skills
         .iter()
@@ -324,6 +339,74 @@ async fn evolution_joins_latest_canonical_verdicts_and_keeps_unknowns_honest() {
     assert_eq!(research_a["accepted_turns"], 1);
     assert_eq!(research_a["revised_turns"], 1);
     assert_eq!(research_a["avg_duration_ms"], 200.0);
+}
+
+#[tokio::test]
+async fn evolution_counts_only_the_latest_record_for_a_replayed_turn() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    seed_project(&paths, "alpha");
+    let dir = paths.project_dir("alpha");
+    let now = chrono::Utc::now();
+
+    // Append the revised record first, then replay an older copy. Selection is
+    // by the canonical (sid, turn_id) key and timestamp, not file order.
+    append_experience(
+        &dir,
+        &turn(
+            "s1",
+            "replayed",
+            now,
+            "reviewer",
+            Some("role-new"),
+            &[("research", "skill-new")],
+            Some(3.0),
+            Some("completed"),
+            Some(300),
+        ),
+    )
+    .unwrap();
+    append_experience(
+        &dir,
+        &turn(
+            "s1",
+            "replayed",
+            now - chrono::Duration::hours(1),
+            "worker",
+            Some("role-old"),
+            &[("research", "skill-old")],
+            Some(1.0),
+            Some("failed"),
+            Some(100),
+        ),
+    )
+    .unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let body: Value = fetch_evolution(addr, "alpha")
+        .await
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["turn_records"], 1, "a replay is one canonical turn");
+    assert_eq!(body["turn_records_7d"], 1);
+    assert_eq!(body["completed_turns"], 1);
+    assert_eq!(body["failed_turns"], 0);
+    assert_eq!(body["priced_turns"], 1);
+    assert_eq!(body["avg_duration_ms"], 300.0);
+    let roles = body["roles"].as_array().unwrap();
+    assert_eq!(roles.len(), 1);
+    assert_eq!(roles[0]["id"], "reviewer");
+    assert_eq!(roles[0]["sha"], "role-new");
+    assert_eq!(roles[0]["total_cost_usd"], 3.0);
+    let skills = body["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0]["sha"], "skill-new");
 }
 
 #[tokio::test]

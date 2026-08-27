@@ -47,6 +47,7 @@ import { getHostDetail, getHosts, type HostDetail, type HostSummary } from "../l
 import { allowedVendorsFor, eligibleHosts } from "../lib/hostFilter";
 import {
   applyPlaybook,
+  completeHomeLaunch,
   createAndSubmitHomeTurn,
   playbookFromState,
   PLAYBOOKS,
@@ -408,10 +409,15 @@ export default function HomeView({
       });
     };
     run()
-      .then((sid) => {
+      .then((receipt) => {
         setPending(false);
         cancelNewProject();
-        onLaunched(sid);
+        completeHomeLaunch(
+          receipt,
+          lang,
+          (message) => toastBus.handler?.info(message),
+          onLaunched,
+        );
       })
       .catch((e) => {
         setPending(false);

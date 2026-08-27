@@ -162,7 +162,7 @@ async fn tail_loop_warns_once_when_marker_missing_for_threshold() {
         .expect("tail_marker_missing should emit a user-facing event")
         .expect("event stream should still be open");
     match ev {
-        ccteam_harness::ThreadEvent::Error(err) => {
+        ccteam_harness::ThreadEvent::Diagnostic(err) => {
             assert_eq!(err.kind, "tail_marker_missing");
             assert!(err.message.contains("会话暂时没有产出"), "{}", err.message);
             assert!(err.message.contains("下一步"), "{}", err.message);

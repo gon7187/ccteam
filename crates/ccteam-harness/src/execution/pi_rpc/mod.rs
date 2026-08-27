@@ -367,12 +367,12 @@ impl PiRpcAdapter {
                         continue;
                     }
                     Ok(PiTransportEvent::Event(PiEvent::ExtensionError { event, error })) => {
-                        let _ = live_for_task
-                            .event_tx
-                            .send(ThreadEvent::Error(ThreadErrorEvent {
+                        let _ = live_for_task.event_tx.send(ThreadEvent::Diagnostic(
+                            ThreadErrorEvent {
                                 kind: "protocol".to_string(),
                                 message: format!("Pi extension `{event}` failed: {error}"),
-                            }));
+                            },
+                        ));
                         continue;
                     }
                     Ok(PiTransportEvent::Event(event)) => live_for_task
@@ -389,13 +389,12 @@ impl PiRpcAdapter {
                         let mut state = live_for_task.translate.lock().unwrap();
                         let output = state.translator.transport_failed(message.clone());
                         if output.events.is_empty() {
-                            let _ =
-                                live_for_task
-                                    .event_tx
-                                    .send(ThreadEvent::Error(ThreadErrorEvent {
-                                        kind: "protocol".to_string(),
-                                        message,
-                                    }));
+                            let _ = live_for_task.event_tx.send(ThreadEvent::Diagnostic(
+                                ThreadErrorEvent {
+                                    kind: "protocol".to_string(),
+                                    message,
+                                },
+                            ));
                             return;
                         }
                         output
@@ -1269,7 +1268,7 @@ impl HarnessAdapter for PiRpcAdapter {
                 match receiver.recv().await {
                     Ok(event) => Some((event, receiver)),
                     Err(broadcast::error::RecvError::Lagged(count)) => Some((
-                        ThreadEvent::Error(ThreadErrorEvent {
+                        ThreadEvent::Diagnostic(ThreadErrorEvent {
                             kind: "protocol".to_string(),
                             message: format!("Pi canonical event stream lagged by {count}"),
                         }),

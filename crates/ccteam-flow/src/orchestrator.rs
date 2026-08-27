@@ -2097,7 +2097,7 @@ impl Orchestrator {
     /// - [`ThreadEvent::TurnCompleted`] → `agent_done` with
     ///   `status="completed"` + `cost_usd = usage_to_cost(usage,
     ///   vendor)`.
-    /// - [`ThreadEvent::TurnFailed`] / [`ThreadEvent::Error`] →
+    /// - [`ThreadEvent::TurnFailed`] →
     ///   `agent_done` with `status="errored"` + `error=err.message`.
     /// - `Item*` → Wave 1 noop (Wave 2 will surface `chat_*` event
     ///   types).
@@ -2172,16 +2172,7 @@ impl Orchestrator {
                 "slug": slug,
                 "ts": Utc::now().to_rfc3339(),
             })),
-            ThreadEvent::Error(err) => Some(json!({
-                "event": "agent_done",
-                "role": role,
-                "session_id": sid,
-                "status": "errored",
-                "error": err.message,
-                "vendor": vendor_str,
-                "slug": slug,
-                "ts": Utc::now().to_rfc3339(),
-            })),
+            ThreadEvent::Diagnostic(_) => None,
             ThreadEvent::TurnStarted { .. }
             | ThreadEvent::ItemStarted { .. }
             | ThreadEvent::ItemUpdated { .. }

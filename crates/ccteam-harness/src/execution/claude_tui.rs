@@ -1552,7 +1552,7 @@ async fn observe_marker(
     });
     if let Some(message) = user_message {
         let _ = tx
-            .send(ThreadEvent::Error(ThreadErrorEvent {
+            .send(ThreadEvent::Diagnostic(ThreadErrorEvent {
                 kind: "tail_marker_missing".to_string(),
                 message,
             }))

@@ -19,14 +19,17 @@ use std::time::Duration;
 use ccteam_core::CcteamPaths;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
-    HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput,
+    HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, ThreadStatus,
+    TurnId, TurnInput, TurnSubmission, UnifiedTokenUsage,
 };
 use ccteam_web::{router_with_state, AppState};
 use futures::stream::{self, BoxStream};
+use futures::StreamExt;
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::io::AsyncBufReadExt;
 use tokio::net::TcpListener;
+use tokio_stream::wrappers::BroadcastStream;
 
 fn fake_paths(root: &std::path::Path) -> CcteamPaths {
     CcteamPaths {
@@ -37,6 +40,169 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
 
 struct FakeAdapter {
     vendor: AgentVendor,
+}
+
+/// A real-shaped paneless turn script whose terminal boundary is released by
+/// the test. Claude deliberately returns a submit id distinct from its `sj-N`
+/// translator id; Codex uses its opaque `turn.id` shape. Both expose assistant
+/// text before the terminal boundary, reproducing the provisional-mirror race.
+struct TerminalTurnAdapter {
+    vendor: AgentVendor,
+    submit_id: String,
+    input_id: String,
+    terminal_id: String,
+    assistant_messages: Vec<String>,
+    events: tokio::sync::broadcast::Sender<ThreadEvent>,
+    release_terminal: Arc<tokio::sync::Semaphore>,
+}
+
+impl TerminalTurnAdapter {
+    fn new(
+        vendor: AgentVendor,
+        submit_id: &str,
+        input_id: &str,
+        terminal_id: &str,
+        assistant_messages: &[&str],
+    ) -> Self {
+        let (events, _) = tokio::sync::broadcast::channel(32);
+        Self {
+            vendor,
+            submit_id: submit_id.into(),
+            input_id: input_id.into(),
+            terminal_id: terminal_id.into(),
+            assistant_messages: assistant_messages
+                .iter()
+                .map(|message| (*message).to_string())
+                .collect(),
+            events,
+            release_terminal: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+
+    fn release(&self) {
+        self.release_terminal.add_permits(1);
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessAdapter for TerminalTurnAdapter {
+    fn name(&self) -> &'static str {
+        "terminal-turn-web-test"
+    }
+
+    fn vendor(&self) -> AgentVendor {
+        self.vendor
+    }
+
+    async fn start_thread(
+        &self,
+        _spec: &AgentSpecBrief,
+        ctx: &SpawnCtx,
+    ) -> Result<ThreadHandle, HarnessError> {
+        Ok(ThreadHandle {
+            vendor: self.vendor,
+            mode: ExecutionMode::Chat,
+            identity: format!("{}-{}", ctx.slug, ctx.sid),
+            started_at: chrono::Utc::now(),
+            raw_extras: Value::Null,
+        })
+    }
+
+    async fn submit_turn(
+        &self,
+        _h: &ThreadHandle,
+        _input: TurnInput,
+    ) -> Result<TurnId, HarnessError> {
+        let _ = self.events.send(ThreadEvent::TurnStarted {
+            turn_id: self.terminal_id.clone(),
+        });
+        for (index, message) in self.assistant_messages.iter().enumerate() {
+            let _ = self.events.send(ThreadEvent::ItemCompleted {
+                item: ThreadItem {
+                    id: format!("message-{}", index + 1),
+                    details: ThreadItemDetails::AgentMessage(message.clone()),
+                },
+            });
+        }
+        let events = self.events.clone();
+        let release = Arc::clone(&self.release_terminal);
+        let turn_id = self.terminal_id.clone();
+        let model = match self.vendor {
+            AgentVendor::Claude => Some("claude-sonnet-4-6".to_string()),
+            AgentVendor::Codex => Some("gpt-5.6-codex".to_string()),
+            _ => None,
+        };
+        tokio::spawn(async move {
+            release
+                .acquire()
+                .await
+                .expect("terminal release semaphore stays open")
+                .forget();
+            let _ = events.send(ThreadEvent::TurnCompleted {
+                turn_id,
+                usage: UnifiedTokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+                model,
+            });
+        });
+        Ok(TurnId::new(self.submit_id.clone()))
+    }
+
+    async fn submit_turn_routed(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        _routing: ccteam_harness::TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError> {
+        self.submit_turn(h, input)
+            .await
+            .map(|turn_id| TurnSubmission::started_with_input_id(turn_id, self.input_id.clone()))
+    }
+
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<ccteam_harness::ToolSurfaceRebuild, HarnessError> {
+        Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired {
+            reason: "test double".to_string(),
+        })
+    }
+
+    fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+        ccteam_harness::EventAttachment::Rebuildable
+    }
+
+    fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
+        Box::pin(
+            BroadcastStream::new(self.events.subscribe())
+                .filter_map(|event| async move { event.ok() }),
+        )
+    }
+
+    async fn resume_thread(&self, _persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
+        Err(HarnessError::NotImplemented {
+            reason: "web-test".into(),
+        })
+    }
+
+    async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Ok(DirectiveOutcome::Done { receipt: d.name })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
+    }
 }
 
 #[async_trait::async_trait]
@@ -1037,6 +1203,270 @@ async fn session_history_defaults_to_newest_100_and_pages_backwards() {
         .await
         .unwrap();
     assert_eq!(invalid.status(), 400);
+}
+
+async fn assert_terminal_turn_feedback_roundtrip(
+    vendor: AgentVendor,
+    submit_id: &str,
+    input_id: &str,
+    terminal_id: &str,
+    assistant_messages: &[&str],
+) {
+    ccteam_core::disable_tool_surface_bootstrap_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let state_path = paths.project_state("demo");
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    let mut project_state =
+        ccteam_core::ProjectState::initial_for_team("demo".into(), "dev".into());
+    project_state.owner = Some("user:web-api".into());
+    project_state.save(&state_path).unwrap();
+
+    let adapter = Arc::new(TerminalTurnAdapter::new(
+        vendor,
+        submit_id,
+        input_id,
+        terminal_id,
+        assistant_messages,
+    ));
+    let adapter_for_factory = Arc::clone(&adapter);
+    let factory = Arc::new(move |_vendor, _protocol| {
+        Arc::clone(&adapter_for_factory) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let mut gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    gateway.enable_project_creation(paths.clone());
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    gateway.set_event_sink(event_tx);
+    tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+    let addr = spawn_server(AppState::new(paths.clone()).with_gateway_owned(gateway)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://{addr}/api/v1");
+    let vendor_wire = match vendor {
+        AgentVendor::Claude => "claude",
+        AgentVendor::Codex => "codex",
+        _ => unreachable!("this regression covers Claude and Codex only"),
+    };
+
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": vendor_wire}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let submitted = client
+        .post(format!("{base}/sessions/{sid}/turn"))
+        .json(&serde_json::json!({"text": "implement the change"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), 202);
+
+    let interim_id = format!("{sid}-1");
+    for _ in 0..100 {
+        let turns = ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &sid)
+            .unwrap_or_default();
+        if turns.iter().any(|turn| turn.turn_id == input_id)
+            && turns.iter().any(|turn| turn.turn_id == interim_id)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let inflight_history: Value = client
+        .get(format!("{base}/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        inflight_history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["assistant"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()))
+            .count(),
+        0,
+        "provisional assistant rows are not terminal history: {inflight_history}"
+    );
+
+    for rejected_id in [input_id, interim_id.as_str(), terminal_id] {
+        let rejected = client
+            .put(format!("{base}/sessions/{sid}/turns/{rejected_id}/verdict"))
+            .json(&serde_json::json!({"verdict": "accept"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected.status(),
+            404,
+            "nonterminal id {rejected_id} must not be verdictable"
+        );
+    }
+
+    adapter.release();
+    let progress = paths.progress_jsonl("demo");
+    let mut experience = Vec::new();
+    for _ in 0..200 {
+        experience = ccteam_harness::execution::experience::read_all_experience(&project_dir)
+            .unwrap_or_default();
+        let completed = ccteam_core::progress::read_all_events(&progress)
+            .unwrap_or_default()
+            .iter()
+            .any(|event| {
+                event["event"] == ccteam_core::progress::CHAT_TURN_COMPLETED
+                    && event["turn_id"] == terminal_id
+            });
+        let mirrored = ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &sid)
+            .unwrap_or_default()
+            .iter()
+            .any(|turn| {
+                turn.turn_id == terminal_id && turn.outcome.as_deref() == Some("completed")
+            });
+        if completed && mirrored && !experience.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let history: Value = client
+        .get(format!("{base}/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let assistant_rows = history["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            event["assistant"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assistant_rows.len(),
+        1,
+        "one completed turn produces one assistant history row: {history}"
+    );
+    let history_turn_id = assistant_rows[0]["turn_id"]
+        .as_str()
+        .expect("completed history row carries a turn id");
+    assert_eq!(history_turn_id, terminal_id);
+    assert_eq!(
+        assistant_rows[0]["assistant"],
+        *assistant_messages.last().unwrap()
+    );
+
+    let terminal_experience = experience
+        .iter()
+        .filter_map(|record| match record {
+            ccteam_harness::execution::experience::ExperienceRecord::Turn(turn)
+                if turn.sid == sid =>
+            {
+                Some(turn)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_experience.len(), 1, "one terminal experience row");
+    assert_eq!(terminal_experience[0].turn_id, terminal_id);
+    assert_eq!(terminal_experience[0].outcome.as_deref(), Some("completed"));
+
+    let completion_rows = ccteam_core::progress::read_all_events(&progress)
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            event["event"] == ccteam_core::progress::CHAT_TURN_COMPLETED && event["sid"] == sid
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completion_rows.len(), 1, "one canonical completion row");
+    assert_eq!(completion_rows[0]["turn_id"], terminal_id);
+
+    let accepted: Value = client
+        .put(format!(
+            "{base}/sessions/{sid}/turns/{history_turn_id}/verdict"
+        ))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accepted["turn_id"], terminal_id);
+    assert_eq!(accepted["changed"], true);
+
+    for rejected_id in [input_id, interim_id.as_str(), submit_id] {
+        if rejected_id == terminal_id {
+            continue;
+        }
+        let rejected = client
+            .put(format!("{base}/sessions/{sid}/turns/{rejected_id}/verdict"))
+            .json(&serde_json::json!({"verdict": "accept"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), 404, "nonterminal id {rejected_id}");
+    }
+
+    let evolution: Value = client
+        .get(format!("{base}/projects/demo/evolution"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(evolution["turn_records"], 1, "{evolution}");
+    assert_eq!(evolution["verdict_records"], 1, "{evolution}");
+    assert_eq!(evolution["accepted_turns"], 1, "{evolution}");
+}
+
+#[tokio::test]
+async fn claude_terminal_id_roundtrips_history_verdict_and_evolution() {
+    assert_terminal_turn_feedback_roundtrip(
+        AgentVendor::Claude,
+        "turn-submit-claude",
+        "input-claude-1",
+        "sj-1",
+        &["claude final answer"],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn codex_opaque_terminal_id_roundtrips_history_verdict_and_evolution() {
+    assert_terminal_turn_feedback_roundtrip(
+        AgentVendor::Codex,
+        "turn_01JOPAQUECODEX",
+        "input-codex-1",
+        "turn_01JOPAQUECODEX",
+        &["codex checkpoint", "codex final answer"],
+    )
+    .await;
 }
 
 #[tokio::test]

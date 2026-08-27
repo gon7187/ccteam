@@ -478,6 +478,16 @@ for raw in sys.stdin:
             assistant("stop", "retry-final", cost=0.03)
         elif message == "tool-preamble":
             assistant("toolUse", "I will run a tool", tool=True)
+        elif message == "extension-error":
+            emit(
+                {
+                    "type": "extension_error",
+                    "extensionPath": "/fake/audit.js",
+                    "event": "before_agent_start",
+                    "error": "bad payload",
+                }
+            )
+            assistant("stop", "extension-recovered")
         elif message == "usage":
             assistant("toolUse", "tool preamble", tool=True, cost=0.10)
             emit(

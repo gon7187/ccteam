@@ -5,7 +5,7 @@
 //! (`.1` archive first, active journal last), so a stale derived verdict can
 //! never override the latest human decision.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use axum::{
     extract::{Path, State},
@@ -58,7 +58,7 @@ pub struct EvolutionBucket {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct EvolutionSummary {
     pub slug: String,
-    /// Total turn records in experience.jsonl.
+    /// Distinct terminal turns projected from experience.jsonl.
     pub turn_records: u64,
     /// Latest canonical verdicts that match projected turns.
     pub verdict_records: u64,
@@ -120,38 +120,43 @@ pub(crate) async fn handle_evolution(
         }
     };
 
-    let mut turn_records = 0u64;
+    // The derived journal is append-only and may replay a terminal record
+    // after recovery. Canonical turn identity is (sid, turn_id): select the
+    // newest timestamp before aggregating, with the later line winning ties.
+    let mut latest_turns: BTreeMap<(String, String), &TurnExperience> = BTreeMap::new();
+    for rec in &records {
+        let ExperienceRecord::Turn(turn) = rec else {
+            continue;
+        };
+        let key = (turn.sid.clone(), turn.turn_id.clone());
+        let should_replace = latest_turns
+            .get(&key)
+            .is_none_or(|current| turn.ts >= current.ts);
+        if should_replace {
+            latest_turns.insert(key, turn);
+        }
+    }
+
+    let turn_records = u64::try_from(latest_turns.len()).unwrap_or(u64::MAX);
     let mut turn_records_7d = 0u64;
     let week_ago = chrono::Utc::now() - chrono::Duration::days(7);
-    let mut turn_keys = BTreeSet::new();
     let mut summary_acc = Acc::default();
     // key = (kind, id, sha)
     let mut role_acc: BTreeMap<(String, String), Acc> = BTreeMap::new();
     let mut skill_acc: BTreeMap<(String, String), Acc> = BTreeMap::new();
 
-    for rec in &records {
-        match rec {
-            ExperienceRecord::Turn(t) => {
-                turn_records += 1;
-                turn_keys.insert((t.sid.clone(), t.turn_id.clone()));
-                if t.ts >= week_ago {
-                    turn_records_7d += 1;
-                }
-                let verdict = verdicts
-                    .get(&(t.sid.clone(), t.turn_id.clone()))
-                    .map(|entry| entry.verdict);
-                summary_acc.observe(t, verdict);
-                accumulate_turn(t, verdict, &mut role_acc, &mut skill_acc);
-            }
-            // `experience.jsonl` is a derived index. Its verdict rows are
-            // deliberately ignored; canonical progress facts above win.
-            ExperienceRecord::Verdict(_) => {}
+    for (key, turn) in &latest_turns {
+        if turn.ts >= week_ago {
+            turn_records_7d += 1;
         }
+        let verdict = verdicts.get(key).map(|entry| entry.verdict);
+        summary_acc.observe(turn, verdict);
+        accumulate_turn(turn, verdict, &mut role_acc, &mut skill_acc);
     }
 
     let verdict_records = u64::try_from(
-        turn_keys
-            .iter()
+        latest_turns
+            .keys()
             .filter(|key| verdicts.contains_key(*key))
             .count(),
     )
@@ -255,11 +260,12 @@ fn accumulate_turn(
     roles: &mut BTreeMap<(String, String), Acc>,
     skills: &mut BTreeMap<(String, String), Acc>,
 ) {
-    if !t.role.is_empty() {
-        let sha = t.role_sha.clone().unwrap_or_else(|| "unknown".into());
-        let e = roles.entry((t.role.clone(), sha)).or_default();
-        e.observe(t, verdict);
-    }
+    // Roleless is the default execution posture, not missing analytics. Keep
+    // the honest empty wire id (`role: ""`) and the existing unknown digest;
+    // the SPA labels that bucket `(default)` without inventing a colliding role.
+    let sha = t.role_sha.clone().unwrap_or_else(|| "unknown".into());
+    let e = roles.entry((t.role.clone(), sha)).or_default();
+    e.observe(t, verdict);
     if let Some(map) = &t.skills_sha {
         for (id, sha) in map {
             let e = skills.entry((id.clone(), sha.clone())).or_default();

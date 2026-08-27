@@ -29,7 +29,8 @@ import { MemoryRouter } from "react-router-dom";
 
 import HomeView, { NewProjectFields } from "./HomeView";
 import type { HostSummary } from "../lib/hostsApi";
-import { createAndSubmitHomeTurn } from "../lib/playbooks";
+import { completeHomeLaunch, createAndSubmitHomeTurn } from "../lib/playbooks";
+import { toastBus } from "../lib/toastBus";
 
 function render() {
   return renderToString(
@@ -271,7 +272,13 @@ describe("HomeView (landing page)", () => {
         },
         { createSession, submitTurn: submit },
       ),
-    ).resolves.toBe("s42");
+    ).resolves.toEqual({
+      sid: "s42",
+      vendor: "codex",
+      model: "gpt-5.6-codex",
+      effort: "xhigh",
+      fallback: true,
+    });
 
     expect(createSession).toHaveBeenCalledTimes(2);
     expect(createSession.mock.calls[0]).toEqual([
@@ -300,11 +307,106 @@ describe("HomeView (landing page)", () => {
     expect(submit).toHaveBeenCalledWith("s42", prompt, []);
   });
 
+  it("starts Commander directly on the best confirmed Codex posture when Claude is absent", async () => {
+    const createSession = vi.fn().mockResolvedValue({ sid: "s43" });
+    const submit = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      createAndSubmitHomeTurn(
+        {
+          slug: "ccteam",
+          // This is the generic host-normalized posture HomeView currently
+          // derives before the Commander policy gets a say.
+          options: {
+            role: "",
+            vendor: "codex",
+            permission_mode: "skip",
+            protocol: "stream-json",
+          },
+          text: "task",
+          attachments: [],
+          commander: true,
+          installedVendors: ["codex"],
+          catalog: {
+            codex: {
+              models: [{ id: "gpt-5.6-codex", efforts: ["low", "high", "xhigh"] }],
+              efforts: ["low", "medium", "high", "xhigh"],
+            },
+          },
+        },
+        { createSession, submitTurn: submit },
+      ),
+    ).resolves.toEqual({
+      sid: "s43",
+      vendor: "codex",
+      model: "gpt-5.6-codex",
+      effort: "xhigh",
+      fallback: false,
+    });
+
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(createSession).toHaveBeenCalledWith("ccteam", {
+      role: "",
+      vendor: "codex",
+      permission_mode: "skip",
+      protocol: "stream-json",
+      model: "gpt-5.6-codex",
+      effort: "xhigh",
+    });
+    expect(submit).toHaveBeenCalledWith("s43", "task", []);
+  });
+
+  it("retains the unavailable Commander error instead of launching an unrelated Grok lead", async () => {
+    const unavailable = new Error("Claude executable not found");
+    const createSession = vi.fn().mockRejectedValue(unavailable);
+    const submit = vi.fn();
+
+    await expect(
+      createAndSubmitHomeTurn(
+        {
+          slug: "ccteam",
+          // Generic host normalization would otherwise turn Commander into
+          // Grok merely because Grok is the first installed vendor.
+          options: {
+            role: "",
+            vendor: "grok",
+            permission_mode: "skip",
+            protocol: "acp",
+          },
+          text: "task",
+          attachments: [],
+          commander: true,
+          installedVendors: ["grok"],
+          catalog: {},
+        },
+        { createSession, submitTurn: submit },
+      ),
+    ).rejects.toBe(unavailable);
+
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(createSession).toHaveBeenCalledWith("ccteam", {
+      role: "",
+      vendor: "claude",
+      permission_mode: "skip",
+      protocol: "stream-json",
+      model: "opus",
+      effort: "max",
+    });
+    expect(submit).not.toHaveBeenCalled();
+  });
+
   it("does not blindly retry Commander auth, network, ACL, or general failures", async () => {
     for (const message of [
       "UNAUTHENTICATED",
       "network: connection failed",
+      "network failure: model opus is unavailable",
       "HTTP 403: project is not visible",
+      "HTTP 500: model opus is unavailable",
+      "request timed out while creating the session",
+      "quota exceeded: model opus is unavailable",
+      "budget guard rejected spawn: model opus is unavailable",
+      "delegation depth limit reached: model opus is unavailable",
+      "delegation cycle detected: model opus is unavailable",
       "会话启动失败: internal state corrupt",
     ]) {
       const createSession = vi.fn().mockRejectedValue(new Error(message));
@@ -323,9 +425,9 @@ describe("HomeView (landing page)", () => {
             },
             text: "task",
             attachments: [],
-            commander: true,
-            installedVendors: ["codex"],
-            catalog: {},
+          commander: true,
+          installedVendors: ["claude", "codex"],
+          catalog: {},
           },
           { createSession, submitTurn: submit },
         ),
@@ -335,11 +437,71 @@ describe("HomeView (landing page)", () => {
     }
   });
 
-  it("does not retry the fallback create itself", async () => {
+  it("does not retry the fallback create itself and preserves both sanitized causes", async () => {
     const createSession = vi
       .fn()
-      .mockRejectedValueOnce(new Error("invalid model `opus`"))
-      .mockRejectedValueOnce(new Error("codex start failed"));
+      .mockRejectedValueOnce(new Error("invalid model `opus`\nBearer primary-secret"))
+      .mockRejectedValueOnce(new Error("codex start failed\u0000 token=fallback-secret"));
+    const submit = vi.fn();
+    const failure = await createAndSubmitHomeTurn(
+      {
+        slug: "ccteam",
+        options: {
+          role: "",
+          vendor: "claude",
+          protocol: "stream-json",
+          model: "opus",
+          effort: "max",
+        },
+        text: "task",
+        attachments: [],
+        commander: true,
+        installedVendors: ["claude", "codex"],
+        catalog: {},
+      },
+      { createSession, submitTurn: submit },
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    const message = (failure as Error).message;
+    expect(message).toContain("primary: invalid model `opus` Bearer [redacted]");
+    expect(message).toContain("fallback: codex start failed token=[redacted]");
+    expect(message).not.toContain("primary-secret");
+    expect(message).not.toContain("fallback-secret");
+    expect(message).not.toContain("\n");
+    expect(createSession).toHaveBeenCalledTimes(2);
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("surfaces the actual successful posture before navigating", () => {
+    const info = vi.fn();
+    const onLaunched = vi.fn();
+    toastBus.handler = { push: vi.fn(), error: vi.fn(), info };
+    try {
+      completeHomeLaunch(
+        {
+          sid: "s42",
+          vendor: "codex",
+          model: "gpt-5.6-codex",
+          effort: "xhigh",
+          fallback: true,
+        },
+        "en",
+        info,
+        onLaunched,
+      );
+      expect(info).toHaveBeenCalledWith(
+        "Launched s42 · codex · gpt-5.6-codex · xhigh · Commander fallback",
+      );
+      expect(onLaunched).toHaveBeenCalledWith("s42");
+    } finally {
+      toastBus.handler = null;
+    }
+  });
+
+  it("still returns the original non-capability error object without a retry", async () => {
+    const original = new Error("HTTP 403: project is not visible");
+    const createSession = vi.fn().mockRejectedValue(original);
     const submit = vi.fn();
     await expect(
       createAndSubmitHomeTurn(
@@ -360,8 +522,8 @@ describe("HomeView (landing page)", () => {
         },
         { createSession, submitTurn: submit },
       ),
-    ).rejects.toThrow("codex start failed");
-    expect(createSession).toHaveBeenCalledTimes(2);
+    ).rejects.toBe(original);
+    expect(createSession).toHaveBeenCalledOnce();
     expect(submit).not.toHaveBeenCalled();
   });
 });
