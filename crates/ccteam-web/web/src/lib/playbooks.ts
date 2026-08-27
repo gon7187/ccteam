@@ -10,7 +10,7 @@
 
 import { Crown, Lightbulb, Pyramid, Radar, ShieldCheck, Trophy } from "lucide-react";
 import type { TurnAttachment } from "./attachmentsApi";
-import { makeT, type Lang } from "./i18n";
+import { makeT, tr, type Lang } from "./i18n";
 import type { VendorCatalog } from "./modelsApi";
 import type { CreateSessionOpts } from "./sessionsApi";
 import { effortRowsFor, type VendorId } from "./vendors";
@@ -159,6 +159,63 @@ interface HomeTurnLaunchDeps {
   ) => Promise<unknown>;
 }
 
+/** The posture that actually created the session. This is deliberately not a
+ * copy of the user's initial draft: Commander may have taken its one allowed
+ * Codex fallback, and the UI must report that fact instead of implying Opus. */
+export interface HomeTurnLaunchReceipt {
+  sid: string;
+  vendor: string;
+  model?: string;
+  effort?: string;
+  fallback: boolean;
+}
+
+function sanitizeLaunchCause(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const printable = Array.from(raw, (character) => {
+    const code = character.charCodeAt(0);
+    return code < 32 || code === 127 ? " " : character;
+  }).join("");
+  const flattened = printable
+    .replace(/\s+/g, " ")
+    .trim();
+  const redacted = flattened
+    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\b(token|authorization|api[ _-]?key)\s*[:=]\s*\S+/gi, "$1=[redacted]");
+  return redacted.slice(0, 240) || "unknown";
+}
+
+function receiptFor(
+  created: { sid: string },
+  options: CreateSessionOpts,
+  fallback: boolean,
+): HomeTurnLaunchReceipt {
+  return {
+    sid: created.sid,
+    vendor: options.vendor ?? "claude",
+    ...(options.model ? { model: options.model } : {}),
+    ...(options.effort ? { effort: options.effort } : {}),
+    fallback,
+  };
+}
+
+/** Report the posture that really launched, then navigate to that sid. The
+ * caller supplies the visible notification seam so this helper stays usable
+ * outside React and cannot mutate the user's first-turn prompt. */
+export function completeHomeLaunch(
+  receipt: HomeTurnLaunchReceipt,
+  lang: Lang,
+  notify: (message: string) => void,
+  onLaunched: (sid: string) => void,
+): void {
+  const details = [receipt.sid, receipt.vendor, receipt.model, receipt.effort].filter(Boolean);
+  if (receipt.fallback) {
+    details.push(tr(lang, "Commander 回退", "Commander fallback", "fallback Commander"));
+  }
+  notify(`${tr(lang, "已启动", "Launched", "Запущено")} ${details.join(" · ")}`);
+  onLaunched(receipt.sid);
+}
+
 /** Create the lazy session and submit its first user turn.
  *
  * Commander gets one tightly-classified bootstrap fallback: when its exact
@@ -169,7 +226,7 @@ interface HomeTurnLaunchDeps {
 export async function createAndSubmitHomeTurn(
   input: HomeTurnLaunchInput,
   deps: HomeTurnLaunchDeps,
-): Promise<string> {
+): Promise<HomeTurnLaunchReceipt> {
   // Commander owns its bootstrap posture before HomeView's generic host
   // normalization: a host proven to lack Claude may use the best confirmed
   // Codex posture, but an unrelated installed vendor must never become the
@@ -199,28 +256,38 @@ export async function createAndSubmitHomeTurn(
   }
 
   let created: { sid: string };
+  let actualOptions = initialOptions;
+  let fallbackUsed = false;
   try {
     created = await deps.createSession(input.slug, initialOptions);
-  } catch (error) {
+  } catch (primaryError) {
     const fallback = input.commander
       && isCommanderBootstrapCapabilityError(
-        error,
+        primaryError,
         initialOptions,
         input.installedVendors,
       )
       ? bestCommanderCodexPosture(input.installedVendors, input.catalog)
       : null;
-    if (!fallback) throw error;
-    created = await deps.createSession(input.slug, {
+    if (!fallback) throw primaryError;
+    actualOptions = {
       ...initialOptions,
       vendor: fallback.vendor,
       protocol: "stream-json",
       model: fallback.model,
       effort: fallback.effort,
-    });
+    };
+    fallbackUsed = true;
+    try {
+      created = await deps.createSession(input.slug, actualOptions);
+    } catch (fallbackError) {
+      throw new Error(
+        `Commander bootstrap failed; primary: ${sanitizeLaunchCause(primaryError)}; fallback: ${sanitizeLaunchCause(fallbackError)}`,
+      );
+    }
   }
   await deps.submitTurn(created.sid, input.text, input.attachments);
-  return created.sid;
+  return receiptFor(created, actualOptions, fallbackUsed);
 }
 
 /** One-shot router-state extraction for the Team→Home handoff: the 起手 CTA

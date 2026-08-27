@@ -29,7 +29,8 @@ import { MemoryRouter } from "react-router-dom";
 
 import HomeView, { NewProjectFields } from "./HomeView";
 import type { HostSummary } from "../lib/hostsApi";
-import { createAndSubmitHomeTurn } from "../lib/playbooks";
+import { completeHomeLaunch, createAndSubmitHomeTurn } from "../lib/playbooks";
+import { toastBus } from "../lib/toastBus";
 
 function render() {
   return renderToString(
@@ -271,7 +272,13 @@ describe("HomeView (landing page)", () => {
         },
         { createSession, submitTurn: submit },
       ),
-    ).resolves.toBe("s42");
+    ).resolves.toEqual({
+      sid: "s42",
+      vendor: "codex",
+      model: "gpt-5.6-codex",
+      effort: "xhigh",
+      fallback: true,
+    });
 
     expect(createSession).toHaveBeenCalledTimes(2);
     expect(createSession.mock.calls[0]).toEqual([
@@ -329,7 +336,13 @@ describe("HomeView (landing page)", () => {
         },
         { createSession, submitTurn: submit },
       ),
-    ).resolves.toBe("s43");
+    ).resolves.toEqual({
+      sid: "s43",
+      vendor: "codex",
+      model: "gpt-5.6-codex",
+      effort: "xhigh",
+      fallback: false,
+    });
 
     expect(createSession).toHaveBeenCalledOnce();
     expect(createSession).toHaveBeenCalledWith("ccteam", {
@@ -424,11 +437,71 @@ describe("HomeView (landing page)", () => {
     }
   });
 
-  it("does not retry the fallback create itself", async () => {
+  it("does not retry the fallback create itself and preserves both sanitized causes", async () => {
     const createSession = vi
       .fn()
-      .mockRejectedValueOnce(new Error("invalid model `opus`"))
-      .mockRejectedValueOnce(new Error("codex start failed"));
+      .mockRejectedValueOnce(new Error("invalid model `opus`\nBearer primary-secret"))
+      .mockRejectedValueOnce(new Error("codex start failed\u0000 token=fallback-secret"));
+    const submit = vi.fn();
+    const failure = await createAndSubmitHomeTurn(
+      {
+        slug: "ccteam",
+        options: {
+          role: "",
+          vendor: "claude",
+          protocol: "stream-json",
+          model: "opus",
+          effort: "max",
+        },
+        text: "task",
+        attachments: [],
+        commander: true,
+        installedVendors: ["claude", "codex"],
+        catalog: {},
+      },
+      { createSession, submitTurn: submit },
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    const message = (failure as Error).message;
+    expect(message).toContain("primary: invalid model `opus` Bearer [redacted]");
+    expect(message).toContain("fallback: codex start failed token=[redacted]");
+    expect(message).not.toContain("primary-secret");
+    expect(message).not.toContain("fallback-secret");
+    expect(message).not.toContain("\n");
+    expect(createSession).toHaveBeenCalledTimes(2);
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("surfaces the actual successful posture before navigating", () => {
+    const info = vi.fn();
+    const onLaunched = vi.fn();
+    toastBus.handler = { push: vi.fn(), error: vi.fn(), info };
+    try {
+      completeHomeLaunch(
+        {
+          sid: "s42",
+          vendor: "codex",
+          model: "gpt-5.6-codex",
+          effort: "xhigh",
+          fallback: true,
+        },
+        "en",
+        info,
+        onLaunched,
+      );
+      expect(info).toHaveBeenCalledWith(
+        "Launched s42 · codex · gpt-5.6-codex · xhigh · Commander fallback",
+      );
+      expect(onLaunched).toHaveBeenCalledWith("s42");
+    } finally {
+      toastBus.handler = null;
+    }
+  });
+
+  it("still returns the original non-capability error object without a retry", async () => {
+    const original = new Error("HTTP 403: project is not visible");
+    const createSession = vi.fn().mockRejectedValue(original);
     const submit = vi.fn();
     await expect(
       createAndSubmitHomeTurn(
@@ -449,8 +522,8 @@ describe("HomeView (landing page)", () => {
         },
         { createSession, submitTurn: submit },
       ),
-    ).rejects.toThrow("codex start failed");
-    expect(createSession).toHaveBeenCalledTimes(2);
+    ).rejects.toBe(original);
+    expect(createSession).toHaveBeenCalledOnce();
     expect(submit).not.toHaveBeenCalled();
   });
 });

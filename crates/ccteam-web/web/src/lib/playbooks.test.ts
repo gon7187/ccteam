@@ -92,18 +92,55 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
     expect(prompt).toContain("status");
     expect(prompt).toContain("Codex");
     expect(prompt).toContain("session_spawn / session_dispatch");
-    expect(prompt).toContain("только если");
-    expect(prompt).toContain("явно недоступны");
-    expect(prompt).toContain("не повторяй");
-    for (const guard of ["ACL", "глубины делегирования", "бюджета", "цикла"]) {
+    expect(prompt).toContain("Только явное сообщение");
+    expect(prompt).toContain("не подключены или недоступны");
+    expect(prompt).toContain("не повторяй запрос");
+    for (const guard of ["ACL", "глубины делегирования", "бюджете", "цикле"]) {
       expect(prompt).toContain(guard);
     }
     for (const [lang, required] of [
-      ["zh", ["session_spawn / session_dispatch", "仅当", "明确报告为不可用", "不要重试", "委派深度"]],
-      ["ru", ["session_spawn / session_dispatch", "только если", "явно недоступны", "не повторяй", "глубины делегирования"]],
-      ["en", ["session_spawn / session_dispatch", "only when", "explicitly unavailable", "Do not retry", "delegation-depth"]],
+      [
+        "zh",
+        [
+          "session_spawn / session_dispatch",
+          "只有 status 或 spawn 的 capability 错误",
+          "明确报告为未连接或不可用",
+          "认证、ACL、超时、配额",
+          "fail closed",
+          "委派深度",
+        ],
+      ],
+      [
+        "ru",
+        [
+          "session_spawn / session_dispatch",
+          "Только явное сообщение status или capability-ошибка spawn",
+          "не подключены или недоступны",
+          "аутентификации, ACL, тайм-ауте, квоте",
+          "fail closed",
+          "глубины делегирования",
+        ],
+      ],
+      [
+        "en",
+        [
+          "session_spawn / session_dispatch",
+          "Only an explicit status result or spawn capability error",
+          "disconnected or unavailable",
+          "authentication, ACL, timeout, quota",
+          "fail closed",
+          "delegation-depth",
+        ],
+      ],
     ] as const) {
       for (const phrase of required) expect(I18N[lang].tplCommanderP).toContain(phrase);
+    }
+    for (const [lang, broadFallback] of [
+      ["zh", "Claude 或 Opus 不可用时，由 Codex 接管"],
+      ["ru", "если Claude или Opus недоступен — эту роль берёт Codex"],
+      ["en", "if Claude or Opus is unavailable, Codex takes command"],
+    ] as const) {
+      expect(I18N[lang].tplCommanderP).not.toContain(broadFallback);
     }
   });
 

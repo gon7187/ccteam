@@ -691,6 +691,8 @@ html.dark .dot.off { background: #4b4e57; }
 }
 .msg.system { align-self: center; max-width: 100%; }
 .msg.system .bubble { background: transparent; color: var(--text-faint); font-size: 12px; text-align: center; padding: 2px 8px; }
+.msg.error .who { color: var(--red-text); }
+.msg.error .bubble { background: var(--red-soft); color: var(--red-text); border: 1px solid color-mix(in srgb, var(--red) 25%, var(--border)); }
 .msg.approval .bubble {
   background: var(--bg-soft); border: 1px solid var(--border);
   border-radius: var(--radius-card); white-space: pre-wrap;

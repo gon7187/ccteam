@@ -122,4 +122,16 @@ describe("EvolutionPanel", () => {
       renderToString(<EvolutionPanel lang="ru" evolution={empty} loading={false} />),
     ).toContain("Данных об опыте пока нет");
   });
+
+  it("labels the honest empty role id as the default role bucket", () => {
+    const roleless = {
+      ...SUMMARY,
+      roles: [{ ...SUMMARY.roles[0]!, id: "", sha: "unknown" }],
+    };
+    const html = renderToString(
+      <EvolutionPanel lang="en" evolution={roleless} loading={false} />,
+    ).replace(/<!-- -->/g, "");
+    expect(html).toContain("role:(default)");
+    expect(html).not.toContain("role:__default__");
+  });
 });

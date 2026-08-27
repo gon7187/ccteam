@@ -873,7 +873,17 @@ fn turn_to_event(turn: &TurnRecord, verdict: Option<&TurnVerdict>) -> serde_json
         "role": turn.role,
         "user": turn.user,
         "assistant": turn.assistant,
+        // turns.jsonl is terminal-only. Success rows historically omitted the
+        // optional field, so absence means completed; explicit failures and
+        // other terminal outcomes remain verbatim.
+        "outcome": turn.outcome.as_deref().unwrap_or("completed"),
     });
+    if let Some(error_kind) = turn.error_kind.as_deref() {
+        event["error_kind"] = json!(error_kind);
+    }
+    if let Some(error) = turn.error.as_deref() {
+        event["error"] = json!(error);
+    }
     if !turn.attachments.is_empty() {
         event["attachments"] =
             serde_json::to_value(&turn.attachments).unwrap_or_else(|_| json!([]));
@@ -2611,9 +2621,33 @@ mod tests {
         assert_eq!(ev["role"], "cto");
         assert_eq!(ev["user"], "spawn a reviewer");
         assert_eq!(ev["assistant"], "done — s2");
+        assert_eq!(ev["outcome"], "completed");
         assert_eq!(ev["attachments"][0]["id"], "1780000000000-chart.png");
         assert_eq!(ev["attachments"][0]["kind"], "image");
         assert!(ev["attachments"][0].get("path").is_none());
+    }
+
+    #[test]
+    fn turn_to_event_carries_terminal_failure_metadata() {
+        let turn = TurnRecord {
+            turn_id: "t-failed".into(),
+            ts: chrono::Utc::now(),
+            vendor: "codex".into(),
+            role: "".into(),
+            user: "do the work".into(),
+            assistant: "".into(),
+            usage: serde_json::Value::Null,
+            tool_calls: vec![],
+            attachments: vec![],
+            outcome: Some("failed".into()),
+            error_kind: Some("server_overloaded".into()),
+            error: Some("provider is overloaded".into()),
+        };
+
+        let event = turn_to_event(&turn, None);
+        assert_eq!(event["outcome"], "failed");
+        assert_eq!(event["error_kind"], "server_overloaded");
+        assert_eq!(event["error"], "provider is overloaded");
     }
 
     /// Build a minimal [`GatewayEvent`] with the given `sid` for filter tests.

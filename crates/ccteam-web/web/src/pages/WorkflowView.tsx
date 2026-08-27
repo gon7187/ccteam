@@ -2,7 +2,7 @@
 // a set-nav second column (232px, 「工作流」) with five sub-pages —
 // Skills / Roles / Plugins / MCP Servers / 自进化.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Activity, Package, Server, ShoppingBag, User } from "lucide-react";
 import { listProjectRoles, type RoleSummary } from "../lib/sessionsApi";
 import { getProjectMarketplace, type DecoratedPlugin } from "../lib/marketplaceApi";
@@ -62,7 +62,17 @@ export default function WorkflowView({
   const slug = projects.includes(selectedSlug) ? selectedSlug : (projects[0] ?? "");
   const [roles, setRoles] = useState<RoleSummary[]>([]);
   const [skills, setSkills] = useState<DecoratedPlugin[]>([]);
-  const [evolution, setEvolution] = useState<EvolutionSummary | null>(null);
+  const [evolutionState, setEvolutionState] = useState<{
+    slug: string;
+    data: EvolutionSummary | null;
+    loading: boolean;
+  }>({ slug: "", data: null, loading: false });
+  const evolutionRequestRef = useRef(0);
+  const evolution = evolutionState.slug === slug ? evolutionState.data : null;
+  const evolutionLoading =
+    tab === "evolution" &&
+    Boolean(slug) &&
+    (evolutionState.slug !== slug || evolutionState.loading);
   const [loading, setLoading] = useState(false);
   // v0.8.24 gap-fill — MCP servers page.
   const [mcp, setMcp] = useState<McpServersResponse | null>(null);
@@ -70,7 +80,7 @@ export default function WorkflowView({
   const [mcpBusy, setMcpBusy] = useState(false);
 
   const refreshTab = useCallback(async () => {
-    if (!slug) return;
+    if (!slug || tab === "evolution") return;
     setLoading(true);
     try {
       if (tab === "roles") {
@@ -80,8 +90,6 @@ export default function WorkflowView({
         setSkills((idx.plugins ?? []).filter((p) => p.type === "skill"));
       } else if (tab === "market") {
         return;
-      } else if (tab === "evolution") {
-        setEvolution(await getEvolution(slug));
       } else if (tab === "mcp") {
         setMcp(await getMcpServers(slug));
       }
@@ -90,6 +98,38 @@ export default function WorkflowView({
     } finally {
       setLoading(false);
     }
+  }, [slug, tab]);
+
+  // Evolution data is project-scoped, not merely the last response to win.
+  // Keying the state by slug hides the previous project's projection on the
+  // very render that switches projects; the epoch + cleanup then reject any
+  // late response from the superseded project.
+  useEffect(() => {
+    if (tab !== "evolution") return;
+    const request = ++evolutionRequestRef.current;
+    let cancelled = false;
+    if (!slug) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    queueMicrotask(() => {
+      if (cancelled || request !== evolutionRequestRef.current) return;
+      setEvolutionState({ slug, data: null, loading: true });
+    });
+    getEvolution(slug)
+      .then((data) => {
+        if (cancelled || request !== evolutionRequestRef.current) return;
+        setEvolutionState({ slug, data, loading: false });
+      })
+      .catch((error) => {
+        if (cancelled || request !== evolutionRequestRef.current) return;
+        setEvolutionState({ slug, data: null, loading: false });
+        toastBus.handler?.error(error instanceof Error ? error.message : String(error));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [slug, tab]);
 
   useEffect(() => {
@@ -195,7 +235,9 @@ export default function WorkflowView({
 
       <div className="set-detail">
         <div className="set-detail-inner fade-in" key={tab}>
-          {loading ? <p style={{ color: "var(--text-faint)", fontSize: 13 }}>{t("loading")}</p> : null}
+          {(tab === "evolution" ? evolutionLoading : loading) ? (
+            <p style={{ color: "var(--text-faint)", fontSize: 13 }}>{t("loading")}</p>
+          ) : null}
 
           {tab === "skills" ? (
             <>
@@ -484,7 +526,7 @@ export default function WorkflowView({
                   "Оценки человека замыкают обратную связь: принятое и отправленное на доработку учитывается по ревизиям отпечатков ролей и навыков. Улучшение запрашивает у агента только предложение и только после вашего подтверждения. Ничего не меняется автоматически.",
                 ),
               )}
-              <EvolutionPanel lang={lang} evolution={evolution} loading={loading} />
+              <EvolutionPanel lang={lang} evolution={evolution} loading={evolutionLoading} />
             </>
           ) : null}
 

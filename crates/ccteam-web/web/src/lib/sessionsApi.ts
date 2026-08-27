@@ -78,6 +78,11 @@ export interface SessionHistoryEvent {
   role: string;
   user: string;
   assistant: string;
+  /** Canonical terminal result. Missing on legacy mirrored turns. */
+  outcome?: "completed" | "failed" | string;
+  /** Structured provider failure category and readable detail, when failed. */
+  error_kind?: string;
+  error?: string;
   /** Latest human verdict for this completed turn. Absent on older daemons
    * and unrated turns. */
   verdict?: TurnVerdictRecord;

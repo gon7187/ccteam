@@ -215,7 +215,11 @@ export default function SessionView({
   // only frames arriving after the reseed append from then on.
   const foldedRef = useRef(0);
   const eventsRef = useRef(events);
-  const historyRequestRef = useRef(0);
+  // Full/metadata refreshes and backwards pagination are independent request
+  // lanes. A live answer may refresh canonical turn ids while an older page is
+  // in flight; it must not invalidate that page or strand its loading flag.
+  const historyMetadataRequestRef = useRef(0);
+  const historyPaginationRequestRef = useRef(0);
   const [historyPage, setHistoryPage] = useState({
     hasMore: false,
     nextBefore: null as string | null,
@@ -228,11 +232,19 @@ export default function SessionView({
   // ---- authoritative seed: mirrored history (mount-scoped) -----------------
   useEffect(() => {
     let cancelled = false;
-    const request = ++historyRequestRef.current;
+    // ChatConsole keys this component by sid, but keep the component safe for
+    // direct prop reuse too: an old sid's backwards page must never mutate the
+    // new sid's rows or cursor after its deferred request settles.
+    const paginationRequest = ++historyPaginationRequestRef.current;
+    queueMicrotask(() => {
+      if (cancelled || paginationRequest !== historyPaginationRequestRef.current) return;
+      setHistoryPage({ hasMore: false, nextBefore: null, loadingEarlier: false });
+    });
+    const request = ++historyMetadataRequestRef.current;
     const verdictVersions = new Map(verdictMutationVersionRef.current);
     getHistory(sid)
       .then((h) => {
-        if (cancelled || request !== historyRequestRef.current) return;
+        if (cancelled || request !== historyMetadataRequestRef.current) return;
         const seeded = historyToRows(h.events);
         if (seeded.length > 0) {
           setRows((current) => preserveNewerVerdicts(seeded, current, verdictVersions));
@@ -258,11 +270,21 @@ export default function SessionView({
   useEffect(() => {
     if (connectionEpoch <= 1) return;
     let cancelled = false;
-    const request = ++historyRequestRef.current;
+    // A reconnect replaces the whole window and its cursor. Invalidate any
+    // older page immediately and release its loading affordance even if the
+    // stale request later aborts, rejects, or resolves.
+    ++historyPaginationRequestRef.current;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setHistoryPage((current) =>
+        current.loadingEarlier ? { ...current, loadingEarlier: false } : current,
+      );
+    });
+    const request = ++historyMetadataRequestRef.current;
     const verdictVersions = new Map(verdictMutationVersionRef.current);
     getHistory(sid)
       .then((h) => {
-        if (cancelled || request !== historyRequestRef.current) return;
+        if (cancelled || request !== historyMetadataRequestRef.current) return;
         foldedRef.current = eventsRef.current.length;
         const seeded = historyToRows(h.events);
         setRows((current) => preserveNewerVerdicts(seeded, current, verdictVersions));
@@ -283,12 +305,12 @@ export default function SessionView({
   const loadEarlier = useCallback(() => {
     if (!historyPage.hasMore || !historyPage.nextBefore || historyPage.loadingEarlier) return;
     const before = historyPage.nextBefore;
-    const request = ++historyRequestRef.current;
+    const request = ++historyPaginationRequestRef.current;
     const verdictVersions = new Map(verdictMutationVersionRef.current);
     setHistoryPage((current) => ({ ...current, loadingEarlier: true }));
     getHistory(sid, { before })
       .then((history) => {
-        if (request !== historyRequestRef.current) return;
+        if (request !== historyPaginationRequestRef.current) return;
         const earlier = historyToRows(history.events);
         if (earlier.length > 0) {
           setRows((current) => [
@@ -303,8 +325,13 @@ export default function SessionView({
         });
       })
       .catch(() => {
-        if (request !== historyRequestRef.current) return;
-        setHistoryPage((current) => ({ ...current, loadingEarlier: false }));
+        /* The cursor remains retryable; finally releases the affordance. */
+      })
+      .finally(() => {
+        if (request !== historyPaginationRequestRef.current) return;
+        setHistoryPage((current) =>
+          current.loadingEarlier ? { ...current, loadingEarlier: false } : current,
+        );
       });
   }, [sid, historyPage, preserveNewerVerdicts]);
 
@@ -347,11 +374,11 @@ export default function SessionView({
     }
     refreshedAnswerRef.current = latestAnswer;
     let cancelled = false;
-    const request = ++historyRequestRef.current;
+    const request = ++historyMetadataRequestRef.current;
     const verdictVersions = new Map(verdictMutationVersionRef.current);
     getHistory(sid)
       .then((history) => {
-        if (cancelled || request !== historyRequestRef.current) return;
+        if (cancelled || request !== historyMetadataRequestRef.current) return;
         setRows((current) =>
           preserveNewerVerdicts(
             mergeAuthoritativeTurnMetadata(current, history.events),
@@ -812,6 +839,18 @@ export default function SessionView({
                       </div>
                     );
                   }
+                  if (row.kind === "error") {
+                    return (
+                      <div key={row.id} className="msg error fade-in">
+                        <span className="who">
+                          {tr(lang, "错误", "Error", "Ошибка")}
+                          {row.errorKind ? ` · ${row.errorKind}` : ""}
+                        </span>
+                        <div className="bubble">{row.content}</div>
+                        <RowTime ts={row.ts} lang={lang} />
+                      </div>
+                    );
+                  }
                   if (row.kind === "activity") {
                     return (
                       <div key={row.id} className="msg activity">
@@ -847,15 +886,17 @@ export default function SessionView({
                           project={session?.project}
                           attachments={row.attachments}
                         />
-                        <TurnVerdictControls
-                          lang={lang}
-                          row={row}
-                          busy={row.turnId ? verdictBusy[row.turnId] === true : false}
-                          onVerdict={(verdict, feedback) =>
-                            saveTurnVerdict(row, verdict, feedback)
-                          }
-                          onImprove={(feedback) => requestImprovement(row, feedback)}
-                        />
+                        {row.outcome === "completed" ? (
+                          <TurnVerdictControls
+                            lang={lang}
+                            row={row}
+                            busy={row.turnId ? verdictBusy[row.turnId] === true : false}
+                            onVerdict={(verdict, feedback) =>
+                              saveTurnVerdict(row, verdict, feedback)
+                            }
+                            onImprove={(feedback) => requestImprovement(row, feedback)}
+                          />
+                        ) : null}
                       </div>
                       <RowTime ts={row.ts} lang={lang} />
                     </div>

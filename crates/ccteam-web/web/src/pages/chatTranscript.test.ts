@@ -325,6 +325,7 @@ describe("chatTranscript historyToRows", () => {
         role: "reviewer",
         user: "review this",
         assistant: "done",
+        outcome: "completed",
         verdict: {
           verdict: "revise",
           feedback: "Cover the failure path",
@@ -344,6 +345,36 @@ describe("chatTranscript historyToRows", () => {
     });
   });
 
+  it("maps a failed terminal turn to an error row and drops its verdict", () => {
+    const rows = historyToRows([
+      {
+        turn_id: "t-failed",
+        ts: "2026-08-28T00:00:00Z",
+        role: "",
+        user: "do the work",
+        assistant: "",
+        outcome: "failed",
+        error_kind: "server_overloaded",
+        error: "provider is overloaded",
+        verdict: {
+          verdict: "revise",
+          feedback: "try again",
+          ts: "2026-08-28T00:01:00Z",
+        },
+      },
+    ]);
+
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toMatchObject({
+      kind: "error",
+      content: "provider is overloaded",
+      turnId: "t-failed",
+      outcome: "failed",
+      errorKind: "server_overloaded",
+    });
+    expect(rows[1]?.verdict).toBeUndefined();
+  });
+
   it("adds authoritative turn metadata to a live answer without dropping transient rows", () => {
     const live: TranscriptRow[] = [
       { id: "activity", kind: "activity", content: "working" },
@@ -357,6 +388,7 @@ describe("chatTranscript historyToRows", () => {
         role: "reviewer",
         user: "review this",
         assistant: "done",
+        outcome: "completed",
         verdict: {
           verdict: "accept",
           feedback: null,
@@ -371,6 +403,7 @@ describe("chatTranscript historyToRows", () => {
         ...live[1],
         turnId: "t-reviewed",
         ts: "2026-08-28T00:00:00Z",
+        outcome: "completed",
         verdict: events[0]?.verdict,
       },
       live[2],
