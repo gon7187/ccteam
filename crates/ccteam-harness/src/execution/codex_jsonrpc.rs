@@ -105,10 +105,14 @@ impl CodexJsonRpcClient {
     /// not the same raw JSONL control protocol exposed by the standalone
     /// daemon socket.
     pub async fn connect_stdio_command(program: &str) -> Result<Self> {
+        let stable_cwd = dirs::home_dir()
+            .filter(|path| path.is_dir())
+            .context("resolve existing home directory for codex app-server")?;
         let mut child = Command::new(program)
             .arg("app-server")
             .arg("--listen")
             .arg("stdio://")
+            .current_dir(stable_cwd)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

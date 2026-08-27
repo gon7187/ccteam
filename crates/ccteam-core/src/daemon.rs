@@ -680,6 +680,7 @@ pub fn start_managed(paths: &CcteamPaths, spec: &DaemonStartSpec) -> Result<Star
     let mut command = std::process::Command::new(&spec.program);
     command
         .args(&spec.args)
+        .current_dir(&paths.root)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_stderr));
@@ -1040,6 +1041,38 @@ mod tests {
             version: env!("CARGO_PKG_VERSION").to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_daemon_starts_from_its_persistent_home() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = paths(&tmp);
+        let marker = tmp.path().join("daemon-cwd");
+        let fake_daemon = tmp.path().join("fake-daemon");
+        std::fs::write(
+            &fake_daemon,
+            format!("#!/bin/sh\npwd -P > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_daemon).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_daemon, permissions).unwrap();
+
+        let spec = DaemonStartSpec {
+            program: fake_daemon,
+            args: Vec::new(),
+            log_path: tmp.path().join("daemon.log"),
+            ready_timeout: Duration::from_secs(1),
+        };
+        let _ = start_managed(&paths, &spec).unwrap_err();
+
+        assert_eq!(
+            PathBuf::from(std::fs::read_to_string(marker).unwrap().trim()),
+            paths.root
+        );
     }
 
     #[test]
