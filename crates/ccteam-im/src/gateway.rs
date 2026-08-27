@@ -12687,7 +12687,7 @@ impl Gateway {
     /// (c) records the turn in `notified_turns` so it is delivered AT-MOST-once,
     /// and (d) v0.10.1 — SPENDS the watch: this boundary is the end of the
     /// dispatched task, and one dispatch subscribes to exactly one task. A
-    /// rejected parent submissions are retried briefly without duplicating the
+    /// Rejected parent submissions are retried briefly without duplicating the
     /// completion event; failure retains the durable watch for startup
     /// reconciliation. The same per-child claim as dispatch/watch registration
     /// serializes the whole delivery, so a new task cannot re-arm between the
