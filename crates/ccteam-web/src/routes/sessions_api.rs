@@ -14,6 +14,7 @@
 //! - `POST   /api/v1/projects/{slug}/sessions`        → create → 201 `{sid}`
 //! - `GET    /api/v1/sessions/{sid}`                  → `{sid, events}` history
 //! - `POST   /api/v1/sessions/{sid}/turn`             → submit → 202 `{accepted:true}`
+//! - `PUT    /api/v1/sessions/{sid}/turns/{turn_id}/verdict` → human verdict
 //! - `GET    /api/v1/sessions/{sid}/events`           → SSE (filtered by `sid`)
 //! - `POST   /api/v1/sessions/{sid}/stop`             → stop → 200 `{stopped:true}`
 //! - `POST   /api/v1/sessions/{sid}/interrupt`        → interrupt running turn → 200 `{interrupted:true}`
@@ -47,8 +48,9 @@
 //! `<project_dir>/.ccteam/chat/<sid>/turns.jsonl` via the shared journal facade.
 //! v0.8.8 F1 — the mirror is keyed by the session **sid**, not the role, so
 //! two same-role sessions have independent histories (no cross-bleed). It is
-//! best-effort: an empty `events` array is a valid 200 when nothing has been
-//! written yet. A `sid` unknown to the gateway is a 404.
+//! An empty `events` array is a valid 200 when nothing has been written yet;
+//! real transcript/verdict read failures are 500. A `sid` unknown to the
+//! gateway is a 404.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -63,7 +65,10 @@ use axum::{
     },
     Extension, Json,
 };
-use ccteam_harness::execution::turns_mirror::{turns_jsonl_path, TurnRecord};
+use ccteam_harness::execution::progress_bridge::{
+    append_turn_verdict_if_changed, latest_turn_verdicts, TurnVerdict, Verdict,
+};
+use ccteam_harness::execution::turns_mirror::{read_all_turns, turns_jsonl_path, TurnRecord};
 use ccteam_harness::{
     AgentVendor, ChoicePrompt, HarnessAdapter, PermissionMode, SessionProtocol, ThreadHandle,
     ThreadStatus,
@@ -468,10 +473,11 @@ pub(crate) async fn handle_create_session(
 /// appears in the flat `<slug>.jsonl` progress — so we resolve the sid to
 /// its `{role, project_dir}` via [`Gateway::session_resolve`] (404 if the
 /// sid is unknown to the gateway) and read the ccteam-owned per-session
-/// mirror `<project_dir>/.ccteam/chat/<sid>/turns.jsonl`. Best-effort:
-/// returns the newest 100 turns by default and supports backwards cursor
+/// mirror `<project_dir>/.ccteam/chat/<sid>/turns.jsonl`. Returns the newest
+/// 100 turns by default and supports backwards cursor
 /// pagination. `{sid, events: []}` (200) when no turn has been mirrored yet
-/// (or the file read fails). 503 with no gateway.
+/// yet. Transcript or verdict journal read failures are 500. 503 with no
+/// gateway.
 ///
 /// Lock discipline: `session_resolve` is sync (no `.await`) and only clones
 /// scalar fields, so we run it under the gateway guard, then **drop the
@@ -488,6 +494,7 @@ pub(crate) async fn handle_create_session(
     responses(
         (status = 200, description = "History `{sid, events:[...], next_before, has_more}`", body = serde_json::Value),
         (status = 404, description = "Unknown session"),
+        (status = 500, description = "Transcript or verdict journal read failed"),
         (status = 503, description = "No live gateway (standalone web)"),
     ),
 )]
@@ -528,7 +535,34 @@ pub(crate) async fn handle_session_history(
                 .into_response();
         }
     };
-    let page = collect_session_turns(&resolved.project_dir, &resolved.sid, limit, before);
+    let verdicts = match latest_turn_verdicts(&app.paths.progress_jsonl(&resolved.project)) {
+        Ok(verdicts) => verdicts,
+        Err(err) => {
+            tracing::error!(%sid, project = %resolved.project, %err, "read turn verdicts failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "session verdict history unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    let page = match collect_session_turns(
+        &resolved.project_dir,
+        &resolved.sid,
+        limit,
+        before,
+        &verdicts,
+    ) {
+        Ok(page) => page,
+        Err(err) => {
+            tracing::error!(%sid, %err, "read session history failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "session history unavailable"})),
+            )
+                .into_response();
+        }
+    };
     Json(json!({
         "sid": sid,
         "events": page.events,
@@ -545,6 +579,138 @@ const MAX_HISTORY_LIMIT: usize = 1000;
 pub(crate) struct SessionHistoryQuery {
     limit: Option<usize>,
     before: Option<String>,
+}
+
+const MAX_VERDICT_FEEDBACK_CHARS: usize = 4_000;
+
+/// Human verdict accepted by the turn feedback endpoint.
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnVerdictChoice {
+    Accept,
+    Revise,
+}
+
+/// Body for `PUT /api/v1/sessions/{sid}/turns/{turn_id}/verdict`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TurnVerdictRequest {
+    pub verdict: TurnVerdictChoice,
+    pub feedback: Option<String>,
+}
+
+/// Persist the latest human verdict for one exact mirrored turn.
+#[utoipa::path(
+    put,
+    path = "/api/v1/sessions/{sid}/turns/{turn_id}/verdict",
+    tag = "sessions",
+    params(
+        ("sid" = String, Path, description = "Gateway session id (`s{n}`)"),
+        ("turn_id" = String, Path, description = "Exact mirrored turn id"),
+    ),
+    request_body = TurnVerdictRequest,
+    responses(
+        (status = 200, description = "Canonical verdict `{sid, turn_id, verdict, feedback, changed}`", body = serde_json::Value),
+        (status = 400, description = "Invalid feedback"),
+        (status = 404, description = "Unknown or inaccessible session/turn"),
+        (status = 500, description = "Transcript read or verdict append failed"),
+        (status = 503, description = "No live gateway (standalone web)"),
+    ),
+)]
+pub(crate) async fn handle_turn_verdict(
+    State(app): State<AppState>,
+    Extension(identity): Extension<crate::auth::Identity>,
+    Path((sid, turn_id)): Path<(String, String)>,
+    Json(body): Json<TurnVerdictRequest>,
+) -> Response {
+    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
+        return deny;
+    }
+    let Some(gw) = app.gateway.as_ref() else {
+        return no_gateway();
+    };
+    let resolved = {
+        let guard = ccteam_im::latency::gateway_lock(gw, "web.sessions.verdict").await;
+        guard.session_resolve_any(&sid)
+    };
+    let Some(resolved) = resolved else {
+        return unknown_session(&sid);
+    };
+
+    let feedback = body
+        .feedback
+        .as_deref()
+        .map(str::trim)
+        .filter(|feedback| !feedback.is_empty())
+        .map(str::to_string);
+    if feedback
+        .as_deref()
+        .is_some_and(|feedback| feedback.chars().count() > MAX_VERDICT_FEEDBACK_CHARS)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "feedback must be at most 4000 characters"})),
+        )
+            .into_response();
+    }
+    if matches!(body.verdict, TurnVerdictChoice::Revise) && feedback.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "revise verdict requires non-empty feedback"})),
+        )
+            .into_response();
+    }
+
+    let turns = match read_all_turns(&resolved.project_dir, &resolved.sid) {
+        Ok(turns) => turns,
+        Err(err) => {
+            tracing::error!(%sid, %turn_id, %err, "read turns before verdict failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "session history unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    if !turns.iter().any(|turn| turn.turn_id == turn_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown turn: {turn_id}")})),
+        )
+            .into_response();
+    }
+
+    let verdict = TurnVerdict {
+        sid: resolved.sid,
+        turn_id,
+        ts: chrono::Utc::now(),
+        verdict: match body.verdict {
+            TurnVerdictChoice::Accept => Verdict::Accept,
+            TurnVerdictChoice::Revise => Verdict::Revise,
+        },
+        feedback,
+    };
+    let changed = match append_turn_verdict_if_changed(
+        &app.paths.progress_jsonl(&resolved.project),
+        &verdict,
+    ) {
+        Ok(changed) => changed,
+        Err(err) => {
+            tracing::error!(sid = %verdict.sid, turn_id = %verdict.turn_id, %err, "append turn verdict failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "turn verdict storage unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    Json(json!({
+        "sid": verdict.sid,
+        "turn_id": verdict.turn_id,
+        "verdict": verdict.verdict,
+        "feedback": verdict.feedback,
+        "changed": changed,
+    }))
+    .into_response()
 }
 
 /// PATCH body for `PATCH /api/v1/sessions/{sid}` — the only mutable field is
@@ -644,8 +810,8 @@ fn rename_payload(renamed: &ccteam_im::gateway::SessionRename) -> serde_json::Va
 /// Reconstruct a session's history from its ccteam-owned transcript mirror
 /// `<project_dir>/.ccteam/chat/<sid>/turns.jsonl` (the same file the W1
 /// `session_collect` path reads). Each [`TurnRecord`] becomes one event
-/// object; any read error folds to an empty page — a best-effort history
-/// view (an absent file is the legitimate first-turn case). Split out from the
+/// object; an absent file is the legitimate first-turn case, while real read
+/// failures propagate to the handler as 500. Split out from the
 /// handler so the disk → events mapping is unit-testable without a live
 /// gateway.
 ///
@@ -664,29 +830,35 @@ fn collect_session_turns(
     sid: &str,
     limit: usize,
     before: Option<u64>,
-) -> SessionHistoryPage {
+    verdicts: &std::collections::BTreeMap<(String, String), TurnVerdict>,
+) -> anyhow::Result<SessionHistoryPage> {
     let path = turns_jsonl_path(project_dir, sid);
-    match ccteam_core::journal::tail_filter_map(&path, limit, before, |line| {
+    let tail = ccteam_core::journal::tail_filter_map(&path, limit, before, |line| {
         serde_json::from_slice::<TurnRecord>(line).ok()
-    }) {
-        Ok(tail) => SessionHistoryPage {
-            events: tail.events.iter().map(turn_to_event).collect(),
-            next_before: if tail.has_more {
-                tail.first_offset.map(|offset| offset.to_string())
-            } else {
-                None
-            },
-            has_more: tail.has_more,
+    })?;
+    Ok(SessionHistoryPage {
+        events: tail
+            .events
+            .iter()
+            .map(|turn| {
+                let verdict = verdicts.get(&(sid.to_string(), turn.turn_id.clone()));
+                turn_to_event(turn, verdict)
+            })
+            .collect(),
+        next_before: if tail.has_more {
+            tail.first_offset.map(|offset| offset.to_string())
+        } else {
+            None
         },
-        Err(_) => SessionHistoryPage::default(),
-    }
+        has_more: tail.has_more,
+    })
 }
 
 /// Map one mirrored [`TurnRecord`] to the history event shape the SPA
 /// renders. Keeps the user prompt + assistant reply + turn id/ts so a
 /// reopened per-session page can seed its transcript before the live SSE
 /// takes over.
-fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
+fn turn_to_event(turn: &TurnRecord, verdict: Option<&TurnVerdict>) -> serde_json::Value {
     let mut event = json!({
         "turn_id": turn.turn_id,
         "ts": turn.ts,
@@ -697,6 +869,16 @@ fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
     if !turn.attachments.is_empty() {
         event["attachments"] =
             serde_json::to_value(&turn.attachments).unwrap_or_else(|_| json!([]));
+    }
+    if let Some(verdict) = verdict {
+        let mut value = json!({
+            "verdict": verdict.verdict,
+            "ts": verdict.ts,
+        });
+        if let Some(feedback) = verdict.feedback.as_deref() {
+            value["feedback"] = json!(feedback);
+        }
+        event["verdict"] = value;
     }
     event
 }
@@ -2317,7 +2499,15 @@ mod tests {
                 .unwrap();
             writeln!(f, "not-json").unwrap();
         }
-        let events = collect_session_turns(project_dir, sid, 100, None).events;
+        let events = collect_session_turns(
+            project_dir,
+            sid,
+            100,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap()
+        .events;
         assert_eq!(events.len(), 2, "two parseable turns → two events");
         assert_eq!(events[0]["turn_id"], "t1");
         assert_eq!(events[0]["user"], "review the diff");
@@ -2352,7 +2542,15 @@ mod tests {
         append_turn(project_dir, "s1", &mk("t1", "from-s1")).unwrap();
         append_turn(project_dir, "s2", &mk("t2", "from-s2")).unwrap();
 
-        let only_s1 = collect_session_turns(project_dir, "s1", 100, None).events;
+        let only_s1 = collect_session_turns(
+            project_dir,
+            "s1",
+            100,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap()
+        .events;
         assert_eq!(
             only_s1.len(),
             1,
@@ -2361,7 +2559,15 @@ mod tests {
         assert_eq!(only_s1[0]["turn_id"], "t1");
         assert_eq!(only_s1[0]["assistant"], "from-s1");
 
-        let only_s2 = collect_session_turns(project_dir, "s2", 100, None).events;
+        let only_s2 = collect_session_turns(
+            project_dir,
+            "s2",
+            100,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap()
+        .events;
         assert_eq!(
             only_s2.len(),
             1,
@@ -2392,7 +2598,7 @@ mod tests {
             error_kind: None,
             error: None,
         };
-        let ev = turn_to_event(&turn);
+        let ev = turn_to_event(&turn, None);
         assert_eq!(ev["turn_id"], "t9");
         assert_eq!(ev["role"], "cto");
         assert_eq!(ev["user"], "spawn a reviewer");
@@ -2966,9 +3172,16 @@ mod tests {
         // not an error. The journal facade returns an empty tail for a missing file.
         // v0.8.8 F1 — keyed by sid (the never-spawned `s99` has no mirror yet).
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(collect_session_turns(tmp.path(), "s99", 100, None)
-            .events
-            .is_empty());
+        assert!(collect_session_turns(
+            tmp.path(),
+            "s99",
+            100,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap()
+        .events
+        .is_empty());
     }
 
     fn test_paths(root: &std::path::Path) -> ccteam_core::CcteamPaths {

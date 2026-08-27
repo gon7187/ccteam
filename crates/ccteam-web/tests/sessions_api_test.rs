@@ -207,6 +207,19 @@ async fn session_history_no_gateway_is_503() {
 }
 
 #[tokio::test]
+async fn session_verdict_no_gateway_is_503() {
+    let tmp = TempDir::new().unwrap();
+    let addr = spawn_server(AppState::new(fake_paths(tmp.path()))).await;
+    let resp = reqwest::Client::new()
+        .put(format!("http://{addr}/api/v1/sessions/s1/turns/t1/verdict"))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+}
+
+#[tokio::test]
 async fn session_turn_no_gateway_is_503() {
     let tmp = TempDir::new().unwrap();
     let addr = spawn_server(AppState::new(fake_paths(tmp.path()))).await;
@@ -1026,6 +1039,251 @@ async fn session_history_defaults_to_newest_100_and_pages_backwards() {
     assert_eq!(invalid.status(), 400);
 }
 
+#[tokio::test]
+async fn session_verdict_is_idempotent_and_history_joins_latest_archive_and_active_value() {
+    ccteam_core::disable_tool_surface_bootstrap_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr = spawn_server(AppState::new(paths.clone()).with_gateway_owned(gateway)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://{addr}/api/v1");
+
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ccteam_harness::execution::turns_mirror::append_turn(
+        &project_dir,
+        &sid,
+        &ccteam_harness::execution::turns_mirror::TurnRecord {
+            turn_id: "turn-1".into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: String::new(),
+            user: "implement it".into(),
+            assistant: "done".into(),
+            usage: Value::Null,
+            tool_calls: vec![],
+            attachments: vec![],
+            outcome: Some("completed".into()),
+            error_kind: None,
+            error: None,
+        },
+    )
+    .unwrap();
+
+    // Seed the retained archive: history must expose this verdict even when
+    // the active journal does not exist yet.
+    let progress = paths.progress_jsonl("demo");
+    std::fs::create_dir_all(progress.parent().unwrap()).unwrap();
+    let archive = ccteam_harness::execution::progress_bridge::progress_archive_path(&progress);
+    std::fs::write(
+        &archive,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "event": "turn_verdict",
+                "sid": sid,
+                "turn_id": "turn-1",
+                "ts": "2026-08-28T10:00:00Z",
+                "verdict": "accept"
+            })
+        ),
+    )
+    .unwrap();
+
+    let archived_history: Value = client
+        .get(format!("{base}/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        archived_history["events"][0]["verdict"]["verdict"],
+        "accept"
+    );
+    assert_eq!(
+        archived_history["events"][0]["verdict"]["ts"],
+        "2026-08-28T10:00:00Z"
+    );
+
+    // PUT of the same semantic value is idempotent even though the server
+    // generates a fresh timestamp.
+    let accepted: Value = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-1/verdict"))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accepted["sid"], sid);
+    assert_eq!(accepted["turn_id"], "turn-1");
+    assert_eq!(accepted["verdict"], "accept");
+    assert!(accepted["feedback"].is_null());
+    assert_eq!(accepted["changed"], false);
+
+    let revised: Value = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-1/verdict"))
+        .json(&serde_json::json!({
+            "verdict": "revise",
+            "feedback": "  cover the timeout path  "
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(revised["feedback"], "cover the timeout path");
+    assert_eq!(revised["changed"], true);
+
+    let duplicate: Value = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-1/verdict"))
+        .json(&serde_json::json!({
+            "verdict": "revise",
+            "feedback": "cover the timeout path"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(duplicate["changed"], false);
+
+    let history: Value = client
+        .get(format!("{base}/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(history["events"][0]["verdict"]["verdict"], "revise");
+    assert_eq!(
+        history["events"][0]["verdict"]["feedback"],
+        "cover the timeout path"
+    );
+    assert!(history["events"][0]["verdict"]["ts"].is_string());
+
+    let active_rows = std::fs::read_to_string(&progress).unwrap();
+    assert_eq!(
+        active_rows.lines().count(),
+        1,
+        "one changed value is appended; identical retries are suppressed"
+    );
+
+    for body in [
+        serde_json::json!({"verdict": "revise", "feedback": "   "}),
+        serde_json::json!({"verdict": "revise", "feedback": "x".repeat(4001)}),
+    ] {
+        let invalid = client
+            .put(format!("{base}/sessions/{sid}/turns/turn-1/verdict"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), 400, "invalid verdict body: {body}");
+    }
+
+    let unknown_turn = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-missing/verdict"))
+        .json(&serde_json::json!({
+            "verdict": "revise",
+            "feedback": "missing"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown_turn.status(), 404);
+}
+
+#[tokio::test]
+async fn session_verdict_and_history_surface_progress_storage_failures() {
+    ccteam_core::disable_tool_surface_bootstrap_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let progress = paths.progress_jsonl("demo");
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://{addr}/api/v1");
+
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ccteam_harness::execution::turns_mirror::append_turn(
+        &project_dir,
+        &sid,
+        &ccteam_harness::execution::turns_mirror::TurnRecord {
+            turn_id: "turn-1".into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: String::new(),
+            user: "work".into(),
+            assistant: "done".into(),
+            usage: Value::Null,
+            tool_calls: vec![],
+            attachments: vec![],
+            outcome: Some("completed".into()),
+            error_kind: None,
+            error: None,
+        },
+    )
+    .unwrap();
+
+    // A directory at the active journal path deterministically makes both
+    // canonical read and append fail, even when the tests run as root.
+    std::fs::create_dir_all(&progress).unwrap();
+    let write_failed = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-1/verdict"))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(write_failed.status(), 500);
+
+    let read_failed = client
+        .get(format!("{base}/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read_failed.status(), 500);
+}
+
 /// ACL: a tenant may rename its OWN project's session, but a different
 /// tenant (no ownership of that project) gets 404 — the same project-owned
 /// gate every other `/sessions/{sid}/*` route uses (`gate_sid` →
@@ -1089,6 +1347,38 @@ async fn rename_session_denies_cross_tenant_project() {
         .unwrap();
     assert_eq!(denied.status(), 404, "cross-tenant rename must be denied");
 
+    ccteam_harness::execution::turns_mirror::append_turn(
+        &project_dir,
+        &sid,
+        &ccteam_harness::execution::turns_mirror::TurnRecord {
+            turn_id: "turn-owned".into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: "cto".into(),
+            user: "work".into(),
+            assistant: "done".into(),
+            usage: Value::Null,
+            tool_calls: vec![],
+            attachments: vec![],
+            outcome: Some("completed".into()),
+            error_kind: None,
+            error: None,
+        },
+    )
+    .unwrap();
+    let denied_verdict = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-owned/verdict"))
+        .header("Authorization", format!("Bearer ccteam:{token_b}"))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        denied_verdict.status(),
+        404,
+        "cross-tenant verdict must be denied"
+    );
+
     // Tenant A (the owner) can rename it.
     let ok = client
         .patch(format!("{base}/sessions/{sid}"))
@@ -1098,6 +1388,18 @@ async fn rename_session_denies_cross_tenant_project() {
         .await
         .unwrap();
     assert_eq!(ok.status(), 200, "the owning tenant can rename its session");
+    let own_verdict = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-owned/verdict"))
+        .header("Authorization", format!("Bearer ccteam:{token_a}"))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        own_verdict.status(),
+        200,
+        "the owning tenant can rate its turn"
+    );
 
     // Cross-user fix (2026-07-28) — the ADMIN is gated by the same rule. `can_see_owner` keeps the
     // operator out of a tenant's PROJECT (`/projects/demo/*` 404s below), but
@@ -1128,6 +1430,18 @@ async fn rename_session_denies_cross_tenant_project() {
         admin_rename.status(),
         404,
         "admin must not drive a tenant's session"
+    );
+    let admin_verdict = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-owned/verdict"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        admin_verdict.status(),
+        404,
+        "admin must not rate a tenant's turn"
     );
 }
 
