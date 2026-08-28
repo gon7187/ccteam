@@ -1160,7 +1160,28 @@ async fn execute_project_retire(
             "id": id,
             "result": outcome,
         }),
-        Err(error_value) => error(format!("ccteam/project-retire: {error_value:#}")),
+        // A failure AFTER the durable marker leaves the project permanently
+        // retired, so the CLI must be able to tell the two apart structurally
+        // rather than by matching on message text: it finishes the removal
+        // (drop the catalog row) instead of reporting "nothing happened".
+        Err(error_value) => {
+            let message = format!("ccteam/project-retire: {error_value:#}");
+            match error_value.downcast_ref::<crate::gateway::ProjectRetireError>() {
+                Some(retire_error) => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32000,
+                        "message": message,
+                        "data": {
+                            "slug": retire_error.slug,
+                            "marker_committed": retire_error.marker_committed,
+                        },
+                    },
+                }),
+                None => error(message),
+            }
+        }
     }
 }
 
@@ -4530,6 +4551,9 @@ mod session_tool_tests {
         notify: std::sync::Arc<tokio::sync::Notify>,
         spawn_barrier: Option<std::sync::Arc<StubSpawnBarrier>>,
         close_barrier: Option<std::sync::Arc<StubSpawnBarrier>>,
+        /// Number of `close_thread` calls that must fail before closes start
+        /// succeeding (post-marker retire failures).
+        close_failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -4719,6 +4743,19 @@ mod session_tool_tests {
                         .expect("test barrier stays open")
                         .forget();
                 }
+            }
+            if self
+                .close_failures
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(ccteam_harness::HarnessError::ShutdownFailed(
+                    "injected close failure".to_string(),
+                ));
             }
             Ok(())
         }
@@ -7941,5 +7978,133 @@ mod session_tool_tests {
                 "{tool}: another tenant's node must stay indistinguishable from an unknown sid"
             );
         }
+    }
+
+    /// A gateway with daemon path context, one live `alpha` session, and a
+    /// configurable number of injected `close_thread` failures.
+    async fn retire_gateway(
+        close_failures: usize,
+        tmp: &std::path::Path,
+    ) -> (CcteamPaths, GatewayHandle) {
+        let paths = CcteamPaths {
+            root: tmp.join("home"),
+            projects_root: tmp.join("projects"),
+        };
+        let project_dir = paths.projects_root.join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(close_failures));
+        let factory: std::sync::Arc<
+            dyn Fn(
+                    ccteam_harness::AgentVendor,
+                    ccteam_harness::SessionProtocol,
+                )
+                    -> std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+                + Send
+                + Sync,
+        > = std::sync::Arc::new(move |_, _| {
+            std::sync::Arc::new(StubAdapter {
+                close_failures: std::sync::Arc::clone(&failures),
+                ..Default::default()
+            }) as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+        });
+        let mut gw = Gateway::new_with_factory(factory, "alpha", &project_dir);
+        mark_stub_vendors_installed(&mut gw);
+        gw.enable_project_creation(paths.clone());
+        gw.create_session_api(
+            "alpha".into(),
+            String::new(),
+            ccteam_harness::AgentVendor::Claude,
+            ccteam_harness::PermissionMode::Skip,
+        )
+        .await
+        .unwrap();
+        (paths, std::sync::Arc::new(tokio::sync::Mutex::new(gw)))
+    }
+
+    fn retire_request(slug: &str) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "ccteam/project-retire",
+            "params": { "arguments": { "slug": slug } },
+        })
+    }
+
+    /// G6 — a typo must not mint a durable tombstone. `mark_progress_retired`
+    /// creates the lock inode for ANY string, which would burn that slug for
+    /// good.
+    #[tokio::test]
+    async fn project_retire_rpc_refuses_an_unknown_slug_without_minting_a_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway) = retire_gateway(0, tmp.path()).await;
+
+        let response = execute_project_retire(&retire_request("alfa"), Some(&gateway)).await;
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("not registered"), "{message}");
+        assert_eq!(response["error"]["code"], json!(-32000));
+        assert_eq!(response["error"]["data"]["slug"], json!("alfa"));
+        assert_eq!(response["error"]["data"]["marker_committed"], json!(false));
+        assert!(
+            !ccteam_harness::execution::progress_bridge::progress_slug_is_reserved(
+                &paths.progress_jsonl("alfa")
+            )
+            .unwrap(),
+            "an unknown slug must not be reserved by a failed retire"
+        );
+    }
+
+    /// G8 — a failure AFTER the durable marker must be distinguishable
+    /// structurally, so the CLI finishes the removal instead of reporting that
+    /// nothing happened.
+    #[tokio::test]
+    async fn project_retire_rpc_reports_a_committed_marker_in_error_data() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway) = retire_gateway(1, tmp.path()).await;
+
+        let response = execute_project_retire(&retire_request("alpha"), Some(&gateway)).await;
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("close failed"), "{message}");
+        assert_eq!(response["error"]["code"], json!(-32000));
+        assert_eq!(response["error"]["data"]["slug"], json!("alpha"));
+        assert_eq!(response["error"]["data"]["marker_committed"], json!(true));
+        assert!(
+            ccteam_harness::execution::progress_bridge::progress_state_is_retired(
+                &paths.progress_jsonl("alpha")
+            )
+            .unwrap()
+        );
+    }
+
+    /// G7 — `session_dispatch` is fenced by the retired project's admission
+    /// gate.
+    #[tokio::test]
+    async fn session_dispatch_refuses_a_retired_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gateway, principal) = dispatch_gateway(true, 0, tmp.path()).await;
+        let child = parse(
+            &run_session_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gateway,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        gateway
+            .lock()
+            .await
+            .mark_project_retiring_for_tests("alpha");
+
+        let error = run_session_dispatch(
+            &ambient(&principal, "alpha", json!({ "sid": child, "task": "go" })),
+            &gateway,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("retired"), "{error}");
     }
 }

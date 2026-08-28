@@ -527,6 +527,12 @@ impl Drop for UnlockedTurnRollbackGuard {
 #[derive(Clone, Default)]
 struct CleanupTaskTracker {
     handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Project-owned cleanup work, bucketed by slug. Retirement drains ONLY
+    /// its own bucket: the daemon-wide `handles` list also carries other
+    /// projects' pending-turn rollbacks and `close_thread` joins, and one slow
+    /// unrelated task used to fail a retire AFTER its tombstone was committed
+    /// — leaving the project retired but still in `config.yaml`.
+    project_handles: Arc<std::sync::Mutex<BTreeMap<String, Vec<tokio::task::JoinHandle<()>>>>>,
 }
 
 impl CleanupTaskTracker {
@@ -535,6 +541,37 @@ impl CleanupTaskTracker {
         if let Ok(mut handles) = self.handles.lock() {
             handles.retain(|handle| !handle.is_finished());
             handles.push(handle);
+        }
+    }
+
+    /// Track a task that belongs to ONE project, so retirement can barrier on
+    /// exactly that project's writers.
+    fn spawn_for(&self, slug: &str, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        let handle = tokio::spawn(task);
+        if let Ok(mut buckets) = self.project_handles.lock() {
+            for bucket in buckets.values_mut() {
+                bucket.retain(|handle| !handle.is_finished());
+            }
+            buckets.retain(|_, bucket| !bucket.is_empty());
+            buckets.entry(slug.to_string()).or_default().push(handle);
+        }
+    }
+
+    /// Await every tracked task owned by `slug` (including ones queued while
+    /// draining).
+    async fn drain_project(&self, slug: &str) {
+        loop {
+            let handles = self
+                .project_handles
+                .lock()
+                .map(|mut buckets| buckets.remove(slug).unwrap_or_default())
+                .unwrap_or_default();
+            if handles.is_empty() {
+                break;
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
         }
     }
 
@@ -550,13 +587,22 @@ impl CleanupTaskTracker {
         rx
     }
 
+    /// Daemon-wide barrier: global tasks AND every project bucket.
     async fn drain(&self) {
         loop {
-            let handles = self
+            let mut handles = self
                 .handles
                 .lock()
                 .map(|mut handles| std::mem::take(&mut *handles))
                 .unwrap_or_default();
+            handles.extend(
+                self.project_handles
+                    .lock()
+                    .map(|mut buckets| std::mem::take(&mut *buckets))
+                    .unwrap_or_default()
+                    .into_values()
+                    .flatten(),
+            );
             if handles.is_empty() {
                 break;
             }
@@ -1546,8 +1592,13 @@ pub struct ProjectRetireOutcome {
 /// report that truthfully and the only forward path is retrying the retire.
 #[derive(Debug)]
 pub struct ProjectRetireError {
+    /// Canonical project slug the retirement was requested for.
     pub slug: String,
+    /// `true` once the durable RETIRED marker is on disk: the generation is
+    /// retired for good, so the caller may finish (remove the catalog row) or
+    /// retry, but must never report the project as untouched.
     pub marker_committed: bool,
+    /// The underlying failure.
     pub source: anyhow::Error,
 }
 
@@ -2893,13 +2944,24 @@ impl Gateway {
         self.project_paths = Some(paths);
         // A daemon may restart between committing a retirement marker and the
         // CLI/web removing config.yaml.  Never roster that stale catalog row.
-        let stale = self
-            .projects
-            .keys()
-            .filter(|slug| self.durable_project_is_retired(slug).unwrap_or(true))
-            .cloned()
-            .collect::<Vec<_>>();
+        // Only a marker that READS as retired retires a project. An unreadable
+        // lock (EMFILE, EACCES, a clobbered path) is a diagnosis, not a
+        // verdict: treating it as "retired" here silently and permanently
+        // blacklisted a healthy project for the daemon's whole lifetime.
+        let mut stale = Vec::new();
+        for slug in self.projects.keys().cloned().collect::<Vec<_>>() {
+            match self.durable_project_is_retired(&slug) {
+                Ok(true) => stale.push(slug),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    %slug,
+                    %error,
+                    "ccteam-im: project retirement marker unreadable at startup; keeping the project rostered"
+                ),
+            }
+        }
         for slug in stale {
+            tracing::info!(%slug, "ccteam-im: dropping stale catalog row for a retired project");
             self.retired_projects.insert(slug.clone());
             self.remove_project_routes(&slug);
         }
@@ -3427,8 +3489,9 @@ impl Gateway {
             return;
         };
         let path = paths.progress_jsonl(slug);
+        let owner_slug = slug.to_string();
         let slug = slug.to_string();
-        self.cleanup_tasks.spawn(async move {
+        self.cleanup_tasks.spawn_for(&owner_slug, async move {
             let append = tokio::task::spawn_blocking(move || {
                 ccteam_core::progress::append_event(&path, &event)
             })
@@ -4117,7 +4180,7 @@ impl Gateway {
     /// Register or update a project root addressable by `/cd <slug>`.
     pub fn register_project(&mut self, slug: impl Into<String>, dir: impl Into<PathBuf>) {
         let slug = slug.into();
-        if self.project_admission_blocked(&slug) {
+        if self.load_time_project_is_retired(&slug) {
             return;
         }
         self.projects.insert(slug, dir.into());
@@ -4132,26 +4195,65 @@ impl Gateway {
         )
     }
 
+    /// LOAD-TIME durable retirement check — takes the project's progress lock
+    /// (`flock`) and therefore must NEVER run on an admission hot path (see
+    /// [`Self::ensure_project_active`]). Call it only where a project enters
+    /// the roster: startup scan, `register_project`, bot-template
+    /// registration, lazy config load, import. A positive result is memoized
+    /// into `retired_projects`, which is what every hot path reads.
+    ///
+    /// A READ ERROR is not "retired": a transient EMFILE/EACCES must not
+    /// blacklist a healthy project for the daemon's lifetime. It is logged and
+    /// the project stays rostered; per-request handling remains fail-closed
+    /// through the in-memory fence a real retirement installs.
+    fn load_time_project_is_retired(&mut self, slug: &str) -> bool {
+        if self.retiring_projects.contains(slug) || self.retired_projects.contains(slug) {
+            return true;
+        }
+        match self.durable_project_is_retired(slug) {
+            Ok(false) => false,
+            Ok(true) => {
+                tracing::info!(%slug, "ccteam-im: project is durably retired; not rostering it");
+                self.retired_projects.insert(slug.to_string());
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %slug,
+                    %error,
+                    "ccteam-im: project retirement marker unreadable; keeping the project rostered"
+                );
+                false
+            }
+        }
+    }
+
+    /// In-memory admission fence. Pure by construction: it is consulted while
+    /// the daemon-wide gateway mutex is held, so it must not touch disk.
     fn project_admission_blocked(&self, slug: &str) -> bool {
-        self.retiring_projects.contains(slug)
-            || self.retired_projects.contains(slug)
-            || self.durable_project_is_retired(slug).unwrap_or(true)
+        self.retiring_projects.contains(slug) || self.retired_projects.contains(slug)
     }
 
     /// One fail-closed admission gate shared by spawn, rebuild, resume,
-    /// dispatch and scheduled delivery.  A malformed marker is not treated as
-    /// active state: operators must repair or finish retirement explicitly.
+    /// dispatch and scheduled delivery.
+    ///
+    /// PURE IN-MEMORY (v0.10.4): the durable tombstone is monotonic, so the
+    /// disk read belongs at the few load-time points that populate
+    /// `retired_projects` ([`Self::load_time_project_is_retired`]). Reading it
+    /// here froze the whole daemon behind one `flock` per submit/spawn/resume
+    /// whenever a progress rotation held that lock.
     pub(crate) fn ensure_project_active(&self, slug: &str) -> Result<()> {
-        if self.retiring_projects.contains(slug) || self.retired_projects.contains(slug) {
+        if self.project_admission_blocked(slug) {
             anyhow::bail!("project `{slug}` is retired");
         }
-        match self.durable_project_is_retired(slug) {
-            Ok(false) => Ok(()),
-            Ok(true) => anyhow::bail!("project `{slug}` is retired"),
-            Err(error) => Err(error).with_context(|| {
-                format!("project `{slug}` retirement state is unreadable; admission denied")
-            }),
-        }
+        Ok(())
+    }
+
+    /// Test-only: install the in-memory retirement fence a real retire would,
+    /// without draining sessions.
+    #[cfg(test)]
+    pub(crate) fn mark_project_retiring_for_tests(&mut self, slug: &str) {
+        self.retiring_projects.insert(slug.to_string());
     }
 
     fn remove_project_routes(&mut self, slug: &str) {
@@ -4180,6 +4282,9 @@ impl Gateway {
             return;
         }
         if self.projects.contains_key(slug) {
+            // Already rostered: this is the hot path (every spawn goes through
+            // here), so it must stay disk-free. The durable read below runs
+            // only on the rare first load of a slug.
             return;
         }
         // Read the hot-reloaded config.yaml (re-parsed only on mtime change);
@@ -4190,7 +4295,11 @@ impl Gateway {
             _ => return,
         };
         if let Some(entry) = cfg.projects.iter().find(|p| p.slug == slug) {
-            self.projects.insert(slug.to_string(), entry.path.clone());
+            let path = entry.path.clone();
+            if self.load_time_project_is_retired(slug) {
+                return;
+            }
+            self.projects.insert(slug.to_string(), path);
         }
     }
 
@@ -4304,7 +4413,7 @@ impl Gateway {
         bot: &BotRegistration,
         project_dir: impl Into<PathBuf>,
     ) {
-        if self.project_admission_blocked(&bot.workflow_slug) {
+        if self.load_time_project_is_retired(&bot.workflow_slug) {
             return;
         }
         self.register_project(bot.workflow_slug.clone(), project_dir);
@@ -5250,16 +5359,29 @@ impl Gateway {
                         None
                     };
                     if let Err(error) = removed.adapter.close_thread(&removed.thread).await {
-                        // A failed close is not a stopped session.  Keep the
-                        // handle retryable (without a pump or principal) so a
-                        // retire retry can prove teardown instead of losing
-                        // the only process handle and faking success.
-                        completion_gateway
-                            .lock()
-                            .await
-                            .sessions
-                            .entry(sid.clone())
-                            .or_insert(*removed);
+                        // A failed close is not a stopped session. Put the
+                        // session back FULLY ARMED — live map + event pump +
+                        // principal — rather than as a zombie: a re-inserted
+                        // row without a pump never delivers an event again and
+                        // without a principal fails every `session_*` call it
+                        // makes, while still occupying a `max_live` slot.
+                        // Keeping it in `sessions` (rather than a side map) is
+                        // what stops `resume` from installing a duplicate body
+                        // under the same sid, and keeps close retryable.
+                        {
+                            let secret = removed.secret.clone();
+                            let project = removed.project.clone();
+                            let role = removed.role.clone();
+                            let depth = removed.delegation_depth;
+                            let mut guard = completion_gateway.lock().await;
+                            if !guard.sessions.contains_key(&sid) {
+                                guard.sessions.insert(sid.clone(), *removed);
+                                guard.principals.promote(
+                                    &sid, &secret, &project, &role, depth,
+                                );
+                                guard.spawn_event_pump(&sid);
+                            }
+                        }
                         return match pump_join_error {
                             Some(pump_error) => Err(anyhow!(
                                 "session {sid} close failed: {error}; event pump join also failed: {pump_error}"
@@ -5461,15 +5583,36 @@ impl Gateway {
                 source,
             })
         };
-        let progress_path = gateway
-            .lock()
-            .await
-            .project_paths
-            .as_ref()
-            .map(|paths| paths.progress_jsonl(&slug))
-            .ok_or_else(|| {
+        // A tombstone is irreversible and `mark_progress_retired` CREATES the
+        // lock inode, so a typo would burn a slug forever. Nothing is written
+        // until the slug is both well-formed and a project this daemon knows.
+        ccteam_core::validate_slug_format(&slug).map_err(&not_started)?;
+        let (progress_path, catalog_root, rostered) = {
+            let guard = gateway.lock().await;
+            let paths = guard.project_paths.as_ref().ok_or_else(|| {
                 not_started(anyhow!("project retirement requires daemon path context"))
             })?;
+            (
+                paths.progress_jsonl(&slug),
+                paths.root.clone(),
+                guard.projects.contains_key(&slug),
+            )
+        };
+        if !rostered {
+            let lookup_slug = slug.clone();
+            let known = tokio::task::spawn_blocking(move || {
+                ccteam_core::config::lookup_project(&catalog_root, &lookup_slug)
+            })
+            .await
+            .context("project catalog lookup worker failed")
+            .and_then(|result| result)
+            .map_err(&not_started)?;
+            if known.is_none() {
+                return Err(not_started(anyhow!(
+                    "project `{slug}` is not registered; nothing to retire"
+                )));
+            }
+        }
 
         // The marker is first and durable.  If the daemon dies after this
         // point, the next daemon refuses the stale config/bot row before it can
@@ -5529,13 +5672,15 @@ impl Gateway {
 
         Self::wait_for_project_reservations_to_drain(&gateway, &slug).await?;
         let initial = initial_sids.iter().cloned().collect::<BTreeSet<_>>();
-        let remaining = gateway
+        let remaining: Vec<String> = gateway
             .lock()
             .await
             .project_session_snapshot(&slug)
             .into_iter()
             .filter(|sid| !initial.contains(sid))
             .collect();
+        let mut project_sids = initial;
+        project_sids.extend(remaining.iter().cloned());
         for (sid, result) in Self::stop_sessions_shared(Arc::clone(&gateway), remaining).await {
             match result {
                 Ok(()) => stopped.push(sid),
@@ -5543,8 +5688,38 @@ impl Gateway {
             }
         }
 
+        // Cross-project delegations: a watch is keyed by the CHILD's sid, so
+        // `remove_project_routes` only reaches the ones whose child lived here.
+        // A delegation dispatched BY a session of this project to a child
+        // elsewhere would otherwise never terminate — its parent is gone, the
+        // completion notification can never be delivered (resume is fenced),
+        // and the child's `delegation.json` would be re-seeded by every
+        // startup reconcile, showing the task in flight forever.
+        let orphaned_children = {
+            let guard = gateway.lock().await;
+            guard
+                .delegations
+                .iter()
+                .filter(|(_, mirror)| {
+                    project_sids.contains(&mirror.parent_sid)
+                        || guard.project_slug_for_sid(&mirror.parent_sid).as_deref()
+                            == Some(slug.as_str())
+                })
+                .map(|(child_sid, _)| child_sid.clone())
+                .collect::<Vec<_>>()
+        };
+        for child_sid in orphaned_children {
+            // Same terminal persistence a cancelled delegation gets: mirror +
+            // watch set + the durable `delegation.json` all go away.
+            Self::disarm_delegation_watch_shared(Arc::clone(&gateway), &child_sid).await;
+        }
+
+        // Barrier on THIS project's cleanup work only. The global tracker is
+        // daemon-wide; an unrelated slow task must never fail a retire whose
+        // tombstone is already committed. The storage fence remains the real
+        // guarantee — a writer that queues past this point fails on RETIRED.
         let cleanup_tasks = gateway.lock().await.cleanup_tasks.clone();
-        tokio::time::timeout(Duration::from_secs(30), cleanup_tasks.drain())
+        tokio::time::timeout(Duration::from_secs(30), cleanup_tasks.drain_project(&slug))
             .await
             .map_err(|_| anyhow!("timed out draining project `{slug}` cleanup tasks"))?;
         Self::remove_project_scheduled_rows(&gateway, &slug).await?;
@@ -29784,6 +29959,11 @@ mod tests {
                 .with_close_failures(1),
         );
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        // An event sink is what makes an event pump installable at all, so the
+        // re-arm assertion below is testing the gateway rather than a stub gap.
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(etx);
+        tokio::spawn(async move { while erx.recv().await.is_some() {} });
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -29794,6 +29974,7 @@ mod tests {
             .await
             .unwrap()
             .sid;
+        assert!(gateway.event_pumps.contains_key(&sid));
         if let Some(pump) = gateway.event_pumps.remove(&sid) {
             pump.abort();
             let _ = pump.await;
@@ -29843,7 +30024,27 @@ mod tests {
         assert!(error.contains("event pump join also failed"), "{error}");
         assert_eq!(resume.await.unwrap().unwrap(), sid);
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
-        assert!(gateway.lock().await.sessions.contains_key(&sid));
+        {
+            // A failed close must put the session back FULLY ARMED. A row
+            // re-inserted without its pump never delivers another event, and
+            // one without its principal fails every `session_*` call it makes
+            // — while still occupying a `max_live` slot.
+            let guard = gateway.lock().await;
+            let secret = guard
+                .sessions
+                .get(&sid)
+                .expect("close failure keeps the session live and retryable")
+                .secret
+                .clone();
+            assert!(
+                guard.event_pumps.contains_key(&sid),
+                "re-inserted session must have its event pump back"
+            );
+            assert!(
+                guard.principals.verify(&sid, &secret).is_some(),
+                "re-inserted session must keep a usable principal"
+            );
+        }
 
         Gateway::stop_session_shared(Arc::clone(&gateway), &sid)
             .await
@@ -39304,5 +39505,299 @@ mod tests {
             1,
             "uninstalled thread must be closed"
         );
+    }
+
+    /// G1 — the hot admission gate is IN-MEMORY ONLY. It runs under the
+    /// daemon-wide gateway mutex on every submit/spawn/resume/dispatch, so a
+    /// blocking `flock` on the project's progress lock (held for the length of
+    /// a 64MiB rotation) used to freeze the entire daemon.
+    #[tokio::test]
+    async fn ensure_project_active_consults_only_the_in_memory_fence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        assert!(gateway.ensure_project_active("alpha").is_ok());
+
+        // The tombstone appears on disk AFTER the roster was built, and no
+        // retire ran through this gateway. A hot-path reader would see it.
+        ccteam_harness::execution::progress_bridge::mark_progress_retired(
+            &paths.progress_jsonl("alpha"),
+        )
+        .unwrap();
+        assert!(
+            gateway.ensure_project_active("alpha").is_ok(),
+            "admission must not read the progress lock on the hot path"
+        );
+        assert!(!gateway.retired_projects.contains("alpha"));
+
+        // The load-time path is where the durable read belongs.
+        let fresh_adapter = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut fresh = Gateway::new(fresh_adapter, "alpha", &project_dir);
+        fresh.enable_project_creation(paths);
+        assert!(fresh.retired_projects.contains("alpha"));
+        assert!(!fresh.projects.contains_key("alpha"));
+        assert!(fresh.ensure_project_active("alpha").is_err());
+    }
+
+    /// G4 — an unreadable lock is a diagnosis, not a verdict. `unwrap_or(true)`
+    /// used to blacklist a healthy project for the daemon's whole lifetime on a
+    /// transient EMFILE/EACCES, silently.
+    #[tokio::test]
+    async fn unreadable_retirement_marker_keeps_the_project_rostered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        // A directory where the lock file belongs: every read of the marker
+        // fails with "progress lock is not a regular file".
+        let lock_path = paths.progress_jsonl("alpha").with_file_name("alpha.lock");
+        std::fs::create_dir_all(&lock_path).unwrap();
+        assert!(
+            ccteam_harness::execution::progress_bridge::progress_state_is_retired(
+                &paths.progress_jsonl("alpha")
+            )
+            .is_err()
+        );
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        assert!(
+            !gateway.retired_projects.contains("alpha"),
+            "an unreadable marker must not retire a project"
+        );
+        assert!(gateway.projects.contains_key("alpha"));
+        assert!(gateway.ensure_project_active("alpha").is_ok());
+
+        // The load-time helper reaches the same verdict.
+        gateway.projects.remove("alpha");
+        gateway.register_project("alpha", &project_dir);
+        assert!(gateway.projects.contains_key("alpha"));
+        assert!(!gateway.retired_projects.contains("alpha"));
+    }
+
+    /// G3 — the cleanup barrier is scoped to the retiring project. Draining the
+    /// daemon-wide tracker let one slow unrelated task fail a retire AFTER its
+    /// tombstone was committed, stranding the project retired-but-configured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_retire_ignores_unrelated_global_cleanup_tasks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        // Another project's long-running cleanup task, sitting in the global
+        // tracker for far longer than the retire barrier's 30s timeout.
+        gateway.lock().await.cleanup_tasks.spawn(async {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            Gateway::retire_project_shared(Arc::clone(&gateway), "alpha"),
+        )
+        .await
+        .expect("retire must not barrier on another project's cleanup work")
+        .unwrap();
+        assert_eq!(outcome.slug, "alpha");
+    }
+
+    /// G5 — a delegation is keyed by the CHILD's sid, so dropping routes by
+    /// slug leaves a watch whose PARENT lived in the retired project armed
+    /// forever: the notification can never be delivered (resume is fenced) and
+    /// the startup reconcile re-seeds it from the child's `delegation.json`.
+    #[tokio::test]
+    async fn project_retire_disarms_cross_project_delegations_of_its_parents() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let beta_dir = paths.projects_root.join("beta");
+        std::fs::create_dir_all(&beta_dir).unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        gateway.register_project("beta", &beta_dir);
+        let parent = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+
+        // A dispatch in flight: parent in `alpha`, child (and its durable
+        // watch) in `beta`.
+        let child = "s9001";
+        ccteam_harness::execution::delegation::write_delegation_watch(
+            &beta_dir,
+            child,
+            &ccteam_harness::execution::delegation::DelegationWatch::armed(
+                parent.clone(),
+                ccteam_harness::NotifyMode::Final,
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        gateway.delegations.insert(
+            child.to_string(),
+            DelegationMirror {
+                generation: 0,
+                parent_sid: parent.clone(),
+                notify: ccteam_harness::NotifyMode::Final,
+                title: None,
+                slug: "beta".to_string(),
+                project_dir: beta_dir.clone(),
+                notified_turns: Vec::new(),
+            },
+        );
+        gateway
+            .delegation_watch_set
+            .write()
+            .unwrap()
+            .insert(child.to_string());
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        Gateway::retire_project_shared(Arc::clone(&gateway), "alpha")
+            .await
+            .unwrap();
+
+        {
+            let guard = gateway.lock().await;
+            assert!(!guard.delegations.contains_key(child));
+            assert!(!guard.delegation_watch_set.read().unwrap().contains(child));
+        }
+        assert!(
+            ccteam_harness::execution::delegation::read_delegation_watch(&beta_dir, child)
+                .is_none(),
+            "the child's durable watch must reach a terminal state, not be re-seeded"
+        );
+    }
+
+    /// G6 — `mark_progress_retired` CREATES the lock inode, so retiring an
+    /// unknown slug burns it forever. A CLI typo must not be able to do that.
+    #[tokio::test]
+    async fn project_retire_refuses_an_unregistered_or_malformed_slug() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        for (slug, expected) in [("alfa", "not registered"), ("Bad Slug", "slug must match")] {
+            let error = Gateway::retire_project_shared(Arc::clone(&gateway), slug)
+                .await
+                .unwrap_err();
+            let typed = error
+                .downcast_ref::<ProjectRetireError>()
+                .expect("every retire failure is typed");
+            assert!(!typed.marker_committed, "{slug}");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert!(
+                !ccteam_harness::execution::progress_bridge::progress_slug_is_reserved(
+                    &paths.progress_jsonl(slug)
+                )
+                .unwrap(),
+                "no lock inode may be minted for `{slug}`"
+            );
+        }
+    }
+
+    /// G7 — fence coverage for the admission sites the spawn regression test
+    /// does not reach: scheduled create, dead-sid resume, submit into a session
+    /// that is still live, and `/role`.
+    #[tokio::test]
+    async fn retired_project_fences_scheduled_resume_submit_and_role() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        let chat = ChatKey::new("web", "web-api", "web-api");
+        let live = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        // A second session whose live row is gone but whose meta.json remains:
+        // exactly what `resume_stopped_session_shared` rebuilds from.
+        let dead = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        if let Some(pump) = gateway.event_pumps.remove(&dead) {
+            pump.abort();
+            let _ = pump.await;
+        }
+        gateway.sessions.remove(&dead);
+        // Each spawn re-points the chat at its own session; `/role` operates on
+        // the chat's CURRENT one, so aim it back at the still-live session.
+        gateway
+            .current_session
+            .write()
+            .unwrap()
+            .insert(chat.clone(), live.clone());
+
+        // Retire the project the way `retire_project_shared` does.
+        ccteam_harness::execution::progress_bridge::mark_progress_retired(
+            &paths.progress_jsonl("alpha"),
+        )
+        .unwrap();
+        gateway.retiring_projects.insert("alpha".to_string());
+
+        let scheduled = gateway
+            .create_scheduled_message(
+                &live,
+                "later".into(),
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(scheduled.contains("retired"), "{scheduled}");
+
+        let submit = gateway
+            .plan_unlocked_turn(&live, "hi".into(), TurnOrigin::User, None)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(submit.contains("retired"), "{submit}");
+
+        let role = gateway
+            .switch_current_role(&chat, "reviewer".into())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(role.contains("retired"), "{role}");
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let resume = Gateway::resume_stopped_session_shared(
+            Arc::clone(&gateway),
+            &dead,
+            "user:web-api",
+            Some("alpha"),
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(resume.contains("retired"), "{resume}");
     }
 }
