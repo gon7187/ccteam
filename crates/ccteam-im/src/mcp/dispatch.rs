@@ -1161,9 +1161,13 @@ async fn execute_project_retire(
             "result": outcome,
         }),
         // A failure AFTER the durable marker leaves the project permanently
-        // retired, so the CLI must be able to tell the two apart structurally
-        // rather than by matching on message text: it finishes the removal
-        // (drop the catalog row) instead of reporting "nothing happened".
+        // retired, so the caller must be able to tell the two apart
+        // structurally rather than by matching on message text.
+        // `marker_committed: true` means: report a PERMANENT retirement (the
+        // generation is irreversibly dead) and KEEP the `config.yaml` row, so
+        // a retry of `ccteam project rm <slug>` still has something to remove
+        // and the failed teardown is not hidden behind a deregistered slug.
+        // `marker_committed: false` means nothing durable happened at all.
         Err(error_value) => {
             let message = format!("ccteam/project-retire: {error_value:#}");
             match error_value.downcast_ref::<crate::gateway::ProjectRetireError>() {
@@ -8054,7 +8058,8 @@ mod session_tool_tests {
     }
 
     /// G8 — a failure AFTER the durable marker must be distinguishable
-    /// structurally, so the CLI finishes the removal instead of reporting that
+    /// structurally, so the caller reports a PERMANENT retirement and keeps
+    /// the `config.yaml` row for the retry to remove, instead of claiming that
     /// nothing happened.
     #[tokio::test]
     async fn project_retire_rpc_reports_a_committed_marker_in_error_data() {
