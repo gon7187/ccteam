@@ -132,7 +132,27 @@ pub(crate) async fn handle_projects(
     Extension(identity): Extension<crate::auth::Identity>,
     headers: HeaderMap,
 ) -> Response {
-    match build_projects(&app, &identity) {
+    // `build_projects` takes a blocking per-project flock (plus config/registry
+    // reads), so it must never run on an async worker — same shape as
+    // `routes::status`.
+    let build_app = app.clone();
+    let build_identity = identity.clone();
+    let built = match tokio::task::spawn_blocking(move || {
+        build_projects(&build_app, &build_identity)
+    })
+    .await
+    {
+        Ok(built) => built,
+        Err(err) => {
+            tracing::error!(?err, "GET /api/v1/projects worker failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("project collect worker failed: {err}")})),
+            )
+                .into_response();
+        }
+    };
+    match built {
         Ok(mut rows) => {
             let version = app.progress_projection.snapshot_version();
             for row in &mut rows {
@@ -1046,7 +1066,14 @@ pub(crate) async fn handle_active_sessions_aggregate(
     State(app): State<AppState>,
     Extension(identity): Extension<crate::auth::Identity>,
 ) -> impl IntoResponse {
-    let summaries = match ccteam_core::collect_projects(&app.paths) {
+    // Same blocking-flock hazard as `GET /api/v1/projects`: keep the catalog
+    // walk off the async workers.
+    let collect_paths = app.paths.clone();
+    let collected =
+        tokio::task::spawn_blocking(move || ccteam_core::collect_projects(&collect_paths))
+            .await
+            .unwrap_or_else(|err| Err(anyhow::anyhow!("project collect worker failed: {err}")));
+    let summaries = match collected {
         Ok(v) => v,
         Err(err) => {
             tracing::error!(?err, "GET /api/v1/sessions/active collect_projects failed");
