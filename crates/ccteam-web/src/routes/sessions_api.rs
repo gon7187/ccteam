@@ -1446,7 +1446,7 @@ pub(crate) async fn handle_list_scheduled(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    let result = gw.lock().await.scheduled_items_for_sid(&sid);
+    let result = Gateway::scheduled_items_for_sid_shared(Arc::clone(gw), &sid).await;
     match result {
         Ok(items) => Json(items).into_response(),
         Err(_) => unknown_session(&sid),
@@ -1521,13 +1521,16 @@ pub(crate) async fn handle_create_scheduled(
                 .collect::<std::collections::HashSet<_>>(),
         )
     };
-    let result = gw.lock().await.create_scheduled_message(
+    let result = Gateway::create_scheduled_message_shared(
+        Arc::clone(gw),
         &sid,
         request.text,
         send_at,
         identity.owner_tag(),
         visible_projects.as_ref(),
-    );
+        None,
+    )
+    .await;
     match result {
         Ok(item) => (StatusCode::CREATED, Json(item)).into_response(),
         Err(err) => {
@@ -1578,7 +1581,7 @@ pub(crate) async fn handle_cancel_scheduled(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    match gw.lock().await.cancel_scheduled_message(&sid, &id) {
+    match Gateway::cancel_scheduled_message_shared(Arc::clone(gw), &sid, &id).await {
         Ok(_) => Json(json!({"cancelled": true, "id": id})).into_response(),
         Err(err) if err.to_string().contains("unknown scheduled") => unknown_session(&id),
         Err(err) if err.to_string().contains("already being delivered") => (

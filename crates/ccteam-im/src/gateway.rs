@@ -817,6 +817,16 @@ fn delegation_notify_error_is_retryable(error: &anyhow::Error) -> bool {
         })
 }
 
+/// A scheduled/pending row may become retryable only when the adapter proves
+/// that it never crossed the vendor dispatch boundary. No string matching and
+/// no generic transport error qualifies: all ambiguous outcomes stay fenced.
+fn submit_was_proven_pre_dispatch(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<HarnessError>(),
+        Some(HarnessError::ThreadUnavailableBeforeDispatch(_))
+    )
+}
+
 /// Snapshot used by the pure live-capacity eviction selector.
 ///
 /// `last_active` is the PERSISTED `meta.json.last_active` (RFC3339,
@@ -934,6 +944,10 @@ pub struct Gateway {
     next_sid_path: Option<PathBuf>,
     /// Daemon-wide monotonic scheduled-message counter (`d{n}`).
     next_scheduled_path: Option<PathBuf>,
+    /// Serializes only scheduled creates (global id + visible-count cap). File
+    /// writes happen while this independent lock is held, never the gateway.
+    scheduled_create_lock: Arc<tokio::sync::Mutex<()>>,
+    scheduled_persistence: Arc<dyn ScheduledPersistence>,
     /// v0.8.21 Wave-2 — sids that were live at last persist, stashed by
     /// `load_state` (sync) for the async `resume_restored_sessions` step to
     /// cold-start rebuild from their `meta.json`. Drained once on startup.
@@ -1013,6 +1027,9 @@ pub struct Gateway {
     /// while the row itself remains durable until the worker records a
     /// terminal fired/failed state.
     scheduled_in_flight: HashSet<String>,
+    /// Process-local retry throttle for proven pre-dispatch storage failures.
+    /// The durable row remains Pending; this cache prevents a zero-delay loop.
+    scheduled_retry: BTreeMap<String, ScheduledRetryState>,
     /// Wakes the lightweight next-fire timer after create/cancel/GC.
     scheduled_notify: Arc<tokio::sync::Notify>,
     event_sink: Option<GatewayEventSink>,
@@ -1113,6 +1130,56 @@ pub struct Gateway {
 struct ScheduledEntry {
     project_dir: PathBuf,
     item: crate::scheduled::ScheduledItem,
+}
+
+/// Blocking durability adapter. Every daemon caller executes it through
+/// `spawn_blocking` after dropping the gateway mutex; tests replace it with a
+/// slow/failing adapter to prove registry responsiveness and crash semantics.
+trait ScheduledPersistence: Send + Sync {
+    fn write_queue(
+        &self,
+        project_dir: &Path,
+        sid: &str,
+        items: &[crate::scheduled::ScheduledItem],
+    ) -> Result<()>;
+
+    fn write_counter(&self, path: &Path, next: u64) -> Result<()>;
+}
+
+#[derive(Debug, Default)]
+struct FsScheduledPersistence;
+
+impl ScheduledPersistence for FsScheduledPersistence {
+    fn write_queue(
+        &self,
+        project_dir: &Path,
+        sid: &str,
+        items: &[crate::scheduled::ScheduledItem],
+    ) -> Result<()> {
+        crate::scheduled::write_scheduled(project_dir, sid, items)
+    }
+
+    fn write_counter(&self, path: &Path, next: u64) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        atomic_write_durable(path, next.to_string().as_bytes())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScheduledRetryState {
+    failures: u32,
+    not_before: chrono::DateTime<chrono::Utc>,
+}
+
+const SCHEDULED_STORAGE_RETRY_BASE_MS: i64 = 100;
+const SCHEDULED_STORAGE_RETRY_MAX_MS: i64 = 5_000;
+
+enum ScheduledTerminalOutcome {
+    Fired,
+    Failed(String),
+    Unknown(String),
 }
 
 /// v0.9.0 W2 (F2/F7) — in-memory mirror of one child's durable delegation
@@ -2285,6 +2352,7 @@ struct SpawnClaims {
     per_chat: std::sync::Mutex<BTreeMap<ChatKey, Arc<tokio::sync::Mutex<()>>>>,
     per_sid: std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     per_turn: std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    per_scheduled: std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SpawnClaims {
@@ -2331,6 +2399,19 @@ impl SpawnClaims {
     async fn lock_for_turn(&self, sid: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let entry = {
             let mut map = self.per_turn.lock().unwrap();
+            Arc::clone(
+                map.entry(sid.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        entry.lock_owned().await
+    }
+
+    /// Serialize scheduled-file mutations per sid without occupying the
+    /// daemon-wide gateway registry.
+    async fn lock_for_scheduled(&self, sid: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let entry = {
+            let mut map = self.per_scheduled.lock().unwrap();
             Arc::clone(
                 map.entry(sid.to_string())
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
@@ -2582,6 +2663,8 @@ impl Gateway {
             cleanup_tasks: CleanupTaskTracker::default(),
             next_sid_path: None,
             next_scheduled_path: None,
+            scheduled_create_lock: Arc::new(tokio::sync::Mutex::new(())),
+            scheduled_persistence: Arc::new(FsScheduledPersistence),
             restore_pending: Vec::new(),
             detached: BTreeMap::new(),
             post_mortem_pending: Vec::new(),
@@ -2603,6 +2686,7 @@ impl Gateway {
             next_scheduled: 0,
             scheduled_items: BTreeMap::new(),
             scheduled_in_flight: HashSet::new(),
+            scheduled_retry: BTreeMap::new(),
             scheduled_notify: Arc::new(tokio::sync::Notify::new()),
             event_sink: None,
             events_broadcast,
@@ -3491,6 +3575,58 @@ impl Gateway {
              (body pid {}, unobserved since {}). Your message is queued (#{queued}) and will be \
              delivered as soon as that turn ends; `/stop` ends it now.",
             detached.body.pid, since
+        );
+        Ok((receipt, format!("queued-behind-body:{sid}:{queued}")))
+    }
+
+    /// Shared-daemon variant of [`Self::queue_behind_detached_body`]. The
+    /// gateway mutex is used only to snapshot the detached body; file locking,
+    /// JSON serialization, and fsync run on a blocking worker.
+    async fn queue_behind_detached_body_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        text: String,
+        reply_to: ChatKey,
+        literal: bool,
+        origin: TurnOrigin,
+        deadline: GatewayDeadline,
+    ) -> Result<(String, String)> {
+        let (cwd, pid, since) = {
+            let guard = deadline.lock(&gateway).await?;
+            let detached = guard
+                .detached
+                .get(sid)
+                .ok_or_else(|| anyhow!("Сессия {sid} не отсоединена"))?;
+            (
+                detached.cwd.clone(),
+                detached.body.pid,
+                detached.since.to_rfc3339(),
+            )
+        };
+        let sid_owned = sid.to_string();
+        let sid_for_write = sid_owned.clone();
+        let channel = reply_to.channel;
+        let queued = tokio::task::spawn_blocking(move || {
+            crate::pending_turns::enqueue_pending_turn(
+                &cwd,
+                &sid_for_write,
+                text,
+                Some(channel),
+                literal,
+                origin.is_internal(),
+                origin == TurnOrigin::DelegationCompletion,
+            )?;
+            Ok::<_, anyhow::Error>(crate::pending_turns::pending_turn_count(
+                &cwd,
+                &sid_for_write,
+            ))
+        })
+        .await
+        .map_err(|error| anyhow!("pending enqueue worker failed: {error}"))??;
+        let receipt = format!(
+            "⏳ {sid} is still finishing a turn that started before ccteam restarted \
+             (body pid {pid}, unobserved since {since}). Your message is queued (#{queued}) and will be \
+             delivered as soon as that turn ends; `/stop` ends it now."
         );
         Ok((receipt, format!("queued-behind-body:{sid}:{queued}")))
     }
@@ -5415,6 +5551,25 @@ impl Gateway {
             .await;
         }
 
+        if text.split_whitespace().next() == Some("/inbox") {
+            if !attachments.is_empty() {
+                return Err(anyhow!(
+                    "Отложенные сообщения /inbox не поддерживают файлы или skills"
+                ));
+            }
+            let mut reply =
+                Self::handle_inbox_command_shared(Arc::clone(&gateway), &chat, text.trim()).await?;
+            if channel != "web" {
+                if let Some(hint) = command_next_hint("/inbox") {
+                    append_next_hint(&mut reply, hint);
+                }
+            }
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(true);
+            }
+            return Ok(vec![RichReply::plain(reply)]);
+        }
+
         if text.split_whitespace().next() == Some("/new") {
             let args = text.split_whitespace().skip(1).collect::<Vec<_>>();
             let NewSessionArgs {
@@ -6402,6 +6557,117 @@ impl Gateway {
         Ok(format!("{prefix} {text}"))
     }
 
+    async fn handle_inbox_command_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        chat: &ChatKey,
+        trimmed: &str,
+    ) -> Result<String> {
+        let rest = trimmed.strip_prefix("/inbox").unwrap_or("").trim();
+        if rest.is_empty() {
+            let mut items = {
+                let guard = gateway.lock().await;
+                guard
+                    .scheduled_items
+                    .values()
+                    .filter(|entry| guard.chat_can_access_scheduled_entry(chat, entry))
+                    .map(|entry| entry.item.clone())
+                    .collect::<Vec<_>>()
+            };
+            items.sort_by(crate::scheduled::scheduled_order);
+            if items.is_empty() {
+                return Ok(format!(
+                    "📥 /inbox пуст (часовой пояс daemon: {})",
+                    crate::scheduled::daemon_timezone_label()
+                ));
+            }
+            let mut lines = vec![format!(
+                "📥 Отложенные сообщения (часовой пояс daemon: {})",
+                crate::scheduled::daemon_timezone_label()
+            )];
+            for item in items {
+                let when = item
+                    .send_at
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M");
+                let state = match item.status {
+                    crate::scheduled::ScheduledStatus::Pending => String::new(),
+                    crate::scheduled::ScheduledStatus::Dispatching => format!(
+                        " [результат отправки требует ручной сверки: {}]",
+                        item.fail_reason
+                            .as_deref()
+                            .unwrap_or("автоматический повтор отключён")
+                    ),
+                    crate::scheduled::ScheduledStatus::Failed => format!(
+                        " [ошибка: {}]",
+                        item.fail_reason.as_deref().unwrap_or("неизвестная ошибка")
+                    ),
+                };
+                lines.push(format!(
+                    "{} · {} · {} · {}{}",
+                    item.id,
+                    item.sid,
+                    when,
+                    crate::scheduled::preview(&item.text),
+                    state
+                ));
+            }
+            return Ok(lines.join("\n"));
+        }
+
+        if rest == "cancel" || rest.starts_with("cancel ") {
+            let mut parts = rest["cancel".len()..].split_whitespace();
+            let id = parts
+                .next()
+                .ok_or_else(|| anyhow!("Использование: /inbox cancel <dN>"))?;
+            if parts.next().is_some() {
+                return Err(anyhow!("Использование: /inbox cancel <dN>"));
+            }
+            let sid = {
+                let guard = gateway.lock().await;
+                guard
+                    .scheduled_items
+                    .get(id)
+                    .filter(|entry| guard.chat_can_access_scheduled_entry(chat, entry))
+                    .map(|entry| entry.item.sid.clone())
+                    .ok_or_else(|| anyhow!("Отложенное сообщение {id} недоступно этому чату"))?
+            };
+            Self::cancel_scheduled_message_shared(Arc::clone(&gateway), &sid, id).await?;
+            return Ok(format!("Отложенное сообщение {id} отменено"));
+        }
+
+        let (when, text) = parse_inbox_create_args(rest)?;
+        let send_at = crate::scheduled::parse_send_time(&when)?;
+        let sid = {
+            let guard = gateway.lock().await;
+            let current = guard.current_session.read().unwrap().get(chat).cloned();
+            current.ok_or_else(|| {
+                anyhow!("Для /inbox нужна текущая сессия; используйте /sessions, затем /use <sid>")
+            })?
+        };
+        let item = Self::create_scheduled_message_shared(
+            Arc::clone(&gateway),
+            &sid,
+            text,
+            send_at,
+            canonical_owner(chat).identity(),
+            None,
+            Some((chat.channel.clone(), chat.chat_id.clone())),
+        )
+        .await?;
+        Ok(format!(
+            "Отложено {} → {} на {} ({})",
+            item.id,
+            item.sid,
+            item.send_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M"),
+            crate::scheduled::daemon_timezone_label()
+        ))
+    }
+
+    /// Legacy direct-`&mut Gateway` entrypoint used by the standalone/test
+    /// surface. The daemon's shared ingress intercepts `/inbox` earlier and
+    /// exclusively calls [`Self::handle_inbox_command_shared`].
     fn handle_inbox_command(&mut self, chat: &ChatKey, trimmed: &str) -> Result<String> {
         self.gc_failed_scheduled(chrono::Utc::now());
         let rest = trimmed.strip_prefix("/inbox").unwrap_or("").trim();
@@ -7873,10 +8139,8 @@ impl Gateway {
         }
     }
 
-    /// v0.8.24 F5 — after a session becomes live, drain any cold-start
-    /// pending turns (FIFO) and re-submit them through the normal path.
-    /// Returns the turn ids of successfully submitted drained turns (order
-    /// preserved) so a not-live submit can surface a real id to callers.
+    /// Direct/in-memory drain. Each FIFO row is durably claimed and is removed
+    /// only after the adapter acknowledges acceptance.
     async fn drain_and_dispatch_pending_turns(&mut self, session_id: &str) -> Vec<String> {
         let (project, chat, owner) = {
             let Some(session) = self.sessions.get(session_id) else {
@@ -7894,18 +8158,36 @@ impl Gateway {
         let Some(cwd) = self.projects.get(&project).cloned() else {
             return Vec::new();
         };
-        let pending = match crate::pending_turns::drain_pending_turns(&cwd, session_id) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(sid = %session_id, error = %e, "drain pending_turns failed");
-                return Vec::new();
-            }
-        };
-        if pending.is_empty() {
-            return Vec::new();
-        }
         let mut ids = Vec::new();
-        for turn in pending {
+        let mut retries = 0u32;
+        loop {
+            let turn = match crate::pending_turns::claim_next_pending_turn(
+                &cwd,
+                session_id,
+                chrono::Utc::now(),
+            ) {
+                Ok(crate::pending_turns::PendingClaim::Claimed(turn)) => turn,
+                Ok(crate::pending_turns::PendingClaim::Waiting(retry_at)) => {
+                    if retries >= crate::pending_turns::MAX_RETRIES_PER_DRAIN {
+                        break;
+                    }
+                    let delay = retry_at
+                        .signed_duration_since(chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or_default();
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Ok(crate::pending_turns::PendingClaim::Empty) => break,
+                Ok(crate::pending_turns::PendingClaim::Unknown(turn)) => {
+                    tracing::warn!(sid = %session_id, pending_id = %turn.id, "pending turn outcome is unknown; automatic drain stopped");
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(sid = %session_id, %error, "claim pending turn failed");
+                    break;
+                }
+            };
             // v0.10.1 — the queue carries who asked (`internal`); the drain used
             // to relabel every row internal, which made a human's queued
             // question look unasked-for on the delivery side.
@@ -7919,29 +8201,65 @@ impl Gateway {
             // Box::pin: drain ↔ submit_resolved are mutually recursive when
             // a not-live submit enqueues then drains (async recursion needs
             // indirection for a finite future type).
-            match Box::pin(self.submit_resolved(
+            let outcome = Box::pin(self.submit_resolved(
                 &chat,
                 session_id,
                 "",
-                turn.text,
+                turn.text.clone(),
                 origin,
                 turn.literal,
             ))
-            .await
-            {
-                Ok(SubmitResult::Turn { id, .. }) => ids.push(id),
-                Ok(SubmitResult::Directive(_)) => {}
-                Ok(SubmitResult::Queued { id, .. }) => {
-                    // The body came back between drain and submit (rare);
-                    // the turn is back in the FIFO, not lost.
-                    tracing::info!(sid = %session_id, %id, "pending turn re-queued behind a detached body");
+            .await;
+            match outcome {
+                Ok(SubmitResult::Turn { id, .. }) => {
+                    ids.push(id);
+                    if let Err(error) =
+                        crate::pending_turns::ack_pending_turn(&cwd, session_id, &turn.id)
+                    {
+                        tracing::error!(sid = %session_id, pending_id = %turn.id, %error, "ack pending turn failed; dispatch fence retained");
+                        break;
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        sid = %session_id,
-                        error = %e,
-                        "dispatch pending turn failed"
-                    );
+                Ok(SubmitResult::Directive(_)) => {
+                    if let Err(error) =
+                        crate::pending_turns::ack_pending_turn(&cwd, session_id, &turn.id)
+                    {
+                        tracing::error!(sid = %session_id, pending_id = %turn.id, %error, "ack pending directive failed; dispatch fence retained");
+                        break;
+                    }
+                }
+                Ok(SubmitResult::Queued { id, .. }) => {
+                    tracing::info!(sid = %session_id, %id, "pending turn re-queued behind a detached body");
+                    if let Err(error) =
+                        crate::pending_turns::ack_pending_turn(&cwd, session_id, &turn.id)
+                    {
+                        tracing::error!(sid = %session_id, pending_id = %turn.id, %error, "ack re-queued pending turn failed");
+                        break;
+                    }
+                }
+                Err(error) if submit_was_proven_pre_dispatch(&error) => {
+                    retries = retries.saturating_add(1);
+                    if let Err(store_error) = crate::pending_turns::retry_pending_turn(
+                        &cwd,
+                        session_id,
+                        &turn.id,
+                        chrono::Utc::now(),
+                        format!("{error:#}"),
+                    ) {
+                        tracing::error!(sid = %session_id, pending_id = %turn.id, error = %store_error, "persist pending retry failed; dispatch fence retained");
+                        break;
+                    }
+                }
+                Err(error) => {
+                    if let Err(store_error) = crate::pending_turns::mark_pending_turn_unknown(
+                        &cwd,
+                        session_id,
+                        &turn.id,
+                        format!("{error:#}"),
+                    ) {
+                        tracing::error!(sid = %session_id, pending_id = %turn.id, error = %store_error, "persist pending unknown failed; dispatch fence retained");
+                    }
+                    break;
                 }
             }
         }
@@ -7952,9 +8270,25 @@ impl Gateway {
         gateway: Arc<tokio::sync::Mutex<Self>>,
         session_id: &str,
     ) -> Vec<String> {
+        let cleanup_tasks = {
+            let guard = gateway.lock().await;
+            guard.cleanup_tasks.clone()
+        };
+        let sid = session_id.to_string();
+        let worker_gateway = Arc::clone(&gateway);
+        let completion = cleanup_tasks.spawn_result(async move {
+            Self::process_pending_turns_owned(worker_gateway, sid).await
+        });
+        completion.await.unwrap_or_default()
+    }
+
+    async fn process_pending_turns_owned(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        session_id: String,
+    ) -> Vec<String> {
         let cwd = {
             let guard = gateway.lock().await;
-            let Some(session) = guard.sessions.get(session_id) else {
+            let Some(session) = guard.sessions.get(&session_id) else {
                 return Vec::new();
             };
             guard.projects.get(&session.project).cloned()
@@ -7962,15 +8296,46 @@ impl Gateway {
         let Some(cwd) = cwd else {
             return Vec::new();
         };
-        let pending = match crate::pending_turns::drain_pending_turns(&cwd, session_id) {
-            Ok(pending) => pending,
-            Err(error) => {
-                tracing::warn!(sid = %session_id, %error, "drain pending_turns failed");
-                return Vec::new();
-            }
-        };
         let mut ids = Vec::new();
-        for turn in pending {
+        let mut retries = 0u32;
+        loop {
+            let claim_cwd = cwd.clone();
+            let claim_sid = session_id.clone();
+            let claim = tokio::task::spawn_blocking(move || {
+                crate::pending_turns::claim_next_pending_turn(
+                    &claim_cwd,
+                    &claim_sid,
+                    chrono::Utc::now(),
+                )
+            })
+            .await;
+            let turn = match claim {
+                Ok(Ok(crate::pending_turns::PendingClaim::Claimed(turn))) => turn,
+                Ok(Ok(crate::pending_turns::PendingClaim::Waiting(retry_at))) => {
+                    if retries >= crate::pending_turns::MAX_RETRIES_PER_DRAIN {
+                        break;
+                    }
+                    let delay = retry_at
+                        .signed_duration_since(chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or_default();
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Ok(Ok(crate::pending_turns::PendingClaim::Empty)) => break,
+                Ok(Ok(crate::pending_turns::PendingClaim::Unknown(turn))) => {
+                    tracing::warn!(sid = %session_id, pending_id = %turn.id, "pending turn outcome is unknown; automatic drain stopped");
+                    break;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(sid = %session_id, %error, "claim pending turn failed");
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(sid = %session_id, %error, "pending claim worker failed");
+                    break;
+                }
+            };
             let origin = if turn.delegation_completion {
                 TurnOrigin::DelegationCompletion
             } else if turn.internal {
@@ -7978,29 +8343,98 @@ impl Gateway {
             } else {
                 TurnOrigin::User
             };
-            match Self::submit_to_sid_shared_result_with_ready(
+            let outcome = Self::submit_to_sid_shared_result_with_ready(
                 Arc::clone(&gateway),
-                session_id,
-                turn.text,
+                &session_id,
+                turn.text.clone(),
                 origin,
                 None,
                 GatewayDeadline::start(),
                 None,
                 !turn.literal,
             )
-            .await
-            {
-                Ok(SubmitResult::Turn { id, .. }) => ids.push(id),
-                Ok(SubmitResult::Directive(_)) => {}
-                Ok(SubmitResult::Queued { id, .. }) => {
-                    tracing::info!(sid = %session_id, %id, "pending turn re-queued behind a detached body");
+            .await;
+            match outcome {
+                Ok(SubmitResult::Turn { id, .. }) => {
+                    ids.push(id);
+                    if let Err(error) = Self::ack_pending_turn_blocking(
+                        cwd.clone(),
+                        session_id.clone(),
+                        turn.id.clone(),
+                    )
+                    .await
+                    {
+                        tracing::error!(sid = %session_id, pending_id = %turn.id, %error, "ack pending turn failed; dispatch fence retained");
+                        break;
+                    }
+                }
+                Ok(SubmitResult::Directive(_)) | Ok(SubmitResult::Queued { .. }) => {
+                    if let Err(error) = Self::ack_pending_turn_blocking(
+                        cwd.clone(),
+                        session_id.clone(),
+                        turn.id.clone(),
+                    )
+                    .await
+                    {
+                        tracing::error!(sid = %session_id, pending_id = %turn.id, %error, "ack accepted pending turn failed; dispatch fence retained");
+                        break;
+                    }
+                }
+                Err(error) if submit_was_proven_pre_dispatch(&error) => {
+                    retries = retries.saturating_add(1);
+                    let retry_cwd = cwd.clone();
+                    let retry_sid = session_id.clone();
+                    let pending_id = turn.id.clone();
+                    let reason = format!("{error:#}");
+                    let retry = tokio::task::spawn_blocking(move || {
+                        crate::pending_turns::retry_pending_turn(
+                            &retry_cwd,
+                            &retry_sid,
+                            &pending_id,
+                            chrono::Utc::now(),
+                            reason,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|join_error| {
+                        Err(anyhow!("pending retry worker failed: {join_error}"))
+                    });
+                    if let Err(store_error) = retry {
+                        tracing::error!(sid = %session_id, pending_id = %turn.id, error = %store_error, "persist pending retry failed; dispatch fence retained");
+                        break;
+                    }
                 }
                 Err(error) => {
-                    tracing::warn!(sid = %session_id, %error, "dispatch pending turn failed");
+                    let unknown_cwd = cwd.clone();
+                    let unknown_sid = session_id.clone();
+                    let pending_id = turn.id.clone();
+                    let reason = format!("{error:#}");
+                    let stored = tokio::task::spawn_blocking(move || {
+                        crate::pending_turns::mark_pending_turn_unknown(
+                            &unknown_cwd,
+                            &unknown_sid,
+                            &pending_id,
+                            reason,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|join_error| {
+                        Err(anyhow!("pending unknown worker failed: {join_error}"))
+                    });
+                    if let Err(store_error) = stored {
+                        tracing::error!(sid = %session_id, pending_id = %turn.id, error = %store_error, "persist pending unknown failed; dispatch fence retained");
+                    }
+                    break;
                 }
             }
         }
         ids
+    }
+
+    async fn ack_pending_turn_blocking(cwd: PathBuf, sid: String, id: String) -> Result<()> {
+        tokio::task::spawn_blocking(move || crate::pending_turns::ack_pending_turn(&cwd, &sid, &id))
+            .await
+            .map_err(|error| anyhow!("pending ack worker failed: {error}"))?
     }
 
     fn spawn_event_pump(&mut self, session_id: &str) {
@@ -9461,23 +9895,16 @@ impl Gateway {
             self.scheduled_items
                 .insert(item.id.clone(), ScheduledEntry { project_dir, item });
         }
-        let interrupted = self
+        for entry in self
             .scheduled_items
-            .iter()
-            .filter(|(_, entry)| {
-                entry.item.status == crate::scheduled::ScheduledStatus::Dispatching
-            })
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for id in interrupted {
-            let reason = "Результат отправки неизвестен после перезапуска daemon; автоматический повтор отключён, нужна ручная сверка"
-                .to_string();
-            if let Err(err) = self.fail_scheduled(&id, reason) {
-                // The durable row remains Dispatching on write failure, which
-                // is still fail-closed: neither scheduler ingress considers it
-                // eligible for automatic delivery.
-                tracing::error!(id = %id, error = %err, "persist interrupted scheduled recovery failed");
-            }
+            .values_mut()
+            .filter(|entry| entry.item.status == crate::scheduled::ScheduledStatus::Dispatching)
+        {
+            entry.item.fail_reason = Some(
+                "Результат отправки неизвестен после перезапуска daemon; автоматический повтор отключён, нужна ручная сверка"
+                    .to_string(),
+            );
+            entry.item.failed_at = None;
         }
         // If a surviving queue proves the counter file was stale/missing, repair
         // it before accepting another create. Fired ids still rely on the
@@ -9523,6 +9950,320 @@ impl Gateway {
         crate::scheduled::write_scheduled(project_dir, sid, &items)
     }
 
+    fn scheduled_snapshot_for_sid(&self, sid: &str) -> Vec<crate::scheduled::ScheduledItem> {
+        let mut items = self
+            .scheduled_items
+            .values()
+            .filter(|entry| entry.item.sid == sid)
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
+        items.sort_by(crate::scheduled::scheduled_order);
+        items
+    }
+
+    async fn write_scheduled_snapshot_off_lock(
+        persistence: Arc<dyn ScheduledPersistence>,
+        project_dir: PathBuf,
+        sid: String,
+        items: Vec<crate::scheduled::ScheduledItem>,
+    ) -> Result<()> {
+        tokio::task::spawn_blocking(move || persistence.write_queue(&project_dir, &sid, &items))
+            .await
+            .map_err(|error| anyhow!("scheduled persistence worker failed: {error}"))?
+    }
+
+    async fn write_scheduled_counter_off_lock(
+        persistence: Arc<dyn ScheduledPersistence>,
+        path: Option<PathBuf>,
+        next: u64,
+    ) -> Result<()> {
+        let Some(path) = path else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || persistence.write_counter(&path, next))
+            .await
+            .map_err(|error| anyhow!("scheduled counter worker failed: {error}"))?
+    }
+
+    async fn append_scheduled_progress_off_lock(
+        paths: Option<CcteamPaths>,
+        item: crate::scheduled::ScheduledItem,
+        event: &'static str,
+        reason: Option<String>,
+    ) {
+        let Some(paths) = paths else {
+            return;
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            let preview = crate::scheduled::preview(&item.text);
+            let row = ccteam_harness::execution::progress_bridge::build_scheduled_event(
+                event,
+                &item.id,
+                &item.sid,
+                &item.send_at.to_rfc3339(),
+                (!preview.is_empty()).then_some(preview.as_str()),
+                reason.as_deref(),
+            );
+            if let Err(error) = ccteam_core::progress::append_event(
+                &paths.progress_jsonl(&item.project),
+                &row,
+            ) {
+                tracing::warn!(id = %item.id, sid = %item.sid, %error, "append scheduled progress failed");
+            }
+        })
+        .await;
+    }
+
+    /// Lock-free web/API list: the in-memory registry is only a cache of the
+    /// durable queue and requires no filesystem work on the read path.
+    pub async fn scheduled_items_for_sid_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+    ) -> Result<Vec<crate::scheduled::ScheduledItem>> {
+        let guard = gateway.lock().await;
+        guard.scheduled_target(sid)?;
+        Ok(guard.scheduled_snapshot_for_sid(sid))
+    }
+
+    /// Durable create with a short gateway plan/apply split. Counter and queue
+    /// fsyncs run through the blocking persistence adapter while only the
+    /// independent create/per-sid claims are held.
+    pub async fn create_scheduled_message_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        text: String,
+        send_at: chrono::DateTime<chrono::Utc>,
+        created_by: String,
+        visible_projects: Option<&HashSet<String>>,
+        reply: Option<(String, String)>,
+    ) -> Result<crate::scheduled::ScheduledItem> {
+        let cleanup_tasks = gateway.lock().await.cleanup_tasks.clone();
+        let sid = sid.to_string();
+        let visible_projects = visible_projects.cloned();
+        let reply = reply.map(|(channel, chat_id)| ChatKey::new(&channel, &chat_id, &chat_id));
+        let worker_gateway = Arc::clone(&gateway);
+        let completion = cleanup_tasks.spawn_result(async move {
+            Self::create_scheduled_message_owned(
+                worker_gateway,
+                sid,
+                text,
+                send_at,
+                created_by,
+                visible_projects,
+                reply,
+            )
+            .await
+        });
+        completion
+            .await
+            .map_err(|_| anyhow!("scheduled create worker stopped before completion"))?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_scheduled_message_owned(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: String,
+        text: String,
+        send_at: chrono::DateTime<chrono::Utc>,
+        created_by: String,
+        visible_projects: Option<HashSet<String>>,
+        reply: Option<ChatKey>,
+    ) -> Result<crate::scheduled::ScheduledItem> {
+        let (create_lock, claims) = {
+            let guard = gateway.lock().await;
+            (
+                Arc::clone(&guard.scheduled_create_lock),
+                Arc::clone(&guard.spawn_claims),
+            )
+        };
+        let _create = create_lock.lock_owned().await;
+        let _sid_claim = claims.lock_for_scheduled(&sid).await;
+        let now = chrono::Utc::now();
+        if text.trim().is_empty() {
+            return Err(anyhow!("Текст отложенного сообщения не может быть пустым"));
+        }
+        if send_at <= now {
+            return Err(anyhow!("Время отложенного сообщения должно быть в будущем"));
+        }
+        if send_at.signed_duration_since(now) > crate::scheduled::MAX_HORIZON {
+            return Err(anyhow!(
+                "Время отложенного сообщения должно быть не дальше 7 дней"
+            ));
+        }
+        let (item, project_dir, queue, next_path, persistence, paths) = {
+            let guard = gateway.lock().await;
+            let visible_pending = reply.as_ref().map_or_else(
+                || guard.scheduled_pending_count_in_projects(visible_projects.as_ref()),
+                |chat| {
+                    guard
+                        .scheduled_items
+                        .values()
+                        .filter(|entry| {
+                            entry.item.status == crate::scheduled::ScheduledStatus::Pending
+                                && guard.chat_can_access_scheduled_entry(chat, entry)
+                        })
+                        .count()
+                },
+            );
+            if visible_pending >= crate::scheduled::MAX_PENDING_VISIBLE {
+                return Err(anyhow!(
+                    "this chat already sees {} pending scheduled messages (limit {})",
+                    visible_pending,
+                    crate::scheduled::MAX_PENDING_VISIBLE
+                ));
+            }
+            let sid_pending = guard
+                .scheduled_items
+                .values()
+                .filter(|entry| {
+                    entry.item.sid == sid
+                        && entry.item.status == crate::scheduled::ScheduledStatus::Pending
+                })
+                .count();
+            if sid_pending >= crate::scheduled::MAX_PENDING_PER_SID {
+                return Err(anyhow!(
+                    "session {sid} already has {} pending scheduled messages (limit {})",
+                    sid_pending,
+                    crate::scheduled::MAX_PENDING_PER_SID
+                ));
+            }
+            let (project, project_dir) = guard.scheduled_target(&sid)?;
+            let next = guard.next_scheduled.saturating_add(1);
+            let (reply_channel, reply_chat_id) = reply
+                .as_ref()
+                .map(|chat| (Some(chat.channel.clone()), Some(chat.chat_id.clone())))
+                .unwrap_or((None, None));
+            let item = crate::scheduled::ScheduledItem {
+                id: format!("d{next}"),
+                sid: sid.clone(),
+                project,
+                text: text.clone(),
+                send_at,
+                created_at: now,
+                created_by: created_by.clone(),
+                status: crate::scheduled::ScheduledStatus::Pending,
+                fail_reason: None,
+                failed_at: None,
+                reply_channel,
+                reply_chat_id,
+            };
+            let mut queue = guard.scheduled_snapshot_for_sid(&sid);
+            queue.push(item.clone());
+            queue.sort_by(crate::scheduled::scheduled_order);
+            (
+                item,
+                project_dir,
+                queue,
+                guard.next_scheduled_path.clone(),
+                Arc::clone(&guard.scheduled_persistence),
+                guard.project_paths.clone(),
+            )
+        };
+        let next = item
+            .id
+            .strip_prefix('d')
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("scheduled id is constructed from a u64");
+        Self::write_scheduled_counter_off_lock(Arc::clone(&persistence), next_path, next).await?;
+        {
+            let mut guard = gateway.lock().await;
+            guard.next_scheduled = guard.next_scheduled.max(next);
+        }
+        Self::write_scheduled_snapshot_off_lock(persistence, project_dir.clone(), sid, queue)
+            .await?;
+        {
+            let mut guard = gateway.lock().await;
+            guard.scheduled_items.insert(
+                item.id.clone(),
+                ScheduledEntry {
+                    project_dir,
+                    item: item.clone(),
+                },
+            );
+            guard.emit_scheduled_changed(&item);
+            guard.scheduled_notify.notify_one();
+        }
+        drop(_sid_claim);
+        drop(_create);
+        Self::append_scheduled_progress_off_lock(
+            paths,
+            item.clone(),
+            ccteam_harness::execution::progress_bridge::SCHEDULED_ENQUEUED,
+            None,
+        )
+        .await;
+        Ok(item)
+    }
+
+    /// Cancellation-safe shared delete. Once accepted by the cleanup tracker,
+    /// the durable write and cache apply complete even if the HTTP/IM caller
+    /// disconnects.
+    pub async fn cancel_scheduled_message_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        id: &str,
+    ) -> Result<crate::scheduled::ScheduledItem> {
+        let cleanup_tasks = gateway.lock().await.cleanup_tasks.clone();
+        let sid = sid.to_string();
+        let id = id.to_string();
+        let worker_gateway = Arc::clone(&gateway);
+        let completion = cleanup_tasks.spawn_result(async move {
+            Self::cancel_scheduled_message_owned(worker_gateway, sid, id).await
+        });
+        completion
+            .await
+            .map_err(|_| anyhow!("scheduled cancel worker stopped before completion"))?
+    }
+
+    async fn cancel_scheduled_message_owned(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: String,
+        id: String,
+    ) -> Result<crate::scheduled::ScheduledItem> {
+        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+        let _sid_claim = claims.lock_for_scheduled(&sid).await;
+        let (entry, queue, persistence, paths) = {
+            let guard = gateway.lock().await;
+            if guard.scheduled_in_flight.contains(&id) {
+                return Err(anyhow!(
+                    "scheduled message {id} is already being delivered and cannot be cancelled"
+                ));
+            }
+            let entry = guard
+                .scheduled_items
+                .get(&id)
+                .filter(|entry| entry.item.sid == sid)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown scheduled message: {id}"))?;
+            let mut queue = guard.scheduled_snapshot_for_sid(&sid);
+            queue.retain(|item| item.id != id);
+            (
+                entry,
+                queue,
+                Arc::clone(&guard.scheduled_persistence),
+                guard.project_paths.clone(),
+            )
+        };
+        Self::write_scheduled_snapshot_off_lock(persistence, entry.project_dir.clone(), sid, queue)
+            .await?;
+        {
+            let mut guard = gateway.lock().await;
+            guard.scheduled_items.remove(&id);
+            guard.scheduled_retry.remove(&id);
+            guard.emit_scheduled_changed(&entry.item);
+            guard.scheduled_notify.notify_one();
+        }
+        drop(_sid_claim);
+        Self::append_scheduled_progress_off_lock(
+            paths,
+            entry.item.clone(),
+            ccteam_harness::execution::progress_bridge::SCHEDULED_CANCELLED,
+            None,
+        )
+        .await;
+        Ok(entry.item)
+    }
+
     /// Pending rows visible in a set of projects. `None` means every project
     /// (admin); tenants pass their project ACL set from the REST layer.
     pub fn scheduled_pending_count_in_projects(
@@ -9540,7 +10281,8 @@ impl Gateway {
             .count()
     }
 
-    /// List pending, dispatching/unknown, and short-lived failed rows for one sid.
+    /// Legacy direct-`&mut Gateway` list used by standalone/tests. Shared
+    /// daemon routes use [`Self::scheduled_items_for_sid_shared`].
     pub fn scheduled_items_for_sid(
         &mut self,
         sid: &str,
@@ -9557,9 +10299,8 @@ impl Gateway {
         Ok(items)
     }
 
-    /// REST/web create. The route supplies its already-resolved visible project
-    /// set so the 100-pending human limit is checked atomically under the same
-    /// gateway lock as insertion.
+    /// Legacy direct-`&mut Gateway` create used by standalone/tests. Shared
+    /// daemon routes use [`Self::create_scheduled_message_shared`].
     pub fn create_scheduled_message(
         &mut self,
         sid: &str,
@@ -9666,7 +10407,7 @@ impl Gateway {
         Ok(item)
     }
 
-    /// Cancel/dismiss one pending, inactive dispatching, or failed row. An
+    /// Legacy direct-`&mut Gateway` cancellation used by standalone/tests. An
     /// actively-owned dispatching row rejects cancellation. The sid is part of the REST
     /// resource address and prevents a globally-valid id being cancelled under
     /// another session path.
@@ -9743,6 +10484,54 @@ impl Gateway {
         });
     }
 
+    fn emit_scheduled_failure_signal(&self, item: &crate::scheduled::ScheduledItem, reason: &str) {
+        let (Some(channel), Some(chat_id)) = (&item.reply_channel, &item.reply_chat_id) else {
+            return;
+        };
+        self.emit_user_signal(GatewayEvent {
+            id: format!("scheduled-failed-{}", item.id),
+            cid: None,
+            channel: channel.clone(),
+            chat_id: chat_id.clone(),
+            thread_ts: None,
+            content: format!(
+                "⏰ Не удалось отправить {} в {}: {} (сохранено в /inbox на 24 ч)",
+                item.id, item.sid, reason
+            ),
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows: Vec::new(),
+            sid: Some(item.sid.clone()),
+            slug: Some(item.project.clone()),
+        });
+    }
+
+    fn defer_scheduled_after_storage_error(
+        &mut self,
+        id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        let failures = self
+            .scheduled_retry
+            .get(id)
+            .map(|state| state.failures.saturating_add(1))
+            .unwrap_or(1);
+        let shift = failures.saturating_sub(1).min(6);
+        let delay_ms = SCHEDULED_STORAGE_RETRY_BASE_MS
+            .saturating_mul(1_i64 << shift)
+            .min(SCHEDULED_STORAGE_RETRY_MAX_MS);
+        let not_before = now + chrono::Duration::milliseconds(delay_ms);
+        self.scheduled_retry.insert(
+            id.to_string(),
+            ScheduledRetryState {
+                failures,
+                not_before,
+            },
+        );
+        not_before
+    }
+
     fn gc_failed_scheduled(&mut self, now: chrono::DateTime<chrono::Utc>) {
         let expired = self
             .scheduled_items
@@ -9768,146 +10557,420 @@ impl Gateway {
                 if self.scheduled_in_flight.contains(id) {
                     return None;
                 }
-                match entry.item.status {
+                let base = match entry.item.status {
                     crate::scheduled::ScheduledStatus::Pending => Some(entry.item.send_at),
                     crate::scheduled::ScheduledStatus::Dispatching => None,
                     crate::scheduled::ScheduledStatus::Failed => entry
                         .item
                         .failed_at
                         .map(|at| at + crate::scheduled::FAILED_RETENTION),
-                }
+                }?;
+                Some(
+                    self.scheduled_retry
+                        .get(id)
+                        .map(|retry| retry.not_before.max(base))
+                        .unwrap_or(base),
+                )
             })
             .min()
     }
 
-    /// Atomically snapshot due one-shots in deterministic order, persist each
-    /// as `Dispatching`, then claim it for one cleanup-owned worker. The
-    /// durable transition happens before any vendor future starts: after a
-    /// crash the row is unknown/manual-reconciliation, never Pending/retried.
-    fn claim_due_scheduled(&mut self, now: chrono::DateTime<chrono::Utc>) -> Vec<ScheduledEntry> {
-        let mut due = self
-            .scheduled_items
-            .iter()
-            .filter(|(id, entry)| {
-                entry.item.status == crate::scheduled::ScheduledStatus::Pending
-                    && entry.item.send_at <= now
-                    && !self.scheduled_in_flight.contains(*id)
-            })
-            .map(|(_, entry)| entry.clone())
-            .collect::<Vec<_>>();
-        due.sort_by(|a, b| crate::scheduled::scheduled_order(&a.item, &b.item));
-        let mut claimed = Vec::with_capacity(due.len());
-        for pending in due {
-            if now.signed_duration_since(pending.item.send_at) > crate::scheduled::MAX_CATCH_UP_AGE
-            {
-                let reason = "Отложенная отправка просрочена более чем на 24 часа".to_string();
-                if let Err(err) = self.fail_scheduled(&pending.item.id, reason) {
-                    tracing::error!(id = %pending.item.id, error = %err, "persist overdue scheduled failure failed");
-                }
-                continue;
-            }
-
-            let mut dispatching = pending.clone();
-            dispatching.item.status = crate::scheduled::ScheduledStatus::Dispatching;
-            dispatching.item.fail_reason = Some(
-                "Отправка начата; при аварийном перезапуске автоматический повтор отключён"
-                    .to_string(),
-            );
-            dispatching.item.failed_at = None;
-            self.scheduled_items
-                .insert(dispatching.item.id.clone(), dispatching.clone());
-            if let Err(err) =
-                self.persist_scheduled_sid(&dispatching.project_dir, &dispatching.item.sid)
-            {
-                self.scheduled_items
-                    .insert(pending.item.id.clone(), pending.clone());
-                let reason = format!("Не удалось зафиксировать начало отправки: {err:#}");
-                if let Err(fail_err) = self.fail_scheduled(&pending.item.id, reason) {
-                    tracing::error!(
-                        id = %pending.item.id,
-                        error = %fail_err,
-                        "persist pre-dispatch scheduled failure failed"
-                    );
-                }
-                continue;
-            }
-            self.scheduled_in_flight.insert(dispatching.item.id.clone());
-            self.emit_scheduled_changed(&dispatching.item);
-            claimed.push(dispatching);
-        }
-        claimed
-    }
-
-    /// Own one sid's claimed items all the way through vendor submit and durable
-    /// fired/failed persistence. This future is always spawned in
-    /// [`CleanupTaskTracker`], so aborting the scheduler/catch-up caller after
-    /// dispatch cannot cancel terminal persistence. One worker per sid keeps
-    /// that sid's deterministic due order; independent sids run in parallel.
-    async fn fire_due_scheduled_owned(
+    /// Durably cross `Pending -> Dispatching` under the per-sid storage lane.
+    /// The lane is released before the returned row is submitted to a vendor.
+    async fn claim_scheduled_for_dispatch_owned(
         gateway: Arc<tokio::sync::Mutex<Self>>,
-        entries: Vec<ScheduledEntry>,
-    ) {
-        for entry in entries {
-            let outcome =
-                Self::submit_scheduled_user_turn_shared(Arc::clone(&gateway), &entry.item).await;
-
+        sid: &str,
+        id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<ScheduledEntry> {
+        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+        let sid_claim = claims.lock_for_scheduled(sid).await;
+        let plan = {
             let mut guard = gateway.lock().await;
-            // The process claim rejects too-late cancellation. The durable
-            // Dispatching state is the stronger crash/restart fence.
-            if !guard.scheduled_in_flight.remove(&entry.item.id) {
-                tracing::error!(
-                    id = %entry.item.id,
-                    sid = %entry.item.sid,
-                    "scheduled fire lost its in-flight ownership claim"
-                );
-                continue;
-            }
-            let terminal = match outcome {
-                Ok(()) => guard.complete_scheduled_fire(&entry),
-                Err(err) => guard.fail_scheduled(&entry.item.id, format!("{err:#}")),
+            let Some(prior) = guard
+                .scheduled_items
+                .get(id)
+                .filter(|entry| entry.item.sid == sid)
+                .cloned()
+            else {
+                guard.scheduled_in_flight.remove(id);
+                guard.scheduled_retry.remove(id);
+                guard.scheduled_notify.notify_one();
+                return None;
             };
-            if let Err(err) = terminal {
-                // Both terminal helpers restore the previous durable-safe
-                // Dispatching row on persistence failure. Surface the storage
-                // fault, but never turn it back into a retryable Pending row.
-                tracing::error!(
-                    id = %entry.item.id,
-                    sid = %entry.item.sid,
-                    error = %err,
-                    "scheduled terminal persistence failed; row remains dispatching"
-                );
+            let retry_ready = guard
+                .scheduled_retry
+                .get(id)
+                .map(|retry| retry.not_before <= now)
+                .unwrap_or(true);
+            if !guard.scheduled_in_flight.contains(id)
+                || prior.item.status != crate::scheduled::ScheduledStatus::Pending
+                || prior.item.send_at > now
+                || !retry_ready
+            {
+                guard.scheduled_in_flight.remove(id);
+                guard.scheduled_notify.notify_one();
+                return None;
             }
-            // A scheduler that ignored this item (startup catch-up launches
-            // and returns) may be sleeping with every other row claimed.
+            let overdue =
+                now.signed_duration_since(prior.item.send_at) > crate::scheduled::MAX_CATCH_UP_AGE;
+            let reason =
+                overdue.then(|| "Отложенная отправка просрочена более чем на 24 часа".to_string());
+            let next_item = if let Some(reason) = reason.as_ref() {
+                prior.item.fail_proven(reason.clone(), now)
+            } else {
+                prior.item.begin_dispatch()
+            };
+            let Ok(next_item) = next_item else {
+                guard.scheduled_in_flight.remove(id);
+                guard.scheduled_notify.notify_one();
+                return None;
+            };
+            let mut queue = guard.scheduled_snapshot_for_sid(sid);
+            let Some(slot) = queue.iter_mut().find(|item| item.id == id) else {
+                guard.scheduled_in_flight.remove(id);
+                guard.scheduled_notify.notify_one();
+                return None;
+            };
+            *slot = next_item.clone();
+            (
+                prior,
+                next_item,
+                queue,
+                reason,
+                Arc::clone(&guard.scheduled_persistence),
+                guard.project_paths.clone(),
+            )
+        };
+        let (prior, next_item, queue, reason, persistence, paths) = plan;
+        if let Err(error) = Self::write_scheduled_snapshot_off_lock(
+            persistence,
+            prior.project_dir.clone(),
+            sid.to_string(),
+            queue,
+        )
+        .await
+        {
+            let not_before = {
+                let mut guard = gateway.lock().await;
+                guard.scheduled_in_flight.remove(id);
+                let not_before = guard.defer_scheduled_after_storage_error(id, now);
+                guard.scheduled_notify.notify_one();
+                not_before
+            };
+            tracing::warn!(
+                %id,
+                %sid,
+                %error,
+                retry_at = %not_before,
+                "persist scheduled dispatch fence failed; pending row deferred"
+            );
+            return None;
+        }
+        let next_entry = ScheduledEntry {
+            project_dir: prior.project_dir.clone(),
+            item: next_item.clone(),
+        };
+        {
+            let mut guard = gateway.lock().await;
+            guard
+                .scheduled_items
+                .insert(id.to_string(), next_entry.clone());
+            guard.scheduled_retry.remove(id);
+            if let Some(reason) = reason.as_deref() {
+                guard.scheduled_in_flight.remove(id);
+                guard.emit_scheduled_failure_signal(&next_item, reason);
+            }
+            guard.emit_scheduled_changed(&next_item);
             guard.scheduled_notify.notify_one();
         }
+        drop(sid_claim);
+        if let Some(reason) = reason {
+            Self::append_scheduled_progress_off_lock(
+                paths,
+                next_item,
+                ccteam_harness::execution::progress_bridge::SCHEDULED_FAILED,
+                Some(reason),
+            )
+            .await;
+            None
+        } else {
+            Some(next_entry)
+        }
     }
 
-    /// Claim due rows under the short registry lock, durably fence them, and
-    /// hand each item to the gateway cleanup tracker before returning.
+    /// Persist the terminal delivery outcome. Any storage failure leaves the
+    /// already-durable `Dispatching` row untouched and non-retryable.
+    async fn finish_scheduled_delivery_owned(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        entry: ScheduledEntry,
+        outcome: Result<()>,
+    ) {
+        let terminal = match outcome {
+            Ok(()) => ScheduledTerminalOutcome::Fired,
+            Err(error) if submit_was_proven_pre_dispatch(&error) => {
+                ScheduledTerminalOutcome::Failed(format!("{error:#}"))
+            }
+            Err(error) => ScheduledTerminalOutcome::Unknown(format!(
+                "Результат отправки неизвестен: {error:#}; автоматический повтор отключён, нужна ручная сверка"
+            )),
+        };
+        let sid = entry.item.sid.clone();
+        let id = entry.item.id.clone();
+        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+        let sid_claim = claims.lock_for_scheduled(&sid).await;
+        let plan = {
+            let mut guard = gateway.lock().await;
+            let Some(current) = guard.scheduled_items.get(&id).cloned() else {
+                guard.scheduled_in_flight.remove(&id);
+                guard.scheduled_notify.notify_one();
+                return;
+            };
+            if current.item.status != crate::scheduled::ScheduledStatus::Dispatching {
+                guard.scheduled_in_flight.remove(&id);
+                guard.scheduled_notify.notify_one();
+                return;
+            }
+            let next_item = match &terminal {
+                ScheduledTerminalOutcome::Fired => None,
+                ScheduledTerminalOutcome::Failed(reason) => current
+                    .item
+                    .fail_proven(reason.clone(), chrono::Utc::now())
+                    .ok(),
+                ScheduledTerminalOutcome::Unknown(reason) => {
+                    current.item.keep_unknown(reason.clone()).ok()
+                }
+            };
+            if !matches!(terminal, ScheduledTerminalOutcome::Fired) && next_item.is_none() {
+                guard.scheduled_in_flight.remove(&id);
+                guard.scheduled_notify.notify_one();
+                return;
+            }
+            let mut queue = guard.scheduled_snapshot_for_sid(&sid);
+            match next_item.as_ref() {
+                Some(next) => {
+                    let Some(slot) = queue.iter_mut().find(|item| item.id == id) else {
+                        guard.scheduled_in_flight.remove(&id);
+                        guard.scheduled_notify.notify_one();
+                        return;
+                    };
+                    *slot = next.clone();
+                }
+                None => queue.retain(|item| item.id != id),
+            }
+            (
+                current,
+                next_item,
+                queue,
+                Arc::clone(&guard.scheduled_persistence),
+                guard.project_paths.clone(),
+            )
+        };
+        let (current, next_item, queue, persistence, paths) = plan;
+        if let Err(error) = Self::write_scheduled_snapshot_off_lock(
+            persistence,
+            current.project_dir.clone(),
+            sid.clone(),
+            queue,
+        )
+        .await
+        {
+            let mut guard = gateway.lock().await;
+            guard.scheduled_in_flight.remove(&id);
+            guard.scheduled_notify.notify_one();
+            tracing::error!(
+                %id,
+                %sid,
+                %error,
+                "scheduled terminal persistence failed; row remains dispatching"
+            );
+            return;
+        }
+        let changed = next_item.as_ref().unwrap_or(&current.item).clone();
+        {
+            let mut guard = gateway.lock().await;
+            match next_item.clone() {
+                Some(next) => {
+                    guard.scheduled_items.insert(
+                        id.clone(),
+                        ScheduledEntry {
+                            project_dir: current.project_dir.clone(),
+                            item: next,
+                        },
+                    );
+                }
+                None => {
+                    guard.scheduled_items.remove(&id);
+                }
+            }
+            guard.scheduled_in_flight.remove(&id);
+            guard.scheduled_retry.remove(&id);
+            if let ScheduledTerminalOutcome::Failed(reason) = &terminal {
+                guard.emit_scheduled_failure_signal(&changed, reason);
+            }
+            guard.emit_scheduled_changed(&changed);
+            guard.scheduled_notify.notify_one();
+        }
+        drop(sid_claim);
+        match terminal {
+            ScheduledTerminalOutcome::Fired => {
+                Self::append_scheduled_progress_off_lock(
+                    paths,
+                    changed,
+                    ccteam_harness::execution::progress_bridge::SCHEDULED_FIRED,
+                    None,
+                )
+                .await;
+            }
+            ScheduledTerminalOutcome::Failed(reason) => {
+                Self::append_scheduled_progress_off_lock(
+                    paths,
+                    changed,
+                    ccteam_harness::execution::progress_bridge::SCHEDULED_FAILED,
+                    Some(reason),
+                )
+                .await;
+            }
+            ScheduledTerminalOutcome::Unknown(_) => {}
+        }
+    }
+
+    async fn gc_scheduled_row_owned(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: String,
+        id: String,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+        let _sid_claim = claims.lock_for_scheduled(&sid).await;
+        let plan = {
+            let mut guard = gateway.lock().await;
+            let Some(entry) = guard
+                .scheduled_items
+                .get(&id)
+                .filter(|entry| entry.item.sid == sid && entry.item.failed_expired(now))
+                .cloned()
+            else {
+                guard.scheduled_in_flight.remove(&id);
+                guard.scheduled_notify.notify_one();
+                return;
+            };
+            let mut queue = guard.scheduled_snapshot_for_sid(&sid);
+            queue.retain(|item| item.id != id);
+            (entry, queue, Arc::clone(&guard.scheduled_persistence))
+        };
+        let (entry, queue, persistence) = plan;
+        if let Err(error) = Self::write_scheduled_snapshot_off_lock(
+            persistence,
+            entry.project_dir.clone(),
+            sid.clone(),
+            queue,
+        )
+        .await
+        {
+            let not_before = {
+                let mut guard = gateway.lock().await;
+                guard.scheduled_in_flight.remove(&id);
+                let not_before = guard.defer_scheduled_after_storage_error(&id, now);
+                guard.scheduled_notify.notify_one();
+                not_before
+            };
+            tracing::warn!(%id, %sid, %error, retry_at = %not_before, "scheduled GC persistence failed; retry deferred");
+            return;
+        }
+        let mut guard = gateway.lock().await;
+        guard.scheduled_items.remove(&id);
+        guard.scheduled_in_flight.remove(&id);
+        guard.scheduled_retry.remove(&id);
+        guard.emit_scheduled_changed(&entry.item);
+        guard.scheduled_notify.notify_one();
+    }
+
+    /// One cleanup-owned worker preserves due order for a sid. Each storage
+    /// transition releases its per-sid lane before vendor submit.
+    async fn fire_due_scheduled_owned(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: String,
+        ids: Vec<String>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        for id in ids {
+            let Some(entry) =
+                Self::claim_scheduled_for_dispatch_owned(Arc::clone(&gateway), &sid, &id, now)
+                    .await
+            else {
+                continue;
+            };
+            let outcome =
+                Self::submit_scheduled_user_turn_shared(Arc::clone(&gateway), &entry.item).await;
+            Self::finish_scheduled_delivery_owned(Arc::clone(&gateway), entry, outcome).await;
+        }
+    }
+
+    /// Reserve due/expired rows under the short registry lock, then hand all
+    /// durability work to cleanup-owned per-sid workers. Reservations prevent
+    /// the wakeable scheduler from hot-spawning duplicates while an fsync is
+    /// slow; a failed write installs bounded backoff before releasing it.
     async fn launch_due_scheduled_shared(
         gateway: Arc<tokio::sync::Mutex<Self>>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> usize {
-        let (due, cleanup_tasks) = {
+        let (due, expired, cleanup_tasks) = {
             let mut guard = gateway.lock().await;
-            guard.gc_failed_scheduled(now);
-            let due = guard.claim_due_scheduled(now);
-            (due, guard.cleanup_tasks.clone())
-        };
-        let count = due.len();
-        let mut per_sid: Vec<(String, Vec<ScheduledEntry>)> = Vec::new();
-        for entry in due {
-            if let Some((_, entries)) = per_sid.iter_mut().find(|(sid, _)| sid == &entry.item.sid) {
-                entries.push(entry);
-            } else {
-                per_sid.push((entry.item.sid.clone(), vec![entry]));
+            let retry_ready = |id: &str| {
+                guard
+                    .scheduled_retry
+                    .get(id)
+                    .map(|retry| retry.not_before <= now)
+                    .unwrap_or(true)
+            };
+            let mut due = guard
+                .scheduled_items
+                .iter()
+                .filter(|(id, entry)| {
+                    entry.item.status == crate::scheduled::ScheduledStatus::Pending
+                        && entry.item.send_at <= now
+                        && !guard.scheduled_in_flight.contains(*id)
+                        && retry_ready(id)
+                })
+                .map(|(_, entry)| entry.clone())
+                .collect::<Vec<_>>();
+            due.sort_by(|a, b| crate::scheduled::scheduled_order(&a.item, &b.item));
+            let mut expired = guard
+                .scheduled_items
+                .iter()
+                .filter(|(id, entry)| {
+                    entry.item.failed_expired(now)
+                        && !guard.scheduled_in_flight.contains(*id)
+                        && retry_ready(id)
+                })
+                .map(|(_, entry)| entry.clone())
+                .collect::<Vec<_>>();
+            expired.sort_by(|a, b| crate::scheduled::scheduled_order(&a.item, &b.item));
+            for entry in due.iter().chain(expired.iter()) {
+                guard.scheduled_in_flight.insert(entry.item.id.clone());
             }
+            (due, expired, guard.cleanup_tasks.clone())
+        };
+        let count = due.len() + expired.len();
+        let mut due_by_sid = BTreeMap::<String, Vec<String>>::new();
+        for entry in due {
+            due_by_sid
+                .entry(entry.item.sid)
+                .or_default()
+                .push(entry.item.id);
         }
-        for (_, entries) in per_sid {
-            let gateway = Arc::clone(&gateway);
+        for (sid, ids) in due_by_sid {
+            let worker_gateway = Arc::clone(&gateway);
             cleanup_tasks.spawn(async move {
-                Self::fire_due_scheduled_owned(gateway, entries).await;
+                Self::fire_due_scheduled_owned(worker_gateway, sid, ids, now).await;
+            });
+        }
+        for entry in expired {
+            let worker_gateway = Arc::clone(&gateway);
+            cleanup_tasks.spawn(async move {
+                Self::gc_scheduled_row_owned(worker_gateway, entry.item.sid, entry.item.id, now)
+                    .await;
             });
         }
         count
@@ -9941,69 +11004,6 @@ impl Gateway {
                 "Текст отложенного сообщения распознан как directive"
             )),
         }
-    }
-
-    fn complete_scheduled_fire(&mut self, entry: &ScheduledEntry) -> Result<()> {
-        let current = self
-            .scheduled_items
-            .remove(&entry.item.id)
-            .ok_or_else(|| anyhow!("scheduled row disappeared: {}", entry.item.id))?;
-        if let Err(err) = self.persist_scheduled_sid(&entry.project_dir, &entry.item.sid) {
-            self.scheduled_items.insert(entry.item.id.clone(), current);
-            return Err(err);
-        }
-        self.emit_scheduled_progress(
-            &entry.item,
-            ccteam_harness::execution::progress_bridge::SCHEDULED_FIRED,
-            None,
-        );
-        self.emit_scheduled_changed(&entry.item);
-        Ok(())
-    }
-
-    fn fail_scheduled(&mut self, id: &str, reason: String) -> Result<()> {
-        let prior = self
-            .scheduled_items
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow!("scheduled row disappeared: {id}"))?;
-        let mut entry = prior.clone();
-        entry.item.status = crate::scheduled::ScheduledStatus::Failed;
-        entry.item.fail_reason = Some(reason.clone());
-        entry.item.failed_at = Some(chrono::Utc::now());
-        self.scheduled_items.insert(id.to_string(), entry.clone());
-        if let Err(err) = self.persist_scheduled_sid(&entry.project_dir, &entry.item.sid) {
-            self.scheduled_items.insert(id.to_string(), prior);
-            return Err(err);
-        }
-        self.emit_scheduled_progress(
-            &entry.item,
-            ccteam_harness::execution::progress_bridge::SCHEDULED_FAILED,
-            Some(&reason),
-        );
-        self.emit_scheduled_changed(&entry.item);
-        if let (Some(channel), Some(chat_id)) =
-            (&entry.item.reply_channel, &entry.item.reply_chat_id)
-        {
-            self.emit_user_signal(GatewayEvent {
-                id: format!("scheduled-failed-{}", entry.item.id),
-                cid: None,
-                channel: channel.clone(),
-                chat_id: chat_id.clone(),
-                thread_ts: None,
-                content: format!(
-                    "⏰ Не удалось отправить {} в {}: {} (сохранено в /inbox на 24 ч)",
-                    entry.item.id, entry.item.sid, reason
-                ),
-                kind: GatewayEventKind::Answer,
-                attachments: Vec::new(),
-                options: Vec::new(),
-                button_rows: Vec::new(),
-                sid: Some(entry.item.sid.clone()),
-                slug: Some(entry.item.project.clone()),
-            });
-        }
-        Ok(())
     }
 
     /// Lightweight wakeable next-fire task. It sleeps until the earliest UTC
@@ -15881,19 +16881,21 @@ impl Gateway {
                     // One sid, one body: queue behind the detached body and
                     // tell the caller (receipt over the session's SSE, handle
                     // back to the API/MCP caller).
-                    let guard = deadline.lock(&gateway).await?;
                     let reply_to = context
                         .as_ref()
                         .map(|context| context.reply_to.clone())
                         .or_else(|| ChatKey::from_identity(&identity))
                         .unwrap_or_else(web_api_chat);
-                    let (receipt, id) = guard.queue_behind_detached_body(
+                    let (receipt, id) = Self::queue_behind_detached_body_shared(
+                        Arc::clone(&gateway),
                         sid,
-                        &text,
-                        &reply_to,
+                        text,
+                        reply_to,
                         !parse_directives,
                         origin,
-                    )?;
+                        deadline,
+                    )
+                    .await?;
                     if let Some(ready) = ready.take() {
                         let _ = ready.send(true);
                     }
@@ -20700,8 +21702,11 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn body_exit_pending_submit_does_not_hold_the_gateway_registry() {
+        use std::os::fd::AsRawFd;
+
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().join("alpha");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -20720,12 +21725,52 @@ mod tests {
         let mut restarted = Gateway::new(fake, "alpha", &project_dir);
         restarted.enable_persistence(tmp.path()).unwrap();
         restarted.resume_restored_sessions().await;
-        restarted
-            .submit_to_sid(&sid, "queued while detached".into())
-            .await
-            .unwrap();
-        body_gone(&mut body);
         let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+
+        // Hold the pending module's stable sibling lock so the enqueue's
+        // spawn_blocking worker stops inside durable storage. The unrelated
+        // gateway registry must remain immediately observable.
+        let lock_path = project_dir
+            .join(".ccteam")
+            .join("chat")
+            .join(&sid)
+            .join(".pending_turns.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) },
+            0
+        );
+        let queue_gateway = Arc::clone(&gateway);
+        let queue_sid = sid.clone();
+        let queue = tokio::spawn(async move {
+            Gateway::submit_to_sid_shared(
+                queue_gateway,
+                &queue_sid,
+                "queued while detached".into(),
+                GatewayDeadline::start(),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            !queue.is_finished(),
+            "enqueue must be waiting on durable lock"
+        );
+        assert_other_chat_observability_is_prompt(&gateway).await;
+        assert_eq!(
+            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
+        queue.await.unwrap().unwrap();
+
+        body_gone(&mut body);
         submit.arm();
         let tick_gateway = Arc::clone(&gateway);
         let tick = tokio::spawn(async move { Gateway::body_watch_tick(&tick_gateway).await });
@@ -21436,6 +22481,98 @@ mod tests {
 
         fn release_all(&self) {
             self.release.add_permits(64);
+        }
+    }
+
+    struct TestScheduledPersistence {
+        inner: FsScheduledPersistence,
+        queue_calls: AtomicUsize,
+        fail_queue_remaining: AtomicUsize,
+        block_after_sid: std::sync::Mutex<Option<String>>,
+        blocked_entries: AtomicUsize,
+        blocked_notify: tokio::sync::Notify,
+        released: std::sync::Mutex<bool>,
+        release_cv: std::sync::Condvar,
+    }
+
+    impl Default for TestScheduledPersistence {
+        fn default() -> Self {
+            Self {
+                inner: FsScheduledPersistence,
+                queue_calls: AtomicUsize::new(0),
+                fail_queue_remaining: AtomicUsize::new(0),
+                block_after_sid: std::sync::Mutex::new(None),
+                blocked_entries: AtomicUsize::new(0),
+                blocked_notify: tokio::sync::Notify::new(),
+                released: std::sync::Mutex::new(true),
+                release_cv: std::sync::Condvar::new(),
+            }
+        }
+    }
+
+    impl TestScheduledPersistence {
+        fn arm_after_write(&self, sid: &str) {
+            *self.block_after_sid.lock().unwrap() = Some(sid.to_string());
+            *self.released.lock().unwrap() = false;
+        }
+
+        fn fail_next_queue_writes(&self, count: usize) {
+            self.fail_queue_remaining.store(count, Ordering::SeqCst);
+        }
+
+        async fn wait_until_blocked(&self, count: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while self.blocked_entries.load(Ordering::SeqCst) < count {
+                    self.blocked_notify.notified().await;
+                }
+            })
+            .await
+            .expect("scheduled persistence reaches the post-write barrier");
+        }
+
+        fn release_all(&self) {
+            *self.released.lock().unwrap() = true;
+            self.release_cv.notify_all();
+        }
+    }
+
+    impl ScheduledPersistence for TestScheduledPersistence {
+        fn write_queue(
+            &self,
+            project_dir: &Path,
+            sid: &str,
+            items: &[crate::scheduled::ScheduledItem],
+        ) -> Result<()> {
+            self.queue_calls.fetch_add(1, Ordering::SeqCst);
+            if self
+                .fail_queue_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(anyhow!("injected scheduled queue persistence failure"));
+            }
+            self.inner.write_queue(project_dir, sid, items)?;
+            let should_block = self
+                .block_after_sid
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|blocked_sid| blocked_sid == sid);
+            if should_block {
+                self.blocked_entries.fetch_add(1, Ordering::SeqCst);
+                self.blocked_notify.notify_waiters();
+                let mut released = self.released.lock().unwrap();
+                while !*released {
+                    released = self.release_cv.wait(released).unwrap();
+                }
+            }
+            Ok(())
+        }
+
+        fn write_counter(&self, path: &Path, next: u64) -> Result<()> {
+            self.inner.write_counter(path, next)
         }
     }
 
@@ -24149,6 +25286,191 @@ mod tests {
                 ("alpha-reviewer-s1".to_string(), "queued-second".to_string()),
             ],
             "FIFO: pre-queued then just-enqueued"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_pending_drain_keeps_cleanup_owned_ack_and_registry_responsive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let submit = Arc::new(TestStartBarrier::default());
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude).with_submit_barrier(Arc::clone(&submit)),
+        );
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        crate::pending_turns::enqueue_pending_turn(
+            tmp.path(),
+            &sid,
+            "survive drain caller abort",
+            Some("web".into()),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let gateway = Arc::new(Mutex::new(gateway));
+        submit.arm();
+        let drain_gateway = Arc::clone(&gateway);
+        let drain_sid = sid.clone();
+        let drain = tokio::spawn(async move {
+            Gateway::drain_and_dispatch_pending_turns_shared(drain_gateway, &drain_sid).await
+        });
+        submit.wait_until_entered(1).await;
+
+        assert_other_chat_observability_is_prompt(&gateway).await;
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(tmp.path(), &sid),
+            1,
+            "claim is a durable fence, not a destructive drain"
+        );
+        drain.abort();
+        let _ = drain.await;
+        submit.release_all();
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        assert_eq!(fake.submissions.lock().await.len(), 1);
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(tmp.path(), &sid),
+            0,
+            "cleanup-owned worker acknowledges after accepted submit"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_drain_retries_only_typed_predispatch_rejection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        // One shared submit performs one internal resume/retry. Two proven
+        // lookup misses return the durable row to Pending once; its next
+        // backoff-governed attempt is accepted.
+        fake.predispatch_unavailable_remaining
+            .store(2, Ordering::SeqCst);
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        crate::pending_turns::enqueue_pending_turn(
+            tmp.path(),
+            &sid,
+            "safe retry",
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let gateway = Arc::new(Mutex::new(gateway));
+
+        let ids =
+            Gateway::drain_and_dispatch_pending_turns_shared(Arc::clone(&gateway), &sid).await;
+        assert_eq!(ids.len(), 1);
+        assert_eq!(fake.submissions.lock().await.len(), 1);
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(tmp.path(), &sid),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_drain_stops_after_its_bounded_predispatch_retry_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        fake.predispatch_unavailable_remaining
+            .store(100, Ordering::SeqCst);
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        crate::pending_turns::enqueue_pending_turn(
+            tmp.path(),
+            &sid,
+            "bounded retry",
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let gateway = Arc::new(Mutex::new(gateway));
+
+        let ids =
+            Gateway::drain_and_dispatch_pending_turns_shared(Arc::clone(&gateway), &sid).await;
+        assert!(ids.is_empty());
+        assert!(fake.submissions.lock().await.is_empty());
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(tmp.path(), &sid),
+            1
+        );
+        assert!(matches!(
+            crate::pending_turns::claim_next_pending_turn(tmp.path(), &sid, chrono::Utc::now())
+                .unwrap(),
+            crate::pending_turns::PendingClaim::Waiting(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_postdispatch_error_stays_unknown_and_never_duplicates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        fake.post_dispatch_thread_deaths_remaining
+            .store(1, Ordering::SeqCst);
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        crate::pending_turns::enqueue_pending_turn(
+            tmp.path(),
+            &sid,
+            "accepted before transport loss",
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let gateway = Arc::new(Mutex::new(gateway));
+
+        Gateway::drain_and_dispatch_pending_turns_shared(Arc::clone(&gateway), &sid).await;
+        assert_eq!(fake.submissions.lock().await.len(), 1);
+        assert!(matches!(
+            crate::pending_turns::claim_next_pending_turn(tmp.path(), &sid, chrono::Utc::now())
+                .unwrap(),
+            crate::pending_turns::PendingClaim::Unknown(_)
+        ));
+        Gateway::drain_and_dispatch_pending_turns_shared(Arc::clone(&gateway), &sid).await;
+        assert_eq!(
+            fake.submissions.lock().await.len(),
+            1,
+            "an ambiguous accepted turn is never blindly retried"
         );
     }
 
@@ -36349,6 +37671,197 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_scheduled_create_and_cancel_finish_cache_apply_after_caller_abort() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let persistence = Arc::new(TestScheduledPersistence::default());
+        gateway.scheduled_persistence = persistence.clone();
+        let gateway = Arc::new(Mutex::new(gateway));
+
+        persistence.arm_after_write(&sid);
+        let create_gateway = Arc::clone(&gateway);
+        let create_sid = sid.clone();
+        let create = tokio::spawn(async move {
+            Gateway::create_scheduled_message_shared(
+                create_gateway,
+                &create_sid,
+                "survive cancelled create request".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+                None,
+            )
+            .await
+        });
+        persistence.wait_until_blocked(1).await;
+        assert_eq!(
+            crate::scheduled::read_scheduled(tmp.path(), &sid)
+                .unwrap()
+                .len(),
+            1,
+            "the queue write has succeeded before the cache apply gate"
+        );
+        assert!(gateway.lock().await.scheduled_items.is_empty());
+        create.abort();
+        let _ = create.await;
+        persistence.release_all();
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        let item = gateway
+            .lock()
+            .await
+            .scheduled_items
+            .values()
+            .next()
+            .unwrap()
+            .item
+            .clone();
+
+        persistence.arm_after_write(&sid);
+        let cancel_gateway = Arc::clone(&gateway);
+        let cancel_sid = sid.clone();
+        let cancel_id = item.id.clone();
+        let cancel = tokio::spawn(async move {
+            Gateway::cancel_scheduled_message_shared(cancel_gateway, &cancel_sid, &cancel_id).await
+        });
+        persistence.wait_until_blocked(2).await;
+        assert!(
+            crate::scheduled::read_scheduled(tmp.path(), &sid)
+                .unwrap()
+                .is_empty(),
+            "the durable delete has succeeded before cache apply"
+        );
+        assert!(gateway.lock().await.scheduled_items.contains_key(&item.id));
+        cancel.abort();
+        let _ = cancel.await;
+        persistence.release_all();
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        assert!(gateway.lock().await.scheduled_items.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_scheduled_fsync_never_owns_the_gateway_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let item = gateway
+            .create_scheduled_message(
+                &sid,
+                "slow durable claim".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        gateway
+            .scheduled_items
+            .get_mut(&item.id)
+            .unwrap()
+            .item
+            .send_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let persistence = Arc::new(TestScheduledPersistence::default());
+        persistence.arm_after_write(&sid);
+        gateway.scheduled_persistence = persistence.clone();
+        let gateway = Arc::new(Mutex::new(gateway));
+
+        Gateway::catch_up_scheduled(Arc::clone(&gateway)).await;
+        persistence.wait_until_blocked(1).await;
+        assert_other_chat_observability_is_prompt(&gateway).await;
+        assert_eq!(
+            crate::scheduled::read_scheduled(tmp.path(), &sid).unwrap()[0].status,
+            crate::scheduled::ScheduledStatus::Dispatching
+        );
+        persistence.release_all();
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        assert!(gateway.lock().await.scheduled_items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_storage_failure_backs_off_without_a_hot_retry_loop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let item = gateway
+            .create_scheduled_message(
+                &sid,
+                "retry storage, not vendor".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        let now = chrono::Utc::now();
+        gateway
+            .scheduled_items
+            .get_mut(&item.id)
+            .unwrap()
+            .item
+            .send_at = now - chrono::Duration::seconds(1);
+        let persistence = Arc::new(TestScheduledPersistence::default());
+        persistence.fail_next_queue_writes(1);
+        gateway.scheduled_persistence = persistence.clone();
+        let gateway = Arc::new(Mutex::new(gateway));
+
+        assert_eq!(
+            Gateway::launch_due_scheduled_shared(Arc::clone(&gateway), now).await,
+            1
+        );
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        {
+            let guard = gateway.lock().await;
+            assert_eq!(
+                guard.scheduled_items[&item.id].item.status,
+                crate::scheduled::ScheduledStatus::Pending
+            );
+            assert!(guard.scheduled_retry[&item.id].not_before > now);
+            assert!(guard.next_scheduled_at().unwrap() > now);
+            assert!(!guard.scheduled_in_flight.contains(&item.id));
+        }
+        assert_eq!(persistence.queue_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            Gateway::launch_due_scheduled_shared(Arc::clone(&gateway), now).await,
+            0,
+            "the same instant is inside the retry backoff"
+        );
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        assert_eq!(persistence.queue_calls.load(Ordering::SeqCst), 1);
+        assert!(fake.submissions.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scheduled_catch_up_releases_registry_and_claims_one_shot() {
         let tmp = tempfile::TempDir::new().unwrap();
         seed_role(tmp.path(), "reviewer");
@@ -36636,7 +38149,7 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(
             recovered[0].status,
-            crate::scheduled::ScheduledStatus::Failed
+            crate::scheduled::ScheduledStatus::Dispatching
         );
         assert!(recovered[0]
             .fail_reason
@@ -36649,8 +38162,105 @@ mod tests {
         assert!(fake.submissions.lock().await.is_empty());
         assert_eq!(
             crate::scheduled::read_scheduled(&project_dir, &sid).unwrap()[0].status,
-            crate::scheduled::ScheduledStatus::Failed
+            crate::scheduled::ScheduledStatus::Dispatching
         );
+    }
+
+    #[tokio::test]
+    async fn scheduled_post_dispatch_error_stays_unknown_and_is_not_retried() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        fake.post_dispatch_thread_deaths_remaining
+            .store(1, Ordering::SeqCst);
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let item = gateway
+            .create_scheduled_message(
+                &sid,
+                "accepted before transport loss".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        gateway
+            .scheduled_items
+            .get_mut(&item.id)
+            .unwrap()
+            .item
+            .send_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let gateway = Arc::new(Mutex::new(gateway));
+
+        Gateway::catch_up_scheduled(Arc::clone(&gateway)).await;
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        let unknown = gateway.lock().await.scheduled_items_for_sid(&sid).unwrap();
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(
+            unknown[0].status,
+            crate::scheduled::ScheduledStatus::Dispatching,
+            "an adapter error after the dispatch boundary is not proof of rejection"
+        );
+
+        Gateway::catch_up_scheduled(Arc::clone(&gateway)).await;
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        assert_eq!(
+            fake.submissions.lock().await.len(),
+            1,
+            "unknown delivery must never be retried blindly"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_proven_pre_dispatch_rejection_becomes_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        fake.predispatch_unavailable_remaining
+            .store(2, Ordering::SeqCst);
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let item = gateway
+            .create_scheduled_message(
+                &sid,
+                "never reached vendor".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        gateway
+            .scheduled_items
+            .get_mut(&item.id)
+            .unwrap()
+            .item
+            .send_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let gateway = Arc::new(Mutex::new(gateway));
+
+        Gateway::catch_up_scheduled(Arc::clone(&gateway)).await;
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        let failed = gateway.lock().await.scheduled_items_for_sid(&sid).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].status, crate::scheduled::ScheduledStatus::Failed);
+        assert!(fake.submissions.lock().await.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
