@@ -92,13 +92,15 @@ impl HarnessAdapter for FakeAdapter {
     }
 
     fn event_attachment(&self) -> ccteam_harness::EventAttachment {
-        // Scripted test stream: one-shot. Re-attaching would replay
-        // the script, which is exactly what `Rebuildable` forbids.
+        // This fake models one long-lived transport attachment. Re-attaching
+        // would create a second body, which is exactly what `OneShot` forbids.
         ccteam_harness::EventAttachment::OneShot
     }
 
     fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
-        Box::pin(stream::empty())
+        // EOF is a real body-death signal to the gateway. Keep the fake body
+        // alive while these graph tests create children and inspect status.
+        Box::pin(stream::pending())
     }
 
     async fn resume_thread(&self, _persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
@@ -181,13 +183,30 @@ fn register_project(paths: &CcteamPaths, slug: &str, owner: Option<&str>) -> std
     paths.projects_root.join(slug)
 }
 
+async fn create_live_parent(gateway: &mut Gateway, slug: &str) -> DelegationParent {
+    let outcome = gateway
+        .create_session_api(
+            slug.to_string(),
+            String::new(),
+            AgentVendor::Claude,
+            PermissionMode::Skip,
+        )
+        .await
+        .expect("create a live roleless parent against the FakeAdapter");
+    DelegationParent {
+        sid: outcome.sid,
+        depth: 0,
+        role: String::new(),
+    }
+}
+
 /// Build a gateway over "demo" + spawn ONE delegated child (mirrors what
 /// `session_spawn` does for an Ambient caller) — the real code path that
 /// emits `delegation_spawned` (progress.jsonl, when project_paths is wired)
 /// AND its [`ccteam_im::gateway::GatewayEventKind::Delegation`] broadcast
 /// twin (unconditional — see `Gateway::emit_delegation_progress`).
-/// Returns `(gateway, child_sid)`.
-async fn spawn_delegated_child(project_dir: std::path::PathBuf) -> (Gateway, String) {
+/// Returns `(gateway, parent_sid, child_sid)`.
+async fn spawn_delegated_child(project_dir: std::path::PathBuf) -> (Gateway, String, String) {
     spawn_delegated_child_in("demo", project_dir).await
 }
 
@@ -197,8 +216,10 @@ async fn spawn_delegated_child(project_dir: std::path::PathBuf) -> (Gateway, Str
 async fn spawn_delegated_child_in(
     slug: &str,
     project_dir: std::path::PathBuf,
-) -> (Gateway, String) {
+) -> (Gateway, String, String) {
     let mut gateway = Gateway::new_with_factory(factory(), slug, project_dir);
+    let parent = create_live_parent(&mut gateway, slug).await;
+    let parent_sid = parent.sid.clone();
     let outcome = gateway
         .create_delegated_session(
             slug.to_string(),
@@ -208,16 +229,12 @@ async fn spawn_delegated_child_in(
             SessionProtocol::StreamJson,
             "web-api".to_string(),
             SpawnTuning::default(),
-            Some(DelegationParent {
-                sid: "s0".to_string(),
-                depth: 0,
-                role: "brain".to_string(),
-            }),
+            Some(parent),
             Some("research task".to_string()),
         )
         .await
         .expect("create_delegated_session succeeds against a FakeAdapter");
-    (gateway, outcome.sid)
+    (gateway, parent_sid, outcome.sid)
 }
 
 /// Persist a `meta.json` for a sid the gateway does NOT track — an idle
@@ -353,13 +370,13 @@ async fn agents_graph_shape_and_tenant_acl_filter() {
     reg.save(&paths.users_dir()).unwrap();
     let tenant_tok = tenant.web_token.clone();
 
-    let (gateway, child_sid) = spawn_delegated_child(project_dir).await;
+    let (gateway, parent_sid, child_sid) = spawn_delegated_child(project_dir).await;
     let gw = Arc::new(tokio::sync::Mutex::new(gateway));
     let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()))
         .with_gateway(Arc::clone(&gw), gw.lock().await.principals());
     let addr = spawn(state).await;
 
-    // Admin sees the graph: one node (the delegated child) + one edge s0→child.
+    // Admin sees both real sessions and their parent→child edge.
     let admin_auth = bearer(ADMIN_HEX);
     let resp = client()
         .get(format!("http://{addr}/api/v1/agents/graph"))
@@ -370,14 +387,27 @@ async fn agents_graph_shape_and_tenant_acl_filter() {
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     let nodes = body["nodes"].as_array().unwrap();
-    assert_eq!(nodes.len(), 1, "one delegated child node; got {body}");
-    assert_eq!(nodes[0]["sid"], Value::String(child_sid.clone()));
-    assert_eq!(nodes[0]["slug"], Value::String("demo".to_string()));
-    assert_eq!(nodes[0]["parent_sid"], Value::String("s0".to_string()));
-    assert_eq!(nodes[0]["status"], Value::String("live".to_string()));
+    assert_eq!(
+        nodes.len(),
+        2,
+        "one parent and one delegated child; got {body}"
+    );
+    let node = |sid: &str| {
+        nodes
+            .iter()
+            .find(|node| node["sid"] == sid)
+            .unwrap_or_else(|| panic!("expected node {sid} in {body}"))
+    };
+    let parent = node(&parent_sid);
+    assert_eq!(parent["status"], Value::String("live".to_string()));
+    assert!(parent["parent_sid"].is_null());
+    let child = node(&child_sid);
+    assert_eq!(child["slug"], Value::String("demo".to_string()));
+    assert_eq!(child["parent_sid"], Value::String(parent_sid.clone()));
+    assert_eq!(child["status"], Value::String("live".to_string()));
     let edges = body["edges"].as_array().unwrap();
     assert_eq!(edges.len(), 1);
-    assert_eq!(edges[0]["parent"], Value::String("s0".to_string()));
+    assert_eq!(edges[0]["parent"], Value::String(parent_sid));
     assert_eq!(edges[0]["child"], Value::String(child_sid.clone()));
     assert_eq!(
         body["hosts"],
@@ -426,7 +456,7 @@ async fn agents_graph_joins_live_session_model_and_falls_back_durably_for_idle()
     let paths = fake_paths(tmp.path());
     let project_dir = register_project(&paths, "demo", None);
 
-    let (gateway, child_sid) = spawn_delegated_child(project_dir.clone()).await;
+    let (gateway, _parent_sid, child_sid) = spawn_delegated_child(project_dir.clone()).await;
     idle_meta(&project_dir, "s9", Some("spawn-time-pick"), None);
     idle_meta(&project_dir, "s10", None, Some("vendor-reported-model"));
     idle_meta(&project_dir, "s11", None, None);
@@ -507,7 +537,8 @@ async fn agents_graph_survives_a_stalled_adapter() {
     let paths = fake_paths(tmp.path());
     let project_dir = register_project(&paths, "stall", None);
 
-    let (gateway, child_sid) = spawn_delegated_child_in("stall", project_dir.clone()).await;
+    let (gateway, _parent_sid, child_sid) =
+        spawn_delegated_child_in("stall", project_dir.clone()).await;
 
     let gw = Arc::new(tokio::sync::Mutex::new(gateway));
     let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()))
@@ -558,7 +589,9 @@ async fn agents_events_delivers_delegation_frame_with_slug_and_replays_last_even
     reg.save(&paths.users_dir()).unwrap();
     let tenant_tok = tenant.web_token.clone();
 
-    let gateway = Gateway::new_with_factory(factory(), "demo", project_dir.clone());
+    let mut gateway = Gateway::new_with_factory(factory(), "demo", project_dir.clone());
+    let parent = create_live_parent(&mut gateway, "demo").await;
+    let parent_sid = parent.sid.clone();
     let gw = Arc::new(tokio::sync::Mutex::new(gateway));
     let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()))
         .with_gateway(Arc::clone(&gw), gw.lock().await.principals());
@@ -583,11 +616,7 @@ async fn agents_events_delivers_delegation_frame_with_slug_and_replays_last_even
             SessionProtocol::StreamJson,
             "web-api".to_string(),
             SpawnTuning::default(),
-            Some(DelegationParent {
-                sid: "s0".to_string(),
-                depth: 0,
-                role: "brain".to_string(),
-            }),
+            Some(parent),
             Some("research task".to_string()),
         )
         .await
@@ -605,7 +634,7 @@ async fn agents_events_delivers_delegation_frame_with_slug_and_replays_last_even
         .unwrap_or_else(|| panic!("no `event: delegation` frame among {events:?}"));
     let payload: Value = serde_json::from_str(&delegation.1).unwrap();
     assert_eq!(payload["relation"], Value::String("spawned".to_string()));
-    assert_eq!(payload["parent_sid"], Value::String("s0".to_string()));
+    assert_eq!(payload["parent_sid"], Value::String(parent_sid));
     assert_eq!(payload["child_sid"], Value::String(child_sid.clone()));
     assert_eq!(payload["slug"], Value::String("demo".to_string()));
     assert_eq!(payload["title"], Value::String("research task".to_string()));

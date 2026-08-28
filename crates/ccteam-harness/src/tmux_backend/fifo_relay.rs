@@ -21,7 +21,7 @@
 //!
 //! `ccteam-core` depends on `ccteam-harness` (tmux_ops moved here in W1), so
 //! mux MUST NOT depend on core — that would cycle. The FIFO directory
-//! (`~/.ccteam/pty`, honoring `CCTEAM_HOME`) is therefore resolved by a
+//! (`~/.ccteam/state/pty`, honoring `CCTEAM_HOME`) is therefore resolved by a
 //! small local helper that mirrors `CcteamPaths::pty_dir` rather than
 //! importing it.
 //!
@@ -48,21 +48,22 @@ use crate::MuxSessionId;
 /// this surfaces as a `MuxEvent::OutputDropped` on the stream.
 pub const BROADCAST_CAPACITY: usize = 256;
 
-/// Resolve `~/.ccteam/pty` honoring `CCTEAM_HOME`, mirroring
+/// Resolve `~/.ccteam/state/pty` honoring `CCTEAM_HOME`, mirroring
 /// `ccteam_core::CcteamPaths::pty_dir` without taking the dependency
 /// (which would create a cargo cycle). Falls back to `$TMPDIR` / `/tmp`
 /// when neither `CCTEAM_HOME` nor `$HOME` is set (tests / sandboxes).
 fn pty_dir() -> PathBuf {
-    let root = if let Some(h) = std::env::var_os("CCTEAM_HOME") {
-        PathBuf::from(h)
-    } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".ccteam")
-    } else if let Some(tmp) = std::env::var_os("TMPDIR") {
-        PathBuf::from(tmp).join(".ccteam")
-    } else {
-        PathBuf::from("/tmp").join(".ccteam")
-    };
-    root.join("pty")
+    let root = crate::ccteam_root_from_env().unwrap_or_else(|| {
+        std::env::var_os("TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".ccteam")
+    });
+    pty_dir_in(&root)
+}
+
+fn pty_dir_in(root: &Path) -> PathBuf {
+    root.join("state").join("pty")
 }
 
 /// Registry of live `tmux pipe-pane` relays keyed by `MuxSessionId`.
@@ -328,16 +329,10 @@ mod tests {
     }
 
     #[test]
-    fn pty_dir_honors_ccteam_home() {
-        // Smoke: with CCTEAM_HOME set, pty_dir is <home>/pty. We don't
-        // mutate the process env here (that would race other tests in
-        // the same binary); instead assert the suffix shape holds for
-        // whatever the ambient resolution produced.
-        let d = pty_dir();
-        assert!(
-            d.ends_with("pty"),
-            "pty_dir must end in `pty`: {}",
-            d.display()
+    fn pty_dir_uses_canonical_state_layout() {
+        assert_eq!(
+            pty_dir_in(Path::new("/tmp/ccteam-home")),
+            PathBuf::from("/tmp/ccteam-home/state/pty")
         );
     }
 }

@@ -263,10 +263,10 @@ impl CcteamPaths {
             .join(crate::pending_inject::PENDING_INJECT_FILE)
     }
 
-    /// `~/.ccteam/pty/` — V0.3.2 F56 directory holding FIFO files used
-    /// by the web layer's `tmux pipe-pane` relay (one FIFO per active
+    /// `~/.ccteam/state/pty/` — V0.3.2 F56 directory holding FIFO files used
+    /// by the harness layer's `tmux pipe-pane` relay (one FIFO per active
     /// `<slug>` or `<slug>-<sid>` subscription). Files are created /
-    /// unlinked at runtime by `ccteam_web::routes::pty_ws`.
+    /// unlinked at runtime by `ccteam_harness::tmux_backend`.
     ///
     /// **Architectural red line** (CLAUDE.md §三, PRD §F56 §6): this
     /// directory is a presentation-layer control plane. The

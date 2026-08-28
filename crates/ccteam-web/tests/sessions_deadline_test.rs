@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use ccteam_core::CcteamPaths;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, EventAttachment, ExecutionMode,
-    HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus,
-    ToolSurfaceRebuild, TurnId, TurnInput, TurnRouting, TurnSubmission,
+    HarnessAdapter, HarnessError, InterruptOutcome, SpawnCtx, ThreadEvent, ThreadHandle,
+    ThreadStatus, ToolSurfaceRebuild, TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 use ccteam_im::gateway::Gateway;
 use ccteam_web::{router_with_state, AppState};
@@ -86,6 +86,13 @@ impl HarnessAdapter for DeadlineWebAdapter {
 
     async fn close_thread(&self, _handle: &ThreadHandle) -> Result<(), HarnessError> {
         Ok(())
+    }
+
+    async fn interrupt_turn(
+        &self,
+        _handle: &ThreadHandle,
+    ) -> Result<InterruptOutcome, HarnessError> {
+        Ok(InterruptOutcome::Interrupted)
     }
 
     async fn handle_directive(
@@ -196,6 +203,7 @@ async fn http_queue_and_vendor_deadlines_are_classified_and_recover() {
             .status(),
         200
     );
+
     assert_eq!(
         client
             .post(format!("{base}/sessions/{sid}/turn"))
@@ -230,6 +238,31 @@ async fn http_queue_and_vendor_deadlines_are_classified_and_recover() {
             .status(),
         200
     );
+
+    let blind_retry = client
+        .post(format!("{base}/sessions/{sid}/turn"))
+        .json(&serde_json::json!({"text": "blind retry after vendor timeout"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blind_retry.status(), 502);
+    assert_gateway_error(
+        &blind_retry.json::<Value>().await.unwrap(),
+        "vendor_submit_timeout",
+    );
+    assert_eq!(adapter.submissions.load(Ordering::SeqCst), 2);
+
+    let interrupted = client
+        .post(format!("{base}/sessions/{sid}/interrupt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(interrupted.status(), 200);
+    assert_eq!(
+        interrupted.json::<Value>().await.unwrap(),
+        serde_json::json!({"outcome": "interrupted", "interrupted": true})
+    );
+
     assert_eq!(
         client
             .post(format!("{base}/sessions/{sid}/turn"))

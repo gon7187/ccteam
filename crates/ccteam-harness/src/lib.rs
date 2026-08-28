@@ -314,14 +314,9 @@ pub trait ProcessBackend: Send + Sync {
         self.send_text(id, "\u{1b}").await
     }
 
-    /// Subscribe to the typed event stream. Stream ends when session
-    /// ends. The refcount + FIFO bookkeeping (F56) is internalized
-    /// inside the impl (audit delta 10).
-    ///
-    /// **W1 status**: `TmuxBackend::subscribe` returns an error pointing
-    /// to W2. The existing `ccteam-web::pty::PtyRegistry` continues to
-    /// own the `pipe-pane` refcount relay for V0.8. W2 ports the
-    /// registry into `TmuxBackend` and exposes only the stream.
+    /// Subscribe to the typed event stream. Stream ends when the session
+    /// ends. `TmuxBackend` owns the refcounted `pipe-pane` FIFO relay under
+    /// the canonical `state/pty` root; callers only consume this stream.
     async fn subscribe(&self, id: &MuxSessionId) -> Result<MuxEventStream>;
 
     /// Register a regex pattern for daemon-side matching. Once
