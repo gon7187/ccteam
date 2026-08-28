@@ -1016,6 +1016,17 @@ pub struct Gateway {
     /// the hot admission fence while a retire request drains in-flight work.
     retiring_projects: BTreeSet<String>,
     retired_projects: BTreeSet<String>,
+    /// Projects whose durable retirement marker could NOT be read (EMFILE,
+    /// EACCES, a clobbered lock path). "Unreadable" is neither verdict: the
+    /// project stays rostered (a transient error must not blacklist it for
+    /// the daemon's lifetime) but admission is fail-CLOSED until a clean read
+    /// resolves it — see [`Self::refresh_unknown_retirement_shared`].
+    retirement_unknown: BTreeSet<String>,
+    /// Test hook fired on the blocking worker that resolves unknown delegation
+    /// parents during a retire, so a test can prove the gateway mutex is FREE
+    /// while that disk work runs. Compiled out of production builds.
+    #[cfg(test)]
+    orphan_scan_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     /// The chats that speak for the box OWNER, per platform (`"telegram"` →
     /// `{"339498819"}`, `"lark"` → `{"ou_…"}`). Fed from each global bot's
     /// credential allowlist by the daemon (see [`Self::bind_operator_chats`]).
@@ -2780,6 +2791,9 @@ impl Gateway {
             projects,
             retiring_projects: BTreeSet::new(),
             retired_projects: BTreeSet::new(),
+            retirement_unknown: BTreeSet::new(),
+            #[cfg(test)]
+            orphan_scan_probe: None,
             operator_chats: BTreeMap::new(),
             current_project: BTreeMap::new(),
             pending_prefix: BTreeMap::new(),
@@ -2948,20 +2962,29 @@ impl Gateway {
         // lock (EMFILE, EACCES, a clobbered path) is a diagnosis, not a
         // verdict: treating it as "retired" here silently and permanently
         // blacklisted a healthy project for the daemon's whole lifetime.
+        // An unreadable lock is fail-CLOSED, not fail-open: the project stays
+        // rostered but lands in `retirement_unknown`, which blocks admission
+        // until a clean read resolves it.
         let mut stale = Vec::new();
         for slug in self.projects.keys().cloned().collect::<Vec<_>>() {
             match self.durable_project_is_retired(&slug) {
                 Ok(true) => stale.push(slug),
-                Ok(false) => {}
-                Err(error) => tracing::warn!(
-                    %slug,
-                    %error,
-                    "ccteam-im: project retirement marker unreadable at startup; keeping the project rostered"
-                ),
+                Ok(false) => {
+                    self.retirement_unknown.remove(&slug);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %slug,
+                        %error,
+                        "ccteam-im: project retirement marker unreadable at startup; keeping the project rostered but blocking admission"
+                    );
+                    self.retirement_unknown.insert(slug);
+                }
             }
         }
         for slug in stale {
             tracing::info!(%slug, "ccteam-im: dropping stale catalog row for a retired project");
+            self.retirement_unknown.remove(&slug);
             self.retired_projects.insert(slug.clone());
             self.remove_project_routes(&slug);
         }
@@ -4203,17 +4226,22 @@ impl Gateway {
     /// into `retired_projects`, which is what every hot path reads.
     ///
     /// A READ ERROR is not "retired": a transient EMFILE/EACCES must not
-    /// blacklist a healthy project for the daemon's lifetime. It is logged and
-    /// the project stays rostered; per-request handling remains fail-closed
-    /// through the in-memory fence a real retirement installs.
+    /// blacklist a healthy project for the daemon's lifetime, so the project
+    /// stays ROSTERED. It is not "active" either — the slug is recorded in
+    /// `retirement_unknown`, which [`Self::project_admission_blocked`] treats
+    /// as blocked until a clean read resolves it.
     fn load_time_project_is_retired(&mut self, slug: &str) -> bool {
         if self.retiring_projects.contains(slug) || self.retired_projects.contains(slug) {
             return true;
         }
         match self.durable_project_is_retired(slug) {
-            Ok(false) => false,
+            Ok(false) => {
+                self.retirement_unknown.remove(slug);
+                false
+            }
             Ok(true) => {
                 tracing::info!(%slug, "ccteam-im: project is durably retired; not rostering it");
+                self.retirement_unknown.remove(slug);
                 self.retired_projects.insert(slug.to_string());
                 true
             }
@@ -4221,8 +4249,9 @@ impl Gateway {
                 tracing::warn!(
                     %slug,
                     %error,
-                    "ccteam-im: project retirement marker unreadable; keeping the project rostered"
+                    "ccteam-im: project retirement marker unreadable; keeping the project rostered but blocking admission"
                 );
+                self.retirement_unknown.insert(slug.to_string());
                 false
             }
         }
@@ -4230,8 +4259,29 @@ impl Gateway {
 
     /// In-memory admission fence. Pure by construction: it is consulted while
     /// the daemon-wide gateway mutex is held, so it must not touch disk.
+    /// See [`Self::orphan_scan_probe`] the field. Always `None` in production.
+    fn orphan_scan_probe(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        #[cfg(test)]
+        {
+            self.orphan_scan_probe.clone()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    /// Test-only: install the blocking-worker probe used by the orphaned
+    /// delegation scan.
+    #[cfg(test)]
+    fn set_orphan_scan_probe(&mut self, probe: Arc<dyn Fn() + Send + Sync>) {
+        self.orphan_scan_probe = Some(probe);
+    }
+
     fn project_admission_blocked(&self, slug: &str) -> bool {
-        self.retiring_projects.contains(slug) || self.retired_projects.contains(slug)
+        self.retiring_projects.contains(slug)
+            || self.retired_projects.contains(slug)
+            || self.retirement_unknown.contains(slug)
     }
 
     /// One fail-closed admission gate shared by spawn, rebuild, resume,
@@ -4243,8 +4293,13 @@ impl Gateway {
     /// here froze the whole daemon behind one `flock` per submit/spawn/resume
     /// whenever a progress rotation held that lock.
     pub(crate) fn ensure_project_active(&self, slug: &str) -> Result<()> {
-        if self.project_admission_blocked(slug) {
+        if self.retiring_projects.contains(slug) || self.retired_projects.contains(slug) {
             anyhow::bail!("project `{slug}` is retired");
+        }
+        if self.retirement_unknown.contains(slug) {
+            anyhow::bail!(
+                "project `{slug}` retirement state unreadable; run ccteam doctor / retry"
+            );
         }
         Ok(())
     }
@@ -5305,6 +5360,9 @@ impl Gateway {
             Live {
                 session: Box<GatewaySession>,
                 pump: Option<tokio::task::JoinHandle<()>>,
+                /// Chats whose focus pointed at this sid and was dropped in
+                /// the plan phase. A failed close re-arms them (see below).
+                focus: Vec<ChatKey>,
             },
             Detached(DetachedBody),
         }
@@ -5322,14 +5380,20 @@ impl Gateway {
                 guard.principals.forget(sid);
                 let pump = guard.event_pumps.remove(sid);
                 let removed = guard.sessions.remove(sid).expect("checked live session");
-                guard
-                    .current_session
-                    .write()
-                    .unwrap()
-                    .retain(|_, current| current != sid);
+                let focus = {
+                    let mut current = guard.current_session.write().unwrap();
+                    let focused: Vec<ChatKey> = current
+                        .iter()
+                        .filter(|(_, current)| current.as_str() == sid)
+                        .map(|(chat, _)| chat.clone())
+                        .collect();
+                    current.retain(|_, current| current != sid);
+                    focused
+                };
                 StopPlan::Live {
                     session: Box::new(removed),
                     pump,
+                    focus,
                 }
             } else if let Some(detached) = guard.detached.get(sid).cloned() {
                 StopPlan::Detached(detached)
@@ -5347,6 +5411,7 @@ impl Gateway {
                 StopPlan::Live {
                     session: removed,
                     pump,
+                    focus,
                 } => {
                     let pump_join_error = if let Some(pump) = pump {
                         pump.abort();
@@ -5381,6 +5446,27 @@ impl Gateway {
                                 );
                                 guard.spawn_event_pump(&sid);
                             }
+                            // ... and its CHAT FOCUS. Without this the chat
+                            // silently loses a session that is still live and
+                            // pumping: the user's next message spawns a brand
+                            // new sid (new vendor process, new spend) while the
+                            // old one keeps its `max_live` slot. Only chats
+                            // that still point at nothing are restored — a
+                            // focus moved on during the close belongs to
+                            // whoever moved it.
+                            let mut current = guard.current_session.write().unwrap();
+                            for chat in &focus {
+                                current.entry(chat.clone()).or_insert_with(|| sid.clone());
+                            }
+                        }
+                        // The success path persists routing; the failure path
+                        // must too, or the restored in-memory focus and the
+                        // durable routing.json diverge until the next write.
+                        if let Err(persist_error) =
+                            Self::persist_latest_routing_shared(&completion_gateway).await
+                        {
+                            tracing::warn!(%sid, %persist_error,
+                                "ccteam-im: failed to persist routing after a failed session close");
                         }
                         return match pump_join_error {
                             Some(pump_error) => Err(anyhow!(
@@ -5563,6 +5649,82 @@ impl Gateway {
         Ok(())
     }
 
+    /// Re-probe every project whose retirement marker was unreadable, OFF the
+    /// gateway mutex.
+    ///
+    /// `retirement_unknown` is fail-closed, so an EMFILE/EACCES blip would
+    /// otherwise wedge a healthy project for the daemon's lifetime. This is
+    /// the self-healing half: it runs at load-time entries and before a
+    /// retire, snapshots the set under the lock, releases it, reads each
+    /// marker with the SHARED lock on a blocking worker, then re-takes the
+    /// lock to apply the verdicts — `Ok(false)` clears the slug, `Ok(true)`
+    /// promotes it to `retired_projects`, an error leaves it unknown.
+    ///
+    /// Pass `Some(slug)` to probe one project, `None` to sweep the whole set.
+    async fn refresh_unknown_retirement_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        slug: Option<&str>,
+    ) {
+        let (targets, paths) = {
+            let guard = gateway.lock().await;
+            if guard.retirement_unknown.is_empty() {
+                return;
+            }
+            let targets: Vec<String> = match slug {
+                Some(slug) if guard.retirement_unknown.contains(slug) => vec![slug.to_string()],
+                Some(_) => return,
+                None => guard.retirement_unknown.iter().cloned().collect(),
+            };
+            let Some(paths) = guard.project_paths.clone() else {
+                return;
+            };
+            (targets, paths)
+        };
+        let probe_targets = targets.clone();
+        let Ok(verdicts) = tokio::task::spawn_blocking(move || {
+            probe_targets
+                .into_iter()
+                .map(|slug| {
+                    let retired =
+                        ccteam_harness::execution::progress_bridge::progress_state_is_retired_shared(
+                            &paths.progress_jsonl(&slug),
+                        );
+                    (slug, retired)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        else {
+            return;
+        };
+        let mut guard = gateway.lock().await;
+        for (slug, verdict) in verdicts {
+            match verdict {
+                Ok(false) => {
+                    guard.retirement_unknown.remove(&slug);
+                    tracing::info!(
+                        %slug,
+                        "ccteam-im: project retirement marker became readable; project is active again"
+                    );
+                }
+                Ok(true) => {
+                    guard.retirement_unknown.remove(&slug);
+                    guard.retired_projects.insert(slug.clone());
+                    guard.remove_project_routes(&slug);
+                    tracing::info!(
+                        %slug,
+                        "ccteam-im: project retirement marker became readable; project is retired"
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    %slug,
+                    %error,
+                    "ccteam-im: project retirement marker still unreadable; admission stays blocked"
+                ),
+            }
+        }
+    }
+
     /// Commit a durable project tombstone, fence every daemon admission path,
     /// then drain all process and writer ownership before cleaning progress.
     /// Config deletion is intentionally caller-owned and may happen only after
@@ -5587,6 +5749,9 @@ impl Gateway {
         // lock inode, so a typo would burn a slug forever. Nothing is written
         // until the slug is both well-formed and a project this daemon knows.
         ccteam_core::validate_slug_format(&slug).map_err(&not_started)?;
+        // Resolve an unreadable marker before deciding anything about this
+        // slug: an EMFILE blip must not make a retire look like a fresh one.
+        Self::refresh_unknown_retirement_shared(&gateway, Some(&slug)).await;
         let (progress_path, catalog_root, rostered) = {
             let guard = gateway.lock().await;
             let paths = guard.project_paths.as_ref().ok_or_else(|| {
@@ -5688,30 +5853,151 @@ impl Gateway {
             }
         }
 
-        // Cross-project delegations: a watch is keyed by the CHILD's sid, so
-        // `remove_project_routes` only reaches the ones whose child lived here.
-        // A delegation dispatched BY a session of this project to a child
-        // elsewhere would otherwise never terminate — its parent is gone, the
-        // completion notification can never be delivered (resume is fenced),
-        // and the child's `delegation.json` would be re-seeded by every
-        // startup reconcile, showing the task in flight forever.
-        let orphaned_children = {
+        // Cross-project delegations, BOTH directions. A watch is keyed by the
+        // CHILD's sid, so `remove_project_routes` reaches only the ones whose
+        // child lived here — and it drops them purely in memory, never calling
+        // `remove_delegation_watch`. Either half, left alone, strands a task
+        // forever:
+        //   * parent HERE, child elsewhere — the parent is gone, its completion
+        //     notification can never be delivered (resume is fenced), and the
+        //     child's `delegation.json` is re-seeded by every startup
+        //     reconcile, showing the task in flight forever;
+        //   * child HERE, parent elsewhere — the child's pump is aborted at the
+        //     turn boundary that would have produced the notification, so a
+        //     LIVE orchestrating parent waits on an answer that can never come.
+        // Both go through `disarm_delegation_watch_shared` (durable
+        // `delegation.json` removal included) BEFORE `remove_project_routes`,
+        // and a still-live outside parent gets a terminal cancellation turn.
+        //
+        // The scan itself must not read disk under the daemon-wide mutex:
+        // resolving an unknown parent sid falls through to `SessionCatalog`,
+        // one blocking `open`+`read`+`parse` per rostered project per miss.
+        // So: snapshot under the lock, resolve off-lock, then disarm.
+        struct OrphanedDelegation {
+            child_sid: String,
+            parent_sid: String,
+            /// The child lived in the retired project and its parent did not:
+            /// that parent is still out there waiting for an answer.
+            notify_parent: bool,
+            title: Option<String>,
+        }
+        let (mut orphaned, unresolved, rostered_projects, catalog, scan_probe) = {
             let guard = gateway.lock().await;
-            guard
-                .delegations
-                .iter()
-                .filter(|(_, mirror)| {
-                    project_sids.contains(&mirror.parent_sid)
-                        || guard.project_slug_for_sid(&mirror.parent_sid).as_deref()
-                            == Some(slug.as_str())
-                })
-                .map(|(child_sid, _)| child_sid.clone())
-                .collect::<Vec<_>>()
+            let mut orphaned: Vec<OrphanedDelegation> = Vec::new();
+            // (child_sid, parent_sid, title) whose parent project needs disk.
+            let mut unresolved: Vec<(String, String, Option<String>)> = Vec::new();
+            for (child_sid, mirror) in guard.delegations.iter() {
+                let parent_here = project_sids.contains(&mirror.parent_sid)
+                    || guard
+                        .sessions
+                        .get(&mirror.parent_sid)
+                        .is_some_and(|session| session.project == slug);
+                let child_here = mirror.slug == slug;
+                if parent_here || child_here {
+                    orphaned.push(OrphanedDelegation {
+                        child_sid: child_sid.clone(),
+                        parent_sid: mirror.parent_sid.clone(),
+                        notify_parent: child_here && !parent_here,
+                        title: mirror.title.clone(),
+                    });
+                } else if !guard.sessions.contains_key(&mirror.parent_sid) {
+                    // Neither end is known to be here and the parent is not
+                    // live: only `meta.json` on disk can say where it lives.
+                    unresolved.push((
+                        child_sid.clone(),
+                        mirror.parent_sid.clone(),
+                        mirror.title.clone(),
+                    ));
+                }
+            }
+            (
+                orphaned,
+                unresolved,
+                guard.projects.clone(),
+                Arc::clone(&guard.session_catalog),
+                guard.orphan_scan_probe(),
+            )
         };
-        for child_sid in orphaned_children {
+        if !unresolved.is_empty() {
+            let probe_slug = slug.clone();
+            let resolved = tokio::task::spawn_blocking(move || {
+                if let Some(probe) = scan_probe {
+                    probe();
+                }
+                unresolved
+                    .into_iter()
+                    .filter(|(_, parent_sid, _)| {
+                        catalog
+                            .find_or_load(parent_sid, &rostered_projects)
+                            .is_some_and(|entry| entry.project == probe_slug)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            orphaned.extend(resolved.into_iter().map(|(child_sid, parent_sid, title)| {
+                OrphanedDelegation {
+                    child_sid,
+                    parent_sid,
+                    // The parent lives in the retired project; there is nobody
+                    // outside to tell.
+                    notify_parent: false,
+                    title,
+                }
+            }));
+        }
+        for orphan in orphaned {
+            // A still-live parent outside the retired project would otherwise
+            // wait forever: the child's pump dies at the very turn boundary
+            // that produces the completion turn. Tell it the task is dead
+            // BEFORE the watch goes away, using the ordinary routed user-role
+            // turn (never a prompt injection). `notify: off` watches are
+            // ledger-only by contract, so they stay silent here too.
+            if orphan.notify_parent {
+                let notify = {
+                    let guard = gateway.lock().await;
+                    guard
+                        .delegations
+                        .get(&orphan.child_sid)
+                        .map(|mirror| mirror.notify)
+                        .filter(|_| guard.sessions.contains_key(&orphan.parent_sid))
+                };
+                if matches!(notify, Some(mode) if mode != ccteam_harness::NotifyMode::Off) {
+                    let label = orphan
+                        .title
+                        .as_deref()
+                        .filter(|title| !title.is_empty())
+                        .map(|title| format!(" \"{title}\""))
+                        .unwrap_or_default();
+                    let child_sid = &orphan.child_sid;
+                    let text = format!(
+                        "[ccteam] [делегирование отменено: проект retired] \
+                         делегированная сессия {child_sid}{label} остановлена вместе с проектом \
+                         `{slug}`, который выведен из эксплуатации. Задача НЕ будет завершена, \
+                         уведомления о завершении не будет, и session_collect/session_dispatch \
+                         по {child_sid} больше недоступны."
+                    );
+                    if let Err(error) = Self::submit_to_sid_shared_with_origin(
+                        Arc::clone(&gateway),
+                        &orphan.parent_sid,
+                        text,
+                        TurnOrigin::DelegationCompletion,
+                        GatewayDeadline::start(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            parent = %orphan.parent_sid,
+                            child = %orphan.child_sid,
+                            %error,
+                            "ccteam-im: failed to deliver the delegation cancellation turn"
+                        );
+                    }
+                }
+            }
             // Same terminal persistence a cancelled delegation gets: mirror +
             // watch set + the durable `delegation.json` all go away.
-            Self::disarm_delegation_watch_shared(Arc::clone(&gateway), &child_sid).await;
+            Self::disarm_delegation_watch_shared(Arc::clone(&gateway), &orphan.child_sid).await;
         }
 
         // Barrier on THIS project's cleanup work only. The global tracker is
@@ -15340,6 +15626,9 @@ impl Gateway {
     ) -> Result<String> {
         let caller = ChatKey::from_identity(caller_identity)
             .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
+        // Load-time entry: give an unreadable retirement marker a fresh,
+        // off-lock read before this project is rostered or spawned into.
+        Self::refresh_unknown_retirement_shared(&gateway, Some(slug)).await;
         let cwd = {
             let mut guard = deadline.lock(&gateway).await?;
             guard.ensure_project_loaded(slug);
@@ -15858,6 +16147,9 @@ impl Gateway {
         tuning: SpawnTuning,
         deadline: GatewayDeadline,
     ) -> Result<CreateSessionOutcome> {
+        // Load-time entry: give an unreadable retirement marker a fresh,
+        // off-lock read before this project is rostered or spawned into.
+        Self::refresh_unknown_retirement_shared(&gateway, Some(&project)).await;
         let (host, wire_slug, root, proxy) = {
             let mut guard = deadline.lock(&gateway).await?;
             guard.ensure_project_loaded(&project);
@@ -16526,6 +16818,9 @@ impl Gateway {
         title: Option<String>,
         deadline: GatewayDeadline,
     ) -> Result<CreateSessionOutcome> {
+        // Load-time entry: give an unreadable retirement marker a fresh,
+        // off-lock read before this project is rostered or spawned into.
+        Self::refresh_unknown_retirement_shared(&gateway, Some(&project)).await;
         let (host, wire_slug, root, proxy) = {
             let mut guard = deadline.lock(&gateway).await?;
             guard.ensure_project_loaded(&project);
@@ -29988,6 +30283,16 @@ mod tests {
         .await
         .unwrap();
         gateway.event_pumps.insert(sid.clone(), failed_pump);
+        // An IM chat focused on this session. A failed close must give the
+        // focus back: otherwise the chat's next message spawns a brand-new sid
+        // (new vendor process, new spend) while the old one is still live,
+        // pumping, and holding a `max_live` slot.
+        let chat = ChatKey::new("telegram", "chat-1", "user-1");
+        gateway
+            .current_session
+            .write()
+            .unwrap()
+            .insert(chat.clone(), sid.clone());
 
         let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
         close.arm();
@@ -30043,6 +30348,11 @@ mod tests {
             assert!(
                 guard.principals.verify(&sid, &secret).is_some(),
                 "re-inserted session must keep a usable principal"
+            );
+            assert_eq!(
+                guard.current_session.read().unwrap().get(&chat),
+                Some(&sid),
+                "re-inserted session must keep its chat focus"
             );
         }
 
@@ -39541,9 +39851,13 @@ mod tests {
         assert!(fresh.ensure_project_active("alpha").is_err());
     }
 
-    /// G4 — an unreadable lock is a diagnosis, not a verdict. `unwrap_or(true)`
-    /// used to blacklist a healthy project for the daemon's whole lifetime on a
-    /// transient EMFILE/EACCES, silently.
+    /// G4 — an unreadable lock is a diagnosis, not a verdict, in BOTH
+    /// directions. `unwrap_or(true)` used to blacklist a healthy project for
+    /// the daemon's whole lifetime; the fail-OPEN replacement was just as bad,
+    /// admitting a possibly-retired project forever. The project stays
+    /// ROSTERED (so the row is not lost and the state is diagnosable) but
+    /// admission is BLOCKED with a distinct error until a clean read resolves
+    /// it — and an off-lock re-probe makes a transient EMFILE self-healing.
     #[tokio::test]
     async fn unreadable_retirement_marker_keeps_the_project_rostered() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -39561,19 +39875,71 @@ mod tests {
 
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", &project_dir);
-        gateway.enable_project_creation(paths);
+        gateway.enable_project_creation(paths.clone());
         assert!(
             !gateway.retired_projects.contains("alpha"),
             "an unreadable marker must not retire a project"
         );
-        assert!(gateway.projects.contains_key("alpha"));
-        assert!(gateway.ensure_project_active("alpha").is_ok());
+        assert!(
+            gateway.projects.contains_key("alpha"),
+            "an unreadable marker must not drop the catalog row either"
+        );
+        assert!(gateway.retirement_unknown.contains("alpha"));
+        let blocked = gateway
+            .ensure_project_active("alpha")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            blocked.contains("retirement state unreadable"),
+            "admission must fail CLOSED with a diagnosable error: {blocked}"
+        );
+        assert!(
+            !blocked.contains("is retired"),
+            "the unknown state must not be reported as a retirement: {blocked}"
+        );
 
         // The load-time helper reaches the same verdict.
         gateway.projects.remove("alpha");
         gateway.register_project("alpha", &project_dir);
         assert!(gateway.projects.contains_key("alpha"));
         assert!(!gateway.retired_projects.contains("alpha"));
+        assert!(gateway.retirement_unknown.contains("alpha"));
+
+        // Self-healing: the lock becomes readable and the very next load-time
+        // entry re-probes it OFF the gateway mutex, admitting the project
+        // again without a daemon restart.
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        std::fs::remove_dir(&lock_path).unwrap();
+        Gateway::refresh_unknown_retirement_shared(&gateway, Some("alpha")).await;
+        {
+            let guard = gateway.lock().await;
+            assert!(guard.retirement_unknown.is_empty());
+            assert!(guard.projects.contains_key("alpha"));
+            guard.ensure_project_active("alpha").unwrap();
+        }
+
+        // The same re-probe promotes a marker that reads as RETIRED once the
+        // lock is legible again.
+        {
+            let mut guard = gateway.lock().await;
+            guard.retirement_unknown.insert("alpha".to_string());
+        }
+        ccteam_harness::execution::progress_bridge::mark_progress_retired(
+            &paths.progress_jsonl("alpha"),
+        )
+        .unwrap();
+        Gateway::refresh_unknown_retirement_shared(&gateway, Some("alpha")).await;
+        {
+            let guard = gateway.lock().await;
+            assert!(guard.retirement_unknown.is_empty());
+            assert!(guard.retired_projects.contains("alpha"));
+            assert!(!guard.projects.contains_key("alpha"));
+            assert!(guard
+                .ensure_project_active("alpha")
+                .unwrap_err()
+                .to_string()
+                .contains("is retired"));
+        }
     }
 
     /// G3 — the cleanup barrier is scoped to the retiring project. Draining the
@@ -39676,6 +40042,176 @@ mod tests {
                 .is_none(),
             "the child's durable watch must reach a terminal state, not be re-seeded"
         );
+    }
+
+    /// G5b — the scan is BIDIRECTIONAL. A child living in the retired project
+    /// with a parent elsewhere used to be dropped by `remove_project_routes`
+    /// purely in memory: no `remove_delegation_watch`, so the startup
+    /// reconcile re-seeded the watch from the child's `delegation.json`, and
+    /// the live parent — whose child pump is aborted at the very turn boundary
+    /// that would have produced the completion turn — waited forever with no
+    /// notification and no recovery path.
+    #[tokio::test]
+    async fn project_retire_cancels_delegations_whose_child_lived_here() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let beta_dir = paths.projects_root.join("beta");
+        std::fs::create_dir_all(&beta_dir).unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        gateway.register_project("beta", &beta_dir);
+
+        // The orchestrating parent lives in `beta` and stays live across the
+        // retire of `alpha`.
+        let parent = gateway
+            .create_session_api(
+                "beta".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let child = "s9002";
+        ccteam_harness::execution::delegation::write_delegation_watch(
+            &project_dir,
+            child,
+            &ccteam_harness::execution::delegation::DelegationWatch::armed(
+                parent.clone(),
+                ccteam_harness::NotifyMode::Final,
+                Some("wave 3".to_string()),
+                None,
+            ),
+        )
+        .unwrap();
+        gateway.delegations.insert(
+            child.to_string(),
+            DelegationMirror {
+                generation: 0,
+                parent_sid: parent.clone(),
+                notify: ccteam_harness::NotifyMode::Final,
+                title: Some("wave 3".to_string()),
+                slug: "alpha".to_string(),
+                project_dir: project_dir.clone(),
+                notified_turns: Vec::new(),
+            },
+        );
+        gateway
+            .delegation_watch_set
+            .write()
+            .unwrap()
+            .insert(child.to_string());
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        Gateway::retire_project_shared(Arc::clone(&gateway), "alpha")
+            .await
+            .unwrap();
+
+        {
+            let guard = gateway.lock().await;
+            assert!(!guard.delegations.contains_key(child));
+            assert!(!guard.delegation_watch_set.read().unwrap().contains(child));
+            assert!(
+                guard.sessions.contains_key(&parent),
+                "the parent lives in another project and must survive"
+            );
+        }
+        assert!(
+            ccteam_harness::execution::delegation::read_delegation_watch(&project_dir, child)
+                .is_none(),
+            "the durable watch must be removed, not left for the startup reconcile"
+        );
+        let submitted = fake.submissions.lock().await.clone();
+        let cancellation = submitted
+            .iter()
+            .find(|(_, text)| text.contains("делегирование отменено"))
+            .map(|(_, text)| text.clone())
+            .unwrap_or_else(|| {
+                panic!("the live parent must receive a terminal cancellation turn: {submitted:?}")
+            });
+        assert!(cancellation.contains(child), "{cancellation}");
+        assert!(cancellation.contains("alpha"), "{cancellation}");
+        assert!(cancellation.contains("wave 3"), "{cancellation}");
+    }
+
+    /// G5c — resolving a delegation parent that is neither live nor in the
+    /// retired project falls through to `SessionCatalog`, one blocking
+    /// `open`+`read`+`parse` per rostered project per miss. Doing that under
+    /// the daemon-wide gateway mutex froze every IM message, web request, SSE
+    /// frame and MCP call for the length of the scan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_retire_resolves_unknown_delegation_parents_off_the_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let beta_dir = paths.projects_root.join("beta");
+        std::fs::create_dir_all(&beta_dir).unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        gateway.register_project("beta", &beta_dir);
+
+        // A watch re-seeded by the startup reconcile: the parent is a stopped
+        // session known only through `meta.json`, so the scan MUST hit disk.
+        let parent = "s7001";
+        let child = "s7002";
+        gateway.delegations.insert(
+            child.to_string(),
+            DelegationMirror {
+                generation: 0,
+                parent_sid: parent.to_string(),
+                notify: ccteam_harness::NotifyMode::Final,
+                title: None,
+                slug: "beta".to_string(),
+                project_dir: beta_dir.clone(),
+                notified_turns: Vec::new(),
+            },
+        );
+        gateway
+            .delegation_watch_set
+            .write()
+            .unwrap()
+            .insert(child.to_string());
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        // Fires on the worker that does the disk resolution. If the scan still
+        // runs under the guard the probe is never installed on a blocking
+        // worker at all and `fired` stays 0 — a RED result either way.
+        let fired = Arc::new(AtomicUsize::new(0));
+        let lock_free = Arc::new(AtomicUsize::new(0));
+        {
+            let probe_gateway = Arc::clone(&gateway);
+            let fired = Arc::clone(&fired);
+            let lock_free = Arc::clone(&lock_free);
+            gateway
+                .lock()
+                .await
+                .set_orphan_scan_probe(Arc::new(move || {
+                    fired.fetch_add(1, Ordering::SeqCst);
+                    if probe_gateway.try_lock().is_ok() {
+                        lock_free.fetch_add(1, Ordering::SeqCst);
+                    }
+                }));
+        }
+
+        Gateway::retire_project_shared(Arc::clone(&gateway), "alpha")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "the unknown parent must be resolved on a blocking worker"
+        );
+        assert_eq!(
+            lock_free.load(Ordering::SeqCst),
+            1,
+            "the gateway mutex must be FREE while the scan reads meta.json"
+        );
+        // The parent lives nowhere the retire touches, so the watch survives.
+        let guard = gateway.lock().await;
+        assert!(guard.delegations.contains_key(child));
     }
 
     /// G6 — `mark_progress_retired` CREATES the lock inode, so retiring an
