@@ -143,8 +143,8 @@ pub fn commander_quick_template() -> QuickTemplate {
             "• Claude Fable, максимальный доступный effort — только критические ситуации, спорные решения и совет старшего.\n",
             "• Claude Haiku — быстрый поиск, мелкая документация и короткие правки.\n\n",
             "Финальный гейт: две независимые свежие сессии — Claude Opus и Codex Sol, обе с максимальным доступным effort. Решение принято только когда оба одобряют одну и ту же ревизию; при расхождении верни замечания исполнителю, исправь и повтори оба ревью.\n\n",
-            "Fallback разрешён только если status явно показывает, что нужный vendor, модель или effort недоступны: замени эту роль Codex с лучшей доступной моделью и максимальным уровнем effort из status. ",
-            "Если spawn вернул любую другую ошибку — авторизация/ACL, квота или бюджет, depth/cycle guard, timeout либо иной отказ — не запускай fallback и не повторяй вслепую: верни исходную ошибку. ",
+            "Fallback разрешён только если явный ответ status либо capability-ошибка spawn с error_code=vendor_unavailable, error_code=model_unavailable или error_code=effort_unavailable доказывает, что нужный vendor, модель или effort недоступны: сделай ровно одну попытку через Codex с лучшей доступной моделью и максимальным уровнем effort из status. ",
+            "Если spawn вернул любую другую ошибку — авторизация/ACL, квота или бюджет, depth/cycle guard, timeout, network/transport, internal либо общий отказ — не запускай fallback и не повторяй вслепую: верни исходную ошибку. ",
             "Не угадывай wire-токен max: используй верхнюю ступень, которую реально объявил vendor. Уведомления о завершении возвращаются тебе; ты собираешь итог.\n\n",
             "Задача:"
         )
@@ -657,12 +657,24 @@ mod tests {
         assert!(templates[0].prefix.contains("Codex"));
         assert!(templates[0]
             .prefix
-            .contains("Fallback разрешён только если status явно показывает"));
+            .contains("Fallback разрешён только если явный ответ status"));
+        for capability_code in [
+            "vendor_unavailable",
+            "model_unavailable",
+            "effort_unavailable",
+        ] {
+            assert!(
+                templates[0].prefix.contains(capability_code),
+                "commander must accept the typed capability proof {capability_code}"
+            );
+        }
         for rejection in [
             "авторизация/ACL",
             "квота или бюджет",
             "depth/cycle",
             "timeout",
+            "network",
+            "internal",
         ] {
             assert!(
                 templates[0].prefix.contains(rejection),
