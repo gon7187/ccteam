@@ -45,6 +45,10 @@ fn record_metrics(bytes_read: u64, records_parsed: u64, invalid_lines: usize) {
     INVALID_LINES.fetch_add(invalid_lines as u64, Ordering::Relaxed);
 }
 
+pub(super) fn record_raw_read(bytes_read: u64) {
+    record_metrics(bytes_read, 0, 0);
+}
+
 /// A corruption-tolerant tail, ordered oldest first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tail<T = Value> {
@@ -54,6 +58,17 @@ pub struct Tail<T = Value> {
     pub first_offset: Option<u64>,
     /// Whether at least one older parseable row exists before `first_offset`.
     pub has_more: bool,
+}
+
+/// Classification of one non-blank row in a typed tail scan.
+///
+/// `Skip` is a valid row hidden by the caller's view. It neither consumes the
+/// visible page budget nor increments corruption metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailDecision<T> {
+    Include(T),
+    Skip,
+    Corrupt,
 }
 
 impl<T> Default for Tail<T> {
@@ -99,7 +114,9 @@ pub struct Delta {
 /// Return the final parseable JSON row, skipping corrupt trailing rows.
 pub fn last_valid(path: &Path) -> Result<Option<Value>> {
     Ok(tail_filter_map_inner(path, 1, None, false, |line| {
-        serde_json::from_slice::<Value>(line).ok()
+        serde_json::from_slice::<Value>(line)
+            .map(TailDecision::Include)
+            .unwrap_or(TailDecision::Corrupt)
     })?
     .events
     .pop())
@@ -128,12 +145,32 @@ pub fn tail_filter_map<T, F>(
     path: &Path,
     n: usize,
     before: Option<u64>,
-    parse: F,
+    mut parse: F,
 ) -> Result<Tail<T>>
 where
     F: FnMut(&[u8]) -> Option<T>,
 {
-    tail_filter_map_inner(path, n, before, true, parse)
+    tail_filter_map_inner(path, n, before, true, |line| match parse(line) {
+        Some(value) => TailDecision::Include(value),
+        None => TailDecision::Corrupt,
+    })
+}
+
+/// Shared typed-tail primitive for views that intentionally hide valid rows.
+///
+/// The reader keeps scanning until it has `n + 1` *included* rows. Therefore
+/// `first_offset`, `has_more`, and the next cursor describe the visible view,
+/// not the number of physical JSONL records crossed.
+pub fn tail_classify_map<T, F>(
+    path: &Path,
+    n: usize,
+    before: Option<u64>,
+    classify: F,
+) -> Result<Tail<T>>
+where
+    F: FnMut(&[u8]) -> TailDecision<T>,
+{
+    tail_filter_map_inner(path, n, before, true, classify)
 }
 
 fn tail_filter_map_inner<T, F>(
@@ -144,7 +181,7 @@ fn tail_filter_map_inner<T, F>(
     mut parse: F,
 ) -> Result<Tail<T>>
 where
-    F: FnMut(&[u8]) -> Option<T>,
+    F: FnMut(&[u8]) -> TailDecision<T>,
 {
     if n == 0 {
         return Ok(Tail::default());
@@ -157,6 +194,7 @@ where
     let target = if probe_older { n.saturating_add(1) } else { n };
     let mut rows = Vec::with_capacity(target.min(1024));
     let mut corrupt_count = 0;
+    let mut records_parsed = 0_u64;
 
     while rows.len() < target {
         let Some((offset, raw)) = reader.next_line()? else {
@@ -167,13 +205,16 @@ where
             continue;
         }
         match parse(line) {
-            Some(value) => rows.push((offset, value)),
-            None => corrupt_count += 1,
+            TailDecision::Include(value) => {
+                records_parsed = records_parsed.saturating_add(1);
+                rows.push((offset, value));
+            }
+            TailDecision::Skip => records_parsed = records_parsed.saturating_add(1),
+            TailDecision::Corrupt => corrupt_count += 1,
         }
     }
 
-    let records_parsed = rows.len();
-    let has_more = probe_older && records_parsed > n;
+    let has_more = probe_older && rows.len() > n;
     if has_more {
         rows.truncate(n);
     }
@@ -181,7 +222,7 @@ where
     let first_offset = rows.first().map(|(offset, _)| *offset);
     let events = rows.into_iter().map(|(_, value)| value).collect();
 
-    record_metrics(reader.bytes_read, records_parsed as u64, corrupt_count);
+    record_metrics(reader.bytes_read, records_parsed, corrupt_count);
 
     Ok(Tail {
         events,
@@ -256,6 +297,75 @@ where
         summary.corrupt_count,
     );
 
+    Ok(summary)
+}
+
+/// Stream complete rows after a durable byte cursor without collecting them.
+/// Like [`read_delta`], an unterminated final row is left for the next pass and
+/// does not advance `next_offset`.
+pub fn scan_stream_from<F>(path: &Path, from_offset: u64, mut reduce: F) -> Result<ScanSummary>
+where
+    F: FnMut(Value),
+{
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ScanSummary {
+                next_offset: from_offset,
+                ..ScanSummary::default()
+            });
+        }
+        Err(err) => return Err(err).with_context(|| format!("open {}", path.display())),
+    };
+    let len = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    if from_offset > len {
+        bail!(
+            "journal offset {from_offset} is beyond {} byte length {len}",
+            path.display()
+        );
+    }
+    file.seek(SeekFrom::Start(from_offset))
+        .with_context(|| format!("seek {} to {from_offset}", path.display()))?;
+
+    let mut reader = BufReader::new(file);
+    let mut summary = ScanSummary {
+        next_offset: from_offset,
+        ..ScanSummary::default()
+    };
+    let mut raw = Vec::new();
+    let mut bytes_read = 0u64;
+    let mut valid_count = 0u64;
+    loop {
+        raw.clear();
+        let read = reader
+            .read_until(b'\n', &mut raw)
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if raw.last() != Some(&b'\n') {
+            break;
+        }
+        summary.next_offset = summary
+            .next_offset
+            .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        let line = trim_ascii(&raw);
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<Value>(line) {
+            Ok(value) => {
+                valid_count = valid_count.saturating_add(1);
+                reduce(value);
+            }
+            Err(_) => summary.corrupt_count += 1,
+        }
+    }
+    record_metrics(bytes_read, valid_count, summary.corrupt_count);
     Ok(summary)
 }
 
@@ -468,6 +578,54 @@ mod tests {
     }
 
     #[test]
+    fn classified_tail_skips_valid_hidden_rows_without_spending_page_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns.jsonl");
+        let mut body = String::new();
+        for n in 0..125_u64 {
+            body.push_str(&format!("{{\"n\":{n},\"visible\":true}}\n"));
+            for _ in 0..3 {
+                body.push_str(&format!("{{\"n\":{n},\"visible\":false}}\n"));
+            }
+        }
+        body.push_str("not-json\n");
+        std::fs::write(&path, body).unwrap();
+
+        let newest = tail_classify_map(&path, 100, None, |line| {
+            let Ok(value) = serde_json::from_slice::<Value>(line) else {
+                return TailDecision::Corrupt;
+            };
+            if value["visible"].as_bool() == Some(true) {
+                TailDecision::Include(value)
+            } else {
+                TailDecision::Skip
+            }
+        })
+        .unwrap();
+        assert_eq!(newest.events.len(), 100);
+        assert_eq!(newest.events.first().unwrap()["n"], 25);
+        assert_eq!(newest.events.last().unwrap()["n"], 124);
+        assert_eq!(newest.corrupt_count, 1);
+        assert!(newest.has_more);
+
+        let older = tail_classify_map(&path, 100, newest.first_offset, |line| {
+            let Ok(value) = serde_json::from_slice::<Value>(line) else {
+                return TailDecision::Corrupt;
+            };
+            if value["visible"].as_bool() == Some(true) {
+                TailDecision::Include(value)
+            } else {
+                TailDecision::Skip
+            }
+        })
+        .unwrap();
+        assert_eq!(older.events.len(), 25);
+        assert_eq!(older.events.first().unwrap()["n"], 0);
+        assert_eq!(older.events.last().unwrap()["n"], 24);
+        assert!(!older.has_more);
+    }
+
+    #[test]
     fn scan_stream_keeps_good_rows_around_torn_utf8() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("progress.jsonl");
@@ -501,6 +659,50 @@ mod tests {
         assert_eq!(resumed.events.len(), 1);
         assert_eq!(resumed.events[0]["n"], 2);
         assert_eq!(resumed.next_offset, std::fs::metadata(path).unwrap().len());
+    }
+
+    #[test]
+    fn streaming_delta_reduces_without_collecting_and_stops_at_partial_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.jsonl");
+        let first = b"{\"n\":1}\n";
+        let corrupt = b"not-json\n";
+        let second = b"{\"n\":2}\n";
+        let partial = b"{\"n\":3";
+        let mut bytes = first.to_vec();
+        bytes.extend_from_slice(corrupt);
+        bytes.extend_from_slice(second);
+        bytes.extend_from_slice(partial);
+        std::fs::write(&path, bytes).unwrap();
+        let mut seen = Vec::new();
+
+        let delta = scan_stream_from(&path, first.len() as u64, |event| {
+            seen.push(event["n"].clone())
+        })
+        .unwrap();
+
+        assert_eq!(seen, vec![Value::from(2)]);
+        assert_eq!(delta.corrupt_count, 1);
+        assert_eq!(
+            delta.next_offset,
+            (first.len() + corrupt.len() + second.len()) as u64
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"}\n").unwrap();
+        let mut resumed = Vec::new();
+        let completed = scan_stream_from(&path, delta.next_offset, |event| {
+            resumed.push(event["n"].clone())
+        })
+        .unwrap();
+        assert_eq!(resumed, vec![Value::from(3)]);
+        assert_eq!(completed.corrupt_count, 0);
+        assert_eq!(
+            completed.next_offset,
+            std::fs::metadata(path).unwrap().len()
+        );
     }
 
     #[test]

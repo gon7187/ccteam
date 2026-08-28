@@ -2,7 +2,7 @@
 // a set-nav second column (232px, 「工作流」) with five sub-pages —
 // Skills / Roles / Plugins / MCP Servers / 自进化.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Activity, Package, Server, ShoppingBag, User } from "lucide-react";
 import { listProjectRoles, type RoleSummary } from "../lib/sessionsApi";
 import { getProjectMarketplace, type DecoratedPlugin } from "../lib/marketplaceApi";
@@ -16,6 +16,7 @@ import {
 import { useProjectsStore } from "../hooks/useProjectsStore";
 import { makeT, tr, type Lang } from "../lib/i18n";
 import { toastBus } from "../lib/toastBus";
+import EvolutionPanel from "./EvolutionPanel";
 import MarketplaceView from "./MarketplaceView";
 
 type TabId = "skills" | "roles" | "market" | "mcp" | "evolution";
@@ -61,7 +62,19 @@ export default function WorkflowView({
   const slug = projects.includes(selectedSlug) ? selectedSlug : (projects[0] ?? "");
   const [roles, setRoles] = useState<RoleSummary[]>([]);
   const [skills, setSkills] = useState<DecoratedPlugin[]>([]);
-  const [evolution, setEvolution] = useState<EvolutionSummary | null>(null);
+  const [evolutionState, setEvolutionState] = useState<{
+    slug: string;
+    data: EvolutionSummary | null;
+    loading: boolean;
+    error: string | null;
+  }>({ slug: "", data: null, loading: false, error: null });
+  const evolutionRequestRef = useRef(0);
+  const evolution = evolutionState.slug === slug ? evolutionState.data : null;
+  const evolutionError = evolutionState.slug === slug ? evolutionState.error : null;
+  const evolutionLoading =
+    tab === "evolution" &&
+    Boolean(slug) &&
+    (evolutionState.slug !== slug || evolutionState.loading);
   const [loading, setLoading] = useState(false);
   // v0.8.24 gap-fill — MCP servers page.
   const [mcp, setMcp] = useState<McpServersResponse | null>(null);
@@ -69,7 +82,7 @@ export default function WorkflowView({
   const [mcpBusy, setMcpBusy] = useState(false);
 
   const refreshTab = useCallback(async () => {
-    if (!slug) return;
+    if (!slug || tab === "evolution") return;
     setLoading(true);
     try {
       if (tab === "roles") {
@@ -79,8 +92,6 @@ export default function WorkflowView({
         setSkills((idx.plugins ?? []).filter((p) => p.type === "skill"));
       } else if (tab === "market") {
         return;
-      } else if (tab === "evolution") {
-        setEvolution(await getEvolution(slug));
       } else if (tab === "mcp") {
         setMcp(await getMcpServers(slug));
       }
@@ -89,6 +100,39 @@ export default function WorkflowView({
     } finally {
       setLoading(false);
     }
+  }, [slug, tab]);
+
+  // Evolution data is project-scoped, not merely the last response to win.
+  // Keying the state by slug hides the previous project's projection on the
+  // very render that switches projects; the epoch + cleanup then reject any
+  // late response from the superseded project.
+  useEffect(() => {
+    if (tab !== "evolution") return;
+    const request = ++evolutionRequestRef.current;
+    let cancelled = false;
+    if (!slug) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    queueMicrotask(() => {
+      if (cancelled || request !== evolutionRequestRef.current) return;
+      setEvolutionState({ slug, data: null, loading: true, error: null });
+    });
+    getEvolution(slug)
+      .then((data) => {
+        if (cancelled || request !== evolutionRequestRef.current) return;
+        setEvolutionState({ slug, data, loading: false, error: null });
+      })
+      .catch((error) => {
+        if (cancelled || request !== evolutionRequestRef.current) return;
+        const detail = error instanceof Error ? error.message : String(error);
+        setEvolutionState({ slug, data: null, loading: false, error: detail });
+        toastBus.handler?.error(detail);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [slug, tab]);
 
   useEffect(() => {
@@ -194,7 +238,9 @@ export default function WorkflowView({
 
       <div className="set-detail">
         <div className="set-detail-inner fade-in" key={tab}>
-          {loading ? <p style={{ color: "var(--text-faint)", fontSize: 13 }}>{t("loading")}</p> : null}
+          {(tab === "evolution" ? evolutionLoading : loading) ? (
+            <p style={{ color: "var(--text-faint)", fontSize: 13 }}>{t("loading")}</p>
+          ) : null}
 
           {tab === "skills" ? (
             <>
@@ -478,51 +524,17 @@ export default function WorkflowView({
                 t("evolve"),
                 tr(
                   lang,
-                  "v0.9 经验底座:每个 turn 落 turn record,role / skill 指纹随使用进化,后续 spawn 自动携带 —— 团队越用越懂你的项目。本版只读。",
-                  "v0.9 experience substrate: every turn writes a turn record; role / skill fingerprints evolve with use. Read-only this version.",
-                  "Основа опыта v0.9: каждый turn сохраняется как запись, отпечатки ролей и навыков меняются с использованием, а следующие spawn получают их автоматически — команда всё лучше понимает ваш проект. В этой версии только чтение.",
+                  "人工评价闭合反馈循环:接受/需修改会被记录,并按 role / skill 指纹版本展示。改进会打开独立的 HITL 提案会话;ccteam 不会自动批准,写入/应用请求必须等待你的明确批准。",
+                  "Human verdicts close the feedback loop: accepted/revised results are recorded by role and skill fingerprint revision. Improve opens a dedicated HITL proposal session. Nothing changes automatically: ccteam auto-approves nothing, and write/apply requests wait for your explicit approval.",
+                  "Оценки человека замыкают обратную связь: принятое и отправленное на доработку учитывается по ревизиям отпечатков ролей и навыков. Улучшение открывает отдельную HITL-сессию предложений; ccteam ничего не одобряет автоматически, а запись и применение ждут вашего явного подтверждения.",
                 ),
               )}
-              {!evolution || evolution.empty ? (
-                !loading ? (
-                  <p style={{ fontSize: 13, color: "var(--text-faint)" }} data-testid="evolution-empty">
-                    {tr(lang, "尚无 experience 数据(诚实空态)。", "No experience data yet (honest empty state).", "Данных об опыте пока нет (честное пустое состояние).")}
-                  </p>
-                ) : null
-              ) : (
-                <>
-                  <div className="stat-grid">
-                    <div className="stat">
-                      <span className="k">{tr(lang, "turn records", "turn records", "записи ходов")}</span>
-                      <span className="v">{evolution.turn_records}</span>
-                      <span className="k" data-testid="evolution-7d">
-                        {tr(lang, "近 7 天", "last 7 days", "за последние 7 дней")} +{evolution.turn_records_7d} ·{" "}
-                        {tr(lang, "verdicts", "verdicts", "вердиктов")} {evolution.verdict_records}
-                      </span>
-                    </div>
-                    <div className="stat">
-                      <span className="k">{tr(lang, "role 指纹", "role fingerprints", "отпечатки ролей")}</span>
-                      <span className="v">{evolution.roles.length}</span>
-                      <span className="k">{evolution.roles.map((b) => b.id).join(" · ") || "—"}</span>
-                    </div>
-                    <div className="stat">
-                      <span className="k">{tr(lang, "skill 指纹", "skill fingerprints", "отпечатки навыков")}</span>
-                      <span className="v">{evolution.skills.length}</span>
-                      <span className="k">{evolution.skills.map((b) => b.id).join(" · ") || "—"}</span>
-                    </div>
-                  </div>
-                  <div className="flow-rows">
-                    {[...evolution.roles, ...evolution.skills].map((b) =>
-                      flowRow(
-                        `${b.kind}:${b.id}`,
-                        `turns=${b.turn_count}${b.sha ? ` · ${b.sha.slice(0, 10)}` : ""}`,
-                        <span className="badge ok">{tr(lang, "只读", "read-only", "только чтение")}</span>,
-                        `${b.kind}-${b.id}-${b.sha}`,
-                      ),
-                    )}
-                  </div>
-                </>
-              )}
+              <EvolutionPanel
+                lang={lang}
+                evolution={evolution}
+                loading={evolutionLoading}
+                error={evolutionError}
+              />
             </>
           ) : null}
 

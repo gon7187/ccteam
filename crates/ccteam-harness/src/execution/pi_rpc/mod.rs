@@ -47,9 +47,9 @@ use crate::execution::session_status::write_status_file;
 use crate::{
     AgentSpecBrief, AgentVendor, ApprovalIR, ApprovalKind, ApprovalScope, ChoiceOption,
     ChoicePrompt, ContextSource, ContextUsage, DetachOutcome, Directive, DirectiveOutcome,
-    ExecutionMode, HarnessAdapter, HarnessError, SessionTitleTarget, SpawnCtx, ThreadErrorEvent,
-    ThreadEvent, ThreadHandle, ThreadStatus, TitleSync, TurnDisposition, TurnId, TurnInput,
-    TurnRouting, TurnSubmission,
+    ExecutionMode, HarnessAdapter, HarnessError, InterruptOutcome, SessionTitleTarget, SpawnCtx,
+    ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadStatus, TitleSync, TurnDisposition, TurnId,
+    TurnInput, TurnRouting, TurnSubmission,
 };
 
 pub const PI_RPC_ADAPTER_NAME: &str = "pi-rpc";
@@ -367,12 +367,12 @@ impl PiRpcAdapter {
                         continue;
                     }
                     Ok(PiTransportEvent::Event(PiEvent::ExtensionError { event, error })) => {
-                        let _ = live_for_task
-                            .event_tx
-                            .send(ThreadEvent::Error(ThreadErrorEvent {
+                        let _ = live_for_task.event_tx.send(ThreadEvent::Diagnostic(
+                            ThreadErrorEvent {
                                 kind: "protocol".to_string(),
                                 message: format!("Pi extension `{event}` failed: {error}"),
-                            }));
+                            },
+                        ));
                         continue;
                     }
                     Ok(PiTransportEvent::Event(event)) => live_for_task
@@ -389,13 +389,12 @@ impl PiRpcAdapter {
                         let mut state = live_for_task.translate.lock().unwrap();
                         let output = state.translator.transport_failed(message.clone());
                         if output.events.is_empty() {
-                            let _ =
-                                live_for_task
-                                    .event_tx
-                                    .send(ThreadEvent::Error(ThreadErrorEvent {
-                                        kind: "protocol".to_string(),
-                                        message,
-                                    }));
+                            let _ = live_for_task.event_tx.send(ThreadEvent::Diagnostic(
+                                ThreadErrorEvent {
+                                    kind: "protocol".to_string(),
+                                    message,
+                                },
+                            ));
                             return;
                         }
                         output
@@ -1182,7 +1181,10 @@ impl HarnessAdapter for PiRpcAdapter {
             }
         };
         let live = self.lookup(&h.identity).ok_or_else(|| {
-            HarnessError::ThreadDied(format!("Pi session {} is not live", h.identity))
+            HarnessError::ThreadUnavailableBeforeDispatch(format!(
+                "Pi session {} is not live",
+                h.identity
+            ))
         })?;
         Self::wait_not_settling(&live).await;
         let (turn_id, disposition, permit, command) = {
@@ -1269,7 +1271,7 @@ impl HarnessAdapter for PiRpcAdapter {
                 match receiver.recv().await {
                     Ok(event) => Some((event, receiver)),
                     Err(broadcast::error::RecvError::Lagged(count)) => Some((
-                        ThreadEvent::Error(ThreadErrorEvent {
+                        ThreadEvent::Diagnostic(ThreadErrorEvent {
                             kind: "protocol".to_string(),
                             message: format!("Pi canonical event stream lagged by {count}"),
                         }),
@@ -1573,10 +1575,20 @@ impl HarnessAdapter for PiRpcAdapter {
             .unwrap_or(true)
     }
 
-    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
         let live = self.lookup(&h.identity).ok_or_else(|| {
             HarnessError::ThreadDied(format!("Pi session {} is not live", h.identity))
         })?;
+        let active = live
+            .translate
+            .lock()
+            .unwrap()
+            .translator
+            .active_turn_id()
+            .is_some();
+        if !active {
+            return Ok(InterruptOutcome::AlreadyIdle);
+        }
         let response = live
             .transport
             .read()
@@ -1585,7 +1597,7 @@ impl HarnessAdapter for PiRpcAdapter {
             .await
             .map_err(HarnessError::SubmitFailed)?;
         if response.success {
-            Ok(())
+            Ok(InterruptOutcome::Interrupted)
         } else {
             Err(HarnessError::SubmitFailed(
                 response

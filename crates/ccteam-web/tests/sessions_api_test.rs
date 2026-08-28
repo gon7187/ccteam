@@ -19,14 +19,18 @@ use std::time::Duration;
 use ccteam_core::CcteamPaths;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
-    HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput,
+    HarnessCapability, HarnessError, InterruptOutcome, SpawnCtx, ThreadEvent, ThreadHandle,
+    ThreadItem, ThreadItemDetails, ThreadStatus, TurnId, TurnInput, TurnSubmission,
+    UnifiedTokenUsage,
 };
 use ccteam_web::{router_with_state, AppState};
 use futures::stream::{self, BoxStream};
+use futures::StreamExt;
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::io::AsyncBufReadExt;
 use tokio::net::TcpListener;
+use tokio_stream::wrappers::BroadcastStream;
 
 fn fake_paths(root: &std::path::Path) -> CcteamPaths {
     CcteamPaths {
@@ -37,6 +41,186 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
 
 struct FakeAdapter {
     vendor: AgentVendor,
+    start_failure: Option<HarnessCapability>,
+}
+
+impl FakeAdapter {
+    fn new(vendor: AgentVendor) -> Self {
+        Self {
+            vendor,
+            start_failure: None,
+        }
+    }
+
+    fn failing(vendor: AgentVendor, capability: HarnessCapability) -> Self {
+        Self {
+            vendor,
+            start_failure: Some(capability),
+        }
+    }
+}
+
+/// A real-shaped paneless turn script whose terminal boundary is released by
+/// the test. Claude deliberately returns a submit id distinct from its `sj-N`
+/// translator id; Codex uses its opaque `turn.id` shape. Both expose assistant
+/// text before the terminal boundary, reproducing the provisional-mirror race.
+struct TerminalTurnAdapter {
+    vendor: AgentVendor,
+    submit_id: String,
+    input_id: String,
+    terminal_id: String,
+    assistant_messages: Vec<String>,
+    events: tokio::sync::broadcast::Sender<ThreadEvent>,
+    release_terminal: Arc<tokio::sync::Semaphore>,
+}
+
+impl TerminalTurnAdapter {
+    fn new(
+        vendor: AgentVendor,
+        submit_id: &str,
+        input_id: &str,
+        terminal_id: &str,
+        assistant_messages: &[&str],
+    ) -> Self {
+        let (events, _) = tokio::sync::broadcast::channel(32);
+        Self {
+            vendor,
+            submit_id: submit_id.into(),
+            input_id: input_id.into(),
+            terminal_id: terminal_id.into(),
+            assistant_messages: assistant_messages
+                .iter()
+                .map(|message| (*message).to_string())
+                .collect(),
+            events,
+            release_terminal: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+
+    fn release(&self) {
+        self.release_terminal.add_permits(1);
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessAdapter for TerminalTurnAdapter {
+    fn name(&self) -> &'static str {
+        "terminal-turn-web-test"
+    }
+
+    fn vendor(&self) -> AgentVendor {
+        self.vendor
+    }
+
+    async fn start_thread(
+        &self,
+        _spec: &AgentSpecBrief,
+        ctx: &SpawnCtx,
+    ) -> Result<ThreadHandle, HarnessError> {
+        Ok(ThreadHandle {
+            vendor: self.vendor,
+            mode: ExecutionMode::Chat,
+            identity: format!("{}-{}", ctx.slug, ctx.sid),
+            started_at: chrono::Utc::now(),
+            raw_extras: Value::Null,
+        })
+    }
+
+    async fn submit_turn(
+        &self,
+        _h: &ThreadHandle,
+        _input: TurnInput,
+    ) -> Result<TurnId, HarnessError> {
+        let _ = self.events.send(ThreadEvent::TurnStarted {
+            turn_id: self.terminal_id.clone(),
+        });
+        for (index, message) in self.assistant_messages.iter().enumerate() {
+            let _ = self.events.send(ThreadEvent::ItemCompleted {
+                item: ThreadItem {
+                    id: format!("message-{}", index + 1),
+                    details: ThreadItemDetails::AgentMessage(message.clone()),
+                },
+            });
+        }
+        let events = self.events.clone();
+        let release = Arc::clone(&self.release_terminal);
+        let turn_id = self.terminal_id.clone();
+        let model = match self.vendor {
+            AgentVendor::Claude => Some("claude-sonnet-4-6".to_string()),
+            AgentVendor::Codex => Some("gpt-5.6-codex".to_string()),
+            _ => None,
+        };
+        tokio::spawn(async move {
+            release
+                .acquire()
+                .await
+                .expect("terminal release semaphore stays open")
+                .forget();
+            let _ = events.send(ThreadEvent::TurnCompleted {
+                turn_id,
+                usage: UnifiedTokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+                model,
+            });
+        });
+        Ok(TurnId::new(self.submit_id.clone()))
+    }
+
+    async fn submit_turn_routed(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        _routing: ccteam_harness::TurnRouting,
+    ) -> Result<TurnSubmission, HarnessError> {
+        self.submit_turn(h, input)
+            .await
+            .map(|turn_id| TurnSubmission::started_with_input_id(turn_id, self.input_id.clone()))
+    }
+
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<ccteam_harness::ToolSurfaceRebuild, HarnessError> {
+        Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired {
+            reason: "test double".to_string(),
+        })
+    }
+
+    fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+        ccteam_harness::EventAttachment::Rebuildable
+    }
+
+    fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
+        Box::pin(
+            BroadcastStream::new(self.events.subscribe())
+                .filter_map(|event| async move { event.ok() }),
+        )
+    }
+
+    async fn resume_thread(&self, _persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
+        Err(HarnessError::NotImplemented {
+            reason: "web-test".into(),
+        })
+    }
+
+    async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Ok(DirectiveOutcome::Done { receipt: d.name })
+    }
+
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
+    }
 }
 
 #[async_trait::async_trait]
@@ -54,6 +238,12 @@ impl HarnessAdapter for FakeAdapter {
         _spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        if let Some(capability) = self.start_failure {
+            return Err(HarnessError::CapabilityUnavailable {
+                capability,
+                detail: "fake vendor capability rejection".to_string(),
+            });
+        }
         Ok(ThreadHandle {
             vendor: self.vendor,
             mode: ExecutionMode::Chat,
@@ -110,6 +300,10 @@ impl HarnessAdapter for FakeAdapter {
 
     async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
         Ok(())
+    }
+
+    async fn interrupt_turn(&self, _h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
+        Ok(InterruptOutcome::AlreadyIdle)
     }
 
     async fn handle_directive(
@@ -197,10 +391,62 @@ async fn create_session_rejects_removed_host_parameter() {
 }
 
 #[tokio::test]
+async fn create_session_exposes_typed_capability_failures() {
+    for (capability, error_code) in [
+        (HarnessCapability::Vendor, "vendor_unavailable"),
+        (HarnessCapability::Model, "model_unavailable"),
+        (HarnessCapability::Effort, "effort_unavailable"),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let paths = fake_paths(tmp.path());
+        let project_dir = paths.projects_root.join("demo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let factory = Arc::new(move |vendor, _protocol| {
+            Arc::new(FakeAdapter::failing(vendor, capability))
+                as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
+        let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
+            .json(&serde_json::json!({
+                "role": "",
+                "vendor": "claude",
+                "model": "opus",
+                "effort": "max"
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 422);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error_code"], error_code);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("fake vendor capability rejection"));
+    }
+}
+
+#[tokio::test]
 async fn session_history_no_gateway_is_503() {
     let tmp = TempDir::new().unwrap();
     let addr = spawn_server(AppState::new(fake_paths(tmp.path()))).await;
     let resp = reqwest::get(format!("http://{addr}/api/v1/sessions/s1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+}
+
+#[tokio::test]
+async fn session_verdict_no_gateway_is_503() {
+    let tmp = TempDir::new().unwrap();
+    let addr = spawn_server(AppState::new(fake_paths(tmp.path()))).await;
+    let resp = reqwest::Client::new()
+        .put(format!("http://{addr}/api/v1/sessions/s1/turns/t1/verdict"))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 503);
@@ -247,6 +493,45 @@ async fn session_interrupt_no_gateway_is_503() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 503);
+}
+
+#[tokio::test]
+async fn session_interrupt_wire_does_not_claim_an_already_idle_turn_was_interrupted() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter {
+            vendor,
+            start_failure: None,
+        }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let response = client
+        .post(format!("http://{addr}/api/v1/sessions/{sid}/interrupt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        serde_json::json!({"outcome": "already_idle", "interrupted": false})
+    );
 }
 
 /// v0.8.22 P1 — `PATCH /sessions/{sid}` (rename) follows the same no-gateway
@@ -431,7 +716,7 @@ async fn session_events_fresh_connect_reseeds_a_pending_approval() {
     let project_dir = paths.projects_root.join("demo");
     std::fs::create_dir_all(&project_dir).unwrap();
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
     let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
@@ -485,7 +770,7 @@ async fn session_events_reconnect_with_last_event_id_replays_the_gap() {
     let project_dir = paths.projects_root.join("demo");
     std::fs::create_dir_all(&project_dir).unwrap();
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
     let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
@@ -561,7 +846,7 @@ async fn history_and_resume_roundtrip_over_http() {
     seed_role_with_model(&project_dir, "cto", None);
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -711,7 +996,7 @@ async fn import_external_claude_session_over_http() {
     std::env::set_var("CCTEAM_HOME", home.path().join(".ccteam"));
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -816,7 +1101,7 @@ async fn rename_session_over_http_happy_path_and_validation() {
     seed_role_with_model(&project_dir, "cto", None);
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -946,7 +1231,7 @@ async fn session_history_defaults_to_newest_100_and_pages_backwards() {
     std::fs::create_dir_all(&project_dir).unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1026,6 +1311,522 @@ async fn session_history_defaults_to_newest_100_and_pages_backwards() {
     assert_eq!(invalid.status(), 400);
 }
 
+async fn assert_terminal_turn_feedback_roundtrip(
+    vendor: AgentVendor,
+    submit_id: &str,
+    input_id: &str,
+    terminal_id: &str,
+    assistant_messages: &[&str],
+) {
+    ccteam_core::disable_tool_surface_bootstrap_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let state_path = paths.project_state("demo");
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    let mut project_state =
+        ccteam_core::ProjectState::initial_for_team("demo".into(), "dev".into());
+    project_state.owner = Some("user:web-api".into());
+    project_state.save(&state_path).unwrap();
+
+    let adapter = Arc::new(TerminalTurnAdapter::new(
+        vendor,
+        submit_id,
+        input_id,
+        terminal_id,
+        assistant_messages,
+    ));
+    let adapter_for_factory = Arc::clone(&adapter);
+    let factory = Arc::new(move |_vendor, _protocol| {
+        Arc::clone(&adapter_for_factory) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let mut gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    gateway.enable_project_creation(paths.clone());
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    gateway.set_event_sink(event_tx);
+    tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+    let addr = spawn_server(AppState::new(paths.clone()).with_gateway_owned(gateway)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://{addr}/api/v1");
+    let vendor_wire = match vendor {
+        AgentVendor::Claude => "claude",
+        AgentVendor::Codex => "codex",
+        _ => unreachable!("this regression covers Claude and Codex only"),
+    };
+
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": vendor_wire}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let submitted = client
+        .post(format!("{base}/sessions/{sid}/turn"))
+        .json(&serde_json::json!({"text": "implement the change"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(submitted.status(), 202);
+
+    let interim_id = format!("{sid}-1");
+    for _ in 0..100 {
+        let turns = ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &sid)
+            .unwrap_or_default();
+        if turns.iter().any(|turn| turn.turn_id == input_id)
+            && turns.iter().any(|turn| turn.turn_id == interim_id)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let inflight_history: Value = client
+        .get(format!("{base}/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        inflight_history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["assistant"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()))
+            .count(),
+        0,
+        "provisional assistant rows are not terminal history: {inflight_history}"
+    );
+
+    for rejected_id in [input_id, interim_id.as_str(), terminal_id] {
+        let rejected = client
+            .put(format!("{base}/sessions/{sid}/turns/{rejected_id}/verdict"))
+            .json(&serde_json::json!({"verdict": "accept"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected.status(),
+            404,
+            "nonterminal id {rejected_id} must not be verdictable"
+        );
+    }
+
+    adapter.release();
+    let progress = paths.progress_jsonl("demo");
+    let mut experience = Vec::new();
+    for _ in 0..200 {
+        experience = ccteam_harness::execution::experience::read_all_experience(&project_dir)
+            .unwrap_or_default();
+        let completed = ccteam_core::progress::read_all_events(&progress)
+            .unwrap_or_default()
+            .iter()
+            .any(|event| {
+                event["event"] == ccteam_core::progress::CHAT_TURN_COMPLETED
+                    && event["turn_id"] == terminal_id
+            });
+        let mirrored = ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &sid)
+            .unwrap_or_default()
+            .iter()
+            .any(|turn| {
+                turn.turn_id == terminal_id && turn.outcome.as_deref() == Some("completed")
+            });
+        if completed && mirrored && !experience.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let history: Value = client
+        .get(format!("{base}/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let assistant_rows = history["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            event["assistant"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assistant_rows.len(),
+        1,
+        "one completed turn produces one assistant history row: {history}"
+    );
+    let history_turn_id = assistant_rows[0]["turn_id"]
+        .as_str()
+        .expect("completed history row carries a turn id");
+    assert_eq!(history_turn_id, terminal_id);
+    assert_eq!(
+        assistant_rows[0]["assistant"],
+        *assistant_messages.last().unwrap()
+    );
+
+    let terminal_experience = experience
+        .iter()
+        .filter_map(|record| match record {
+            ccteam_harness::execution::experience::ExperienceRecord::Turn(turn)
+                if turn.sid == sid =>
+            {
+                Some(turn)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_experience.len(), 1, "one terminal experience row");
+    assert_eq!(terminal_experience[0].turn_id, terminal_id);
+    assert_eq!(terminal_experience[0].outcome.as_deref(), Some("completed"));
+
+    let completion_rows = ccteam_core::progress::read_all_events(&progress)
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            event["event"] == ccteam_core::progress::CHAT_TURN_COMPLETED && event["sid"] == sid
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(completion_rows.len(), 1, "one canonical completion row");
+    assert_eq!(completion_rows[0]["turn_id"], terminal_id);
+
+    let accepted: Value = client
+        .put(format!(
+            "{base}/sessions/{sid}/turns/{history_turn_id}/verdict"
+        ))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accepted["turn_id"], terminal_id);
+    assert_eq!(accepted["changed"], true);
+
+    for rejected_id in [input_id, interim_id.as_str(), submit_id] {
+        if rejected_id == terminal_id {
+            continue;
+        }
+        let rejected = client
+            .put(format!("{base}/sessions/{sid}/turns/{rejected_id}/verdict"))
+            .json(&serde_json::json!({"verdict": "accept"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), 404, "nonterminal id {rejected_id}");
+    }
+
+    let evolution: Value = client
+        .get(format!("{base}/projects/demo/evolution"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(evolution["turn_records"], 1, "{evolution}");
+    assert_eq!(evolution["verdict_records"], 1, "{evolution}");
+    assert_eq!(evolution["accepted_turns"], 1, "{evolution}");
+}
+
+#[tokio::test]
+async fn claude_terminal_id_roundtrips_history_verdict_and_evolution() {
+    assert_terminal_turn_feedback_roundtrip(
+        AgentVendor::Claude,
+        "turn-submit-claude",
+        "input-claude-1",
+        "sj-1",
+        &["claude final answer"],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn codex_opaque_terminal_id_roundtrips_history_verdict_and_evolution() {
+    assert_terminal_turn_feedback_roundtrip(
+        AgentVendor::Codex,
+        "turn_01JOPAQUECODEX",
+        "input-codex-1",
+        "turn_01JOPAQUECODEX",
+        &["codex checkpoint", "codex final answer"],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn session_verdict_is_idempotent_and_history_joins_latest_archive_and_active_value() {
+    ccteam_core::disable_tool_surface_bootstrap_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr = spawn_server(AppState::new(paths.clone()).with_gateway_owned(gateway)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://{addr}/api/v1");
+
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ccteam_harness::execution::turns_mirror::append_turn(
+        &project_dir,
+        &sid,
+        &ccteam_harness::execution::turns_mirror::TurnRecord {
+            turn_id: "turn-1".into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: String::new(),
+            user: "implement it".into(),
+            assistant: "done".into(),
+            usage: Value::Null,
+            tool_calls: vec![],
+            attachments: vec![],
+            outcome: Some("completed".into()),
+            error_kind: None,
+            error: None,
+        },
+    )
+    .unwrap();
+
+    // Seed the retained archive: history must expose this verdict even when
+    // the active journal does not exist yet.
+    let progress = paths.progress_jsonl("demo");
+    std::fs::create_dir_all(progress.parent().unwrap()).unwrap();
+    let archive = ccteam_harness::execution::progress_bridge::progress_archive_path(&progress);
+    std::fs::write(
+        &archive,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "event": "turn_verdict",
+                "sid": sid,
+                "turn_id": "turn-1",
+                "ts": "2026-08-28T10:00:00Z",
+                "verdict": "accept"
+            })
+        ),
+    )
+    .unwrap();
+    ccteam_harness::execution::progress_bridge::load_or_recover_progress_checkpoint(&progress)
+        .unwrap();
+
+    let archived_history: Value = client
+        .get(format!("{base}/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        archived_history["events"][0]["verdict"]["verdict"],
+        "accept"
+    );
+    assert_eq!(
+        archived_history["events"][0]["verdict"]["ts"],
+        "2026-08-28T10:00:00Z"
+    );
+
+    // PUT of the same semantic value is idempotent even though the server
+    // generates a fresh timestamp.
+    let accepted: Value = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-1/verdict"))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accepted["sid"], sid);
+    assert_eq!(accepted["turn_id"], "turn-1");
+    assert_eq!(accepted["verdict"], "accept");
+    assert!(accepted["feedback"].is_null());
+    assert_eq!(accepted["changed"], false);
+
+    let revised: Value = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-1/verdict"))
+        .json(&serde_json::json!({
+            "verdict": "revise",
+            "feedback": "  cover the timeout path  "
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(revised["feedback"], "cover the timeout path");
+    assert_eq!(revised["changed"], true);
+
+    let duplicate: Value = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-1/verdict"))
+        .json(&serde_json::json!({
+            "verdict": "revise",
+            "feedback": "cover the timeout path"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(duplicate["changed"], false);
+
+    let history: Value = client
+        .get(format!("{base}/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(history["events"][0]["verdict"]["verdict"], "revise");
+    assert_eq!(
+        history["events"][0]["verdict"]["feedback"],
+        "cover the timeout path"
+    );
+    assert!(history["events"][0]["verdict"]["ts"].is_string());
+
+    let active_rows = std::fs::read_to_string(&progress).unwrap();
+    assert_eq!(
+        active_rows.lines().count(),
+        1,
+        "one changed value is appended; identical retries are suppressed"
+    );
+
+    for body in [
+        serde_json::json!({"verdict": "revise", "feedback": "   "}),
+        serde_json::json!({"verdict": "revise", "feedback": "x".repeat(4001)}),
+    ] {
+        let invalid = client
+            .put(format!("{base}/sessions/{sid}/turns/turn-1/verdict"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), 400, "invalid verdict body: {body}");
+    }
+
+    let unknown_turn = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-missing/verdict"))
+        .json(&serde_json::json!({
+            "verdict": "revise",
+            "feedback": "missing"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown_turn.status(), 404);
+}
+
+#[tokio::test]
+async fn session_verdict_and_history_surface_progress_storage_failures() {
+    ccteam_core::disable_tool_surface_bootstrap_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let progress = paths.progress_jsonl("demo");
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://{addr}/api/v1");
+
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ccteam_harness::execution::turns_mirror::append_turn(
+        &project_dir,
+        &sid,
+        &ccteam_harness::execution::turns_mirror::TurnRecord {
+            turn_id: "turn-1".into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: String::new(),
+            user: "work".into(),
+            assistant: "done".into(),
+            usage: Value::Null,
+            tool_calls: vec![],
+            attachments: vec![],
+            outcome: Some("completed".into()),
+            error_kind: None,
+            error: None,
+        },
+    )
+    .unwrap();
+
+    // A directory at the active journal path deterministically makes both
+    // canonical read and append fail, even when the tests run as root.
+    std::fs::create_dir_all(&progress).unwrap();
+    let write_failed = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-1/verdict"))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(write_failed.status(), 500);
+
+    let read_degraded = client
+        .get(format!("{base}/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read_degraded.status(), 200);
+    let history = read_degraded.json::<Value>().await.unwrap();
+    assert_eq!(history["verdicts_degraded"], true);
+    assert_eq!(history["verdicts_status"], "unavailable");
+    assert!(history["verdict_corrupt_line_count"].is_null());
+    assert!(history["events"][0].get("verdict").is_none());
+}
+
 /// ACL: a tenant may rename its OWN project's session, but a different
 /// tenant (no ownership of that project) gets 404 — the same project-owned
 /// gate every other `/sessions/{sid}/*` route uses (`gate_sid` →
@@ -1053,7 +1854,7 @@ async fn rename_session_denies_cross_tenant_project() {
     st.save(&state_path).unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1089,6 +1890,38 @@ async fn rename_session_denies_cross_tenant_project() {
         .unwrap();
     assert_eq!(denied.status(), 404, "cross-tenant rename must be denied");
 
+    ccteam_harness::execution::turns_mirror::append_turn(
+        &project_dir,
+        &sid,
+        &ccteam_harness::execution::turns_mirror::TurnRecord {
+            turn_id: "turn-owned".into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: "cto".into(),
+            user: "work".into(),
+            assistant: "done".into(),
+            usage: Value::Null,
+            tool_calls: vec![],
+            attachments: vec![],
+            outcome: Some("completed".into()),
+            error_kind: None,
+            error: None,
+        },
+    )
+    .unwrap();
+    let denied_verdict = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-owned/verdict"))
+        .header("Authorization", format!("Bearer ccteam:{token_b}"))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        denied_verdict.status(),
+        404,
+        "cross-tenant verdict must be denied"
+    );
+
     // Tenant A (the owner) can rename it.
     let ok = client
         .patch(format!("{base}/sessions/{sid}"))
@@ -1098,6 +1931,18 @@ async fn rename_session_denies_cross_tenant_project() {
         .await
         .unwrap();
     assert_eq!(ok.status(), 200, "the owning tenant can rename its session");
+    let own_verdict = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-owned/verdict"))
+        .header("Authorization", format!("Bearer ccteam:{token_a}"))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        own_verdict.status(),
+        200,
+        "the owning tenant can rate its turn"
+    );
 
     // Cross-user fix (2026-07-28) — the ADMIN is gated by the same rule. `can_see_owner` keeps the
     // operator out of a tenant's PROJECT (`/projects/demo/*` 404s below), but
@@ -1129,6 +1974,18 @@ async fn rename_session_denies_cross_tenant_project() {
         404,
         "admin must not drive a tenant's session"
     );
+    let admin_verdict = client
+        .put(format!("{base}/sessions/{sid}/turns/turn-owned/verdict"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .json(&serde_json::json!({"verdict": "accept"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        admin_verdict.status(),
+        404,
+        "admin must not rate a tenant's turn"
+    );
 }
 
 // ── composer attachments (uploads + skills + turn weaving) ─────────────────────
@@ -1154,7 +2011,7 @@ async fn upload_then_turn_weaves_attachment_lines_into_turn_text() {
     seed_project_state(&project_dir, "demo");
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1247,7 +2104,7 @@ async fn skill_list_and_attach_names_skill_file_in_turn() {
     .unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1360,7 +2217,7 @@ async fn global_skill_list_and_nested_attach_use_library_path_only() {
     .unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1432,7 +2289,7 @@ async fn global_skill_attach_rejects_invalid_missing_and_unknown_scope() {
     seed_project_state(&project_dir, "demo");
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1526,7 +2383,7 @@ async fn tenant_can_list_and_attach_global_skills_in_own_session() {
     project_state.save(&state_path).unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1589,7 +2446,7 @@ async fn global_skill_attach_rejects_remote_host_project() {
     .unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1655,7 +2512,7 @@ async fn turn_attachments_reject_foreign_paths_and_unknown_skills() {
     std::fs::write(&outside, "nope").unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());

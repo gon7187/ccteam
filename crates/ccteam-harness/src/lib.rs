@@ -51,13 +51,14 @@ pub use adapter::{
     state_json_path, AccountUsage, AgentSpecBrief, AgentVendor, ApprovalIR, ApprovalKind,
     ApprovalRisk, ApprovalScope, CanonicalEvent, ChoiceOption, ChoicePrompt, ChoiceSelection,
     ContextSource, ContextUsage, DetachOutcome, Directive, DirectiveOutcome, EventAttachment,
-    ExecutionMode, GoalStatus, HarnessAdapter, HarnessError, HarnessSnapshot, HostExecutionScope,
-    PermissionMode, RecoveredTurn, RunningTask, SessionHandle, SessionProtocol, SessionTitleTarget,
-    SpawnCtx, SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
-    ThreadItemDetails, ThreadStatus, TitleSync, ToolSurfaceRebuild, TurnDisposition, TurnId,
-    TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage, UnobservedTurnCtx, CCTEAM_HOME_ENV,
-    CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, CODEX_STATUS_MARKER,
-    CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV, KIMI_BIN_ENV, OPENCODE_BIN_ENV,
+    ExecutionMode, GoalStatus, HarnessAdapter, HarnessCapability, HarnessError, HarnessSnapshot,
+    HostExecutionScope, InterruptOutcome, PermissionMode, RecoveredTurn, RunningTask,
+    SessionHandle, SessionProtocol, SessionTitleTarget, SpawnCtx, SpawnOpts, SubagentState,
+    ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, ThreadStatus,
+    TitleSync, ToolSurfaceRebuild, TurnDisposition, TurnId, TurnInput, TurnRouting, TurnSubmission,
+    UnifiedTokenUsage, UnobservedTurnCtx, CCTEAM_HOME_ENV, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV,
+    CODEX_BIN_ENV, CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV,
+    KIMI_BIN_ENV, OPENCODE_BIN_ENV,
 };
 pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
@@ -313,14 +314,9 @@ pub trait ProcessBackend: Send + Sync {
         self.send_text(id, "\u{1b}").await
     }
 
-    /// Subscribe to the typed event stream. Stream ends when session
-    /// ends. The refcount + FIFO bookkeeping (F56) is internalized
-    /// inside the impl (audit delta 10).
-    ///
-    /// **W1 status**: `TmuxBackend::subscribe` returns an error pointing
-    /// to W2. The existing `ccteam-web::pty::PtyRegistry` continues to
-    /// own the `pipe-pane` refcount relay for V0.8. W2 ports the
-    /// registry into `TmuxBackend` and exposes only the stream.
+    /// Subscribe to the typed event stream. Stream ends when the session
+    /// ends. `TmuxBackend` owns the refcounted `pipe-pane` FIFO relay under
+    /// the canonical `state/pty` root; callers only consume this stream.
     async fn subscribe(&self, id: &MuxSessionId) -> Result<MuxEventStream>;
 
     /// Register a regex pattern for daemon-side matching. Once

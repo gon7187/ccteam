@@ -436,8 +436,8 @@ fn sigterm_emits_full_graceful_shutdown_telemetry() {
     // tearing down state non-cooperatively — a CLAUDE.md §三 violation
     // adjacent to "永不主动 kill 长 session".
     assert!(
-        merged.contains("SIGTERM received"),
-        "F163 retro telemetry: expected 'SIGTERM received' line; got:\n{merged}",
+        merged.contains("получен SIGTERM"),
+        "F163 retro telemetry: expected 'получен SIGTERM' line; got:\n{merged}",
     );
     assert!(
         merged.contains("graceful shutdown complete"),

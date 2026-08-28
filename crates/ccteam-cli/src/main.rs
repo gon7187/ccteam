@@ -734,6 +734,17 @@ fn main() -> Result<()> {
                     },
                 )?;
                 print!("{report}");
+                // Best-effort must not mean fail-open (same decision as
+                // `doctor --repair-progress`): a post-ACK cleanup that could not
+                // complete leaves ccteam state on disk, so a scripted
+                // `project rm … && …` must stop. Code 2 is distinct from the
+                // code-1 "removal refused / nothing committed" failures so a
+                // wrapper can tell a half-finished sweep from a no-op.
+                // A preview mutates nothing, so it can never leave a
+                // half-finished sweep: never exit 2 for `--dry-run`.
+                if !report.dry_run && !report.cleanup_failures.is_empty() {
+                    std::process::exit(2);
+                }
                 Ok(())
             }
             ProjectCommand::Stop { slug } => {
@@ -1158,13 +1169,16 @@ fn run_experience(cmd: ExperienceCommand) -> Result<()> {
                 anyhow::bail!("проект не найден: {slug} ({})", project_dir.display());
             }
             let progress = paths.progress_jsonl(&slug);
-            let progress_arg = progress.exists().then_some(progress.as_path());
+            let progress_arg = (progress.exists()
+                || ccteam_harness::execution::progress_bridge::progress_archive_path(&progress)
+                    .exists())
+            .then_some(progress.as_path());
             let (turns, verdicts) = ccteam_harness::execution::experience::rebuild_experience(
                 &project_dir,
                 progress_arg,
             )?;
             println!(
-                "Индекс опыта для {slug} пересобран: ответов {turns}, сохранено вердиктов {verdicts} → {}",
+                "Индекс опыта для {slug} пересобран: ответов {turns}, проецировано вердиктов {verdicts} → {}",
                 ccteam_harness::execution::experience::experience_jsonl_path(&project_dir)
                     .display()
             );
@@ -1287,13 +1301,20 @@ fn run_doctor(opts: commands::DoctorOptions) -> Result<()> {
         }
         return Ok(());
     }
+    // The repair sweep is per-slug best effort, but a slug it could not sweep
+    // must never look like a clean run: print the whole report, then let the
+    // failure count feed the exit code so scripted `--repair-progress && …`
+    // flows stop instead of proceeding over an unswept home.
+    let mut repair_failed = 0_u64;
     if opts.repair_progress {
-        print!("{}", doctor::repair_progress(&paths)?);
+        let (body, failed) = doctor::repair_progress(&paths)?;
+        print!("{body}");
+        repair_failed = failed;
     }
     // Any other invocation is the full readiness checkup.
     let (body, any_fail) = doctor::run_readiness_checkup(&paths);
     print!("{body}");
-    if any_fail {
+    if any_fail || repair_failed > 0 {
         std::process::exit(1);
     }
     Ok(())

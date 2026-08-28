@@ -336,7 +336,9 @@ fn aggregate_status(app: &AppState) -> StatusResponse {
     };
 
     // ── cost: sum each project's 24h cost + merge the per-vendor breakdown. ──
-    let projects = ccteam_core::queries::collect_projects(&app.paths).unwrap_or_default();
+    // Already on a blocking thread (`StatusSingleflight` computes under
+    // `spawn_blocking`), so the blocking half of the accessor is the right one.
+    let projects = app.collect_projects_blocking().unwrap_or_default();
     let mut projections = projects
         .iter()
         .map(|project| {

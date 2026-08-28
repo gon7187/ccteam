@@ -14,9 +14,20 @@ import type {
   SessionEvent,
   SessionEventOption,
 } from "../hooks/useSessionEvents";
-import type { OutboundAttachmentRef, SessionHistoryEvent } from "../lib/sessionsApi";
+import type {
+  OutboundAttachmentRef,
+  SessionHistoryEvent,
+  TurnVerdictRecord,
+} from "../lib/sessionsApi";
 
-export type RowKind = "user" | "assistant" | "tool" | "system" | "approval" | "activity";
+export type RowKind =
+  | "user"
+  | "assistant"
+  | "tool"
+  | "system"
+  | "error"
+  | "approval"
+  | "activity";
 
 /** One rendered transcript row. `approval` rows carry the W2 ChoicePrompt
  *  options (`{label, id}`) so ChatConsole can render clickable
@@ -35,6 +46,15 @@ export interface TranscriptRow {
   /** Project asset references only; rendering constructs a fixed same-origin
    * URL from `id` and never accepts a URL or byte payload from this state. */
   attachments?: OutboundAttachmentRef[];
+  /** Completed mirrored assistant turn identity. Live-only rows omit it until
+   * the authoritative history refresh lands. */
+  turnId?: string;
+  /** Canonical terminal result. Verdict UI is valid only for `completed`. */
+  outcome?: string;
+  /** Failure category retained for diagnostics without treating it as prose. */
+  errorKind?: string;
+  /** Latest human verdict from authoritative history. */
+  verdict?: TurnVerdictRecord;
   /** Approval-only: the options to render as buttons (`{label, id}`). */
   options?: SessionEventOption[];
   /** Approval-only: the pending-resolution token the resolve POST carries
@@ -277,6 +297,19 @@ export function historyToRows(events: SessionHistoryEvent[]): TranscriptRow[] {
     if (ev.user) {
       rows.push({ id: `${ev.turn_id}-u`, kind: "user", content: ev.user, ts: ev.ts });
     }
+    if (ev.outcome === "failed") {
+      const fallback = ev.error_kind ? `Turn failed (${ev.error_kind})` : "Turn failed";
+      rows.push({
+        id: `${ev.turn_id}-error`,
+        kind: "error",
+        content: ev.error?.trim() || ev.assistant || fallback,
+        ts: ev.ts,
+        turnId: ev.turn_id,
+        outcome: ev.outcome,
+        ...(ev.error_kind ? { errorKind: ev.error_kind } : {}),
+      });
+      continue;
+    }
     if (ev.assistant || (ev.attachments && ev.attachments.length > 0)) {
       rows.push({
         id: `${ev.turn_id}-a`,
@@ -284,10 +317,136 @@ export function historyToRows(events: SessionHistoryEvent[]): TranscriptRow[] {
         content: ev.assistant,
         ts: ev.ts,
         attachments: ev.attachments,
+        turnId: ev.turn_id,
+        ...(ev.outcome ? { outcome: ev.outcome } : {}),
+        ...(ev.outcome === "completed" && ev.verdict ? { verdict: ev.verdict } : {}),
       });
     }
   }
   return rows;
+}
+
+function transcriptSignature(
+  content: string,
+  attachments?: OutboundAttachmentRef[],
+): string {
+  return JSON.stringify([
+    content,
+    (attachments ?? []).map((attachment) => attachment.id),
+  ]);
+}
+
+function assistantSignature(row: TranscriptRow): string {
+  return transcriptSignature(row.content, row.attachments);
+}
+
+type AuthoritativeTerminalRow = TranscriptRow & { turnId: string };
+
+interface AuthoritativeTurn {
+  row: AuthoritativeTerminalRow;
+  signatures: Set<string>;
+}
+
+function applyAuthoritativeTurn(
+  row: TranscriptRow,
+  source: AuthoritativeTerminalRow,
+): TranscriptRow {
+  if (source.kind === "error") {
+    return {
+      id: row.id,
+      kind: "error",
+      content: source.content,
+      ts: row.ts ?? source.ts,
+      turnId: source.turnId,
+      outcome: "failed",
+      ...(source.errorKind ? { errorKind: source.errorKind } : {}),
+    };
+  }
+
+  const verdict = source.verdict ?? row.verdict;
+  const ts = row.ts ?? source.ts;
+  const outcome = source.outcome ?? row.outcome;
+  return {
+    ...row,
+    turnId: source.turnId,
+    ts,
+    ...(outcome ? { outcome } : {}),
+    ...(verdict ? { verdict } : {}),
+  };
+}
+
+/** Overlay authoritative terminal turn state onto live assistant rows without
+ * replacing transient activity/system rows. Live SSE answers intentionally
+ * have no canonical turn id; a history refresh supplies it and can also
+ * replace a provisional answer with the canonical failed/error row. Matching
+ * runs newest-first so repeated identical answers bind to the latest turn. */
+export function mergeAuthoritativeTurnMetadata(
+  rows: TranscriptRow[],
+  events: SessionHistoryEvent[],
+): TranscriptRow[] {
+  const authoritative: AuthoritativeTurn[] = [];
+  for (const event of events) {
+    const terminal = historyToRows([event]).find(
+      (row): row is AuthoritativeTerminalRow =>
+        (row.kind === "assistant" || row.kind === "error")
+        && typeof row.turnId === "string",
+    );
+    if (!terminal) continue;
+    const signatures = new Set([assistantSignature(terminal)]);
+    if (terminal.kind === "error") {
+      // A live SSE answer carries the provider's partial assistant content,
+      // while authoritative failed history renders the readable error. Either
+      // exact representation may be the provisional row we need to replace.
+      signatures.add(transcriptSignature(event.assistant, event.attachments));
+    }
+    authoritative.push({ row: terminal, signatures });
+  }
+  if (authoritative.length === 0) return rows;
+
+  const byTurnId = new Map(authoritative.map((turn) => [turn.row.turnId, turn.row]));
+  const claimed = new Set<string>();
+  let changed = false;
+  const next = rows.map((row) => {
+    if ((row.kind !== "assistant" && row.kind !== "error") || !row.turnId) return row;
+    claimed.add(row.turnId);
+    const source = byTurnId.get(row.turnId);
+    if (!source) return row;
+    const merged = applyAuthoritativeTurn(row, source);
+    if (
+      merged.kind === row.kind
+      && merged.content === row.content
+      && merged.ts === row.ts
+      && merged.outcome === row.outcome
+      && merged.errorKind === row.errorKind
+      && merged.verdict === row.verdict
+    ) return row;
+    changed = true;
+    return merged;
+  });
+
+  let authoritativeCursor = authoritative.length - 1;
+  for (let index = next.length - 1; index >= 0; index -= 1) {
+    const row = next[index];
+    if (!row || row.kind !== "assistant" || row.turnId) continue;
+    const signature = assistantSignature(row);
+    for (let candidateIndex = authoritativeCursor; candidateIndex >= 0; candidateIndex -= 1) {
+      const candidate = authoritative[candidateIndex];
+      if (
+        !candidate
+        || claimed.has(candidate.row.turnId)
+        || !candidate.signatures.has(signature)
+      ) {
+        continue;
+      }
+      next[index] = applyAuthoritativeTurn(row, candidate.row);
+      claimed.add(candidate.row.turnId);
+      authoritativeCursor = candidateIndex - 1;
+      changed = true;
+      break;
+    }
+  }
+
+  return changed ? next : rows;
 }
 
 /** Load a sid's persisted transcript from localStorage. Returns `[]` on

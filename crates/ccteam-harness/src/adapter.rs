@@ -671,7 +671,10 @@ pub enum ThreadEvent {
     ItemCompleted {
         item: ThreadItem,
     },
-    Error(ThreadErrorEvent),
+    /// Nonterminal adapter/transport diagnostic. This never closes, fails, or
+    /// accounts a turn; terminal failures must use `TurnFailed` with an
+    /// explicit canonical turn id.
+    Diagnostic(ThreadErrorEvent),
 }
 
 /// v8.1 neutral event name. This is intentionally an alias for the
@@ -1002,6 +1005,18 @@ pub struct ThreadStatus {
     pub goal: Option<GoalStatus>,
 }
 
+/// What an adapter can prove after an explicit interrupt request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptOutcome {
+    /// The vendor acknowledged interruption of a concrete active turn.
+    Interrupted,
+    /// The adapter proved that no turn was active when asked.
+    AlreadyIdle,
+    /// The cancellation signal was sent, but the transport provides no
+    /// acknowledgement that a concrete turn stopped.
+    Requested,
+}
+
 /// Account-level usage / rate-limits (Claude `get_usage` control_request; Codex
 /// equivalent), vendor-agnostic. Surfaced in the IM `/status` operator
 /// dashboard. This is the ACCOUNT's state (5-hour + weekly windows + extra
@@ -1173,7 +1188,7 @@ pub enum ThreadItemDetails {
     Error(String),
 }
 
-/// Error payload on [`ThreadEvent::TurnFailed`] / [`ThreadEvent::Error`].
+/// Error payload on [`ThreadEvent::TurnFailed`] / [`ThreadEvent::Diagnostic`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadErrorEvent {
     pub kind: String,
@@ -1485,7 +1500,7 @@ pub trait HarnessAdapter: Send + Sync {
     /// WARN-only. The default impl is an honest [`HarnessError::NotImplemented`]
     /// so an adapter without an interrupt mechanism degrades cleanly (the
     /// gateway surfaces the reason) instead of silently doing nothing.
-    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
         let _ = h;
         Err(HarnessError::NotImplemented {
             reason: format!(
@@ -1561,6 +1576,38 @@ pub trait HarnessAdapter: Send + Sync {
 // HarnessError — F107 adds NotImplemented{reason:String} (dynamic)
 // =====================================================================
 
+/// Capability axis that a vendor explicitly rejected while starting a
+/// session. This is deliberately tiny: callers may branch on these stable
+/// facts, while every transport/auth/quota/internal failure remains generic
+/// and fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessCapability {
+    Vendor,
+    Model,
+    Effort,
+}
+
+impl HarnessCapability {
+    /// Stable wire code used by the HTTP API.
+    pub const fn error_code(self) -> &'static str {
+        match self {
+            Self::Vendor => "vendor_unavailable",
+            Self::Model => "model_unavailable",
+            Self::Effort => "effort_unavailable",
+        }
+    }
+}
+
+impl std::fmt::Display for HarnessCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Vendor => "vendor",
+            Self::Model => "model",
+            Self::Effort => "effort",
+        })
+    }
+}
+
 /// Error type returned by every fallible [`HarnessAdapter`] surface.
 ///
 /// V0.6.0 F107 drops the old `&'static str` constraint on
@@ -1569,6 +1616,14 @@ pub trait HarnessAdapter: Send + Sync {
 /// dynamic message naming which wave will fill the gap.
 #[derive(Debug, Error)]
 pub enum HarnessError {
+    /// The vendor explicitly cannot satisfy one requested spawn capability.
+    /// This is the only spawn failure safe for callers to use as a fallback
+    /// signal; generic [`Self::SpawnFailed`] remains deliberately untyped.
+    #[error("{capability} unavailable: {detail}")]
+    CapabilityUnavailable {
+        capability: HarnessCapability,
+        detail: String,
+    },
     /// JSON parse / shape mismatch on the harness state channel.
     #[error("snapshot ingest failed: {0}")]
     IngestFailed(String),
@@ -1586,18 +1641,31 @@ pub enum HarnessError {
     /// Generic submit failure (turn rejected by the harness).
     #[error("submit failed: {0}")]
     SubmitFailed(String),
-    /// The thread's underlying process / channel has died and the turn was
-    /// **not** delivered — distinct from [`Self::SubmitFailed`] (a turn the
-    /// harness actively *rejected*, which must NOT be blindly retried). The
-    /// caller may resume-by-session-id and retry EXACTLY once; because nothing
-    /// was sent, the retry cannot double-submit. stream-json returns this when
-    /// its `claude` child has exited (registry miss / writer closed) before the
-    /// line was handed off.
+    /// The adapter proved that no write/request was attempted because the
+    /// thread was absent before dispatch. This is the ONLY submit error on
+    /// which a caller may resume-by-session-id and retry automatically.
+    #[error("thread unavailable before dispatch: {0}")]
+    ThreadUnavailableBeforeDispatch(String),
+    /// The thread's underlying process / channel died at or after a
+    /// write/request boundary. Delivery is ambiguous: the remote may have
+    /// accepted the turn before the local transport observed the failure, so
+    /// callers must never retry it blindly.
     #[error("thread died: {0}")]
     ThreadDied(String),
     /// Unrecoverable IO error (filesystem reservation, etc.).
     #[error("io error: {0}")]
     Io(String),
+}
+
+impl HarnessError {
+    /// Stable code only for an explicitly classified spawn capability.
+    /// Every other harness failure intentionally has no fallback signal.
+    pub const fn capability_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::CapabilityUnavailable { capability, .. } => Some(capability.error_code()),
+            _ => None,
+        }
+    }
 }
 
 impl From<std::io::Error> for HarnessError {

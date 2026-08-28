@@ -29,6 +29,8 @@ import { MemoryRouter } from "react-router-dom";
 
 import HomeView, { NewProjectFields } from "./HomeView";
 import type { HostSummary } from "../lib/hostsApi";
+import { completeHomeLaunch, createAndSubmitHomeTurn } from "../lib/playbooks";
+import { toastBus } from "../lib/toastBus";
 
 function render() {
   return renderToString(
@@ -159,7 +161,7 @@ describe("HomeView (landing page)", () => {
     for (const id of ["commander", "advisor", "crossreview", "bakeoff", "triangulate", "pyramid"]) {
       expect(html).toContain(`data-testid="tpl-${id}"`);
     }
-    expect(html).toContain("总控-工班");
+    expect(html).toContain("指挥官");
     expect(html).toContain("主力-顾问");
     expect(html).toContain("交叉互审");
     expect(html).toContain("并行竞标");
@@ -183,14 +185,15 @@ describe("HomeView (landing page)", () => {
     for (const vendor of ["claude", "codex", "grok", "kimi", "opencode"]) {
       expect(grid).toContain(`data-vendor="${vendor}"`);
     }
-    // The 总控-工班 flagship fields the claude brain + codex/grok crews.
+    // The commander fields the Claude brain + Codex crews.
     const commander = grid.slice(
       grid.indexOf('data-testid="tpl-commander"'),
       grid.indexOf('data-testid="tpl-advisor"'),
     );
-    for (const vendor of ["claude", "codex", "grok"]) {
+    for (const vendor of ["claude", "codex"]) {
       expect(commander).toContain(`data-vendor="${vendor}"`);
     }
+    expect(commander).not.toContain('data-vendor="grok"');
     // 金字塔用工 leads cheap (kimi/opencode) and escalates to claude.
     const pyramid = grid.slice(grid.indexOf('data-testid="tpl-pyramid"'));
     for (const vendor of ["kimi", "opencode", "claude"]) {
@@ -211,7 +214,7 @@ describe("HomeView (landing page)", () => {
       </MemoryRouter>,
     );
     expect(html).toContain("Quick start");
-    expect(html).toContain("Commander + crews");
+    expect(html).toContain("Commander");
     expect(html).toContain("Driver + advisor");
     expect(html).toContain("Cross review");
     expect(html).toContain("Pyramid staffing");
@@ -234,5 +237,459 @@ describe("HomeView (landing page)", () => {
     );
     expect(html).toContain('data-testid="home-view"');
     expect(html).toContain('data-testid="tpl-commander"');
+  });
+
+  it("retries a failed Commander bootstrap once through the best installed Codex posture", async () => {
+    const createSession = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error("会话启动失败: invalid reasoning effort `max`"), {
+          status: 422,
+          errorCode: "EFFORT_UNAVAILABLE",
+        }),
+      )
+      .mockResolvedValueOnce({ sid: "s42" });
+    const submit = vi.fn().mockResolvedValue(undefined);
+    const prompt = "Commander prompt with the user's concrete task";
+
+    await expect(
+      createAndSubmitHomeTurn(
+        {
+          slug: "ccteam",
+          options: {
+            role: "",
+            vendor: "claude",
+            permission_mode: "skip",
+            protocol: "stream-json",
+            model: "opus",
+            effort: "max",
+          },
+          text: prompt,
+          attachments: [],
+          commander: true,
+          installedVendors: ["claude", "codex"],
+          catalog: {
+            codex: {
+              models: [{ id: "gpt-5.6-codex", efforts: ["low", "high", "xhigh"] }],
+              efforts: ["low", "medium", "high", "xhigh"],
+            },
+          },
+        },
+        { createSession, submitTurn: submit },
+      ),
+    ).resolves.toEqual({
+      sid: "s42",
+      vendor: "codex",
+      model: "gpt-5.6-codex",
+      effort: "xhigh",
+      fallback: true,
+    });
+
+    expect(createSession).toHaveBeenCalledTimes(2);
+    expect(createSession.mock.calls[0]).toEqual([
+      "ccteam",
+      {
+        role: "",
+        vendor: "claude",
+        permission_mode: "skip",
+        protocol: "stream-json",
+        model: "opus",
+        effort: "max",
+      },
+    ]);
+    expect(createSession.mock.calls[1]).toEqual([
+      "ccteam",
+      {
+        role: "",
+        vendor: "codex",
+        permission_mode: "skip",
+        protocol: "stream-json",
+        model: "gpt-5.6-codex",
+        effort: "xhigh",
+      },
+    ]);
+    expect(submit).toHaveBeenCalledOnce();
+    expect(submit).toHaveBeenCalledWith("s42", prompt, []);
+  });
+
+  it("starts Commander directly on the best confirmed Codex posture when Claude is absent", async () => {
+    const createSession = vi.fn().mockResolvedValue({ sid: "s43" });
+    const submit = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      createAndSubmitHomeTurn(
+        {
+          slug: "ccteam",
+          // This is the generic host-normalized posture HomeView currently
+          // derives before the Commander policy gets a say.
+          options: {
+            role: "",
+            vendor: "codex",
+            permission_mode: "skip",
+            protocol: "stream-json",
+          },
+          text: "task",
+          attachments: [],
+          commander: true,
+          installedVendors: ["codex"],
+          catalog: {
+            codex: {
+              models: [{ id: "gpt-5.6-codex", efforts: ["low", "high", "xhigh"] }],
+              efforts: ["low", "medium", "high", "xhigh"],
+            },
+          },
+        },
+        { createSession, submitTurn: submit },
+      ),
+    ).resolves.toEqual({
+      sid: "s43",
+      vendor: "codex",
+      model: "gpt-5.6-codex",
+      effort: "xhigh",
+      fallback: true,
+    });
+
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(createSession).toHaveBeenCalledWith("ccteam", {
+      role: "",
+      vendor: "codex",
+      permission_mode: "skip",
+      protocol: "stream-json",
+      model: "gpt-5.6-codex",
+      effort: "xhigh",
+    });
+    expect(submit).toHaveBeenCalledWith("s43", "task", []);
+  });
+
+  it("launches Commander at the highest Opus effort advertised by the live catalog", async () => {
+    const createSession = vi.fn().mockResolvedValue({ sid: "s44" });
+    const submit = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      createAndSubmitHomeTurn(
+        {
+          slug: "ccteam",
+          options: {
+            role: "",
+            vendor: "claude",
+            permission_mode: "skip",
+            protocol: "stream-json",
+            model: "opus",
+            effort: "max",
+          },
+          text: "task",
+          attachments: [],
+          commander: true,
+          installedVendors: ["claude", "codex"],
+          catalog: {
+            claude: {
+              models: [{ id: "opus", efforts: ["low", "high"] }],
+              efforts: ["low", "medium", "high", "max"],
+            },
+          },
+        },
+        { createSession, submitTurn: submit },
+      ),
+    ).resolves.toEqual({
+      sid: "s44",
+      vendor: "claude",
+      model: "opus",
+      effort: "high",
+      fallback: false,
+    });
+
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(createSession).toHaveBeenCalledWith("ccteam", {
+      role: "",
+      vendor: "claude",
+      permission_mode: "skip",
+      protocol: "stream-json",
+      model: "opus",
+      effort: "high",
+    });
+    expect(submit).toHaveBeenCalledWith("s44", "task", []);
+  });
+
+  it("does not apply a cold Opus effort when the live catalog observed only other models", async () => {
+    const createSession = vi.fn().mockResolvedValue({ sid: "s45" });
+    const submit = vi.fn().mockResolvedValue(undefined);
+
+    await createAndSubmitHomeTurn(
+      {
+        slug: "ccteam",
+        options: {
+          role: "",
+          vendor: "claude",
+          permission_mode: "skip",
+          protocol: "stream-json",
+          model: "opus",
+          effort: "max",
+        },
+        text: "task",
+        attachments: [],
+        commander: true,
+        installedVendors: ["claude", "codex"],
+        catalog: {
+          claude: {
+            models: [{ id: "sonnet", efforts: ["low", "high", "max"] }],
+            efforts: ["low", "medium", "high", "max"],
+          },
+        },
+      },
+      { createSession, submitTurn: submit },
+    );
+
+    expect(createSession).toHaveBeenCalledWith("ccteam", {
+      role: "",
+      vendor: "claude",
+      permission_mode: "skip",
+      protocol: "stream-json",
+      model: "opus",
+    });
+  });
+
+  it("retains the unavailable Commander error instead of launching an unrelated Grok lead", async () => {
+    const unavailable = new Error("Claude executable not found");
+    const createSession = vi.fn().mockRejectedValue(unavailable);
+    const submit = vi.fn();
+
+    await expect(
+      createAndSubmitHomeTurn(
+        {
+          slug: "ccteam",
+          // Generic host normalization would otherwise turn Commander into
+          // Grok merely because Grok is the first installed vendor.
+          options: {
+            role: "",
+            vendor: "grok",
+            permission_mode: "skip",
+            protocol: "acp",
+          },
+          text: "task",
+          attachments: [],
+          commander: true,
+          installedVendors: ["grok"],
+          catalog: {},
+        },
+        { createSession, submitTurn: submit },
+      ),
+    ).rejects.toBe(unavailable);
+
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(createSession).toHaveBeenCalledWith("ccteam", {
+      role: "",
+      vendor: "claude",
+      permission_mode: "skip",
+      protocol: "stream-json",
+      model: "opus",
+      effort: "max",
+    });
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("does not blindly retry Commander auth, network, ACL, or general failures", async () => {
+    for (const message of [
+      "UNAUTHENTICATED",
+      "network: connection failed",
+      "network failure: model opus is unavailable",
+      "HTTP 403: project is not visible",
+      "HTTP 429: model opus is unavailable",
+      "HTTP 500: model opus is unavailable",
+      "provider overloaded: model opus is unavailable",
+      "request timed out while creating the session",
+      "quota exceeded: model opus is unavailable",
+      "budget guard rejected spawn: model opus is unavailable",
+      "delegation depth limit reached: model opus is unavailable",
+      "delegation cycle detected: model opus is unavailable",
+      "会话启动失败: internal state corrupt",
+    ]) {
+      const createSession = vi.fn().mockRejectedValue(new Error(message));
+      const submit = vi.fn();
+      await expect(
+        createAndSubmitHomeTurn(
+          {
+            slug: "ccteam",
+            options: {
+              role: "",
+              vendor: "claude",
+              permission_mode: "skip",
+              protocol: "stream-json",
+              model: "opus",
+              effort: "max",
+            },
+            text: "task",
+            attachments: [],
+          commander: true,
+          installedVendors: ["claude", "codex"],
+          catalog: {},
+          },
+          { createSession, submitTurn: submit },
+        ),
+      ).rejects.toThrow(message);
+      expect(createSession).toHaveBeenCalledOnce();
+      expect(submit).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not retry the fallback create itself and preserves both sanitized causes", async () => {
+    const createSession = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error("invalid model `opus`\nBearer primary-secret"), {
+          status: 422,
+          errorCode: "MODEL_UNAVAILABLE",
+        }),
+      )
+      .mockRejectedValueOnce(new Error("codex start failed\u0000 token=fallback-secret"));
+    const submit = vi.fn();
+    const failure = await createAndSubmitHomeTurn(
+      {
+        slug: "ccteam",
+        options: {
+          role: "",
+          vendor: "claude",
+          protocol: "stream-json",
+          model: "opus",
+          effort: "max",
+        },
+        text: "task",
+        attachments: [],
+        commander: true,
+        installedVendors: ["claude", "codex"],
+        catalog: {},
+      },
+      { createSession, submitTurn: submit },
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    const message = (failure as Error).message;
+    expect(message).toContain("primary: invalid model `opus` Bearer [redacted]");
+    expect(message).toContain("fallback: codex start failed token=[redacted]");
+    expect(message).not.toContain("primary-secret");
+    expect(message).not.toContain("fallback-secret");
+    expect(message).not.toContain("\n");
+    expect(createSession).toHaveBeenCalledTimes(2);
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("redacts auth headers, cookies, and named credentials from both launch causes", async () => {
+    const createSession = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(
+          new Error(
+            "invalid model `opus`\naccess_token=access-secret password=hunter2 secret=shared-secret\n"
+            + '{"access_token":"json-access","password":"json-pass","secret":"json-secret","cookie":"json-cookie","set-cookie":"json-set-cookie"}',
+          ),
+          { status: 422, errorCode: "MODEL_UNAVAILABLE" },
+        ),
+      )
+      .mockRejectedValueOnce(
+        new Error(
+          "codex start failed\nAuthorization: Basic YmFzaWMtc2VjcmV0\nCookie: sid=cookie-secret; theme=dark\nSet-Cookie: refresh=set-cookie-secret; HttpOnly",
+        ),
+      );
+    const failure = await createAndSubmitHomeTurn(
+      {
+        slug: "ccteam",
+        options: {
+          role: "",
+          vendor: "claude",
+          protocol: "stream-json",
+          model: "opus",
+          effort: "max",
+        },
+        text: "task",
+        attachments: [],
+        commander: true,
+        installedVendors: ["claude", "codex"],
+        catalog: {},
+      },
+      { createSession, submitTurn: vi.fn() },
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    const message = (failure as Error).message;
+    expect(message).toContain("primary: invalid model `opus`");
+    expect(message).toContain("fallback: codex start failed");
+    for (const label of [
+      "access_token=[redacted]",
+      "password=[redacted]",
+      "secret=[redacted]",
+      "Authorization: [redacted]",
+      "Cookie: [redacted]",
+      "Set-Cookie: [redacted]",
+    ]) {
+      expect(message).toContain(label);
+    }
+    for (const secret of [
+      "access-secret",
+      "hunter2",
+      "shared-secret",
+      "json-access",
+      "json-pass",
+      "json-secret",
+      "json-cookie",
+      "json-set-cookie",
+      "YmFzaWMtc2VjcmV0",
+      "cookie-secret",
+      "set-cookie-secret",
+    ]) {
+      expect(message).not.toContain(secret);
+    }
+  });
+
+  it("surfaces the actual successful posture before navigating", () => {
+    const info = vi.fn();
+    const onLaunched = vi.fn();
+    toastBus.handler = { push: vi.fn(), error: vi.fn(), info };
+    try {
+      completeHomeLaunch(
+        {
+          sid: "s42",
+          vendor: "codex",
+          model: "gpt-5.6-codex",
+          effort: "xhigh",
+          fallback: true,
+        },
+        "en",
+        info,
+        onLaunched,
+      );
+      expect(info).toHaveBeenCalledWith(
+        "Launched s42 · codex · gpt-5.6-codex · xhigh · Commander fallback",
+      );
+      expect(onLaunched).toHaveBeenCalledWith("s42");
+    } finally {
+      toastBus.handler = null;
+    }
+  });
+
+  it("still returns the original non-capability error object without a retry", async () => {
+    const original = new Error("HTTP 403: project is not visible");
+    const createSession = vi.fn().mockRejectedValue(original);
+    const submit = vi.fn();
+    await expect(
+      createAndSubmitHomeTurn(
+        {
+          slug: "ccteam",
+          options: {
+            role: "",
+            vendor: "claude",
+            protocol: "stream-json",
+            model: "opus",
+            effort: "max",
+          },
+          text: "task",
+          attachments: [],
+          commander: true,
+          installedVendors: ["claude", "codex"],
+          catalog: {},
+        },
+        { createSession, submitTurn: submit },
+      ),
+    ).rejects.toBe(original);
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(submit).not.toHaveBeenCalled();
   });
 });

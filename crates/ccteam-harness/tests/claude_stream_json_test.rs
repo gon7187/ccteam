@@ -21,8 +21,8 @@ use ccteam_harness::execution::claude_stream_json::ClaudeStreamJsonAdapter;
 use ccteam_harness::execution::transcript_tail::anthropic_project_dir;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ChoiceSelection, Directive, DirectiveOutcome, ExecutionMode,
-    HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent, ThreadItemDetails,
-    TurnInput,
+    HarnessAdapter, HarnessError, InterruptOutcome, PermissionMode, SpawnCtx, ThreadEvent,
+    ThreadItemDetails, TurnInput,
 };
 use futures::StreamExt;
 use serial_test::serial;
@@ -932,6 +932,7 @@ async fn interrupt_turn_sends_control_request_and_keeps_session() {
     setup(tmp.path());
     let ctl_log = tmp.path().join("ctl.log");
     std::env::set_var("FAKE_SJ_CTL_LOG", &ctl_log);
+    std::env::set_var("FAKE_SJ_NO_RESULT", "1");
     let adapter = ClaudeStreamJsonAdapter::new();
     let handle = adapter
         .start_thread(
@@ -943,11 +944,33 @@ async fn interrupt_turn_sends_control_request_and_keeps_session() {
         .await
         .expect("start_thread");
 
-    // Interrupt the (notional) running turn → success.
-    adapter
+    // A live but idle session is not proof that a vendor turn exists. Do not
+    // send an interrupt request that could acknowledge the wrong epoch.
+    let idle = adapter
+        .interrupt_turn(&handle)
+        .await
+        .expect("idle interrupt classification");
+    assert_eq!(idle, InterruptOutcome::AlreadyIdle);
+    assert!(
+        std::fs::read_to_string(&ctl_log)
+            .unwrap_or_default()
+            .is_empty(),
+        "an idle session must not receive an interrupt control request"
+    );
+
+    // Start a real turn. The fake emits an assistant event but deliberately
+    // withholds its result, leaving the adapter's canonical active-turn bit set.
+    let _turn = adapter
+        .submit_turn(&handle, TurnInput::UserText("keep-running".into()))
+        .await
+        .expect("submit active turn");
+
+    // Interrupt the proven running turn → success.
+    let interrupted = adapter
         .interrupt_turn(&handle)
         .await
         .expect("interrupt_turn must succeed on a live session");
+    assert_eq!(interrupted, InterruptOutcome::Interrupted);
 
     // The fake recorded an `interrupt` control_request subtype — proves the
     // out-of-band control line was actually sent (not a no-op).
@@ -979,6 +1002,7 @@ async fn interrupt_turn_sends_control_request_and_keeps_session() {
     assert_eq!(st.model.as_deref(), Some("claude-opus-4-8[1m]"));
 
     std::env::remove_var("FAKE_SJ_CTL_LOG");
+    std::env::remove_var("FAKE_SJ_NO_RESULT");
     adapter.close_thread(&handle).await.unwrap();
 }
 

@@ -149,6 +149,31 @@ impl SessionPrincipals {
         }
     }
 
+    /// Forget only the exact credential that a cancelled spawn reserved.
+    /// A retry may already have replaced the same sid with a fresh secret by
+    /// the time asynchronous cleanup runs; that replacement must survive.
+    pub fn forget_if_secret(&self, sid: &str, expected_secret: &str) -> bool {
+        let removed = self
+            .inner
+            .write()
+            .map(|mut map| {
+                let matches = map.get(sid).is_some_and(|principal| {
+                    ccteam_core::session_secret::ct_eq(&principal.secret, expected_secret)
+                });
+                if matches {
+                    map.remove(sid);
+                }
+                matches
+            })
+            .unwrap_or(false);
+        if removed {
+            if let Ok(mut used) = self.used.write() {
+                used.remove(sid);
+            }
+        }
+        removed
+    }
+
     /// Has this sid's principal ever authenticated a request?
     ///
     /// `false` after the session has had a chance to build its tool face means
@@ -266,6 +291,18 @@ mod tests {
             !may_invoke_tools(m.state),
             "a session that does not exist yet must not be able to act"
         );
+    }
+
+    #[test]
+    fn conditional_forget_cannot_erase_a_replacement_principal() {
+        let reg = SessionPrincipals::new();
+        reg.reserve("s1", "old", "alpha", "worker", 0);
+        reg.reserve("s1", "new", "alpha", "worker", 0);
+
+        assert!(!reg.forget_if_secret("s1", "old"));
+        assert!(reg.verify("s1", "new").is_some());
+        assert!(reg.forget_if_secret("s1", "new"));
+        assert!(reg.verify("s1", "new").is_none());
     }
 
     #[test]

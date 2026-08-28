@@ -148,7 +148,7 @@ fn bare_doctor_renders_the_readiness_contract() {
     let sb = sandbox();
     let (stdout, _code) = run_bare_doctor(&sb);
     for expected in [
-        "ccteam doctor — readiness checkup",
+        "ccteam doctor — проверка готовности",
         "claude",
         "codex",
         "grok",
@@ -160,7 +160,7 @@ fn bare_doctor_renders_the_readiness_contract() {
         "version",
         "pricing",
         "home",
-        "summary:",
+        "сводка:",
     ] {
         assert!(
             stdout.contains(expected),
@@ -200,7 +200,7 @@ fn dsh_auth_check_reads_dual_credential_sources() {
     // Neither source present → Fail with both fixes named.
     let (stdout, code) = run_bare_doctor(&sb);
     assert!(
-        agent_row(&stdout, "dsh").contains("auth missing"),
+        agent_row(&stdout, "dsh").contains("нет авторизации"),
         "no DEEPSEEK_API_KEY and no mirrored credentials must read as missing auth: {stdout}"
     );
     assert!(
@@ -215,7 +215,9 @@ fn dsh_auth_check_reads_dual_credential_sources() {
     std::fs::write(sb.dsh_home.join(".credentials.yaml"), "api_key: sk-test\n").unwrap();
     let (stdout, _code) = run_bare_doctor(&sb);
     assert!(
-        agent_row(&stdout, "dsh").contains("auth ok (source: dsh credentials, mirrored at spawn)"),
+        agent_row(&stdout, "dsh").contains(
+            "авторизация пройдена (источник: учётные данные dsh, копируются при запуске)"
+        ),
         "mirrored credentials alone must Pass with their source named: {stdout}"
     );
 
@@ -227,7 +229,7 @@ fn dsh_auth_check_reads_dual_credential_sources() {
         .expect("spawn ccteam doctor");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(
-        agent_row(&stdout, "dsh").contains("auth ok (source: env)"),
+        agent_row(&stdout, "dsh").contains("авторизация пройдена (источник: env)"),
         "env must win over a present mirrored file: {stdout}"
     );
 }
@@ -259,7 +261,7 @@ fn doctor_warns_for_legacy_project_skill_entity_without_failing() {
 
     let (stdout, code) = run_bare_doctor(&sb);
     assert!(
-        stdout.contains("projects\n  [WARN] skills")
+        stdout.contains("проекты\n  [WARN] skills")
             && stdout.contains("legacy-project")
             && stdout.contains("ccteam skill migrate-project"),
         "doctor must emit one migration advisory line. stdout:\n{stdout}"
@@ -286,12 +288,14 @@ fn bare_doctor_warns_when_claude_mcp_is_not_registered() {
         "expected one WARN claude row. stdout:\n{stdout}",
     );
     assert!(
-        stdout.contains("auto-registers at `ccteam daemon start` (or `ccteam config mcp`)"),
+        stdout.contains(
+            "MCP не зарегистрирован — регистрируется автоматически через `ccteam daemon start` (или `ccteam config mcp`)"
+        ),
         "WARN row should explain daemon-start self-healing. stdout:\n{stdout}",
     );
     assert_eq!(code, 0, "MCP advisory must exit 0. stdout:\n{stdout}");
     assert!(
-        stdout.contains("READY (WARN is informational, not blocking)"),
+        stdout.contains("ГОТОВО (WARN носит информационный характер)"),
         "summary should stay READY. stdout:\n{stdout}",
     );
 }
@@ -317,7 +321,7 @@ fn bare_doctor_warns_when_the_claude_entry_still_carries_the_admin_token() {
 
     let (stdout, code) = run_bare_doctor(&sb);
     assert!(
-        agent_row(&stdout, "claude").contains("MCP not registered"),
+        agent_row(&stdout, "claude").contains("MCP не зарегистрирован"),
         "legacy admin-token entry must read as not registered. stdout:\n{stdout}",
     );
     assert_eq!(code, 0, "MCP advisory must exit 0. stdout:\n{stdout}");
@@ -338,7 +342,7 @@ fn codex_config_created_by_mcp_registration_does_not_impersonate_login() {
     let first_stdout = String::from_utf8_lossy(&first.stdout);
     assert!(first.status.success());
     assert!(agent_row(&first_stdout, "codex")
-        .contains("auth missing — run `codex login` or set OPENAI_API_KEY"));
+        .contains("нет авторизации — выполните `codex login` или задайте OPENAI_API_KEY"));
 
     std::fs::write(sb.codex_home.join("auth.json"), "{}").unwrap();
     let second = doctor_command(&sb)
@@ -347,7 +351,7 @@ fn codex_config_created_by_mcp_registration_does_not_impersonate_login() {
         .expect("doctor with authenticated codex");
     let second_stdout = String::from_utf8_lossy(&second.stdout);
     assert!(second.status.success());
-    assert!(agent_row(&second_stdout, "codex").contains("auth ok"));
+    assert!(agent_row(&second_stdout, "codex").contains("авторизация пройдена"));
 }
 
 #[test]
@@ -370,7 +374,7 @@ fn bare_doctor_fails_when_claude_binary_is_not_resolvable() {
         stdout.contains("[FAIL] claude"),
         "expected a FAIL claude row. stdout:\n{stdout}",
     );
-    assert!(stdout.contains("NOT READY (fix the FAIL lines above)"));
+    assert!(stdout.contains("НЕ ГОТОВО (исправьте строки FAIL выше)"));
     assert_eq!(
         out.status.code().unwrap_or(-1),
         1,
@@ -390,7 +394,7 @@ fn bare_doctor_fails_when_claude_version_probe_exits_nonzero() {
     assert_eq!(output.status.code(), Some(1));
     let row = agent_row(&stdout, "claude");
     assert!(row.contains("[FAIL]"));
-    assert!(row.contains("--version` failed (exit 1)"));
+    assert!(row.contains("--version` завершилась ошибкой (код выхода 1)"));
 }
 
 #[test]
@@ -414,12 +418,13 @@ fn bare_doctor_exits_zero_when_claude_binary_and_mcp_are_both_ok() {
 
     let (stdout, code) = run_bare_doctor(&sb);
     assert!(
-        stdout.contains("[PASS] claude") && stdout.contains("auth ok · MCP registered"),
+        stdout.contains("[PASS] claude")
+            && stdout.contains("авторизация пройдена · MCP зарегистрирован"),
         "expected one consolidated PASS claude row. stdout:\n{stdout}",
     );
     assert_eq!(code, 0, "no critical check should FAIL. stdout:\n{stdout}");
     assert!(
-        stdout.contains("READY"),
+        stdout.contains("ГОТОВО"),
         "summary should say READY. stdout:\n{stdout}",
     );
 }
@@ -430,7 +435,7 @@ fn daemon_down_start_hint_is_the_last_non_empty_line() {
     let (stdout, _) = run_bare_doctor(&sb);
     assert_eq!(
         stdout.lines().rfind(|line| !line.is_empty()),
-        Some("daemon not running — start it:  ccteam daemon start")
+        Some("демон не запущен — запустите:  ccteam daemon start")
     );
 }
 

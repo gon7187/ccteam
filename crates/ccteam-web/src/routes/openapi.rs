@@ -263,6 +263,7 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         ))
         .routes(routes!(super::sessions_api::handle_session_status))
         .routes(routes!(super::sessions_api::handle_session_turn))
+        .routes(routes!(super::sessions_api::handle_turn_verdict))
         .routes(routes!(
             super::sessions_api::handle_list_scheduled,
             super::sessions_api::handle_create_scheduled

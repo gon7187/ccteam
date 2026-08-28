@@ -44,6 +44,9 @@ use super::turns_mirror::chat_dir;
 /// File name of the body record under the session's chat dir.
 pub const BODY_FILENAME: &str = "body.json";
 
+const BODY_ENV_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
+const BODY_ENV_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 /// The environment variable every managed spawn sets on its body (see each
 /// adapter's env builder). On Linux the probe cross-checks it in
 /// `/proc/<pid>/environ` as a second, independent proof of identity.
@@ -159,20 +162,29 @@ pub fn probe(project_dir: &Path, sid: &str) -> BodyProbe {
 /// Re-verify a known record against the OS (the watcher's poll). Same proof
 /// as [`probe`] without the disk read.
 pub fn body_is_alive(body: &SessionBody, sid: &str) -> bool {
-    if !process_exists(body.pid) || process_is_zombie(body.pid) {
-        return false;
-    }
-    match process_fingerprint(body.pid) {
-        Ok(now) if now == body.fingerprint => {}
-        _ => return false,
-    }
-    match environ_names_sid(body.pid, sid) {
-        // Readable and it names another sid (or none): a recycled pid that
-        // happens to share the fingerprint resolution — not ours.
-        Some(false) => false,
-        // Readable and ours, or not inspectable on this platform/pid (the
-        // fingerprint already proved the incarnation).
-        _ => true,
+    body_is_alive_with_environ(body, sid, environ_sid_state)
+}
+
+fn body_is_alive_with_environ(
+    body: &SessionBody,
+    sid: &str,
+    mut inspect_environ: impl FnMut(u32, &str) -> SidEnvironment,
+) -> bool {
+    let deadline = Instant::now() + BODY_ENV_SETTLE_TIMEOUT;
+    loop {
+        if !process_exists(body.pid) || process_is_zombie(body.pid) {
+            return false;
+        }
+        match process_fingerprint(body.pid) {
+            Ok(now) if now == body.fingerprint => {}
+            _ => return false,
+        }
+        match inspect_environ(body.pid, sid) {
+            SidEnvironment::Expected | SidEnvironment::Unavailable => return true,
+            SidEnvironment::Other => return false,
+            SidEnvironment::Absent if Instant::now() >= deadline => return false,
+            SidEnvironment::Absent => std::thread::sleep(BODY_ENV_SETTLE_POLL_INTERVAL),
+        }
     }
 }
 
@@ -329,32 +341,57 @@ fn process_is_zombie(_pid: u32) -> bool {
     false
 }
 
-/// Linux: does `/proc/<pid>/environ` carry `CCTEAM_CHAT_SID=<sid>`?
-/// `None` = not inspectable (no /proc, unreadable, zombie/exec'd away).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidEnvironment {
+    Expected,
+    Other,
+    Absent,
+    Unavailable,
+}
+
+/// Linux: classify `CCTEAM_CHAT_SID` in `/proc/<pid>/environ`.
 #[cfg(target_os = "linux")]
-fn environ_names_sid(pid: u32, sid: &str) -> Option<bool> {
-    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+fn environ_sid_state(pid: u32, sid: &str) -> SidEnvironment {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        return SidEnvironment::Unavailable;
+    };
     if raw.is_empty() {
         // A zombie or a process that dropped its environment: nothing to
         // cross-check against.
-        return None;
+        return SidEnvironment::Unavailable;
     }
-    let needle = format!("{BODY_SID_ENV}={sid}");
-    Some(
-        raw.split(|b| *b == 0)
-            .any(|entry| entry == needle.as_bytes()),
-    )
+    let prefix = format!("{BODY_SID_ENV}=");
+    let expected = format!("{prefix}{sid}");
+    match raw
+        .split(|b| *b == 0)
+        .find(|entry| entry.starts_with(prefix.as_bytes()))
+    {
+        Some(entry) if entry == expected.as_bytes() => SidEnvironment::Expected,
+        Some(_) => SidEnvironment::Other,
+        None => SidEnvironment::Absent,
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn environ_names_sid(_pid: u32, _sid: &str) -> Option<bool> {
-    None
+fn environ_sid_state(_pid: u32, _sid: &str) -> SidEnvironment {
+    SidEnvironment::Unavailable
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::process::{Command, Stdio};
+
+    fn current_process_body() -> SessionBody {
+        let pid = std::process::id();
+        SessionBody {
+            pid,
+            fingerprint: process_fingerprint(pid).expect("fingerprint current test process"),
+            adapter: "test".to_string(),
+            recorded_at: String::new(),
+        }
+    }
 
     fn spawn_sleep(sid: &str) -> std::process::Child {
         Command::new("sleep")
@@ -425,6 +462,39 @@ mod tests {
         assert!(matches!(probe(tmp.path(), "s9"), BodyProbe::Alive(_)));
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn pre_exec_absent_sid_settles_to_expected_sid() {
+        let body = current_process_body();
+        let reads = Cell::new(0);
+
+        assert!(body_is_alive_with_environ(&body, "s13", |_, _| {
+            let read = reads.get();
+            reads.set(read + 1);
+            if read == 0 {
+                SidEnvironment::Absent
+            } else {
+                SidEnvironment::Expected
+            }
+        }));
+        assert_eq!(
+            reads.get(),
+            2,
+            "the absent pre-exec environment was retried"
+        );
+    }
+
+    #[test]
+    fn explicit_other_sid_is_not_retried() {
+        let body = current_process_body();
+        let reads = Cell::new(0);
+
+        assert!(!body_is_alive_with_environ(&body, "s14", |_, _| {
+            reads.set(reads.get() + 1);
+            SidEnvironment::Other
+        }));
+        assert_eq!(reads.get(), 1, "an explicit other sid is conclusive");
     }
 
     #[test]

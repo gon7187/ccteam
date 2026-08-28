@@ -63,9 +63,9 @@ use crate::execution::progress_bridge::{
 };
 use crate::execution::session_meta::read_session_meta;
 use crate::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
-    SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId,
-    TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage,
+    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, InterruptOutcome,
+    PermissionMode, SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
+    ThreadItemDetails, TurnId, TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage,
 };
 use crate::{
     ChoiceOption, ChoicePrompt, ChoiceSelection, ContextSource, ContextUsage, Directive,
@@ -1950,10 +1950,10 @@ impl HarnessAdapter for CodexAppServerAdapter {
         let adapter_bridge = self.clone();
         let thread_id = h.identity.clone();
         // Build a futures stream by chaining: (1) one-shot setup that
-        // either yields an Error event or returns a broadcast receiver,
+        // either yields a Diagnostic event or returns a broadcast receiver,
         // then (2) the receiver-driven event flow with thread-id
         // filtering. If we can't get a client yet, surface a single
-        // Error event and stop — orchestrator's progress.jsonl poller
+        // Diagnostic event and stop — orchestrator's progress.jsonl poller
         // remains the state-transition SoT (Wave 1 contract).
         let setup = async move {
             match adapter_setup.client().await {
@@ -1972,14 +1972,14 @@ impl HarnessAdapter for CodexAppServerAdapter {
                     // F122: connect failures still bridge to progress.jsonl
                     // when a bridge ctx is registered (e.g. a test that
                     // registers manually and then drops the peer). Fire
-                    // a best-effort write before yielding the Error event.
+                    // a best-effort write before yielding the diagnostic.
                     let adapter_for_err = adapter_bridge.clone();
                     let wanted = thread_id.clone();
                     let err_for_evt = err.clone();
                     let s = stream::once(async move {
                         if let Some(ctx) = adapter_for_err.bridge_for(&wanted).await {
                             if let Some(line) = build_progress_line(
-                                &ThreadEvent::Error(err_for_evt.clone()),
+                                &ThreadEvent::Diagnostic(err_for_evt.clone()),
                                 &wanted,
                                 &ctx,
                             ) {
@@ -1987,7 +1987,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
                             }
                             adapter_for_err.drop_bridge(&wanted).await;
                         }
-                        ThreadEvent::Error(err_for_evt)
+                        ThreadEvent::Diagnostic(err_for_evt)
                     });
                     s.boxed()
                 }
@@ -2309,14 +2309,14 @@ impl HarnessAdapter for CodexAppServerAdapter {
     /// leaves the thread alive: no `thread/archive`, no unsubscribe. No active
     /// turn → a clean no-op (nothing to interrupt), never an error — so a
     /// gateway `/interrupt` on an idle codex session is harmless.
-    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
         let active = self
             .tracker_snapshot(&h.identity)
             .await
             .and_then(|t| t.active_turn);
         let Some(turn_id) = active else {
             // No in-flight turn — nothing to stop. Idempotent success.
-            return Ok(());
+            return Ok(InterruptOutcome::AlreadyIdle);
         };
         let client = self.client().await?;
         client
@@ -2326,7 +2326,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
             )
             .await
             .map_err(|e| HarnessError::SubmitFailed(format!("turn/interrupt: {e:#}")))?;
-        Ok(())
+        Ok(InterruptOutcome::Interrupted)
     }
 
     /// Codex's title surface is the `thread/name/set` RPC (`thread.rs:660`) —
@@ -3291,16 +3291,7 @@ pub fn build_progress_line(
             &err.kind,
             &err.message,
         )),
-        ThreadEvent::Error(err) => Some(build_agent_done_errored_event(
-            &ctx.role,
-            &ctx.sid,
-            &ctx.slug,
-            "codex",
-            thread_id,
-            None,
-            &err.kind,
-            &err.message,
-        )),
+        ThreadEvent::Diagnostic(_) => None,
         ThreadEvent::ThreadStarted { .. }
         | ThreadEvent::TurnStarted { .. }
         | ThreadEvent::ItemStarted { .. }
@@ -3316,7 +3307,7 @@ pub fn build_progress_line(
 fn is_terminal_progress(evt: &ThreadEvent) -> bool {
     matches!(
         evt,
-        ThreadEvent::TurnCompleted { .. } | ThreadEvent::TurnFailed { .. } | ThreadEvent::Error(_)
+        ThreadEvent::TurnCompleted { .. } | ThreadEvent::TurnFailed { .. }
     )
 }
 
@@ -4173,6 +4164,24 @@ mod tests {
         .unwrap();
         assert_eq!(progress["status"], "errored");
         assert_eq!(progress["error_kind"], "server_overloaded");
+    }
+
+    #[test]
+    fn setup_diagnostic_is_not_terminal_progress_or_phantom_agent_done() {
+        let event = ThreadEvent::Diagnostic(ThreadErrorEvent {
+            kind: "connect".into(),
+            message: "app-server unavailable".into(),
+        });
+        let ctx = ProgressBridgeCtx {
+            progress_path: PathBuf::new(),
+            role: "worker".into(),
+            sid: "s1".into(),
+            slug: "demo".into(),
+            model: None,
+        };
+
+        assert!(!is_terminal_progress(&event));
+        assert!(build_progress_line(&event, "thread-1", &ctx).is_none());
     }
 
     #[test]

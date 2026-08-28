@@ -114,6 +114,7 @@ fn stop_emits_chat_turn_completed_with_usage() {
     let stdin = json!({
         "hook_event_name": "Stop",
         "session_id": "sess-3",
+        "ccteam_sid": "s3",
         "cwd": project_dir.to_string_lossy(),
         "last_assistant_message": "all done",
     });
@@ -125,6 +126,7 @@ fn stop_emits_chat_turn_completed_with_usage() {
     let rows = read_jsonl(&progress);
     let row = rows.last().unwrap();
     assert_eq!(row["event"], "chat_turn_completed");
+    assert_eq!(row["sid"], "s3");
     assert!(row["usage"].is_object());
     std::env::remove_var("CCTEAM_CHAT_ROLE");
 }

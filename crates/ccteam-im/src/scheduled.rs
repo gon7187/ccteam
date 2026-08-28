@@ -24,12 +24,18 @@ pub const MAX_PENDING_PER_SID: usize = 20;
 pub const MAX_PENDING_VISIBLE: usize = 100;
 
 /// Lifecycle of a stored scheduled message. Successful fires and cancellations
-/// are removed; only pending and short-lived failures remain on disk.
+/// are removed; a durable dispatching fence closes the crash window between
+/// vendor acceptance and terminal queue persistence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduledStatus {
     /// Waiting for `send_at`.
     Pending,
+    /// Vendor dispatch may already have happened. This state is persisted
+    /// before crossing the submit boundary and is never automatically retried
+    /// after a daemon restart. It remains an explicit unknown outcome requiring
+    /// manual reconciliation; `Failed` is reserved for proven rejection.
+    Dispatching,
     /// Dispatch failed; retained for 24 hours or until cancelled.
     Failed,
 }
@@ -51,7 +57,7 @@ pub struct ScheduledItem {
     pub created_at: DateTime<Utc>,
     /// Human owner tag (`channel:chat_id` / `user:<tenant>`).
     pub created_by: String,
-    /// Pending or failed.
+    /// Pending, dispatching (outcome not yet terminal), or failed.
     pub status: ScheduledStatus,
     /// Human-readable dispatch failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,6 +81,50 @@ impl ScheduledItem {
             && self
                 .failed_at
                 .is_some_and(|failed_at| now.signed_duration_since(failed_at) >= FAILED_RETENTION)
+    }
+
+    /// Reserve a pending row before any vendor call. This is the only legal
+    /// transition into the ambiguous/unknown state.
+    pub fn begin_dispatch(&self) -> Result<Self> {
+        if self.status != ScheduledStatus::Pending {
+            anyhow::bail!("scheduled row {} is not pending", self.id);
+        }
+        let mut next = self.clone();
+        next.status = ScheduledStatus::Dispatching;
+        next.fail_reason = Some(
+            "Отправка начата; при аварийном перезапуске автоматический повтор отключён".to_string(),
+        );
+        next.failed_at = None;
+        Ok(next)
+    }
+
+    /// Record a proven rejection. `Dispatching -> Failed` is legal only when
+    /// the caller has typed proof that the vendor dispatch boundary was not
+    /// crossed; the state module deliberately cannot infer that from strings.
+    pub fn fail_proven(&self, reason: String, now: DateTime<Utc>) -> Result<Self> {
+        if !matches!(
+            self.status,
+            ScheduledStatus::Pending | ScheduledStatus::Dispatching
+        ) {
+            anyhow::bail!("scheduled row {} cannot fail from this state", self.id);
+        }
+        let mut next = self.clone();
+        next.status = ScheduledStatus::Failed;
+        next.fail_reason = Some(reason);
+        next.failed_at = Some(now);
+        Ok(next)
+    }
+
+    /// Preserve an ambiguous result as `Dispatching`; this must never create a
+    /// retryable row.
+    pub fn keep_unknown(&self, reason: String) -> Result<Self> {
+        if self.status != ScheduledStatus::Dispatching {
+            anyhow::bail!("scheduled row {} is not dispatching", self.id);
+        }
+        let mut next = self.clone();
+        next.fail_reason = Some(reason);
+        next.failed_at = None;
+        Ok(next)
     }
 }
 

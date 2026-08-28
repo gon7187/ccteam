@@ -720,14 +720,19 @@ pub fn translate_jsonl_event(v: &Value, turn_id: &TurnId) -> Vec<ThreadEvent> {
             };
             vec![evt]
         }
-        "error" => vec![ThreadEvent::Error(ThreadErrorEvent {
-            kind: "codex_error".into(),
-            message: v
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("(no message)")
-                .to_string(),
-        })],
+        "error" => vec![ThreadEvent::TurnFailed {
+            turn_id: turn_id.0.clone(),
+            err: ThreadErrorEvent {
+                kind: "codex_error".into(),
+                message: v
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("(no message)")
+                    .to_string(),
+            },
+            usage: UnifiedTokenUsage::default(),
+            model: None,
+        }],
         // V0.6.3 F144 — forward-compat: a `codex exec --json` event
         // `type` we don't translate is **skipped** (empty event vec) so
         // the stream keeps flowing for the events we *do* understand.

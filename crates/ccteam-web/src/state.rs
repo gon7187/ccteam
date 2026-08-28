@@ -13,10 +13,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ccteam_core::CcteamPaths;
+use ccteam_core::{CcteamPaths, ProjectSummary};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
-use crate::auth::AuthState;
+use crate::auth::{AuthState, Identity};
 use crate::chat_protocol::{WebChannelMessage, WebSendMessage};
 use crate::pty::PtyRegistry;
 
@@ -202,6 +202,52 @@ impl AppState {
             vendor_quotas: Arc::new(crate::routes::vendor_quota::VendorQuotaService::default()),
             status_singleflight: crate::routes::status::StatusSingleflight::default(),
         }
+    }
+
+    /// The ONE place in `ccteam-web` allowed to call
+    /// `ccteam_core::collect_projects`.
+    ///
+    /// The catalog walk takes the stable per-project progress lock (shared,
+    /// but still blocked by any exclusive writer — a live `mark_progress_retired`
+    /// during a retire, or a progress append) plus config/registry file reads.
+    /// Run inline on an async handler it parks a tokio worker inside `flock`;
+    /// with as many such requests in flight as the runtime has workers, the
+    /// whole HTTP surface stalls — including the `DELETE /api/v1/projects/{slug}`
+    /// that would release the lock. Sync (non-async) callers already run on a
+    /// blocking thread and use this directly; every async caller must go
+    /// through [`AppState::collect_projects`] instead.
+    ///
+    /// `tests/collect_projects_gate_test.rs` enforces that no other module
+    /// reaches for the core function, so a new handler cannot regress the
+    /// hazard back in.
+    pub(crate) fn collect_projects_blocking(&self) -> anyhow::Result<Vec<ProjectSummary>> {
+        ccteam_core::collect_projects(&self.paths)
+    }
+
+    /// Async-safe catalog walk: owns the `spawn_blocking` so no handler has to
+    /// remember it. A join failure is reported as an error, never a silent
+    /// empty catalog.
+    pub(crate) async fn collect_projects(&self) -> anyhow::Result<Vec<ProjectSummary>> {
+        let app = self.clone();
+        tokio::task::spawn_blocking(move || app.collect_projects_blocking())
+            .await
+            .unwrap_or_else(|err| Err(anyhow::anyhow!("project collect worker failed: {err}")))
+    }
+
+    /// Slugs `identity` may see, off the async workers. Best-effort by design:
+    /// a collect failure degrades to "no projects visible" (fail-closed) rather
+    /// than failing the caller — the callers are overview/hint surfaces.
+    pub(crate) async fn visible_project_slugs(&self, identity: &Identity) -> Vec<String> {
+        self.collect_projects()
+            .await
+            .map(|summaries| {
+                summaries
+                    .into_iter()
+                    .filter(|s| identity.can_see_owner(s.state.owner.as_deref()))
+                    .map(|s| s.state.slug)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn with_dsh_web(mut self, supervisor: Arc<crate::dsh_web::DshWebSupervisor>) -> Self {

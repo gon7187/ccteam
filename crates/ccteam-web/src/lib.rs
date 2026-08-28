@@ -319,6 +319,11 @@ where
     }
 
     let state = build_state(paths, auth_state).with_dsh_web(std::sync::Arc::clone(&supervisor));
+    // Verdict GET/PUT reads a compact projection. Complete the one-time
+    // checkpoint/index upgrade for every catalog project before Axum accepts a
+    // request, so a cold post-upgrade request never scans a 64 MiB journal (or
+    // races the background hydration and returns a transient 500).
+    hydrate_progress_before_serving(&state).await?;
     let app = router_with_state(state.clone());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown_task = tokio::spawn(async move {
@@ -360,6 +365,22 @@ where
             .context("DSH web companion serve loop terminated with error")?;
     }
     supervisor.shutdown_all().await;
+    Ok(())
+}
+
+async fn hydrate_progress_before_serving(state: &AppState) -> Result<()> {
+    let hydration_state = state.clone();
+    let hydration_projection = std::sync::Arc::clone(&state.progress_projection);
+    tokio::task::spawn_blocking(move || {
+        let slugs = hydration_state
+            .collect_projects_blocking()?
+            .into_iter()
+            .map(|project| project.state.slug)
+            .collect::<Vec<_>>();
+        hydration_projection.hydrate_now(&slugs)
+    })
+    .await
+    .context("join progress projection startup hydration")??;
     Ok(())
 }
 
@@ -449,6 +470,52 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn startup_hydration_materializes_legacy_verdict_index_before_serving() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join(".ccteam"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let state_path = paths.project_state("demo");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&ccteam_core::ProjectState::initial("demo".into())).unwrap(),
+        )
+        .unwrap();
+        let progress = paths.progress_jsonl("demo");
+        std::fs::create_dir_all(progress.parent().unwrap()).unwrap();
+        let archive = ccteam_harness::execution::progress_bridge::progress_archive_path(&progress);
+        std::fs::write(
+            archive,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "event": "turn_verdict",
+                    "sid": "s1",
+                    "turn_id": "t1",
+                    "ts": chrono::Utc::now(),
+                    "verdict": "accept",
+                })
+            ),
+        )
+        .unwrap();
+
+        let state = AppState::new(paths.clone());
+        hydrate_progress_before_serving(&state).await.unwrap();
+        assert!(
+            ccteam_harness::execution::progress_bridge::progress_verdict_index_path(&progress)
+                .exists()
+        );
+        assert_eq!(
+            ccteam_harness::execution::progress_bridge::latest_turn_verdicts(&progress)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

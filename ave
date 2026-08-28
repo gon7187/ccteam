@@ -1,0 +1,121 @@
+                // catalog at spawn. Start it only after `/role` published the
+                // new fingerprint generation above.
+                guard.spawn_event_pump_with_fingerprints(&sid, Some(fingerprints.clone()));
+            }
+        }
+        Self::persist_latest_routing_shared(&gateway).await?;
+        Ok(sid)
+    }
+
+    /// Stop one live or detached session without holding the gateway registry
+    /// across vendor/process teardown. Frontends must apply their own ACL
+    /// before entering this sid-only lifecycle core.
+    ///
+    /// Once the session has been claimed, teardown is owned by the gateway's
+    /// cleanup tracker. Dropping the HTTP/IM request future therefore cannot
+    /// strand a half-stopped session or cancel `close_thread`.
+    pub async fn stop_session_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+    ) -> Result<()> {
+        enum StopPlan {
+            Live {
+                session: Box<GatewaySession>,
+                pump: Option<tokio::task::JoinHandle<()>>,
+            },
+            Detached(DetachedBody),
+        }
+
+        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+        let turn_claim = claims.lock_for_turn(sid).await;
+        // Submit paths use the same turn -> resume lock order.  Holding both
+        // prevents a cold/dead resume from installing a replacement body while
+        // close is in flight, which is required for a failed close to remain
+        // genuinely retryable under the original sid.
+        let resume_claim = claims.lock_for_sid(sid).await;
+        let (plan, cleanup_tasks) = {
+            let mut guard = gateway.lock().await;
+            let plan = if guard.sessions.contains_key(sid) {
+                guard.principals.forget(sid);
+                let pump = guard.event_pumps.remove(sid);
+                let removed = guard.sessions.remove(sid).expect("checked live session");
+                guard
+                    .current_session
+                    .write()
+                    .unwrap()
+                    .retain(|_, current| current != sid);
+                StopPlan::Live {
+                    session: Box::new(removed),
+                    pump,
+                }
+            } else if let Some(detached) = guard.detached.get(sid).cloned() {
+                StopPlan::Detached(detached)
+            } else {
+                return Err(anyhow!("unknown session: {sid}"));
+            };
+            (plan, guard.cleanup_tasks.clone())
+        };
+        let completion_gateway = Arc::clone(&gateway);
+        let sid = sid.to_string();
+        let completion = cleanup_tasks.spawn_result(async move {
+            let _turn_claim = turn_claim;
+            let _resume_claim = resume_claim;
+            match plan {
+                StopPlan::Live {
+                    session: removed,
+                    pump,
+                } => {
+                    let pump_join_error = if let Some(pump) = pump {
+                        pump.abort();
+                        match pump.await {
+                            Ok(()) => None,
+                            Err(error) if error.is_cancelled() => None,
+                            Err(error) => Some(error),
+                        }
+                    } else {
+                        None
+                    };
+                    if let Err(error) = removed.adapter.close_thread(&removed.thread).await {
+                        // A failed close is not a stopped session.  Keep the
+                        // handle retryable (without a pump or principal) so a
+                        // retire retry can prove teardown instead of losing
+                        // the only process handle and faking success.
+                        completion_gateway
+                            .lock()
+                            .await
+                            .sessions
+                            .entry(sid.clone())
+                            .or_insert(*removed);
+                        return match pump_join_error {
+                            Some(pump_error) => Err(anyhow!(
+                                "session {sid} close failed: {error}; event pump join also failed: {pump_error}"
+                            )),
+                            None => Err(anyhow!("session {sid} close failed: {error}")),
+                        };
+                    }
+                    let persist = Self::persist_latest_routing_shared(&completion_gateway).await;
+                    if let Some(error) = pump_join_error {
+                        return Err(anyhow!("session {sid} event pump join failed: {error}"));
+                    }
+                    persist
+                }
+                StopPlan::Detached(detached) => {
+                    let body = detached.body.clone();
+                    let terminate_sid = sid.clone();
+                    let termination = tokio::task::spawn_blocking(move || {
+                        session_body::terminate(
+                            &body,
+                            &terminate_sid,
+                            std::time::Duration::from_secs(5),
+                        )
+                    })
+                    .await
+                    .context("join body terminate")
+                    .and_then(|result| result);
+                    classify_detached_termination(termination)?;
+
+                    let mut guard = completion_gateway.lock().await;
+                    let matches = guard
+                        .detached
+                        .get(&sid)
+                        .is_some_and(|current| current.body == detached.body);

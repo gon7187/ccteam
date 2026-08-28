@@ -45,7 +45,13 @@ import {
 } from "../lib/sessionsApi";
 import { getHostDetail, getHosts, type HostDetail, type HostSummary } from "../lib/hostsApi";
 import { allowedVendorsFor, eligibleHosts } from "../lib/hostFilter";
-import { applyPlaybook, playbookFromState, PLAYBOOKS } from "../lib/playbooks";
+import {
+  applyPlaybook,
+  completeHomeLaunch,
+  createAndSubmitHomeTurn,
+  playbookFromState,
+  PLAYBOOKS,
+} from "../lib/playbooks";
 
 export interface ProjectHostIdentity {
   host: string;
@@ -211,6 +217,7 @@ export default function HomeView({
   const [hostDetails, setHostDetails] = useState<Record<string, HostDetail | null>>({});
   const [host, setHost] = useState<string>("local");
   const [draft, setDraft] = useState<ComposerDraft>(() => loadModelDraft());
+  const [pickedPlaybook, setPickedPlaybook] = useState<string | null>(null);
   // What each installed vendor actually declares (models + effort tokens);
   // `{}` until it loads / on an older daemon → the static registry answers.
   const catalog = useVendorCatalog();
@@ -227,8 +234,13 @@ export default function HomeView({
   const pickPlaybook = (id: string) => {
     const patch = applyPlaybook(id, lang);
     if (!patch) return;
+    setPickedPlaybook(id);
     setPrefill((cur) => ({ text: patch.text, nonce: cur.nonce + 1 }));
-    setDraft((cur) => switchDraftVendor(cur, patch.vendor));
+    setDraft((cur) => ({
+      ...switchDraftVendor(cur, patch.vendor),
+      ...(patch.model ? { model: patch.model } : {}),
+      ...(patch.effort ? { effort: patch.effort } : {}),
+    }));
   };
 
   // Team page 起手 CTA lands `{ state: { playbook: id } }` on `/`: apply it
@@ -376,22 +388,36 @@ export default function HomeView({
       // EVERY vendor (omitted only on the default row). The catalog guides the
       // picker but never suppresses an explicit value; the adapter verifies
       // the vendor's effective state and rejects clamps.
-      const { sid } = await apiCreateSession(slug, {
-        role,
-        vendor: effectiveDraft.vendor,
-        permission_mode: effectiveDraft.hitl ? "hitl" : "skip",
-        protocol: wireProtocol(effectiveDraft),
-        model: modelSwitchFor(effectiveDraft, catalog) ?? undefined,
-        effort: effortSwitchFor(effectiveDraft, catalog) ?? undefined,
+      return createAndSubmitHomeTurn({
+        slug,
+        options: {
+          role,
+          vendor: effectiveDraft.vendor,
+          permission_mode: effectiveDraft.hitl ? "hitl" : "skip",
+          protocol: wireProtocol(effectiveDraft),
+          model: modelSwitchFor(effectiveDraft, catalog) ?? undefined,
+          effort: effortSwitchFor(effectiveDraft, catalog) ?? undefined,
+        },
+        text,
+        attachments,
+        commander: pickedPlaybook === "commander",
+        installedVendors: hostVendors,
+        catalog,
+      }, {
+        createSession: apiCreateSession,
+        submitTurn,
       });
-      await submitTurn(sid, text, attachments);
-      return sid;
     };
     run()
-      .then((sid) => {
+      .then((receipt) => {
         setPending(false);
         cancelNewProject();
-        onLaunched(sid);
+        completeHomeLaunch(
+          receipt,
+          lang,
+          (message) => toastBus.handler?.info(message),
+          onLaunched,
+        );
       })
       .catch((e) => {
         setPending(false);

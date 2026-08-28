@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { errorDetail, httpError } from "./httpError";
+import { ApiError, errorDetail, httpError } from "./httpError";
 
 function res(status: number, body: string, ok = false): Response {
   return {
@@ -13,6 +13,22 @@ describe("httpError (the server already wrote the reason — deliver it)", () =>
   it("lifts a ccteam `{error}` body into the message", async () => {
     const e = await httpError(res(404, JSON.stringify({ error: "unknown tenant: u1" })));
     expect(e.message).toBe("HTTP 404: unknown tenant: u1");
+  });
+
+  it("preserves only a bounded machine-readable error code", async () => {
+    const typed = await httpError(res(422, JSON.stringify({
+      error: "model unavailable",
+      error_code: "model_unavailable",
+    })));
+    expect(typed).toBeInstanceOf(ApiError);
+    expect(typed.status).toBe(422);
+    expect(typed.errorCode).toBe("model_unavailable");
+
+    const unsafe = await httpError(res(422, JSON.stringify({
+      error: "model unavailable",
+      error_code: "model_unavailable\nAuthorization: Bearer secret",
+    })));
+    expect(unsafe.errorCode).toBeUndefined();
   });
 
   it("uses a plain-text body verbatim (axum extractor rejections)", async () => {

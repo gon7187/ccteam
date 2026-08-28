@@ -846,7 +846,7 @@ async fn session_new_never_sends_acp_mcp_servers_even_with_secret() {
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &spawn_ctx(&tmp, "s-new"),
+            &spawn_ctx_with_model(&tmp, "s-new"),
         ),
     )
     .await
@@ -1069,7 +1069,7 @@ async fn meta_vendor_uuid_loads_before_new() {
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &spawn_ctx(&tmp, sid),
+            &spawn_ctx_with_model(&tmp, sid),
         )
         .await
         .expect("load start");
@@ -1109,7 +1109,7 @@ async fn load_failure_falls_back_to_session_new_with_fresh_uuid() {
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &spawn_ctx(&tmp, sid),
+            &spawn_ctx_with_model(&tmp, sid),
         )
         .await
         .expect("fallback start");
@@ -1150,7 +1150,7 @@ async fn prompt_roundtrip_uses_shared_acp_turn_runner() {
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &spawn_ctx(&tmp, "s-prompt"),
+            &spawn_ctx_with_model(&tmp, "s-prompt"),
         )
         .await
         .expect("start ok");

@@ -134,7 +134,7 @@ async fn register_base_patterns_loads_claude_tier() {
 /// and assert both OutputChunk and PatternMatched arrive on the stream.
 ///
 /// Gated `#[ignore]` because it needs a real tmux AND a writable
-/// `~/.ccteam/pty` FIFO dir (the relay invokes `tmux pipe-pane "cat >>
+/// `~/.ccteam/state/pty` FIFO dir (the relay invokes `tmux pipe-pane "cat >>
 /// <fifo>"`). Run with `cargo test -p ccteam-harness -- --ignored`.
 #[tokio::test]
 #[ignore = "requires tmux on PATH + writable FIFO dir"]

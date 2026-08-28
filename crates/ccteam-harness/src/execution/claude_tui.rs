@@ -60,9 +60,9 @@ use crate::execution::transcript_tail::{
 use crate::execution::turns_mirror;
 use crate::{default_backend, MuxSessionId, MuxSessionKind, MuxSessionSpec};
 use crate::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
-    SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, TurnId, TurnInput, TurnRouting,
-    TurnSubmission,
+    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, InterruptOutcome,
+    PermissionMode, SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, TurnId, TurnInput,
+    TurnRouting, TurnSubmission,
 };
 use crate::{ChoiceOption, ChoicePrompt, Directive, DirectiveOutcome, ThreadStatus};
 
@@ -1226,7 +1226,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
     /// following `/model` etc. then drives the same session. Idempotent on a
     /// dead pane (mirrors `close_thread`): a missing session is a no-op, not an
     /// error.
-    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
         let backend = default_backend();
         let id = MuxSessionId::new(h.identity.clone());
         if !backend
@@ -1234,13 +1234,13 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             .await
             .map_err(|e| HarnessError::SubmitFailed(format!("mux exists: {e}")))?
         {
-            return Ok(());
+            return Ok(InterruptOutcome::AlreadyIdle);
         }
         backend
             .send_escape(&id)
             .await
             .map_err(|e| HarnessError::SubmitFailed(format!("send Escape (interrupt): {e}")))?;
-        Ok(())
+        Ok(InterruptOutcome::Requested)
     }
 
     /// Same vendor, same title surface as stream-json: the transcript's
@@ -1552,7 +1552,7 @@ async fn observe_marker(
     });
     if let Some(message) = user_message {
         let _ = tx
-            .send(ThreadEvent::Error(ThreadErrorEvent {
+            .send(ThreadEvent::Diagnostic(ThreadErrorEvent {
                 kind: "tail_marker_missing".to_string(),
                 message,
             }))

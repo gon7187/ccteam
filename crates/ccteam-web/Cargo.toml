@@ -33,9 +33,8 @@ ccteam-cost.workspace = true
 # V0.6.1 F139 — share the hook dispatch with the CLI so `POST
 # /internal/hook/...` runs the same code as `ccteam internal hook ...`.
 ccteam-hooks.workspace = true
-# V0.8 W1 — ProcessBackend trait for pty_ws + pane_snapshot routes.
-# pty.rs::PtyRegistry still calls `tmux pipe-pane` directly; that port
-# into `TmuxBackend::subscribe` lands in W2.
+# V0.8 W2 — ProcessBackend backs pty_ws + pane_snapshot routes.
+# `TmuxBackend` owns the `pipe-pane`/FIFO relay; web only adapts its stream.
 ccteam-harness.workspace = true
 # V0.8.6 W5b — the resource-API spine drives live sessions through the
 # IM gateway. AppState holds `Option<Arc<Mutex<Gateway>>>`; session
@@ -127,22 +126,10 @@ utoipa.workspace = true
 utoipa-axum.workspace = true
 utoipa-scalar.workspace = true
 
-# V0.3.2 F56 — WS PTY relay backend.
+# V0.3.2 F56 — WS PTY stream adapter.
 # `futures-util` is promoted from dev-dep to runtime dep so the handler
 # can use `SinkExt::send` + `StreamExt::next` on the split `WebSocket`.
-# `nix` (signal feature) is kept available for the F57 follow-up which
-# wires pause/resume into the PTY refcount semantics — F56 itself only
-# refcounts subscribers and stops `tmux pipe-pane` on the last drop.
-# `portable-pty` stays declared but unused in F56: F56 relays *tmux*
-# pane bytes via `pipe-pane` + a FIFO, so we never own a PTY pair here.
-# TODO(F57): use portable-pty if we ever spawn a private `tmux attach`
-# for stdin routing instead of `tmux send-keys`.
-portable-pty = "0.8"
 futures-util = "0.3"
-# `signal` keeps F57's planned SIGSTOP/SIGCONT path on the menu;
-# `fs` is required for `nix::sys::stat::Mode` + `nix::unistd::mkfifo`
-# (F56 uses these to create the FIFO under `~/.ccteam/pty/`).
-nix = { version = "0.29", default-features = false, features = ["signal", "fs"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -157,5 +144,4 @@ tracing-subscriber.workspace = true
 # `serial_test` serialises tmux-touching tests so concurrent
 # session_name collisions can't happen even on `cargo test -j N`.
 serial_test = "3"
-nix = { version = "0.29", default-features = false, features = ["signal", "process"] }
 flate2.workspace = true

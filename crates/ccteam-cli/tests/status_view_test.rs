@@ -257,7 +257,7 @@ fn status_classifies_nested_sessions_by_sid() {
         "project verdict must still escalate:\n{stdout}"
     );
     assert!(
-        stdout.contains("attention:") && stdout.contains(&format!("{slug} s2 stuck")),
+        stdout.contains("требует внимания:") && stdout.contains(&format!("{slug} s2 stuck")),
         "attention section must identify the stuck sid + activity:\n{stdout}"
     );
     assert!(
@@ -293,7 +293,7 @@ fn status_idle_silence_never_alarms() {
         .find(|line| line.contains(&slug) && !line.contains("session"))
         .expect("project line");
     assert!(
-        project_line.contains("OK") && project_line.contains("last-event"),
+        project_line.contains("OK") && project_line.contains("последнее-событие"),
         "idle-for-days project must stay OK:\n{stdout}"
     );
     assert!(
@@ -327,9 +327,9 @@ fn status_web_token_bare_and_url_prefixed_port_7331() {
     // `web token:` line carries BARE 64-hex, NOT a `ccteam:` prefix.
     let token_line = stdout
         .lines()
-        .find(|l| l.contains("web token:"))
+        .find(|l| l.contains("web-токен:"))
         .expect("web token line");
-    let token_val = token_line.split("web token:").nth(1).unwrap_or("").trim();
+    let token_val = token_line.split("web-токен:").nth(1).unwrap_or("").trim();
     assert!(
         is_hex64(token_val),
         "web token must be bare 64-hex, got {token_val:?}:\n{stdout}"
@@ -343,7 +343,7 @@ fn status_web_token_bare_and_url_prefixed_port_7331() {
     // it carries port 7331 + the `ccteam:`-prefixed token in the query.
     let url_line = stdout
         .lines()
-        .find(|l| l.contains("web url:"))
+        .find(|l| l.contains("web-адрес:"))
         .expect("web url line");
     assert!(
         url_line.contains(":7331/?token=ccteam:") || url_line.contains("?token=ccteam:"),

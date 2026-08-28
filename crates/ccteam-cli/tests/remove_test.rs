@@ -19,6 +19,8 @@
 //!             --purge deletes footprint + provably keeps user content
 //!   t18       `ccteam project rm --dry-run` lists stop targets, acts
 //!             on nothing
+//!   t19–t20   every durable progress sidecar/tree is previewed and removed;
+//!             re-init of the same slug cannot recover old projections
 //!
 //! All tests sandbox `HOME`, `CCTEAM_HOME`, `CCTEAM_PROJECTS_ROOT`, and
 //! `CCTEAM_CLAUDE_JOBS_DIR` so they never touch the developer's real
@@ -26,8 +28,18 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(unix)]
+use std::{
+    io::{BufRead as _, BufReader, Write as _},
+    os::unix::net::UnixListener,
+};
 
 use ccteam_core::{config, CcteamPaths, ProjectEntry, ProjectState};
+use ccteam_harness::execution::progress_bridge::{
+    append_chat_turn_completed_if_absent, append_turn_verdict_if_changed, cleanup_progress_state,
+    latest_turn_verdicts, progress_archive_path, terminal_turns_for_rebuild, TurnVerdict, Verdict,
+    CHAT_TURN_COMPLETED,
+};
 use chrono::Utc;
 use serde_json::json;
 use tempfile::TempDir;
@@ -52,6 +64,14 @@ impl Fixture {
     ///   <tmp>/jobs/                           -- `CCTEAM_CLAUDE_JOBS_DIR`
     /// Registers the slug in `~/.ccteam/config.yaml::projects[]`.
     fn new(slug: &str) -> Self {
+        Self::new_at(slug, None)
+    }
+
+    /// Same layout, but the project directory may sit OUTSIDE
+    /// `projects_root` (`dir_name = Some(..)` puts it at
+    /// `<tmp>/<dir_name>`) — the V0.4.2 arbitrary-path install, where
+    /// `projects_root/<slug>` is NOT this project's directory.
+    fn new_at(slug: &str, dir_name: Option<&str>) -> Self {
         let tmp = TempDir::new().unwrap();
         let ccteam_home = tmp.path().join("ccteam-home");
         let projects_root = tmp.path().join("projects");
@@ -59,7 +79,10 @@ impl Fixture {
         std::fs::create_dir_all(&ccteam_home).unwrap();
         std::fs::create_dir_all(&projects_root).unwrap();
         std::fs::create_dir_all(&claude_jobs_dir).unwrap();
-        let project_dir = projects_root.join(slug);
+        let project_dir = match dir_name {
+            Some(name) => tmp.path().join(name),
+            None => projects_root.join(slug),
+        };
         std::fs::create_dir_all(project_dir.join(".ccteam")).unwrap();
         std::fs::create_dir_all(project_dir.join(".claude").join("agents")).unwrap();
         // Drop a state.json so `project_dir` resolution works under
@@ -168,6 +191,104 @@ impl Fixture {
         });
         std::fs::write(&p, format!("{line}\n")).unwrap();
     }
+
+    fn owned_progress_state_paths(&self) -> Vec<PathBuf> {
+        let active = self.paths().progress_jsonl(&self.slug);
+        let parent = active.parent().unwrap().to_path_buf();
+        let slug = &self.slug;
+        let archive = progress_archive_path(&active);
+        let active_name = active.file_name().unwrap().to_string_lossy().into_owned();
+        let archive_name = archive.file_name().unwrap().to_string_lossy().into_owned();
+        let mut paths = vec![
+            active,
+            archive,
+            parent.join(format!("{slug}.checkpoint.json")),
+            parent.join(format!("{slug}.checkpoint.json.tmp")),
+            parent.join(format!("{slug}.verdicts.json")),
+            parent.join(format!("{slug}.verdicts.json.tmp")),
+            parent.join(format!("{slug}.verdicts.corrupt.json")),
+            parent.join(format!("{slug}.verdicts.corrupt.json.tmp")),
+            parent.join(format!("{slug}.terminals.jsonl")),
+            parent.join(format!("{slug}.turn-verdicts.jsonl")),
+            parent.join(format!("{slug}.terminal-keys")),
+            parent.join(format!("{slug}.verdict-keys")),
+            parent.join(format!("{active_name}.repair-tmp-fixture")),
+            parent.join(format!("{active_name}.bak-fixture")),
+            parent.join(format!("{archive_name}.repair-tmp-fixture")),
+            parent.join(format!("{archive_name}.bak-fixture")),
+        ];
+        paths.sort();
+        paths
+    }
+
+    fn seed_all_owned_progress_state(&self) -> Vec<PathBuf> {
+        let active = self.paths().progress_jsonl(&self.slug);
+        let old_terminal = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s-old",
+            "turn_id": "turn-old",
+            "ts": "2026-08-28T00:00:00Z",
+            "outcome": "completed",
+        });
+        append_chat_turn_completed_if_absent(&active, &old_terminal).unwrap();
+        append_turn_verdict_if_changed(
+            &active,
+            &TurnVerdict {
+                sid: "s-old".into(),
+                turn_id: "turn-old".into(),
+                ts: "2026-08-28T00:00:01Z".parse().unwrap(),
+                verdict: Verdict::Revise,
+                feedback: Some("old lifetime state".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            latest_turn_verdicts(&active).unwrap().len(),
+            1,
+            "fixture must expose the old verdict before removal",
+        );
+        assert_eq!(
+            terminal_turns_for_rebuild(&active).unwrap().len(),
+            1,
+            "fixture must expose the old terminal turn before removal",
+        );
+
+        let paths = self.owned_progress_state_paths();
+        for path in &paths {
+            if std::fs::symlink_metadata(path).is_ok() {
+                continue;
+            }
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-keys")
+            {
+                let receipt = path.join("ab").join("stale.json");
+                std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+                std::fs::write(receipt, b"stale receipt").unwrap();
+            } else if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("checkpoint.json.tmp")
+            {
+                // A crashed or hostile writer can leave the expected file
+                // path as a directory. Cleanup must still stay inside it.
+                std::fs::create_dir_all(path.join("nested")).unwrap();
+                std::fs::write(path.join("nested").join("state"), b"stale").unwrap();
+            } else {
+                std::fs::write(path, b"stale durable state\n").unwrap();
+            }
+        }
+        let enumerated = cleanup_progress_state(&active, true).unwrap();
+        assert_eq!(enumerated.len(), paths.len());
+        assert!(
+            paths.iter().all(|path| enumerated.contains(path)),
+            "public cleanup seam omitted seeded state"
+        );
+        enumerated
+    }
 }
 
 #[test]
@@ -195,11 +316,11 @@ fn t01_remove_dry_run_prints_only() {
         "dry-run header missing; got: {stdout}",
     );
     assert!(
-        stdout.contains("would drop config.yaml::projects entry"),
+        stdout.contains("будет удалена запись config.yaml::projects"),
         "missing config-drop preview; got: {stdout}",
     );
     assert!(
-        stdout.contains("would remove progress.jsonl"),
+        stdout.contains("будет удалён progress.jsonl"),
         "missing progress.jsonl preview; got: {stdout}",
     );
     // Filesystem must be untouched.
@@ -222,11 +343,7 @@ fn t02_remove_basic_drops_config_entry() {
     let progress = fx.paths().progress_jsonl(&fx.slug);
     assert!(progress.exists(), "fixture: progress.jsonl seeded");
 
-    let out = fx
-        .cmd()
-        .args(["project", "rm", &fx.slug])
-        .output()
-        .expect("spawn ccteam remove");
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -251,6 +368,86 @@ fn t02_remove_basic_drops_config_entry() {
         fx.project_dir.join(".ccteam").is_dir(),
         ".ccteam should survive without --purge",
     );
+}
+
+#[test]
+fn t19_project_rm_owned_progress_state_dry_run_is_complete_and_non_mutating() {
+    let fx = Fixture::new("progress-dry");
+    let state_paths = fx.seed_all_owned_progress_state();
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug, "--dry-run"])
+        .output()
+        .expect("spawn ccteam project rm --dry-run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "dry-run should succeed; stderr: {stderr}; stdout: {stdout}",
+    );
+    for path in &state_paths {
+        assert!(
+            stdout.contains(&path.display().to_string()),
+            "dry-run omitted owned progress state {}; stdout: {stdout}",
+            path.display(),
+        );
+        assert!(
+            std::fs::symlink_metadata(path).is_ok(),
+            "dry-run mutated owned progress state {}",
+            path.display(),
+        );
+    }
+}
+
+#[test]
+fn t20_project_rm_owned_progress_state_cannot_reuse_retired_slug() {
+    let fx = Fixture::new("progress-reinit");
+    let state_paths = fx.seed_all_owned_progress_state();
+    let active = fx.paths().progress_jsonl(&fx.slug);
+
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "remove should succeed; stderr: {stderr}; stdout: {stdout}",
+    );
+    for path in &state_paths {
+        assert!(
+            std::fs::symlink_metadata(path).is_err(),
+            "owned progress state survived removal: {}; stdout: {stdout}",
+            path.display(),
+        );
+        assert!(
+            stdout.contains(&path.display().to_string()),
+            "remove report omitted owned progress state {}; stdout: {stdout}",
+            path.display(),
+        );
+    }
+
+    let init = fx
+        .cmd()
+        .current_dir(&fx.project_dir)
+        .args(["init", "--slug", &fx.slug])
+        .output()
+        .expect("re-init removed slug");
+    assert!(
+        !init.status.success(),
+        "same-slug re-init must fail after permanent retirement; stdout: {}",
+        String::from_utf8_lossy(&init.stdout),
+    );
+    assert!(
+        String::from_utf8_lossy(&init.stderr).contains("permanently retired"),
+        "same-slug rejection must explain the durable retirement; stderr: {}",
+        String::from_utf8_lossy(&init.stderr),
+    );
+    assert_eq!(
+        ccteam_core::pick_unused_project_slug(&fx.ccteam_home, &fx.slug).unwrap(),
+        "progress-reinit2",
+        "automatic allocation must move to a fresh generation slug"
+    );
+    assert!(!active.exists(), "retired progress body must stay deleted");
 }
 
 #[test]
@@ -286,11 +483,7 @@ fn t03_purge_clears_ccteam_footprint_only() {
     std::fs::write(agents.join("cto.md"), "---\n---\nuser cto").unwrap();
     std::fs::write(agents.join("reviewer.md"), "---\n---\nuser role").unwrap();
 
-    let out = fx
-        .cmd()
-        .args(["project", "rm", &fx.slug, "--purge"])
-        .output()
-        .expect("spawn ccteam remove --purge");
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug, "--purge"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -371,11 +564,7 @@ fn t03b_purge_strips_chat_hooks_surgically_keeps_other_keys() {
     )
     .unwrap();
 
-    let out = fx
-        .cmd()
-        .args(["project", "rm", &fx.slug, "--purge"])
-        .output()
-        .expect("spawn ccteam remove --purge");
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug, "--purge"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -434,11 +623,7 @@ fn t03b2_purge_strips_hitl_permission_request_hook() {
     )
     .unwrap();
 
-    let out = fx
-        .cmd()
-        .args(["project", "rm", &fx.slug, "--purge"])
-        .output()
-        .expect("spawn ccteam remove --purge");
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug, "--purge"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -487,11 +672,7 @@ fn t03c_purge_deletes_settings_local_when_it_collapses_to_empty() {
     )
     .unwrap();
 
-    let out = fx
-        .cmd()
-        .args(["project", "rm", &fx.slug, "--purge"])
-        .output()
-        .expect("spawn ccteam remove --purge");
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug, "--purge"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -517,11 +698,7 @@ fn t12_project_rm_alias_drops_config_entry() {
     fx.seed_closed_progress();
     let progress = fx.paths().progress_jsonl(&fx.slug);
 
-    let out = fx
-        .cmd()
-        .args(["project", "rm", &fx.slug])
-        .output()
-        .expect("spawn ccteam project rm");
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -582,7 +759,7 @@ fn t14_project_stop_no_sessions_is_ok() {
         "project stop must succeed even with no live sessions; stderr: {stderr}",
     );
     assert!(
-        stdout.contains("stopped 0 chat sessions"),
+        stdout.contains("остановлено чат-сессий: 0"),
         "stop must report zero sessions stopped; got: {stdout}",
     );
 }
@@ -664,7 +841,7 @@ fn t15_project_stop_kills_matching_chat_sessions() {
         "sibling slug's session {sib} must NOT be killed (dash-aware slug match)",
     );
     assert!(
-        stdout.contains("stopped 2 chat sessions"),
+        stdout.contains("остановлено чат-сессий: 2"),
         "stop must report two sessions stopped; got: {stdout}",
     );
 }
@@ -694,11 +871,7 @@ fn t16_project_rm_nonpurge_keeps_project_files() {
     )
     .unwrap();
 
-    let out = fx
-        .cmd()
-        .args(["project", "rm", &fx.slug])
-        .output()
-        .expect("spawn ccteam project rm");
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -787,11 +960,7 @@ fn t17_project_rm_purge_via_group() {
     )
     .unwrap();
 
-    let out = fx
-        .cmd()
-        .args(["project", "rm", &fx.slug, "--purge"])
-        .output()
-        .expect("spawn ccteam project rm --purge");
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug, "--purge"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -895,7 +1064,7 @@ fn t18_project_rm_dry_run_lists_stop_and_acts_on_nothing() {
 
     assert!(out.status.success(), "dry-run rm should succeed");
     assert!(
-        stdout.contains(&format!("would stop chat session `{sess}`")),
+        stdout.contains(&format!("будет остановлена чат-сессия `{sess}`")),
         "dry-run must list the chat session it would stop; got: {stdout}",
     );
     assert!(
@@ -978,50 +1147,127 @@ fn t05_refuses_with_running_claude_bg() {
     );
 }
 
-/// Bind a fake MCP socket listener so daemon reachability is true for
-/// the sandbox. The returned listener must stay alive while the spawned
-/// CLI process runs.
-fn seed_daemon(fx: &Fixture) -> std::os::unix::net::UnixListener {
-    let socket = ccteam_core::daemon::daemon_socket_path(&fx.paths());
+const TEST_ADMIN_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[cfg(unix)]
+/// Fake `ccteam/project-retire` daemon.
+///
+/// `response_error` turns the reply into a JSON-RPC error;
+/// `error_marker_committed` (when `Some`) attaches the wire's
+/// `error.data.marker_committed` flag, i.e. whether the daemon had already
+/// written the durable tombstone before it failed.
+///
+/// The success path mints the tombstone for **the slug the request names**, not
+/// for the fixture's slug — that is what makes an unregistered-slug request an
+/// irreversible burn, so a test can prove the CLI never sends one.
+fn seed_retire_daemon(
+    fx: &Fixture,
+    response_error: Option<&'static str>,
+    error_marker_committed: Option<bool>,
+) -> std::thread::JoinHandle<Option<serde_json::Value>> {
+    std::fs::create_dir_all(fx.paths().web_token_path().parent().unwrap()).unwrap();
+    std::fs::write(fx.paths().web_token_path(), TEST_ADMIN_TOKEN).unwrap();
+    let socket = ccteam_core::daemon_socket_path(&fx.paths());
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-    std::os::unix::net::UnixListener::bind(socket).unwrap()
+    let listener = UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let paths = fx.paths();
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept fake retirement request: {error}"),
+            }
+        };
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let slug = request
+            .pointer("/params/arguments/slug")
+            .and_then(serde_json::Value::as_str)
+            .expect("retirement request carries a slug")
+            .to_string();
+        let progress = paths.progress_jsonl(&slug);
+        let response = if let Some(message) = response_error {
+            let mut error = json!({ "code": -32000, "message": message });
+            if let Some(committed) = error_marker_committed {
+                error["data"] = json!({ "slug": slug, "marker_committed": committed });
+            }
+            json!({
+                "jsonrpc": "2.0",
+                "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "error": error,
+            })
+        } else {
+            ccteam_harness::execution::progress_bridge::mark_progress_retired(&progress).unwrap();
+            let removed =
+                ccteam_harness::execution::progress_bridge::cleanup_retired_progress_state(
+                    &progress, false,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            json!({
+                "jsonrpc": "2.0",
+                "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "result": {
+                    "slug": slug,
+                    "sessions_stopped": ["s-test"],
+                    "progress_removed": removed,
+                },
+            })
+        };
+        let mut stream = stream;
+        writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+        Some(request)
+    })
 }
 
-/// Compute the unroster trigger path the CLI writes (mirrors
-/// `commands::unroster_trigger_path`). Shares the USER env so the test
-/// process and the spawned ccteam subprocess agree on the path.
-fn unroster_trigger(slug: &str) -> std::path::PathBuf {
-    let user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into());
-    std::path::PathBuf::from("/tmp").join(format!("ccteam-{user}.unroster.{slug}"))
+#[cfg(unix)]
+fn run_remove_with_retire_daemon(fx: &Fixture, args: &[&str]) -> std::process::Output {
+    let daemon = seed_retire_daemon(fx, None, None);
+    let output = fx
+        .cmd()
+        .args(args)
+        .output()
+        .expect("spawn ccteam project rm");
+    let request = daemon
+        .join()
+        .expect("join fake retirement daemon")
+        .unwrap_or_else(|| {
+            panic!(
+                "project rm never contacted daemon; status={}; stderr={}; stdout={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+    assert_eq!(
+        request.get("method").and_then(serde_json::Value::as_str),
+        Some("ccteam/project-retire"),
+        "mutating project rm must use the daemon retirement spine"
+    );
+    output
 }
 
-/// t07: when the daemon socket is reachable, `ccteam remove` writes the
-/// per-slug unroster trigger file and polls for it to disappear. A
-/// background "acker" thread simulates the daemon consuming the trigger.
+/// t07: the CLI requires a truthful daemon retirement acknowledgement before
+/// it drops the registry row.
 #[test]
-fn t07_remove_writes_unroster_trigger_when_daemon_alive() {
+#[cfg(unix)]
+fn t07_remove_requires_daemon_retire_ack() {
     let fx = Fixture::new("dex-ui-t07");
     fx.seed_closed_progress();
-    let _daemon = seed_daemon(&fx);
-
-    let trigger = unroster_trigger(&fx.slug);
-    // Clean up any leftover from a prior run.
-    let _ = std::fs::remove_file(&trigger);
-
-    // Background thread simulates the daemon's poll_unroster_triggers task:
-    // it watches for the trigger file and deletes it within 20ms of creation.
-    let trigger_for_thread = trigger.clone();
-    let acker = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if trigger_for_thread.exists() {
-                let _ = std::fs::remove_file(&trigger_for_thread);
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        false
-    });
+    let daemon = seed_retire_daemon(&fx, None, None);
 
     let out = fx
         .cmd()
@@ -1034,27 +1280,48 @@ fn t07_remove_writes_unroster_trigger_when_daemon_alive() {
         out.status.success(),
         "remove should succeed with daemon alive; stderr: {stderr}; stdout: {stdout}",
     );
-    let acked = acker.join().unwrap();
-    assert!(acked, "acker must have seen and deleted the trigger file");
-    assert!(
-        stdout.contains("acknowledged by daemon"),
-        "step 4 should report daemon acknowledgment; got: {stdout}",
+    let request = daemon.join().unwrap().expect("retirement request");
+    assert_eq!(
+        request
+            .pointer("/method")
+            .and_then(serde_json::Value::as_str),
+        Some("ccteam/project-retire")
     );
-    assert!(!trigger.exists(), "trigger file must be gone after remove");
+    assert_eq!(
+        request
+            .pointer("/params/arguments/slug")
+            .and_then(serde_json::Value::as_str),
+        Some(fx.slug.as_str())
+    );
+    assert_eq!(
+        request
+            .pointer("/params/arguments/_caller_admin_token")
+            .and_then(serde_json::Value::as_str),
+        Some(TEST_ADMIN_TOKEN)
+    );
+    assert!(
+        stdout.contains("подтверждено демоном") && stdout.contains("s-test"),
+        "daemon acknowledgement and stopped sid must be truthful; got: {stdout}",
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .all(|entry| entry.slug != fx.slug),
+        "config row must be removed only after ACK"
+    );
 }
 
-/// t08: when the daemon socket is reachable but nothing acks the trigger
-/// (simulates a slow/stalled daemon), `ccteam remove` times out after 5s,
-/// self-cleans the trigger file, and reports the timeout.
-///
+/// t08: a daemon-side retirement failure is fatal and leaves the registry and
+/// progress generation untouched for a safe retry.
 #[test]
-fn t08_remove_timeout_when_daemon_unresponsive() {
+#[cfg(unix)]
+fn t08_remove_fails_closed_when_daemon_rejects_retirement() {
     let fx = Fixture::new("dex-ui-t08");
     fx.seed_closed_progress();
-    let _daemon = seed_daemon(&fx);
-
-    let trigger = unroster_trigger(&fx.slug);
-    let _ = std::fs::remove_file(&trigger);
+    let progress = fx.paths().progress_jsonl(&fx.slug);
+    let daemon = seed_retire_daemon(&fx, Some("retirement drain failed"), None);
 
     let out = fx
         .cmd()
@@ -1064,16 +1331,209 @@ fn t08_remove_timeout_when_daemon_unresponsive() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
+        !out.status.success(),
+        "daemon rejection must fail the remove; stderr: {stderr}; stdout: {stdout}",
+    );
+    let _request = daemon.join().unwrap().expect("retirement request");
+    assert!(
+        stderr.contains("retirement drain failed"),
+        "daemon error must be surfaced verbatim; got: {stderr}",
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .any(|entry| entry.slug == fx.slug),
+        "config row must survive a missing ACK"
+    );
+    assert!(
+        progress.exists(),
+        "progress must survive a rejected retirement"
+    );
+}
+
+/// t21: an unregistered slug never reaches the daemon. The daemon mints an
+/// irreversible tombstone for whatever slug it is handed, so a typo must never
+/// reach it — not even under `--dry-run`. The command itself still succeeds
+/// (it degrades to a file-cleanup pass, see t24/t25), but it must leave no
+/// tombstone and touch neither the daemon nor the real project's row.
+#[test]
+#[cfg(unix)]
+fn t21_remove_never_lets_an_unregistered_slug_reach_the_daemon() {
+    let fx = Fixture::new("dex-ui-t21");
+    fx.seed_closed_progress();
+    let typo = "dex-ui-t21-typo";
+    let daemon = seed_retire_daemon(&fx, None, None);
+
+    let dry = fx
+        .cmd()
+        .args(["project", "rm", typo, "--dry-run"])
+        .output()
+        .expect("spawn ccteam project rm --dry-run");
+    assert!(
+        dry.status.success(),
+        "--dry-run on an unregistered slug must preview, not refuse; stderr: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&dry.stdout).contains("не зарегистрирован"),
+        "the preview must say the daemon retirement is skipped; stdout: {}",
+        String::from_utf8_lossy(&dry.stdout)
+    );
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", typo])
+        .output()
+        .expect("spawn ccteam project rm");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
         out.status.success(),
-        "timeout must not fail the remove; stderr: {stderr}; stdout: {stdout}",
+        "an unregistered slug degrades to a file sweep; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        stdout.contains("did not acknowledge"),
-        "timeout path must be reported; got: {stdout}",
+        stdout.contains("не зарегистрирован"),
+        "the report must say the daemon retirement was skipped; stdout: {stdout}",
+    );
+
+    // The burn we are preventing: no tombstone inode for the typo.
+    let burned = fx.paths().progress_dir().join(format!("{typo}.lock"));
+    assert!(
+        !burned.exists(),
+        "a typo must not reserve a progress generation: {}",
+        burned.display()
+    );
+    // And the daemon was never asked in the first place.
+    assert!(
+        daemon.join().expect("join fake daemon").is_none(),
+        "an unregistered slug must never reach the daemon retirement spine"
+    );
+    // The real project is untouched.
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .any(|entry| entry.slug == fx.slug),
+        "config must be untouched by a refused removal"
+    );
+}
+
+/// t22: a daemon failure that already committed the durable tombstone must be
+/// reported as such — telling the user the project survived would be a lie that
+/// hides a permanently retired generation.
+#[test]
+#[cfg(unix)]
+fn t22_remove_reports_committed_marker_from_daemon_error_data() {
+    let fx = Fixture::new("dex-ui-t22");
+    fx.seed_closed_progress();
+    let daemon = seed_retire_daemon(&fx, Some("session teardown failed"), Some(true));
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug])
+        .output()
+        .expect("spawn ccteam project rm");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a failed retirement must exit non-zero"
+    );
+    let _request = daemon.join().unwrap().expect("retirement request");
+    assert!(
+        stderr.contains("необратимо retired"),
+        "committed marker must be reported as permanent; stderr: {stderr}",
     );
     assert!(
-        !trigger.exists(),
-        "trigger must be self-cleaned after timeout",
+        stderr.contains("повторите"),
+        "the user must be told to rerun the command; stderr: {stderr}",
+    );
+    assert!(
+        stderr.contains("session teardown failed"),
+        "the daemon cause must be surfaced; stderr: {stderr}",
+    );
+    // Retrying is the documented fix, so the row must still be there.
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .any(|entry| entry.slug == fx.slug),
+        "config row must survive so the retry has something to remove"
+    );
+}
+
+/// t23: the legacy mux sweep runs AFTER the irreversible daemon ACK, so a dead
+/// mux control plane must not strand the registry row on an already-retired
+/// generation.
+#[test]
+#[cfg(unix)]
+fn t23_remove_survives_legacy_mux_failure_after_daemon_ack() {
+    let fx = Fixture::new("dex-ui-t23");
+    fx.seed_closed_progress();
+    // The rmux control socket lives at `$HOME/.ccteam/run/mux.sock`; a regular
+    // file at `$HOME/.ccteam` makes creating that parent fail with ENOTDIR, so
+    // every backend call errors deterministically (no mux binary needed).
+    std::fs::write(fx._tmp.path().join(".ccteam"), b"not a directory").unwrap();
+
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The removal still runs to its commit point (row dropped below), but the
+    // mux sweep did not complete, so the exit code is the post-ACK-cleanup
+    // code 2 — never 0, which would tell a script the teardown was clean.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a dead mux is an incomplete cleanup, not a clean run; stderr: {stderr}",
+    );
+    assert!(
+        stdout.contains("legacy чат-сессии: не удалось проверить"),
+        "the mux failure must be reported, not swallowed; stdout: {stdout}",
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .all(|entry| entry.slug != fx.slug),
+        "config row must still be dropped after the irreversible ACK"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn t08b_remove_fails_closed_when_daemon_is_offline() {
+    let fx = Fixture::new("dex-ui-t08b");
+    fx.seed_closed_progress();
+    let progress = fx.paths().progress_jsonl(&fx.slug);
+    std::fs::create_dir_all(fx.paths().web_token_path().parent().unwrap()).unwrap();
+    std::fs::write(fx.paths().web_token_path(), TEST_ADMIN_TOKEN).unwrap();
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug])
+        .output()
+        .expect("spawn ccteam remove");
+    assert!(!out.status.success(), "offline removal must fail closed");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("config не изменён"),
+        "error must state the commit point; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .any(|entry| entry.slug == fx.slug),
+        "offline removal must keep config"
+    );
+    assert!(
+        progress.exists(),
+        "offline removal must keep progress state"
     );
 }
 
@@ -1082,11 +1542,7 @@ fn t06_force_overrides_refusal() {
     let fx = Fixture::new("dex-ui");
     fx.seed_live_claude_bg("deadbeef");
 
-    let out = fx
-        .cmd()
-        .args(["project", "rm", &fx.slug, "--force"])
-        .output()
-        .expect("spawn ccteam remove --force");
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug, "--force"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1095,7 +1551,7 @@ fn t06_force_overrides_refusal() {
     );
     // Should print the "forced through guard" notice.
     assert!(
-        stdout.contains("forced through guard"),
+        stdout.contains("защита принудительно пройдена"),
         "force should still report the guard it bypassed; got: {stdout}",
     );
     // Config entry gone.
@@ -1156,11 +1612,7 @@ fn t09_purge_cleans_imd_registry_dir() {
         "fixture: state/im/registry/<slug>/ seeded"
     );
 
-    let out = fx
-        .cmd()
-        .args(["project", "rm", &fx.slug, "--purge"])
-        .output()
-        .expect("spawn ccteam remove --purge");
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug, "--purge"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1205,11 +1657,7 @@ fn t10_remove_without_purge_keeps_imd_registry() {
     let (reg_path, hb_path) = seed_imd_registry(&fx, "helper");
     let slug_dir = ccteam_im::registry_root_in(&fx.ccteam_home).join(&fx.slug);
 
-    let out = fx
-        .cmd()
-        .args(["project", "rm", &fx.slug])
-        .output()
-        .expect("spawn ccteam remove");
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1269,5 +1717,578 @@ fn t11_purge_dry_run_reports_imd_registry_count() {
     assert!(
         stdout.contains("would purge state/im/registry/dex-bot/") && stdout.contains("1 JSON file"),
         "dry-run must preview state/im/registry/<slug>/ with count; got: {stdout}",
+    );
+}
+
+/// A fake daemon that accepts the retirement request and dies without
+/// answering — the `"mcp.sock closed before responding"` shape. The tombstone
+/// is the daemon's first durable act, so this is the case where the generation
+/// is most likely already retired.
+#[cfg(unix)]
+fn seed_silent_daemon(fx: &Fixture) -> std::thread::JoinHandle<bool> {
+    std::fs::create_dir_all(fx.paths().web_token_path().parent().unwrap()).unwrap();
+    std::fs::write(fx.paths().web_token_path(), TEST_ADMIN_TOKEN).unwrap();
+    let socket = ccteam_core::daemon_socket_path(&fx.paths());
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept fake retirement request: {error}"),
+            }
+        };
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        drop(stream);
+        true
+    })
+}
+
+/// t24: `--purge` on an already-deregistered slug is the ONLY way to finish the
+/// cleanup a plain `project rm` (or a web-console delete) deliberately leaves
+/// behind. It must clean the footprint without ever contacting the daemon and
+/// without minting a tombstone for a slug that owns no generation.
+#[test]
+#[cfg(unix)]
+fn t24_purge_cleans_a_deregistered_slug_without_touching_the_daemon() {
+    let fx = Fixture::new("dex-ui-t24");
+    fx.seed_closed_progress();
+    let (reg_path, _hb) = seed_imd_registry(&fx, "helper");
+    let registry_slug_dir = ccteam_im::registry_root_in(&fx.ccteam_home).join(&fx.slug);
+    let settings = fx.project_dir.join(".claude").join("settings.local.json");
+    std::fs::write(
+        &settings,
+        r#"{
+  "permissions": {"allow": ["Bash(ls:*)"]},
+  "hooks": {
+    "SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": "/h/hook.sh chat-progress session-start"}]}]
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    // Simulate the state a previous non-purge removal (or a web delete) leaves:
+    // the row is gone, the footprint is not.
+    assert!(ccteam_core::remove_project_from_config(&fx.ccteam_home, &fx.slug).unwrap());
+    let daemon = seed_retire_daemon(&fx, None, None);
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug, "--purge"])
+        .output()
+        .expect("spawn ccteam project rm --purge");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "purge of a deregistered slug must succeed; stderr: {stderr}; stdout: {stdout}",
+    );
+    assert!(
+        stdout.contains("не зарегистрирован"),
+        "the report must say the daemon retirement was skipped; stdout: {stdout}",
+    );
+    assert!(
+        !fx.project_dir.join(".ccteam").exists(),
+        "--purge must delete <project>/.ccteam even without a registry row",
+    );
+    assert!(
+        !std::fs::read_to_string(&settings)
+            .unwrap_or_default()
+            .contains("chat-progress"),
+        "--purge must strip ccteam's hook section",
+    );
+    assert!(
+        !reg_path.exists() && !registry_slug_dir.exists(),
+        "--purge must clean state/im/registry/<slug>/",
+    );
+    // The burn we are still preventing: no tombstone for a slug that owns no
+    // generation, and no daemon contact at all.
+    let burned = fx.paths().progress_dir().join(format!("{}.lock", fx.slug));
+    assert!(
+        !burned.exists(),
+        "an unregistered slug must not reserve a progress generation: {}",
+        burned.display(),
+    );
+    assert!(
+        daemon.join().expect("join fake daemon").is_none(),
+        "an unregistered slug must never reach the daemon retirement spine",
+    );
+}
+
+/// t25: without `--purge` a deregistered slug still gets the legacy global
+/// state sweep, and `--dry-run` previews the same shape.
+#[test]
+#[cfg(unix)]
+fn t25_deregistered_slug_still_runs_the_legacy_sweep() {
+    let fx = Fixture::new("dex-ui-t25");
+    fx.seed_closed_progress();
+    let shard = fx.paths().progress_dir().join(&fx.slug);
+    let inbox = fx.paths().inbox_dir().join(&fx.slug);
+    let control = fx.paths().control_dir().join(&fx.slug);
+    for dir in [&shard, &inbox, &control] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("stale"), b"legacy").unwrap();
+    }
+    assert!(ccteam_core::remove_project_from_config(&fx.ccteam_home, &fx.slug).unwrap());
+
+    let dry = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug, "--dry-run"])
+        .output()
+        .expect("spawn ccteam project rm --dry-run");
+    let dry_stdout = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        dry.status.success(),
+        "--dry-run on a deregistered slug must preview instead of refusing; stderr: {}",
+        String::from_utf8_lossy(&dry.stderr),
+    );
+    assert!(
+        dry_stdout.contains(&shard.display().to_string()),
+        "--dry-run must preview the legacy sweep; stdout: {dry_stdout}",
+    );
+    assert!(shard.is_dir(), "--dry-run must not delete anything");
+
+    let daemon = seed_retire_daemon(&fx, None, None);
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug])
+        .output()
+        .expect("spawn ccteam project rm");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "non-purge removal of a deregistered slug must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    for dir in [&shard, &inbox, &control] {
+        assert!(
+            !dir.exists(),
+            "legacy state must be swept: {}; stdout: {stdout}",
+            dir.display(),
+        );
+    }
+    assert!(
+        fx.project_dir.join(".ccteam").is_dir(),
+        "without --purge the project footprint must survive",
+    );
+    assert!(
+        !fx.paths()
+            .progress_dir()
+            .join(format!("{}.lock", fx.slug))
+            .exists(),
+        "no tombstone may be minted for an unregistered slug",
+    );
+    assert!(
+        daemon.join().expect("join fake daemon").is_none(),
+        "an unregistered slug must never reach the daemon retirement spine",
+    );
+}
+
+/// t26: a cleanup failure AFTER the irreversible daemon ACK must never strand
+/// the registry row on an already-retired generation — the same contract t23
+/// pins for the legacy mux sweep, here for the legacy state sweep.
+#[test]
+#[cfg(unix)]
+fn t26_post_ack_cleanup_failure_still_drops_the_config_row() {
+    let fx = Fixture::new("dex-ui-t26");
+    fx.seed_closed_progress();
+    // A crashed or hostile writer can leave a path collision where the purge
+    // expects a file. Reading it fails with EISDIR — deterministically, for
+    // root too, unlike any permission-based fixture.
+    let settings = fx.project_dir.join(".claude").join("settings.local.json");
+    std::fs::create_dir_all(settings.join("collision")).unwrap();
+
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug, "--purge"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&settings.display().to_string()) && stdout.contains("не удалось завершить"),
+        "the failed cleanup must be named in the report; stdout: {stdout}",
+    );
+    assert!(
+        stdout.contains("warning:"),
+        "an incomplete cleanup must be surfaced as a warning; stdout: {stdout}",
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .all(|entry| entry.slug != fx.slug),
+        "config row must still be dropped after the irreversible ACK; stdout: {stdout}",
+    );
+}
+
+/// t27: a transport failure (daemon accepted the request, then died) must not
+/// claim the daemon rejected the retirement — the durable tombstone is the
+/// daemon's first act, so the generation may already be permanently retired.
+#[test]
+#[cfg(unix)]
+fn t27_transport_failure_reports_unknown_retirement_state() {
+    let fx = Fixture::new("dex-ui-t27");
+    fx.seed_closed_progress();
+    let daemon = seed_silent_daemon(&fx);
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug])
+        .output()
+        .expect("spawn ccteam project rm");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an unanswered retirement must fail; stdout: {}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    assert!(
+        daemon.join().expect("join fake daemon"),
+        "the request must have reached the socket",
+    );
+    assert!(
+        stderr.contains("состояние retirement неизвестно") && stderr.contains("необратимо retired"),
+        "a transport failure must report unknown state, not a rejection; stderr: {stderr}",
+    );
+    assert!(
+        stderr.contains("config не изменён"),
+        "the commit point must still be stated; stderr: {stderr}",
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .any(|entry| entry.slug == fx.slug),
+        "config row must survive so the retry has something to remove",
+    );
+}
+
+/// t23b: the preview of a destructive command must not be unavailable exactly
+/// where the destructive command works (t23 is the same box, executing).
+#[test]
+#[cfg(unix)]
+fn t23b_dry_run_survives_legacy_mux_failure() {
+    let fx = Fixture::new("dex-ui-t23b");
+    fx.seed_closed_progress();
+    std::fs::write(fx._tmp.path().join(".ccteam"), b"not a directory").unwrap();
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug, "--dry-run"])
+        .output()
+        .expect("spawn ccteam project rm --dry-run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "a dead mux must not break the preview; stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        stdout.contains("legacy чат-сессии: не удалось проверить"),
+        "the mux failure must be reported, not swallowed; stdout: {stdout}",
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .any(|entry| entry.slug == fx.slug),
+        "--dry-run must not drop the config row",
+    );
+}
+
+/// t28: a slug reserved by surviving progress state is NOT a retired slug.
+/// `preflight_project_upsert` words the two cases apart on purpose, so
+/// `ccteam init` must not stamp a retirement over the reservation.
+#[test]
+fn t28_init_reports_a_reserved_slug_without_claiming_retirement() {
+    let fx = Fixture::new("dex-ui-t28");
+    let orphan_slug = "dex-ui-t28-orphan";
+    // Durable progress state with no config row: the orphan-reservation case.
+    let orphan = fx.paths().progress_jsonl(orphan_slug);
+    std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    std::fs::write(&orphan, b"{\"event\":\"workflow_start\"}\n").unwrap();
+    let target = fx._tmp.path().join("orphan-project");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let out = fx
+        .cmd()
+        .current_dir(&target)
+        .args(["init", "--slug", orphan_slug])
+        .output()
+        .expect("spawn ccteam init");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a reserved slug must not be initialized; stdout: {}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    assert!(
+        stderr.contains("reserved by existing progress state"),
+        "the reservation must be reported verbatim; stderr: {stderr}",
+    );
+    assert!(
+        !stderr.contains("retired"),
+        "a reservation must never be reported as a retirement; stderr: {stderr}",
+    );
+}
+
+/// t29: an arbitrary-path install whose row is already gone has NO provable
+/// project directory, so `--purge` must not act on the conventional
+/// `projects_root/<slug>` guess — that path routinely belongs to a different
+/// project (registered under another slug) or to an unrelated repo. The
+/// ccteam-home footprint is keyed by slug and is still swept.
+#[test]
+#[cfg(unix)]
+fn t29_deregistered_arbitrary_path_purge_never_touches_the_guessed_dir() {
+    let fx = Fixture::new_at("dex-ui-t29", Some("work/dex-ui"));
+    fx.seed_closed_progress();
+    let (reg_path, _hb) = seed_imd_registry(&fx, "helper");
+
+    // The decoy: a live, unrelated project sitting exactly where the guess
+    // points, carrying a DIFFERENT slug in its state.json.
+    let decoy = fx.projects_root.join(&fx.slug);
+    std::fs::create_dir_all(decoy.join(".claude")).unwrap();
+    ProjectState::initial_for_team("ui-v2".into(), "dev".into())
+        .save(&CcteamPaths::project_state_in(&decoy))
+        .unwrap();
+    let decoy_settings = decoy.join(".claude").join("settings.local.json");
+    std::fs::write(
+        &decoy_settings,
+        r#"{"hooks": {"SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": "/h/hook.sh chat-progress session-start"}]}]}}
+"#,
+    )
+    .unwrap();
+
+    // The state a plain `project rm` (or a web-console delete) leaves behind.
+    assert!(ccteam_core::remove_project_from_config(&fx.ccteam_home, &fx.slug).unwrap());
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug, "--purge"])
+        .output()
+        .expect("spawn ccteam project rm --purge");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "an unprovable project dir is not a failure; stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        stdout.contains("путь неизвестен"),
+        "the report must say the project dir could not be proven; stdout: {stdout}",
+    );
+    // The decoy project is untouched — this is the collateral destruction.
+    assert!(
+        decoy.join(".ccteam").join("state.json").is_file(),
+        "another project's .ccteam must survive; stdout: {stdout}",
+    );
+    assert!(
+        std::fs::read_to_string(&decoy_settings)
+            .unwrap()
+            .contains("chat-progress"),
+        "another project's hook section must survive; stdout: {stdout}",
+    );
+    // The real (arbitrary-path) footprint is not silently reported as purged
+    // either — it is simply out of reach without a row.
+    assert!(
+        fx.project_dir.join(".ccteam").is_dir(),
+        "the unprovable directory must not be touched either",
+    );
+    // The slug-keyed ccteam-home footprint is safe and still swept.
+    assert!(
+        !reg_path.exists(),
+        "state/im/registry/<slug>/ is keyed by slug and must still be cleaned; stdout: {stdout}",
+    );
+}
+
+/// t30: the mirror of t29 — when the conventional directory DOES prove it
+/// belongs to this slug (`.ccteam/state.json::slug` matches and no surviving
+/// row owns the path), a deregistered `--purge` still cleans it.
+#[test]
+#[cfg(unix)]
+fn t30_deregistered_conventional_path_purge_still_cleans_a_proven_dir() {
+    let fx = Fixture::new("dex-ui-t30");
+    fx.seed_closed_progress();
+    let settings = fx.project_dir.join(".claude").join("settings.local.json");
+    std::fs::write(
+        &settings,
+        r#"{"hooks": {"SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": "/h/hook.sh chat-progress session-start"}]}]}}
+"#,
+    )
+    .unwrap();
+    assert!(ccteam_core::remove_project_from_config(&fx.ccteam_home, &fx.slug).unwrap());
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug, "--purge"])
+        .output()
+        .expect("spawn ccteam project rm --purge");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "purge of a proven dir must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !stdout.contains("путь неизвестен"),
+        "a proven directory must not be reported as unknown; stdout: {stdout}",
+    );
+    assert!(
+        !fx.project_dir.join(".ccteam").exists(),
+        "a proven directory must still be purged; stdout: {stdout}",
+    );
+    assert!(
+        !std::fs::read_to_string(&settings)
+            .unwrap_or_default()
+            .contains("chat-progress"),
+        "a proven directory's hook section must still be stripped; stdout: {stdout}",
+    );
+}
+
+/// t31: a post-ACK cleanup failure must be visible to scripts. `project rm`
+/// exits 2 (distinct from the code-1 "refused / nothing committed" failures),
+/// while the retirement itself stays committed and the row stays dropped.
+#[test]
+#[cfg(unix)]
+fn t31_post_ack_cleanup_failure_exits_nonzero() {
+    let fx = Fixture::new("dex-ui-t31");
+    fx.seed_closed_progress();
+    // Same deterministic EISDIR collision as t26.
+    let settings = fx.project_dir.join(".claude").join("settings.local.json");
+    std::fs::create_dir_all(settings.join("collision")).unwrap();
+
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug, "--purge"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an incomplete post-ACK cleanup must not exit 0; stdout: {stdout}",
+    );
+    assert!(
+        stdout.contains("retirement уже зафиксирован демоном"),
+        "the report must state the retirement committed so a retry is a file sweep; \
+         stdout: {stdout}",
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .all(|entry| entry.slug != fx.slug),
+        "the config row must still be dropped; stdout: {stdout}",
+    );
+}
+
+/// t32: a preview mutates nothing, so it can never leave a half-finished
+/// sweep behind. The same EISDIR collision that makes the executing purge exit
+/// 2 (t31) must leave `--purge --dry-run` at exit 0 with no retry advice —
+/// otherwise the standard `rm --dry-run && rm` gate is broken exactly where the
+/// destructive command works (t23b, same contract for the mux sweep).
+#[test]
+#[cfg(unix)]
+fn t32_purge_dry_run_preview_failure_exits_zero_without_retry_advice() {
+    let fx = Fixture::new("dex-ui-t32");
+    fx.seed_closed_progress();
+    let settings = fx.project_dir.join(".claude").join("settings.local.json");
+    std::fs::create_dir_all(settings.join("collision")).unwrap();
+    // No daemon at all: a preview never needs one (t23b), and without a
+    // socket there is nothing it could retire even by mistake.
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug, "--purge", "--dry-run"])
+        .output()
+        .expect("spawn ccteam project rm --purge --dry-run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a preview cannot leave a half-finished sweep; stdout: {stdout}; stderr: {stderr}",
+    );
+    assert!(
+        stdout.contains(&settings.display().to_string()) && stdout.contains("не удалось"),
+        "the preview must still name what it could not read; stdout: {stdout}",
+    );
+    assert!(
+        !stdout.contains("warning:") && !stdout.contains("повторный запуск"),
+        "a dry run must not print cleanup warnings or retry advice; stdout: {stdout}",
+    );
+    assert!(
+        !ccteam_harness::execution::progress_bridge::progress_state_is_retired(
+            &fx.paths().progress_jsonl(&fx.slug)
+        )
+        .unwrap(),
+        "--dry-run must not retire the generation"
+    );
+    assert!(
+        settings.join("collision").is_dir(),
+        "--dry-run must not touch the project"
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .any(|entry| entry.slug == fx.slug),
+        "--dry-run must not drop the config row",
+    );
+}
+
+/// t33: the config drop is the commit point AFTER the irreversible daemon ACK.
+/// If it fails, the run must not bail with an empty report and exit 1 ("nothing
+/// committed"): the retirement is already permanent, so the report is printed
+/// with a retry note and the exit is the half-finished-sweep code 2.
+#[test]
+#[cfg(unix)]
+fn t33_commit_point_failure_after_ack_reports_and_exits_two() {
+    let fx = Fixture::new("dex-ui-t33");
+    fx.seed_closed_progress();
+    // `ConfigFileLock::acquire` opens `state/config.lock` for write with
+    // O_NOFOLLOW; a directory in its place fails with EISDIR — for root too.
+    // Reading the catalog does not take the lock, so the run reaches the daemon
+    // and only the commit point fails.
+    let lock = fx.ccteam_home.join("state").join("config.lock");
+    let _ = std::fs::remove_file(&lock);
+    std::fs::create_dir_all(&lock).unwrap();
+
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a committed retirement with a failed config drop is a half-finished sweep, \
+         not a refused removal; stdout: {stdout}; stderr: {stderr}",
+    );
+    assert!(
+        stdout.contains("retirement проекта подтверждено демоном"),
+        "the report must be printed, not discarded; stdout: {stdout}",
+    );
+    assert!(
+        stdout.contains(&format!(
+            "warning: запись config.yaml::projects для `{}` не удалена",
+            fx.slug
+        )) && stdout.contains("retirement уже зафиксирован"),
+        "the failed commit point must be named with retry advice; stdout: {stdout}",
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .any(|entry| entry.slug == fx.slug),
+        "the row survives only because the drop failed; stdout: {stdout}",
     );
 }

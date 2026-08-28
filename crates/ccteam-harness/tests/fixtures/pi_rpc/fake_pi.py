@@ -249,6 +249,10 @@ pending = None
 for raw in sys.stdin:
     command = json.loads(raw)
     kind = command.get("type")
+    control_log = os.environ.get("CCTEAM_PI_FAKE_CONTROL_LOG")
+    if control_log:
+        with open(control_log, "a", encoding="utf-8") as log:
+            log.write(str(kind) + "\n")
     if kind == "get_state":
         response(
             command,
@@ -374,6 +378,8 @@ for raw in sys.stdin:
         if message == "context-null":
             state["context_null"] = True
         save()
+        if message == "accept-then-exit":
+            os._exit(0)
         response(command)
         emit({"type": "agent_start"})
         if message == "bridge-tools":
@@ -478,6 +484,16 @@ for raw in sys.stdin:
             assistant("stop", "retry-final", cost=0.03)
         elif message == "tool-preamble":
             assistant("toolUse", "I will run a tool", tool=True)
+        elif message == "extension-error":
+            emit(
+                {
+                    "type": "extension_error",
+                    "extensionPath": "/fake/audit.js",
+                    "event": "before_agent_start",
+                    "error": "bad payload",
+                }
+            )
+            assistant("stop", "extension-recovered")
         elif message == "usage":
             assistant("toolUse", "tool preamble", tool=True, cost=0.10)
             emit(

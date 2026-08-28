@@ -169,7 +169,7 @@ fn role_search_no_match_is_clean() {
         "an empty search result is not an error.\nstdout: {stdout}"
     );
     assert!(
-        stdout.contains("no plugins match"),
+        stdout.contains("нет plugin, соответствующих"),
         "no-match should print a friendly message; got: {stdout}"
     );
 }
@@ -194,7 +194,7 @@ fn role_list_empty_project_is_not_an_error() {
         "role list on an uninitialized project must exit 0.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        stdout.contains("no roles installed"),
+        stdout.contains("нет установленных ролей"),
         "empty project should print a friendly message; got: {stdout}"
     );
 }

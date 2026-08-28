@@ -112,7 +112,7 @@ async fn relay(
     let inbound = app.chat_inbound.clone();
 
     let sessions = ServerChatFrame::Sessions {
-        items: session_items(&app, &identity),
+        items: session_items(&app, &identity).await,
     };
     send_frame(&mut tx, &sessions).await?;
     for message in take_backlog_for_target(&app, &chat_id).await {
@@ -207,7 +207,7 @@ where
     }
     if is_switch {
         let sessions = ServerChatFrame::Sessions {
-            items: session_items(app, identity),
+            items: session_items(app, identity).await,
         };
         send_frame(tx, &sessions).await?;
     }
@@ -401,8 +401,10 @@ fn parse_sessions_reply(content: &str) -> Option<Vec<SessionItem>> {
 /// SAME ownership policy as `GET /api/v1/projects`; it used to hand every
 /// connected chat the full project list of the box, leaking other users'
 /// project names.
-fn session_items(app: &AppState, identity: &Identity) -> Vec<SessionItem> {
-    let Ok(projects) = ccteam_core::collect_projects(&app.paths) else {
+async fn session_items(app: &AppState, identity: &Identity) -> Vec<SessionItem> {
+    // The accessor keeps the blocking per-project flock off this socket's
+    // tokio worker (and every task sharing it).
+    let Ok(projects) = app.collect_projects().await else {
         return Vec::new();
     };
     let mut items = Vec::new();

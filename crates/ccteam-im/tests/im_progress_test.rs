@@ -462,7 +462,7 @@ async fn codex_streaming_delta_not_sent_as_answer() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn private_telegram_progress_uses_drafts_and_final_message() {
+async fn private_telegram_progress_uses_editable_message_without_drafts() {
     let _g = env_lock();
     std::env::set_var("CCTEAM_IM_PROGRESS", "on");
     std::env::set_var("CCTEAM_IM_PROGRESS_THROTTLE_MS", "0");
@@ -486,54 +486,20 @@ async fn private_telegram_progress_uses_drafts_and_final_message() {
     )
     .await;
 
-    let drafts = mock.drafts().await;
     let outbox = mock.outbox().await;
-    assert!(!drafts.is_empty(), "private progress must use drafts");
-    assert!(drafts.iter().all(|(_, id, body)| {
-        *id > 0 && body.starts_with("<tg-thinking>Thinking...</tg-thinking>")
-    }));
-    assert!(mock.edits().await.is_empty(), "draft mode must not edit");
+    assert!(
+        mock.drafts().await.is_empty(),
+        "private Telegram progress must not call sendRichMessageDraft"
+    );
+    assert!(
+        !mock.edits().await.is_empty(),
+        "private Telegram progress must use ordinary send/edit"
+    );
     assert!(outbox.iter().any(|m| m.content.starts_with("done")));
     assert!(outbox.iter().any(|m| m
         .rich_markdown
         .as_deref()
         .is_some_and(|m| m.starts_with("done"))));
-    drop(home);
-    std::env::remove_var("CCTEAM_IM_PROGRESS");
-    std::env::remove_var("CCTEAM_IM_PROGRESS_THROTTLE_MS");
-}
-
-#[allow(clippy::await_holding_lock)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn private_telegram_draft_failure_falls_back_to_edit() {
-    let _g = env_lock();
-    std::env::set_var("CCTEAM_IM_PROGRESS", "on");
-    std::env::set_var("CCTEAM_IM_PROGRESS_THROTTLE_MS", "0");
-    let home = isolate_home();
-    let projects_root = home.path().join("projects");
-    std::fs::create_dir_all(&projects_root).unwrap();
-    let mock = Arc::new(
-        MockChannel::new()
-            .with_name("telegram")
-            .with_rich_support()
-            .failing_drafts(),
-    );
-    run_scripted_on(
-        mock.clone(),
-        "123",
-        vec![
-            tool_started("t1", "Bash", serde_json::json!({"command": "ls"})),
-            answer("a1", "done"),
-        ],
-        projects_root,
-    )
-    .await;
-
-    assert!(!mock.drafts().await.is_empty());
-    assert!(
-        !mock.edits().await.is_empty(),
-        "failed draft must use edit fallback"
-    );
     drop(home);
     std::env::remove_var("CCTEAM_IM_PROGRESS");
     std::env::remove_var("CCTEAM_IM_PROGRESS_THROTTLE_MS");

@@ -86,6 +86,15 @@ pub fn migrate_v041_to_v042(paths: &CcteamPaths) -> Result<MigrationReport> {
                     continue;
                 }
             };
+            match ccteam_harness::execution::progress_bridge::progress_state_is_retired(
+                &paths.progress_jsonl(&state.slug),
+            ) {
+                Ok(false) => {}
+                Ok(true) | Err(_) => {
+                    report.skipped_paths.push(state_path);
+                    continue;
+                }
+            }
             cfg.projects.push(ProjectEntry {
                 slug: state.slug.clone(),
                 path: entry.path(),

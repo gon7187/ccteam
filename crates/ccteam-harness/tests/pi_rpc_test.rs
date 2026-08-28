@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ContextSource, Directive, DirectiveOutcome, HarnessAdapter,
-    PermissionMode, PiRoleDocument, PiRpcAdapter, SpawnCtx, ThreadEvent, ThreadHandle,
-    ThreadItemDetails, TurnDisposition, TurnInput, TurnRouting,
+    HarnessError, InterruptOutcome, PermissionMode, PiRoleDocument, PiRpcAdapter, SpawnCtx,
+    ThreadEvent, ThreadHandle, ThreadItemDetails, TurnDisposition, TurnInput, TurnRouting,
 };
 use futures::StreamExt;
 use serial_test::serial;
@@ -32,6 +32,7 @@ struct PiTestEnv {
     project: tempfile::TempDir,
     ccteam_home: PathBuf,
     log: PathBuf,
+    control_log: PathBuf,
     sessions: PathBuf,
     previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _mcp: tokio::task::JoinHandle<()>,
@@ -51,6 +52,7 @@ impl PiTestEnv {
         let project = tempfile::tempdir().unwrap();
         let ccteam_home = home.path().join("ccteam-home");
         let log = home.path().join("fake-pi-log.jsonl");
+        let control_log = home.path().join("fake-pi-control.log");
         let sessions = home.path().join("fake-pi-sessions");
         std::fs::create_dir_all(&ccteam_home).unwrap();
         std::fs::create_dir_all(&sessions).unwrap();
@@ -63,6 +65,7 @@ impl PiTestEnv {
             ("CCTEAM_HOME", ccteam_home.as_os_str()),
             ("CCTEAM_PI_BIN", fake.as_os_str()),
             ("CCTEAM_PI_FAKE_LOG", log.as_os_str()),
+            ("CCTEAM_PI_FAKE_CONTROL_LOG", control_log.as_os_str()),
             ("CCTEAM_PI_FAKE_SESSION_DIR", sessions.as_os_str()),
         ];
         let mut previous = Vec::new();
@@ -77,6 +80,7 @@ impl PiTestEnv {
             project,
             ccteam_home,
             log,
+            control_log,
             sessions,
             previous,
             _mcp: mcp,
@@ -192,6 +196,55 @@ async fn pi_adapter_is_a_user_reachable_vendor() {
         serde_json::from_str::<AgentVendor>("\"claude\"").unwrap(),
         AgentVendor::Claude
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn pi_distinguishes_proven_pre_dispatch_absence_from_post_request_disconnect() {
+    let env = PiTestEnv::new().await;
+    let adapter = PiRpcAdapter::new(role_reader());
+    let spec = AgentSpecBrief {
+        role: String::new(),
+    };
+
+    let absent = ThreadHandle {
+        vendor: AgentVendor::Pi,
+        mode: ccteam_harness::ExecutionMode::Chat,
+        identity: "missing-pi-session".to_string(),
+        started_at: chrono::Utc::now(),
+        raw_extras: serde_json::json!({}),
+    };
+    let absent_error = adapter
+        .submit_turn_routed(
+            &absent,
+            TurnInput::UserText("never written".into()),
+            TurnRouting::Inject,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        absent_error,
+        HarnessError::ThreadUnavailableBeforeDispatch(_)
+    ));
+
+    let handle = adapter
+        .start_thread(&spec, &env.ctx("s-disconnect"))
+        .await
+        .unwrap();
+    let error = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("accept-then-exit".into()),
+            TurnRouting::Inject,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, HarnessError::ThreadDied(_)));
+    let native: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(env.sessions.join("ccteam-s-disconnect.jsonl")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(native["history"], serde_json::json!(["accept-then-exit"]));
 }
 
 #[tokio::test]
@@ -392,6 +445,7 @@ async fn settled_terminal_routing_usage_context_and_directives() {
         ("multi", None),
         ("retry", None),
         ("tool-preamble", None),
+        ("extension-error", None),
         ("length", Some("max_tokens")),
         ("error", Some("vendor_error")),
         ("aborted", Some("aborted")),
@@ -421,6 +475,25 @@ async fn settled_terminal_routing_usage_context_and_directives() {
                 ThreadEvent::ItemCompleted { item }
                     if matches!(item.details, ThreadItemDetails::AgentMessage(_))
             )));
+        }
+        if message == "extension-error" {
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ThreadEvent::Diagnostic(error)
+                    if error.kind == "protocol"
+                        && error.message.contains("before_agent_start")
+            )));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        ThreadEvent::TurnCompleted { .. } | ThreadEvent::TurnFailed { .. }
+                    ))
+                    .count(),
+                1,
+                "extension diagnostic must not become a second terminal"
+            );
         }
     }
 
@@ -468,6 +541,15 @@ async fn settled_terminal_routing_usage_context_and_directives() {
     }
 
     let mut abort_events = adapter.events(&handle);
+    let idle = adapter.interrupt_turn(&handle).await.unwrap();
+    assert_eq!(idle, InterruptOutcome::AlreadyIdle);
+    assert!(
+        std::fs::read_to_string(&env.control_log)
+            .unwrap_or_default()
+            .lines()
+            .all(|line| line != "abort"),
+        "an idle Pi session must not receive an abort request"
+    );
     let mut aborting = adapter
         .submit_turn_routed(
             &handle,
@@ -477,7 +559,17 @@ async fn settled_terminal_routing_usage_context_and_directives() {
         .await
         .unwrap();
     aborting.release_completion();
-    adapter.interrupt_turn(&handle).await.unwrap();
+    let interrupted = adapter.interrupt_turn(&handle).await.unwrap();
+    assert_eq!(interrupted, InterruptOutcome::Interrupted);
+    assert_eq!(
+        std::fs::read_to_string(&env.control_log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == "abort")
+            .count(),
+        1,
+        "the proven active turn receives exactly one abort"
+    );
     loop {
         let event = tokio::time::timeout(Duration::from_secs(3), abort_events.next())
             .await

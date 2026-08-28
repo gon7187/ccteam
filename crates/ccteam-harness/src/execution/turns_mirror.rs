@@ -91,8 +91,9 @@ pub struct TurnRecord {
     /// bytes, base64, daemon paths, or browser-provided URLs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentRef>,
-    /// Terminal outcome when this row represents a failed vendor turn.
-    /// Successful/interim rows omit the field so existing JSONL stays compact.
+    /// Lifecycle phase for assistant-side rows. Live message events are
+    /// `interim`; the one canonical terminal assistant row is `completed` or
+    /// `failed`. User-only and legacy rows may omit the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
     /// Stable canonical/vendor error kind (`server_overloaded`, `transport`, …).
@@ -104,6 +105,17 @@ pub struct TurnRecord {
 }
 
 impl TurnRecord {
+    /// Whether this assistant row arrived before the vendor turn boundary.
+    pub fn interim(&self) -> bool {
+        self.outcome.as_deref() == Some("interim")
+    }
+
+    /// Whether this row is the canonical completed assistant answer and may
+    /// therefore receive a human verdict.
+    pub fn verdictable(&self) -> bool {
+        self.outcome.as_deref() == Some("completed") && !self.assistant.is_empty()
+    }
+
     /// Whether this row is the terminal failure boundary for its vendor turn.
     pub fn failed(&self) -> bool {
         self.outcome.as_deref() == Some("failed")
@@ -162,14 +174,18 @@ pub fn append_turn(project_dir: &Path, sid: &str, record: &TurnRecord) -> Result
 /// Read every parseable record from the session's turns.jsonl. Returns an
 /// empty Vec when the file is absent (V0.6.0 F108 first-turn case).
 pub fn read_all_turns(project_dir: &Path, sid: &str) -> Result<Vec<TurnRecord>> {
+    Ok(read_all_turns_detailed(project_dir, sid)?.records)
+}
+
+pub fn read_all_turns_detailed(
+    project_dir: &Path,
+    sid: &str,
+) -> Result<super::fs_atomic::JsonlRead<TurnRecord>> {
     let path = turns_jsonl_path(project_dir, sid);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
     // Skip half-flushed / older-shape / torn rows defensively — F118 recovery
     // has to work on whatever survived, so damage must cost one LINE, not the
     // whole transcript ([`super::fs_atomic::read_jsonl`]).
-    super::fs_atomic::read_jsonl(&path)
+    super::fs_atomic::read_jsonl_detailed(&path)
 }
 
 /// Return the last `n` parseable turns, in chronological order. F118

@@ -1,12 +1,17 @@
-//! Integration coverage for the evolution panel's seven-day turn trend.
+//! Integration coverage for the read-only Evolution analytics projection.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use ccteam_core::CcteamPaths;
 use ccteam_harness::execution::experience::{
-    append_experience, ExperienceRecord, TurnExperience, TurnSignals,
+    append_experience, ExperienceRecord, TurnExperience, TurnSignals, VerdictExperience,
+};
+use ccteam_harness::execution::progress_bridge::{
+    progress_archive_path, TurnVerdict, Verdict, TURN_VERDICT,
 };
 use ccteam_web::{router_with_state, AppState, AuthState};
+use serde_json::Value;
 use tokio::net::TcpListener;
 
 const ADMIN_HEX: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
@@ -41,6 +46,72 @@ fn seed_project(paths: &CcteamPaths, slug: &str) {
     state.save(&state_path).unwrap();
 }
 
+#[allow(clippy::too_many_arguments)]
+fn turn(
+    sid: &str,
+    turn_id: &str,
+    ts: chrono::DateTime<chrono::Utc>,
+    role: &str,
+    role_sha: Option<&str>,
+    skills_sha: &[(&str, &str)],
+    cost_usd: Option<f64>,
+    outcome: Option<&str>,
+    duration_ms: Option<u64>,
+) -> ExperienceRecord {
+    ExperienceRecord::Turn(TurnExperience {
+        sid: sid.into(),
+        turn_id: turn_id.into(),
+        ts,
+        vendor: "claude".into(),
+        model: None,
+        role: role.into(),
+        usage: None,
+        cost_usd,
+        outcome: outcome.map(str::to_owned),
+        duration_ms,
+        role_sha: role_sha.map(str::to_owned),
+        skills_sha: (!skills_sha.is_empty()).then(|| {
+            skills_sha
+                .iter()
+                .map(|(id, sha)| ((*id).to_owned(), (*sha).to_owned()))
+                .collect::<BTreeMap<_, _>>()
+        }),
+        signals: TurnSignals {
+            tool_calls: 0,
+            steered: false,
+            error_recovered: None,
+        },
+    })
+}
+
+async fn fetch_evolution(addr: SocketAddr, slug: &str) -> reqwest::Response {
+    client()
+        .get(format!("http://{addr}/api/v1/projects/{slug}/evolution"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap()
+}
+
+fn verdict_event(verdict: &TurnVerdict) -> Value {
+    let mut value = serde_json::to_value(verdict).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("event".into(), Value::String(TURN_VERDICT.into()));
+    value
+}
+
+fn write_jsonl(path: &std::path::Path, rows: &[Value]) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let body = rows
+        .iter()
+        .map(|row| serde_json::to_string(row).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(path, format!("{body}\n")).unwrap();
+}
+
 #[tokio::test]
 async fn evolution_reports_7day_turn_trend() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -49,37 +120,41 @@ async fn evolution_reports_7day_turn_trend() {
     seed_project(&paths, "alpha");
     let dir = paths.project_dir("alpha");
 
-    let turn = |ts: chrono::DateTime<chrono::Utc>| {
-        ExperienceRecord::Turn(TurnExperience {
-            sid: "s1".into(),
-            turn_id: format!("t-{}", ts.timestamp()),
-            ts,
-            vendor: "claude".into(),
-            model: None,
-            role: "cto".into(),
-            usage: None,
-            cost_usd: None,
-            duration_ms: None,
-            role_sha: Some("abc123abc123".into()),
-            skills_sha: None,
-            signals: TurnSignals {
-                tool_calls: 0,
-                steered: false,
-                error_recovered: None,
-            },
-        })
-    };
-    append_experience(&dir, &turn(chrono::Utc::now())).unwrap();
-    append_experience(&dir, &turn(chrono::Utc::now() - chrono::Duration::days(30))).unwrap();
+    append_experience(
+        &dir,
+        &turn(
+            "s1",
+            "recent",
+            chrono::Utc::now(),
+            "cto",
+            Some("abc123abc123"),
+            &[],
+            None,
+            None,
+            None,
+        ),
+    )
+    .unwrap();
+    append_experience(
+        &dir,
+        &turn(
+            "s1",
+            "old",
+            chrono::Utc::now() - chrono::Duration::days(30),
+            "cto",
+            Some("abc123abc123"),
+            &[],
+            None,
+            None,
+            None,
+        ),
+    )
+    .unwrap();
 
     let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
     let addr = spawn(state).await;
-    let body: serde_json::Value = client()
-        .get(format!("http://{addr}/api/v1/projects/alpha/evolution"))
-        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
-        .send()
+    let body: Value = fetch_evolution(addr, "alpha")
         .await
-        .unwrap()
         .error_for_status()
         .unwrap()
         .json()
@@ -90,5 +165,377 @@ async fn evolution_reports_7day_turn_trend() {
         body["turn_records_7d"], 1,
         "only the recent turn counts: {body}"
     );
+    assert_eq!(body["unrated_turns"], 2);
+    assert_eq!(body["outcome_unknown_turns"], 2);
+    assert_eq!(body["unpriced_turns"], 2);
+    assert!(body["avg_duration_ms"].is_null());
     assert_eq!(body["empty"], false);
+}
+
+#[tokio::test]
+async fn evolution_joins_latest_canonical_verdicts_and_keeps_unknowns_honest() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    seed_project(&paths, "alpha");
+    let dir = paths.project_dir("alpha");
+    let now = chrono::Utc::now();
+
+    for record in [
+        turn(
+            "s1",
+            "accepted",
+            now,
+            "cto",
+            Some("role-a"),
+            &[("research", "skill-a")],
+            Some(2.0),
+            Some("completed"),
+            Some(100),
+        ),
+        turn(
+            "s1",
+            "revised",
+            now,
+            "cto",
+            Some("role-a"),
+            &[("research", "skill-a"), ("ux", "skill-u")],
+            None,
+            Some("failed"),
+            Some(300),
+        ),
+        turn(
+            "s2",
+            "unrated-priced-zero",
+            now,
+            "worker",
+            Some("role-b"),
+            &[("research", "skill-b")],
+            Some(0.0),
+            Some("cancelled"),
+            None,
+        ),
+        turn(
+            "s3",
+            "roleless-unknown",
+            now,
+            "",
+            None,
+            &[],
+            None,
+            None,
+            Some(500),
+        ),
+        // The projection can contain a stale verdict row; canonical progress
+        // must win and derived rows must not inflate verdict metrics.
+        ExperienceRecord::Verdict(VerdictExperience {
+            sid: "s1".into(),
+            turn_id: "revised".into(),
+            ts: now,
+            verdict: Verdict::Accept,
+            feedback: Some("stale projection".into()),
+        }),
+    ] {
+        append_experience(&dir, &record).unwrap();
+    }
+
+    let accepted = TurnVerdict {
+        sid: "s1".into(),
+        turn_id: "accepted".into(),
+        ts: now,
+        verdict: Verdict::Accept,
+        feedback: None,
+    };
+    let stale_revised = TurnVerdict {
+        sid: "s1".into(),
+        turn_id: "revised".into(),
+        ts: now,
+        verdict: Verdict::Accept,
+        feedback: None,
+    };
+    let revised = TurnVerdict {
+        sid: "s1".into(),
+        turn_id: "revised".into(),
+        ts: now + chrono::Duration::seconds(1),
+        verdict: Verdict::Revise,
+        feedback: Some("fix the edge case".into()),
+    };
+    let progress = paths.progress_jsonl("alpha");
+    write_jsonl(
+        &progress_archive_path(&progress),
+        &[verdict_event(&stale_revised)],
+    );
+    write_jsonl(
+        &progress,
+        &[verdict_event(&accepted), verdict_event(&revised)],
+    );
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let body: Value = fetch_evolution(addr, "alpha")
+        .await
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["turn_records"], 4, "derived verdict row is not a turn");
+    assert_eq!(body["verdict_records"], 2, "latest canonical facts only");
+    assert_eq!(body["accepted_turns"], 1);
+    assert_eq!(body["revised_turns"], 1);
+    assert_eq!(body["unrated_turns"], 2);
+    assert_eq!(body["completed_turns"], 1);
+    assert_eq!(body["failed_turns"], 1);
+    assert_eq!(body["outcome_unknown_turns"], 2);
+    assert_eq!(body["priced_turns"], 2, "known zero is still priced");
+    assert_eq!(body["unpriced_turns"], 2);
+    assert_eq!(body["avg_duration_ms"], 300.0);
+    assert_eq!(body["skill_attribution"], "available_at_spawn");
+
+    let roles = body["roles"].as_array().unwrap();
+    let cto = roles.iter().find(|row| row["id"] == "cto").unwrap();
+    assert_eq!(cto["turn_count"], 2);
+    assert_eq!(cto["accepted_turns"], 1);
+    assert_eq!(cto["revised_turns"], 1);
+    assert_eq!(cto["unrated_turns"], 0);
+    assert_eq!(cto["completed_turns"], 1);
+    assert_eq!(cto["failed_turns"], 1);
+    assert_eq!(cto["outcome_unknown_turns"], 0);
+    assert_eq!(cto["priced_turns"], 1);
+    assert_eq!(cto["unpriced_turns"], 1);
+    assert_eq!(cto["avg_duration_ms"], 200.0);
+    assert_eq!(cto["priced_avg_cost_usd"], 2.0);
+    assert_eq!(cto["known_cost_usd"], 2.0);
+    assert!(cto["total_cost_usd"].is_null());
+
+    let worker = roles.iter().find(|row| row["id"] == "worker").unwrap();
+    assert_eq!(worker["priced_turns"], 1);
+    assert_eq!(worker["unpriced_turns"], 0);
+    assert_eq!(worker["priced_avg_cost_usd"], 0.0);
+    assert_eq!(worker["known_cost_usd"], 0.0);
+    assert_eq!(worker["total_cost_usd"], 0.0);
+    assert!(worker["avg_duration_ms"].is_null());
+
+    let default_role = roles.iter().find(|row| row["id"] == "").unwrap();
+    assert_eq!(default_role["sha"], "unknown");
+    assert_eq!(default_role["turn_count"], 1);
+    assert_eq!(default_role["unrated_turns"], 1);
+    assert_eq!(default_role["outcome_unknown_turns"], 1);
+    assert_eq!(default_role["unpriced_turns"], 1);
+    assert_eq!(
+        roles
+            .iter()
+            .map(|row| row["turn_count"].as_u64().unwrap())
+            .sum::<u64>(),
+        body["turn_records"].as_u64().unwrap(),
+        "every turn belongs to exactly one role bucket, including roleless"
+    );
+
+    let skills = body["skills"].as_array().unwrap();
+    let research_a = skills
+        .iter()
+        .find(|row| row["id"] == "research" && row["sha"] == "skill-a")
+        .unwrap();
+    assert_eq!(research_a["turn_count"], 2);
+    assert_eq!(research_a["accepted_turns"], 1);
+    assert_eq!(research_a["revised_turns"], 1);
+    assert_eq!(research_a["avg_duration_ms"], 200.0);
+}
+
+#[tokio::test]
+async fn evolution_counts_only_the_first_record_for_a_replayed_turn() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    seed_project(&paths, "alpha");
+    let dir = paths.project_dir("alpha");
+    let now = chrono::Utc::now();
+
+    // Append the canonical record first, then replay a newer receipt. Selection
+    // is by first durable (sid, turn_id), never by the replay timestamp.
+    append_experience(
+        &dir,
+        &turn(
+            "s1",
+            "replayed",
+            now,
+            "reviewer",
+            Some("role-new"),
+            &[("research", "skill-new")],
+            Some(3.0),
+            Some("completed"),
+            Some(300),
+        ),
+    )
+    .unwrap();
+    append_experience(
+        &dir,
+        &turn(
+            "s1",
+            "replayed",
+            now + chrono::Duration::hours(1),
+            "worker",
+            Some("role-old"),
+            &[("research", "skill-old")],
+            Some(1.0),
+            Some("failed"),
+            Some(100),
+        ),
+    )
+    .unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let body: Value = fetch_evolution(addr, "alpha")
+        .await
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["turn_records"], 1, "a replay is one canonical turn");
+    assert_eq!(body["turn_records_7d"], 1);
+    assert_eq!(body["completed_turns"], 1);
+    assert_eq!(body["failed_turns"], 0);
+    assert_eq!(body["priced_turns"], 1);
+    assert_eq!(body["avg_duration_ms"], 300.0);
+    let roles = body["roles"].as_array().unwrap();
+    assert_eq!(roles.len(), 1);
+    assert_eq!(roles[0]["id"], "reviewer");
+    assert_eq!(roles[0]["sha"], "role-new");
+    assert_eq!(roles[0]["known_cost_usd"], 3.0);
+    assert_eq!(roles[0]["total_cost_usd"], 3.0);
+    let skills = body["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0]["sha"], "skill-new");
+}
+
+#[tokio::test]
+async fn evolution_fails_closed_when_experience_contains_a_corrupt_row() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    seed_project(&paths, "alpha");
+    let dir = paths.project_dir("alpha");
+    append_experience(
+        &dir,
+        &turn(
+            "s1",
+            "t1",
+            chrono::Utc::now(),
+            "cto",
+            Some("role-a"),
+            &[],
+            Some(1.0),
+            Some("completed"),
+            None,
+        ),
+    )
+    .unwrap();
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join(".ccteam/experience.jsonl"))
+        .unwrap();
+    file.write_all(b"{not-json}\n").unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let response = fetch_evolution(addr, "alpha").await;
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data_quality"], "degraded");
+    assert_eq!(body["source"], "experience");
+    assert_eq!(body["corrupt_line_count"], 1);
+}
+
+#[tokio::test]
+async fn evolution_fails_closed_when_progress_contains_a_corrupt_row() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    seed_project(&paths, "alpha");
+    let dir = paths.project_dir("alpha");
+    append_experience(
+        &dir,
+        &turn(
+            "s1",
+            "t1",
+            chrono::Utc::now(),
+            "cto",
+            Some("role-a"),
+            &[],
+            Some(1.0),
+            Some("completed"),
+            None,
+        ),
+    )
+    .unwrap();
+    let progress = paths.progress_jsonl("alpha");
+    std::fs::create_dir_all(progress.parent().unwrap()).unwrap();
+    std::fs::write(&progress, b"{not-json}\n").unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let response = fetch_evolution(addr, "alpha").await;
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data_quality"], "degraded");
+    assert_eq!(body["source"], "progress");
+    assert_eq!(body["corrupt_line_count"], 1);
+}
+
+#[tokio::test]
+async fn evolution_returns_500_for_experience_or_progress_read_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    seed_project(&paths, "experience-broken");
+    seed_project(&paths, "progress-broken");
+
+    let experience_path = paths
+        .project_dir("experience-broken")
+        .join(".ccteam/experience.jsonl");
+    std::fs::create_dir_all(&experience_path).unwrap();
+
+    let progress_dir = paths.project_dir("progress-broken");
+    append_experience(
+        &progress_dir,
+        &turn(
+            "s1",
+            "t1",
+            chrono::Utc::now(),
+            "cto",
+            Some("role-a"),
+            &[],
+            None,
+            None,
+            None,
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(paths.progress_jsonl("progress-broken")).unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    for slug in ["experience-broken", "progress-broken"] {
+        let response = fetch_evolution(addr, slug).await;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "{slug} storage failure must not masquerade as empty analytics"
+        );
+        let body: Value = response.json().await.unwrap();
+        assert!(body["error"].is_string());
+    }
 }

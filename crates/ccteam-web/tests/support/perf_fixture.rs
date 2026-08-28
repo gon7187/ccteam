@@ -247,18 +247,15 @@ fn write_turns(project_dir: &Path, sid: &str) -> u64 {
         .join("turns.jsonl");
     let file = File::create(&path).unwrap();
     let mut writer = BufWriter::with_capacity(1024 * 1024, file);
-    let templates = (0..64)
-        .map(|variant| {
-            format!(
-                "{{\"turn_id\":\"history-{variant:02}\",\"ts\":\"2026-08-17T00:00:{:02}Z\",\"vendor\":\"claude\",\"role\":\"worker\",\"user\":\"deterministic fixture prompt {variant:02}\",\"assistant\":\"deterministic fixture response with enough content to exercise paging {variant:02}\",\"usage\":{{\"input_tokens\":1200,\"output_tokens\":300}},\"tool_calls\":[]}}\n",
-                variant % 60
-            )
-            .into_bytes()
-        })
-        .collect::<Vec<_>>();
     for turn in 0..HISTORY_TURNS {
         writer
-            .write_all(&templates[turn % templates.len()])
+            .write_all(
+                format!(
+                    "{{\"turn_id\":\"history-{turn:05}\",\"ts\":\"2026-08-17T00:00:{:02}Z\",\"vendor\":\"claude\",\"role\":\"worker\",\"user\":\"deterministic fixture prompt {turn:05}\",\"assistant\":\"deterministic fixture response with enough content to exercise paging {turn:05}\",\"usage\":{{\"input_tokens\":1200,\"output_tokens\":300}},\"tool_calls\":[]}}\n",
+                    turn % 60
+                )
+                .as_bytes(),
+            )
             .unwrap();
     }
     writer.flush().unwrap();

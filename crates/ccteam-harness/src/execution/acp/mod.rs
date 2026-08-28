@@ -28,7 +28,7 @@ pub use turn_runner::{route_acp_turn, AcpTurnRoute, AcpTurnRunner, AcpTurnTuning
 use std::path::Path;
 
 use crate::execution::session_status::read_status_file;
-use crate::{HarnessError, ThreadHandle, ThreadStatus};
+use crate::{HarnessCapability, HarnessError, ThreadHandle, ThreadStatus};
 
 /// One spawn-time axis to land on a fresh ACP session: the vendor's own
 /// `configOptions` id and the value the caller explicitly asked for.
@@ -56,10 +56,40 @@ pub struct SpawnAxis<'a> {
 /// nothing is sent, and the vendor's own default holds — that is what an
 /// omitted field means everywhere in ccteam.)
 pub fn spawn_pick_refused(what: &str, value: &str, err: impl std::fmt::Display) -> HarnessError {
-    HarnessError::SpawnFailed(format!(
+    let detail = format!(
         "vendor refused spawn-time {what} `{value}`: {err} \
          (omit {what} to run on the vendor's own default)"
-    ))
+    );
+    match what {
+        "model" => HarnessError::CapabilityUnavailable {
+            capability: HarnessCapability::Model,
+            detail,
+        },
+        "effort" => HarnessError::CapabilityUnavailable {
+            capability: HarnessCapability::Effort,
+            detail,
+        },
+        _ => HarnessError::SpawnFailed(detail),
+    }
+}
+
+/// Classify a failed ACP `session/set_config_option` request. Only the standard
+/// "method absent" / "invalid params" replies prove that the requested axis or
+/// value is unsupported. The transport also represents EOF/read failures as a
+/// `JsonRpcError` with no code, while internal, auth, quota, and vendor-defined
+/// failures can carry other codes; none of those are safe fallback signals.
+pub fn spawn_pick_request_failed(what: &str, value: &str, err: anyhow::Error) -> HarnessError {
+    let is_explicit_capability_refusal = err
+        .downcast_ref::<transport::JsonRpcError>()
+        .and_then(|rpc| rpc.code)
+        .is_some_and(|code| matches!(code, -32601 | -32602));
+    if is_explicit_capability_refusal {
+        spawn_pick_refused(what, value, err)
+    } else {
+        HarnessError::SpawnFailed(format!(
+            "failed to apply spawn-time {what} `{value}`: {err:#}"
+        ))
+    }
 }
 
 /// Status for a session this adapter no longer holds live (idle-released,
@@ -76,5 +106,84 @@ pub fn released_thread_status(h: &ThreadHandle) -> ThreadStatus {
     match (project_dir, sid) {
         (Some(dir), Some(sid)) => read_status_file(Path::new(dir), sid).unwrap_or_default(),
         _ => ThreadStatus::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_pick_refusal_types_only_model_and_effort_axes() {
+        assert!(matches!(
+            spawn_pick_refused("model", "opus", "unknown model"),
+            HarnessError::CapabilityUnavailable {
+                capability: HarnessCapability::Model,
+                ..
+            }
+        ));
+        assert!(matches!(
+            spawn_pick_refused("effort", "max", "unsupported effort"),
+            HarnessError::CapabilityUnavailable {
+                capability: HarnessCapability::Effort,
+                ..
+            }
+        ));
+        assert!(matches!(
+            spawn_pick_refused("mode", "ptc", "unsupported mode"),
+            HarnessError::SpawnFailed(_)
+        ));
+
+        let refused = anyhow::Error::new(transport::JsonRpcError {
+            code: Some(-32602),
+            message: "unknown model".to_string(),
+            data: None,
+        });
+        assert!(matches!(
+            spawn_pick_request_failed("model", "opus", refused),
+            HarnessError::CapabilityUnavailable {
+                capability: HarnessCapability::Model,
+                ..
+            }
+        ));
+        assert!(matches!(
+            spawn_pick_request_failed(
+                "model",
+                "opus",
+                anyhow::anyhow!("jsonrpc reader dropped pending request")
+            ),
+            HarnessError::SpawnFailed(_)
+        ));
+
+        for (code, message) in [
+            (None, "jsonrpc peer closed"),
+            (Some(-32603), "internal error"),
+            (Some(401), "unauthorized"),
+            (Some(429), "quota exceeded"),
+            (Some(-32000), "vendor-defined failure"),
+        ] {
+            let failure = anyhow::Error::new(transport::JsonRpcError {
+                code,
+                message: message.to_string(),
+                data: None,
+            });
+            assert!(matches!(
+                spawn_pick_request_failed("model", "opus", failure),
+                HarnessError::SpawnFailed(_)
+            ));
+        }
+
+        let missing_method = anyhow::Error::new(transport::JsonRpcError {
+            code: Some(-32601),
+            message: "method not found".to_string(),
+            data: None,
+        });
+        assert!(matches!(
+            spawn_pick_request_failed("effort", "max", missing_method),
+            HarnessError::CapabilityUnavailable {
+                capability: HarnessCapability::Effort,
+                ..
+            }
+        ));
     }
 }

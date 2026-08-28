@@ -368,7 +368,15 @@ pub fn render_help(commands: &[CommandView]) -> RichReply {
     const GROUPS: [(&str, &[&str]); 3] = [
         (
             "Навигация",
-            &["/status", "/sessions", "/projects", "/new", "/use", "/cd"],
+            &[
+                "/commander",
+                "/status",
+                "/sessions",
+                "/projects",
+                "/new",
+                "/use",
+                "/cd",
+            ],
         ),
         (
             "Управление",

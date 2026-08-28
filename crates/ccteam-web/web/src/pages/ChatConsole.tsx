@@ -492,6 +492,9 @@ export default function ChatConsole() {
             session={activeSession}
             lang={lang}
             onRename={renameRow}
+            onOpenSession={(proposalSid) =>
+              navigate(`/chat/s/${encodeURIComponent(proposalSid)}`)
+            }
           />
         ) : view === "flow" ? (
           <WorkflowView

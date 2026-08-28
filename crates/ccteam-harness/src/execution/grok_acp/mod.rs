@@ -24,8 +24,8 @@ use tokio::sync::broadcast;
 
 use crate::{
     AgentSpecBrief, AgentVendor, ChoicePrompt, DetachOutcome, Directive, DirectiveOutcome,
-    ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus,
-    TurnId, TurnInput, TurnRouting, TurnSubmission,
+    ExecutionMode, HarnessAdapter, HarnessError, InterruptOutcome, SpawnCtx, ThreadEvent,
+    ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
 use crate::execution::acp::released_thread_status;
@@ -314,7 +314,10 @@ impl GrokAcpAdapter {
         routing: TurnRouting,
     ) -> Result<TurnSubmission, HarnessError> {
         let live = self.get_live(&h.identity).ok_or_else(|| {
-            HarnessError::ThreadDied(format!("grok session {} not live", h.identity))
+            HarnessError::ThreadUnavailableBeforeDispatch(format!(
+                "grok session {} not live",
+                h.identity
+            ))
         })?;
 
         let text = match input {
@@ -916,15 +919,15 @@ impl HarnessAdapter for GrokAcpAdapter {
         Ok(self.thread_status_inner(&live))
     }
 
-    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
         let Some(live) = self.get_live(&h.identity) else {
-            return Ok(());
+            return Ok(InterruptOutcome::AlreadyIdle);
         };
         live.transport
             .notify("session/cancel", json!({ "sessionId": live.session_id }))
             .await
             .map_err(|e| HarnessError::SubmitFailed(format!("session/cancel: {e}")))?;
-        Ok(())
+        Ok(InterruptOutcome::Requested)
     }
 
     fn thread_is_live(&self, h: &ThreadHandle) -> bool {

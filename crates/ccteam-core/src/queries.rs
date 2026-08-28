@@ -172,6 +172,32 @@ pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
         crate::config::CcteamConfig::default()
     });
     for entry in &cfg.projects {
+        // Shared (LOCK_SH) read: `collect_projects` is a pure reader behind
+        // `GET /api/v1/projects`, `/api/v1/status`, `/ws/chat`, `/api/v1/agents/*`
+        // and `POST /mcp`. Taking the exclusive lock once per registered project
+        // made every one of those readers serialize against every other reader.
+        // Semantics are identical (both fail closed on torn/unknown markers and
+        // neither creates state); only writers still exclude us.
+        match ccteam_harness::execution::progress_bridge::progress_state_is_retired_shared(
+            &paths.progress_jsonl(&entry.slug),
+        ) {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::warn!(
+                    slug = %entry.slug,
+                    "registered project is retired; skipping until project removal finishes"
+                );
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    slug = %entry.slug,
+                    error = %err,
+                    "registered project's progress generation is unreadable; skipping fail-closed"
+                );
+                continue;
+            }
+        }
         let state_path = entry.path.join(".ccteam").join("state.json");
         if !state_path.exists() {
             tracing::warn!(
@@ -212,6 +238,21 @@ pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
             };
             if seen_slugs.contains(&slug) {
                 continue;
+            }
+            // Shared read, same reasoning as the registered branch above.
+            match ccteam_harness::execution::progress_bridge::progress_state_is_retired_shared(
+                &paths.progress_jsonl(&slug),
+            ) {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        slug,
+                        error = %err,
+                        "legacy project progress generation is unreadable; skipping fail-closed"
+                    );
+                    continue;
+                }
             }
             let state_path = paths.project_state(&slug);
             if !state_path.exists() {
@@ -1531,6 +1572,79 @@ mod tests {
         let out = collect_projects(&paths).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].state.slug, "myapp");
+    }
+
+    /// Readers must not exclude each other. `collect_projects` consults the
+    /// stable progress lock once per project (registered branch AND legacy
+    /// walk); with the exclusive reader it serialized behind any other reader,
+    /// so two dashboard polls on a box with N projects blocked each other N
+    /// times while neither wrote anything. Mirrors the harness-side
+    /// `shared_retired_reads_report_both_marker_states_and_do_not_serialize`.
+    #[cfg(unix)]
+    #[test]
+    fn collect_projects_readers_do_not_serialize_behind_a_shared_progress_lock() {
+        use std::os::fd::AsRawFd;
+
+        let tmp = TempDir::new().unwrap();
+        let paths = fake_paths(tmp.path());
+
+        // One registered project (config.yaml branch) + one legacy project
+        // discovered by the projects_root walk: both consult the lock.
+        let registered_dir = tmp.path().join("external").join("registered");
+        std::fs::create_dir_all(registered_dir.join(".ccteam")).unwrap();
+        ProjectState::initial("registered".into())
+            .save(&registered_dir.join(".ccteam").join("state.json"))
+            .unwrap();
+        crate::config::append_project(
+            &paths.root,
+            crate::config::ProjectEntry {
+                slug: "registered".into(),
+                path: registered_dir,
+                host: crate::config::default_project_host(),
+                remote_slug: None,
+                remote_path: None,
+                team: "dev".into(),
+                installed_at: Utc::now(),
+            },
+        )
+        .unwrap();
+        ProjectState::initial("legacy".into())
+            .save(&paths.project_state("legacy"))
+            .unwrap();
+
+        // `append_event` creates each slug's stable lock with an ACTIVE marker,
+        // so the reader actually opens and locks it instead of short-circuiting
+        // on a missing inode.
+        let mut held = Vec::new();
+        for slug in ["registered", "legacy"] {
+            let progress = paths.progress_jsonl(slug);
+            ccteam_harness::execution::progress_bridge::append_event(
+                &progress,
+                &json!({"event": "live"}),
+            )
+            .unwrap();
+            let lock_path = progress.with_extension("lock");
+            let file = std::fs::File::open(&lock_path).unwrap();
+            // Another reader is mid-flight on this slug (LOCK_SH).
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+            assert_eq!(rc, 0, "hold shared lock on {}", lock_path.display());
+            held.push(file);
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = fake_paths(tmp.path());
+        let reader = std::thread::spawn(move || {
+            let _ = tx.send(collect_projects(&probe).map(|out| out.len()));
+        });
+        let observed = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "a concurrent collect_projects reader must not block behind another shared reader",
+        );
+        assert_eq!(observed.unwrap(), 2);
+
+        for file in held {
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        reader.join().unwrap();
     }
 
     /// V0.4.2 F73 fallback path: legacy projects under `projects_root`

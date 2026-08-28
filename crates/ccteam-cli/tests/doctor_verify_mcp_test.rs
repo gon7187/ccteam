@@ -107,20 +107,20 @@ fn human_readable_output_contains_verdict_pass_and_breakdown() {
     let (stdout, _stderr, code) = run_doctor_verify_mcp(&[]);
     assert_eq!(code, 0);
     assert!(
-        stdout.contains("MCP tool surface verification"),
+        stdout.contains("Проверка поверхности MCP-инструментов"),
         "missing header: {stdout}"
     );
     assert!(
         stdout.contains("V0.6.6 F171"),
         "header must carry F171 marker for traceability: {stdout}",
     );
-    assert!(stdout.contains("total tools:    8"), "got: {stdout}");
-    assert!(stdout.contains("active:         8"), "got: {stdout}");
-    assert!(stdout.contains("stubs:          0"), "got: {stdout}");
-    assert!(stdout.contains("per-group breakdown:"), "got: {stdout}");
+    assert!(stdout.contains("всего инструментов: 8"), "got: {stdout}");
+    assert!(stdout.contains("активных:          8"), "got: {stdout}");
+    assert!(stdout.contains("заглушек:          0"), "got: {stdout}");
+    assert!(stdout.contains("разбивка по группам:"), "got: {stdout}");
     // Verdict line on clean tree.
     assert!(
-        stdout.contains("verdict: PASS"),
+        stdout.contains("вердикт: PASS"),
         "must print PASS verdict on clean tree: {stdout}",
     );
     // No JSON braces in human mode — guards against double-printing
@@ -175,13 +175,13 @@ fn human_mode_lists_every_shipped_group_with_active_count() {
     let (stdout, _stderr, code) = run_doctor_verify_mcp(&[]);
     assert_eq!(code, 0);
     for (group, active) in [("admin:", 2), ("chat:", 1), ("session:", 5)] {
-        let needle = format!("{group}    {active} active / 0 stub");
+        let needle = format!("{group}    {active} активных / 0 заглушек");
         // Allow extra padding on either side — exact spacing depends
         // on the longest group name. Use a relaxed contains check.
         assert!(
-            stdout
-                .lines()
-                .any(|l| l.contains(group) && l.contains(&format!("{active} active / 0 stub"))),
+            stdout.lines().any(
+                |l| l.contains(group) && l.contains(&format!("{active} активных / 0 заглушек"))
+            ),
             "missing per-group line for `{needle}` in:\n{stdout}",
         );
     }

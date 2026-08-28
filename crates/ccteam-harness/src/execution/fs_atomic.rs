@@ -73,21 +73,46 @@ pub fn atomic_write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
 /// `progress.jsonl` made every live session of a project report `idle` and its
 /// cost roll-up report `$0` (seen in the wild 2026-08-08). One reader, one
 /// tolerance rule, so no log reader has to remember this.
-pub fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+#[derive(Debug)]
+pub struct JsonlRead<T> {
+    pub records: Vec<T>,
+    pub corrupt_line_count: u64,
+}
+
+/// Read JSONL while preserving an explicit data-quality signal. Empty lines
+/// (including the trailing split after a final newline) are ignored; every
+/// non-empty row that does not deserialize increments `corrupt_line_count`.
+pub fn read_jsonl_detailed<T: serde::de::DeserializeOwned>(path: &Path) -> Result<JsonlRead<T>> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(JsonlRead {
+            records: Vec::new(),
+            corrupt_line_count: 0,
+        });
     }
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let mut out = Vec::new();
+    let mut corrupt_line_count = 0_u64;
     for line in bytes.split(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
         // serde rejects invalid UTF-8 (torn append) exactly as it rejects
-        // invalid JSON (half-flushed line) — and an empty line with "EOF while
-        // parsing a value", so blank lines need no special case.
+        // invalid JSON (half-flushed line). Whitespace-only separators were
+        // handled above and are not data-quality failures.
         if let Ok(record) = serde_json::from_slice::<T>(line) {
             out.push(record);
+        } else {
+            corrupt_line_count = corrupt_line_count.saturating_add(1);
         }
     }
-    Ok(out)
+    Ok(JsonlRead {
+        records: out,
+        corrupt_line_count,
+    })
+}
+
+pub fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+    Ok(read_jsonl_detailed(path)?.records)
 }
 
 /// A `.tmp` sibling of `path` that doesn't collide with `with_extension`'s

@@ -23,6 +23,8 @@ import {
   sessionsUrl,
   stopSession,
   submitTurn,
+  putTurnVerdict,
+  turnVerdictUrl,
   type ExternalSessionView,
   type HistorySessionView,
   type RoleDetail,
@@ -66,6 +68,12 @@ describe("sessionsApi url builders", () => {
     );
     expect(projectUploadUrl("data:text/html", "blob:x")).toMatch(
       /^\/api\/v1\/projects\//,
+    );
+  });
+
+  it("builds the per-turn verdict route with encoded sid and turn id", () => {
+    expect(turnVerdictUrl("s/odd", "turn one/two")).toBe(
+      "/api/v1/sessions/s%2Fodd/turns/turn%20one%2Ftwo/verdict",
     );
   });
 });
@@ -134,6 +142,54 @@ describe("sessionsApi", () => {
     });
     expect(got.events[0].assistant).toBe("yo");
     expect(got.has_more).toBe(false);
+  });
+
+  it("PUTs an accept verdict without inventing feedback", async () => {
+    const response = {
+      sid: "s1",
+      turn_id: "t1",
+      verdict: "accept" as const,
+      feedback: null,
+      changed: true,
+    };
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, response));
+
+    await expect(putTurnVerdict("s1", "t1", { verdict: "accept" })).resolves.toEqual(
+      response,
+    );
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/sessions/s1/turns/t1/verdict", {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ verdict: "accept" }),
+    });
+  });
+
+  it("PUTs revise feedback verbatim and surfaces server validation", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, {
+        sid: "s2",
+        turn_id: "t2",
+        verdict: "revise",
+        feedback: "Missing a regression test",
+        changed: true,
+      }),
+    );
+    await putTurnVerdict("s2", "t2", {
+      verdict: "revise",
+      feedback: "Missing a regression test",
+    });
+    expect(JSON.parse(fetchMock.mock.calls[0]![1]!.body as string)).toEqual({
+      verdict: "revise",
+      feedback: "Missing a regression test",
+    });
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(400, { error: "feedback must not be empty" }));
+    await expect(
+      putTurnVerdict("s2", "t2", { verdict: "revise", feedback: "" }),
+    ).rejects.toThrow("feedback must not be empty");
   });
 
   it("adds limit and an opaque before cursor only when paging history", async () => {
@@ -332,6 +388,27 @@ describe("sessionsApi", () => {
     await expect(createSession("dex-ui", { role: "cto" })).rejects.toThrow(
       "会话启动失败: simulated start failure",
     );
+  });
+
+  it("createSession preserves status and error_code on a typed API error", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(422, {
+        ok: false,
+        error: "requested model is unavailable",
+        error_code: "model_unavailable",
+      }),
+    );
+    const failure = await createSession("dex-ui", { role: "cto" }).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).constructor.name).toBe("ApiError");
+    expect(failure).toMatchObject({
+      status: 422,
+      errorCode: "model_unavailable",
+    });
+    expect((failure as Error).message).toContain("requested model is unavailable");
   });
 
   it("caps non-JSON error bodies and prefixes the HTTP status", async () => {

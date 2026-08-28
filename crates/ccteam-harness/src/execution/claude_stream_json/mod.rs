@@ -54,9 +54,9 @@ use crate::execution::session_status::{read_status_file, write_status_file};
 use crate::execution::transcript_tail::anthropic_project_dir;
 use crate::{
     AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, DetachOutcome, Directive,
-    DirectiveOutcome, ExecutionMode, HarnessAdapter, HarnessError, RecoveredTurn, SpawnCtx,
-    ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
-    UnobservedTurnCtx,
+    DirectiveOutcome, ExecutionMode, HarnessAdapter, HarnessCapability, HarnessError,
+    InterruptOutcome, RecoveredTurn, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId,
+    TurnInput, TurnRouting, TurnSubmission, UnobservedTurnCtx,
 };
 
 use bridge::{ApprovalDecision, CanUseToolResolver, SlashClass};
@@ -64,6 +64,130 @@ use protocol::{ClaudeModelOption, Outbound};
 use spawn_spec::StreamJsonSpawnInput;
 use translate::StreamTranslator;
 use transport::StreamJsonTransport;
+
+/// `ENOENT` from `Command::spawn` is ambiguous: it can name the executable,
+/// the cwd, or an interpreter from a script shebang. Only classify the vendor
+/// as absent when the requested executable itself is definitely missing.
+fn program_definitely_missing(program: &str, cwd: &Path) -> bool {
+    if !cwd.is_dir() {
+        return false;
+    }
+
+    let program_path = Path::new(program);
+    if program_path.components().count() > 1 {
+        let candidate = if program_path.is_absolute() {
+            program_path.to_path_buf()
+        } else {
+            cwd.join(program_path)
+        };
+        return std::fs::metadata(candidate)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    }
+
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).all(|directory| {
+        let directory = if directory.is_absolute() {
+            directory
+        } else {
+            cwd.join(directory)
+        };
+        std::fs::metadata(directory.join(program))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn stream_json_connect_error(error: anyhow::Error, program: &str, cwd: &Path) -> HarnessError {
+    let missing_binary = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    }) && program_definitely_missing(program, cwd);
+    if missing_binary {
+        HarnessError::CapabilityUnavailable {
+            capability: HarnessCapability::Vendor,
+            detail: format!("Claude executable is not available: {error:#}"),
+        }
+    } else {
+        HarnessError::SpawnFailed(format!("stream-json connect: {error:#}"))
+    }
+}
+
+fn initialize_rejection_error(
+    detail: &str,
+    model_id: Option<&str>,
+    effort: Option<&str>,
+) -> HarnessError {
+    let normalized = detail.trim().to_ascii_lowercase();
+    let explicit_model_rejection = model_id.is_some_and(|model| !model.trim().is_empty())
+        && ["invalid model", "unknown model", "unsupported model"]
+            .iter()
+            .any(|prefix| normalized.starts_with(prefix));
+    if explicit_model_rejection {
+        return HarnessError::CapabilityUnavailable {
+            capability: HarnessCapability::Model,
+            detail: detail.to_string(),
+        };
+    }
+    let explicit_effort_rejection = effort.is_some_and(|effort| !effort.trim().is_empty())
+        && [
+            "invalid effort",
+            "invalid reasoning effort",
+            "unknown effort",
+            "unknown reasoning effort",
+            "unsupported effort",
+            "unsupported reasoning effort",
+        ]
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix));
+    if explicit_effort_rejection {
+        return HarnessError::CapabilityUnavailable {
+            capability: HarnessCapability::Effort,
+            detail: detail.to_string(),
+        };
+    }
+    HarnessError::SpawnFailed(format!("stream-json initialize rejected: {detail}"))
+}
+
+/// Validate an explicit effort against the per-model capability returned by
+/// this exact Claude `initialize` handshake. A missing model row remains
+/// advisory and proves nothing; only a matching model's own effort list can
+/// produce the typed refusal.
+fn validate_requested_effort(
+    model_id: Option<&str>,
+    effort: Option<&str>,
+    models: &[ClaudeModelOption],
+) -> Result<(), HarnessError> {
+    if models.is_empty() {
+        return Ok(());
+    }
+    let Some(requested_model) = model_id.map(str::trim).filter(|model| !model.is_empty()) else {
+        return Ok(());
+    };
+    let Some(model) = models
+        .iter()
+        .find(|model| model.value.trim().eq_ignore_ascii_case(requested_model))
+    else {
+        return Ok(());
+    };
+    let Some(requested_effort) = effort.map(str::trim).filter(|effort| !effort.is_empty()) else {
+        return Ok(());
+    };
+    if model
+        .efforts
+        .iter()
+        .any(|effort| effort.trim().eq_ignore_ascii_case(requested_effort))
+    {
+        return Ok(());
+    }
+    Err(HarnessError::CapabilityUnavailable {
+        capability: HarnessCapability::Effort,
+        detail: format!(
+            "Claude model `{requested_model}` did not advertise requested effort `{requested_effort}`"
+        ),
+    })
+}
 
 /// §七 ⑤ — host-facet-friendly session identity. `sid → vendor_uuid` is a
 /// stable mapping (the uuid is derived deterministically from `(slug,
@@ -1028,10 +1152,13 @@ impl ClaudeStreamJsonAdapter {
         env: &[(String, String)],
         cwd: &Path,
         body: Option<(&Path, &str)>,
+        model_id: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<(Arc<StreamJsonTransport>, protocol::SystemMsg), HarnessError> {
+        let program = argv.first().map(String::as_str).unwrap_or_default();
         let transport = StreamJsonTransport::connect_stdio(argv, env, cwd)
             .await
-            .map_err(|e| HarnessError::SpawnFailed(format!("stream-json connect: {e:#}")))?;
+            .map_err(|error| stream_json_connect_error(error, program, cwd))?;
         // One sid, one body: record the child BEFORE the handshake, so the
         // next daemon can find this process even if this one dies right now.
         if let Some((project_dir, sid)) = body {
@@ -1048,7 +1175,7 @@ impl ClaudeStreamJsonAdapter {
                 );
             }
         }
-        Self::init_transport(transport).await
+        Self::init_transport(transport, model_id, effort).await
     }
 
     /// v0.9.0 W3 (F3, tech-design §0.4/§4.3) — the remote counterpart of
@@ -1060,12 +1187,14 @@ impl ClaudeStreamJsonAdapter {
     async fn spawn_and_init_remote(
         target: &crate::execution::remote_exec::RemoteExecTarget,
         exec_spec: crate::execution::remote_exec::ExecSpec,
+        model_id: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<(Arc<StreamJsonTransport>, protocol::SystemMsg), HarnessError> {
         let (reader, writer) = crate::execution::remote_exec::connect(target, exec_spec)
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("ccteam-exec.v1 connect: {e:#}")))?;
         let transport = StreamJsonTransport::spawn_from_io(reader, writer, None);
-        Self::init_transport(transport).await
+        Self::init_transport(transport, model_id, effort).await
     }
 
     /// Shared `initialize` control_request handshake — see
@@ -1073,6 +1202,8 @@ impl ClaudeStreamJsonAdapter {
     /// the capability handshake stream-json uses.
     async fn init_transport(
         transport: StreamJsonTransport,
+        model_id: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<(Arc<StreamJsonTransport>, protocol::SystemMsg), HarnessError> {
         match transport
             .request_control("initialize", json!({}), init_timeout())
@@ -1084,10 +1215,8 @@ impl ClaudeStreamJsonAdapter {
             )),
             Ok(body) => {
                 transport.shutdown().await;
-                Err(HarnessError::SpawnFailed(format!(
-                    "stream-json initialize rejected: {}",
-                    body.error.unwrap_or_else(|| body.subtype.clone())
-                )))
+                let detail = body.error.unwrap_or_else(|| body.subtype.clone());
+                Err(initialize_rejection_error(&detail, model_id, effort))
             }
             Err(e) => {
                 transport.shutdown().await;
@@ -1258,7 +1387,14 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             let build_spec = |resume: bool| {
                 Self::build_exec_spec(ctx, make_argv(resume), &env, ship_mcp, &mcp_relpath)
             };
-            match Self::spawn_and_init_remote(remote, build_spec(resume)).await {
+            match Self::spawn_and_init_remote(
+                remote,
+                build_spec(resume),
+                ctx.model_id.as_deref(),
+                ctx.effort.as_deref(),
+            )
+            .await
+            {
                 Ok(ok) => ok,
                 Err(resume_err) if resume => {
                     tracing::warn!(
@@ -1267,7 +1403,13 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                         error = %resume_err,
                         "claude-stream-json: remote --resume spawn failed; falling back to fresh --session-id"
                     );
-                    let fresh = Self::spawn_and_init_remote(remote, build_spec(false)).await?;
+                    let fresh = Self::spawn_and_init_remote(
+                        remote,
+                        build_spec(false),
+                        ctx.model_id.as_deref(),
+                        ctx.effort.as_deref(),
+                    )
+                    .await?;
                     if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
                         let ev = build_chat_session_reset_event_with_reason(
                             &spec.role,
@@ -1284,7 +1426,16 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             }
         } else {
             let body = Some((ctx.project_dir.as_path(), ctx.sid.as_str()));
-            match Self::spawn_and_init(&make_argv(resume), &env, &ctx.cwd, body).await {
+            match Self::spawn_and_init(
+                &make_argv(resume),
+                &env,
+                &ctx.cwd,
+                body,
+                ctx.model_id.as_deref(),
+                ctx.effort.as_deref(),
+            )
+            .await
+            {
                 Ok(ok) => ok,
                 Err(resume_err) if resume => {
                     tracing::warn!(
@@ -1293,8 +1444,15 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                         error = %resume_err,
                         "claude-stream-json: --resume spawn failed; falling back to fresh --session-id"
                     );
-                    let fresh =
-                        Self::spawn_and_init(&make_argv(false), &env, &ctx.cwd, body).await?;
+                    let fresh = Self::spawn_and_init(
+                        &make_argv(false),
+                        &env,
+                        &ctx.cwd,
+                        body,
+                        ctx.model_id.as_deref(),
+                        ctx.effort.as_deref(),
+                    )
+                    .await?;
                     if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
                         let ev = build_chat_session_reset_event_with_reason(
                             &spec.role,
@@ -1310,6 +1468,23 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 Err(e) => return Err(e),
             }
         };
+
+        // A resume may persist the API-reported full model id while the picker
+        // advertises a short alias. Validate only a fresh explicit pick; a
+        // resume must replay its already-proven vendor session identity.
+        if !resume {
+            if let Err(error) = validate_requested_effort(
+                ctx.model_id.as_deref(),
+                ctx.effort.as_deref(),
+                &init.models,
+            ) {
+                transport.shutdown().await;
+                if ctx.remote.is_none() {
+                    crate::execution::session_body::clear(&ctx.project_dir, &ctx.sid);
+                }
+                return Err(error);
+            }
+        }
 
         let identity = SessionIdentity {
             sid: ctx.sid.clone(),
@@ -1497,10 +1672,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             });
         }
         let Some(live) = self.lookup(&h.identity) else {
-            // Registry miss = the session was idle-released / closed: nothing was
-            // sent, so this is a recoverable ThreadDied (caller resumes + retries
-            // once), not a hard SubmitFailed.
-            return Err(HarnessError::ThreadDied(format!(
+            // Registry miss happens before any transport write, so it is the
+            // one typed outcome the caller may safely resume and retry once.
+            return Err(HarnessError::ThreadUnavailableBeforeDispatch(format!(
                 "stream-json session not live: {} (needs resume)",
                 h.identity
             )));
@@ -1528,9 +1702,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             .await
         {
             live.active_turn.store(was_active, Ordering::Release);
-            // Writer closed = the child exited mid-handoff (the probe→send
-            // race): the line was NOT delivered, so it's a recoverable
-            // ThreadDied the gateway resumes + retries once.
+            // A failed async write cannot prove whether zero, some, or all
+            // bytes reached the child. Keep it ambiguous; the gateway must not
+            // blind-retry this `ThreadDied`.
             return Err(HarnessError::ThreadDied(format!(
                 "stream-json send: {error:#}"
             )));
@@ -2037,13 +2211,16 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
     /// left fully live: no `close_thread`, no map removal, no pump abort — only
     /// the current turn stops, so a following `/model` etc. still works on the
     /// same context.
-    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
         let Some(live) = self.lookup(&h.identity) else {
             return Err(HarnessError::SubmitFailed(format!(
                 "interrupt: no live stream-json session for {} (nothing to interrupt)",
                 h.identity
             )));
         };
+        if !live.active_turn.load(Ordering::Acquire) {
+            return Ok(InterruptOutcome::AlreadyIdle);
+        }
         let body = live
             .transport
             .request_control("interrupt", json!({}), init_timeout())
@@ -2055,7 +2232,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 body.error.unwrap_or_else(|| body.subtype.clone())
             )));
         }
-        Ok(())
+        Ok(InterruptOutcome::Interrupted)
     }
 
     /// Claude's title surface is its transcript's `custom-title` entry (the
@@ -2086,13 +2263,119 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
 mod effort_tests {
     use super::protocol::{McpServerStatus, SystemMsg};
     use super::{
-        claude_model_options, dead_ccteam_tool_face, is_model_placeholder, normalize_effort,
-        parse_latest_goal_status, persisted_session_model, preserve_1m_tag, reflect_task_event,
-        set_effort_level, split_model_effort, task_outlives_turn, write_status_file,
-        ClaudeModelOption, TaskTracker, EFFORT_LEVELS,
+        claude_model_options, dead_ccteam_tool_face, initialize_rejection_error,
+        is_model_placeholder, normalize_effort, parse_latest_goal_status, persisted_session_model,
+        preserve_1m_tag, reflect_task_event, set_effort_level, split_model_effort,
+        stream_json_connect_error, task_outlives_turn, validate_requested_effort,
+        write_status_file, ClaudeModelOption, TaskTracker, EFFORT_LEVELS,
     };
-    use crate::ThreadStatus;
+    use crate::{HarnessCapability, HarnessError, ThreadStatus};
+    use std::io;
     use std::sync::Mutex;
+
+    #[test]
+    fn missing_claude_binary_is_the_only_typed_connect_failure() {
+        let cwd = tempfile::tempdir().unwrap();
+        let missing_program = cwd.path().join("missing-claude");
+        let missing = stream_json_connect_error(
+            anyhow::Error::new(io::Error::new(io::ErrorKind::NotFound, "claude missing")),
+            missing_program.to_str().unwrap(),
+            cwd.path(),
+        );
+        assert!(matches!(
+            missing,
+            HarnessError::CapabilityUnavailable {
+                capability: HarnessCapability::Vendor,
+                ..
+            }
+        ));
+
+        // ENOENT can also mean the cwd vanished between validation and spawn.
+        // That is internal state, not proof that the vendor is unavailable.
+        let missing_cwd = cwd.path().join("missing-cwd");
+        let ambiguous = stream_json_connect_error(
+            anyhow::Error::new(io::Error::new(io::ErrorKind::NotFound, "spawn failed")),
+            missing_program.to_str().unwrap(),
+            &missing_cwd,
+        );
+        assert!(matches!(ambiguous, HarnessError::SpawnFailed(_)));
+
+        let denied = stream_json_connect_error(
+            anyhow::Error::new(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cannot execute claude",
+            )),
+            missing_program.to_str().unwrap(),
+            cwd.path(),
+        );
+        assert!(matches!(denied, HarnessError::SpawnFailed(_)));
+    }
+
+    #[test]
+    fn live_initialize_catalog_types_only_proven_effort_absence() {
+        let models = vec![ClaudeModelOption {
+            value: "opus".to_string(),
+            display_name: Some("Opus".to_string()),
+            efforts: vec!["low".to_string(), "high".to_string()],
+        }];
+        validate_requested_effort(Some("opus"), Some("high"), &models).unwrap();
+
+        let effort = validate_requested_effort(Some("opus"), Some("max"), &models).unwrap_err();
+        assert!(matches!(
+            effort,
+            HarnessError::CapabilityUnavailable {
+                capability: HarnessCapability::Effort,
+                ..
+            }
+        ));
+
+        // Model discovery is advisory: absence from the picker is not a
+        // vendor refusal and must not become one.
+        validate_requested_effort(Some("sonnet"), Some("high"), &models).unwrap();
+
+        // An old/partial initialize response proves nothing either.
+        validate_requested_effort(Some("opus"), Some("max"), &[]).unwrap();
+    }
+
+    #[test]
+    fn initialize_rejection_types_only_explicit_axis_refusals() {
+        let model = initialize_rejection_error(
+            "Invalid model `opus-next`",
+            Some("opus-next"),
+            Some("high"),
+        );
+        assert!(matches!(
+            model,
+            HarnessError::CapabilityUnavailable {
+                capability: HarnessCapability::Model,
+                ..
+            }
+        ));
+
+        let effort = initialize_rejection_error(
+            "Unsupported reasoning effort `max`",
+            Some("opus"),
+            Some("max"),
+        );
+        assert!(matches!(
+            effort,
+            HarnessError::CapabilityUnavailable {
+                capability: HarnessCapability::Effort,
+                ..
+            }
+        ));
+
+        for detail in [
+            "model unavailable for this subscription",
+            "request timed out while loading model",
+            "authentication required for model opus",
+        ] {
+            assert!(matches!(
+                initialize_rejection_error(detail, Some("opus"), Some("max")),
+                HarnessError::SpawnFailed(_)
+            ));
+        }
+    }
 
     /// `"default"` (claude's own picker-menu label, any case/whitespace) is a
     /// placeholder, not a real model id; every other string — including a

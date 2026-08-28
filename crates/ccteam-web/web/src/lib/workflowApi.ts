@@ -2,16 +2,29 @@
 
 import { httpError } from "./httpError";
 
-export interface EvolutionBucket {
+export interface EvolutionMetrics {
+  accepted_turns?: number;
+  revised_turns?: number;
+  unrated_turns?: number;
+  completed_turns?: number;
+  failed_turns?: number;
+  outcome_unknown_turns?: number;
+  priced_turns?: number;
+  unpriced_turns?: number;
+  avg_duration_ms?: number | null;
+}
+
+export interface EvolutionBucket extends EvolutionMetrics {
   kind: string;
   id: string;
   sha: string;
   turn_count: number;
-  avg_cost_usd?: number | null;
+  priced_avg_cost_usd?: number | null;
+  known_cost_usd?: number | null;
   total_cost_usd?: number | null;
 }
 
-export interface EvolutionSummary {
+export interface EvolutionSummary extends EvolutionMetrics {
   slug: string;
   turn_records: number;
   verdict_records: number;
@@ -19,6 +32,9 @@ export interface EvolutionSummary {
   turn_records_7d: number;
   roles: EvolutionBucket[];
   skills: EvolutionBucket[];
+  /** Skill hashes describe what was available when the session spawned; they
+   * do not prove that the agent invoked a skill. */
+  skill_attribution?: "available_at_spawn" | string;
   empty: boolean;
 }
 

@@ -71,6 +71,29 @@ struct DraftRoute {
 }
 
 type DraftRoutes = Arc<StdMutex<HashMap<DraftRouteKey, DraftRoute>>>;
+
+/// Releases exactly one successor in a chat-local inbound FIFO even if the
+/// current task is aborted or panics.
+struct InboundLaneCompletion(Option<Arc<tokio::sync::Notify>>);
+
+impl InboundLaneCompletion {
+    fn new(completion: Arc<tokio::sync::Notify>) -> Self {
+        Self(Some(completion))
+    }
+
+    fn release(&mut self) {
+        if let Some(completion) = self.0.take() {
+            completion.notify_one();
+        }
+    }
+}
+
+impl Drop for InboundLaneCompletion {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 #[derive(Default)]
 struct DraftFinalizationState {
     by_status_key: HashMap<String, Arc<AtomicU8>>,
@@ -912,6 +935,11 @@ where
         }
     }
     inbound_consumer.abort();
+    // Dropping the consumer aborts its tracked per-message JoinSet. Await the
+    // cancellation before detaching bodies so no accepted inbound submit can
+    // outlive daemon shutdown and commit a late reply.
+    let _ = inbound_consumer.await;
+    Gateway::drain_cleanup_tasks_shared(&gateway).await;
     gateway_event_consumer.abort();
     scheduled_scheduler.abort();
     body_watcher.abort();
@@ -1605,7 +1633,18 @@ fn spawn_inbound_consumer(
     draft_routes: DraftRoutes,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut lane_tails: HashMap<(String, String, String), Arc<tokio::sync::Notify>> =
+            HashMap::new();
+        let mut observation_tails: HashMap<
+            (String, String, String),
+            tokio::sync::watch::Receiver<bool>,
+        > = HashMap::new();
         while let Some(msg) = rx.recv().await {
+            while tasks.try_join_next().is_some() {}
+            if tasks.len() >= INBOUND_BUF {
+                let _ = tasks.join_next().await;
+            }
             let cid = msg.id.clone();
             let log_cid = crate::transport::safe_correlation_id(&cid);
             let route_t0 = std::time::Instant::now();
@@ -1709,94 +1748,42 @@ fn spawn_inbound_consumer(
                 clean_payload = format!("/stop {}", route.sid);
             }
 
-            let restore_incomplete = !*restore_complete.borrow();
-            if clean_payload.split_whitespace().next() == Some("/sessions") && restore_incomplete {
-                // Startup restore deliberately runs outside the gateway lock
-                // so the daemon and web face remain available while vendor
-                // children resume. A listing must not expose a partial prefix
-                // of that batch (s1 applied while s2 is still spawning), so
-                // park ONLY this request on the explicit completion signal.
-                // Its own task keeps the inbound consumer free to serve every
-                // unrelated message during restore.
-                let gateway = Arc::clone(&gateway);
-                let channel = Arc::clone(&channel);
-                let msg = msg.clone();
-                let cid = cid.clone();
-                let mut restore_complete = restore_complete.clone();
-                tokio::spawn(async move {
-                    if restore_complete.changed().await.is_err() {
-                        tracing::warn!(
-                            "ccteam-im: restore task ended before session-list readiness was signalled"
-                        );
-                    }
-                    let replies = gateway
-                        .lock()
-                        .await
-                        .handle_message_rich(
-                            &msg.channel,
-                            &msg.reply_target,
-                            &msg.sender,
-                            &msg.id,
-                            &clean_payload,
-                            &msg.attachments,
-                            msg.selection.as_ref(),
-                        )
-                        .await;
-                    deliver_gateway_replies(&cid, route_t0, &msg, channel.as_ref(), replies).await;
-                });
-                continue;
-            }
+            let lane_key = (
+                msg.channel.clone(),
+                msg.reply_target.clone(),
+                msg.sender.clone(),
+            );
+            let prior_observation = observation_tails.get(&lane_key).cloned();
+            let can_bypass = Gateway::inbound_can_bypass_turn_lane(
+                &gateway,
+                &msg.channel,
+                &msg.reply_target,
+                &msg.sender,
+                &clean_payload,
+                msg.selection.is_some(),
+            )
+            .await;
 
-            // v0.8.x (concurrency review §4.1 P1) — LOCKING PROTOCOL. Before
-            // this fix, `gateway.lock().await.handle_message(...).await` held
-            // the gateway's global lock for the ENTIRE call, and this loop
-            // awaited it inline before pulling the next message off `rx` — so
-            // one chat spawning a session (tmux/subprocess spawn, stream-json
-            // `system:init`) queued every other chat's message behind it,
-            // both on the lock AND on this loop never reaching `rx.recv()`
-            // again.
-            //
-            // `inbound_may_spawn` is a cheap, synchronous, always-safe-either-
-            // way hint: a message that can only ever SUBMIT to an
-            // already-live session (no gateway command, no `@mention`, the
-            // chat already has a current session) is still processed INLINE
-            // exactly as before — its own lock section is bounded by the
-            // adapter's submit timeout, never a spawn, so keeping it on this
-            // loop costs nothing. A message that might need the implicit
-            // first-message spawn is instead handed to
-            // `Gateway::handle_message_shared` on its OWN task: that entry
-            // point plans under a short lock, drops the lock for the slow
-            // spawn, then re-locks briefly to apply the result — freeing this
-            // loop to `rx.recv()` the next chat's message immediately rather
-            // than queuing behind the spawn.
-            //
-            // SCOPE: explicit spawning commands (`/new` `/role` `/use`
-            // `/clear` `@mention`-to-a-template) are NOT decomposed in this
-            // pass — `inbound_may_spawn` returns `false` for them, so they
-            // still run inline, holding the gateway lock across their own
-            // spawn exactly as before (a pre-existing, documented tradeoff —
-            // same as `start_session`'s inline compose). Dead-child resume
-            // is three-phase (v0.9 T2); `resume_dead_session_shared` is the
-            // lock-free form when a shared handle is available. A scoped,
-            // incremental step, not a full fix.
-            let may_spawn = {
-                let g = gateway.lock().await;
-                g.inbound_may_spawn(
-                    &msg.channel,
-                    &msg.reply_target,
-                    &msg.sender,
-                    &clean_payload,
-                    msg.selection.is_some(),
-                    !msg.attachments.is_empty(),
-                )
-            };
-            if may_spawn {
+            // Every state-changing inbound message enters the same per-chat
+            // lane. Only read-only observability commands bypass it, keeping
+            // `/sessions` and `/status` responsive without letting `/new`,
+            // quick templates, or other routing mutations overtake a turn.
+            if !can_bypass {
+                let predecessor = lane_tails.get(&lane_key).cloned();
+                let completion = Arc::new(tokio::sync::Notify::new());
+                lane_tails.insert(lane_key.clone(), Arc::clone(&completion));
+                let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+                observation_tails.insert(lane_key, ready_rx);
                 let gateway = Arc::clone(&gateway);
                 let channel = Arc::clone(&channel);
                 let msg = msg.clone();
                 let cid = cid.clone();
-                tokio::spawn(async move {
-                    let replies = Gateway::handle_message_shared(
+                tasks.spawn(async move {
+                    let _completion = InboundLaneCompletion::new(completion);
+                    if let Some(predecessor) = predecessor {
+                        predecessor.notified().await;
+                    }
+                    let replies = Gateway::handle_message_shared_with_ready(
                         gateway,
                         &msg.channel,
                         &msg.reply_target,
@@ -1805,6 +1792,7 @@ fn spawn_inbound_consumer(
                         &clean_payload,
                         &msg.attachments,
                         msg.selection.as_ref(),
+                        Some(ready_tx),
                     )
                     .await;
                     deliver_gateway_replies(&cid, route_t0, &msg, channel.as_ref(), replies).await;
@@ -1812,23 +1800,101 @@ fn spawn_inbound_consumer(
                 continue;
             }
 
-            let replies = gateway
-                .lock()
-                .await
-                .handle_message_rich(
+            // Lexical `/status` and `/sessions` are only candidates for the
+            // observability fast path. A preceding `/use` can make the same
+            // free-text command an answer to a pending choice. Reserve its
+            // FIFO slot now, then reclassify after the predecessor's routing
+            // mutation is visible. If it remains read-only, release the slot
+            // before the slow probes; otherwise hold it through normal inbound
+            // handling so no later stateful message can overtake it.
+            let predecessor = lane_tails.get(&lane_key).cloned();
+            let completion = Arc::new(tokio::sync::Notify::new());
+            lane_tails.insert(lane_key.clone(), Arc::clone(&completion));
+            let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+            observation_tails.insert(lane_key, ready_rx);
+            let gateway = Arc::clone(&gateway);
+            let channel = Arc::clone(&channel);
+            let msg = msg.clone();
+            let cid = cid.clone();
+            let mut restore_complete = restore_complete.clone();
+            tasks.spawn(async move {
+                let mut completion = InboundLaneCompletion::new(completion);
+                let still_observability = Gateway::inbound_can_bypass_after_prior_routing(
+                    &gateway,
+                    prior_observation,
                     &msg.channel,
                     &msg.reply_target,
                     &msg.sender,
-                    &msg.id,
                     &clean_payload,
-                    &msg.attachments,
-                    msg.selection.as_ref(),
+                    msg.selection.is_some(),
                 )
                 .await;
-            deliver_gateway_replies(&cid, route_t0, &msg, channel.as_ref(), replies).await;
+                let restore_ready = wait_for_restore_after_reclassification(
+                    still_observability,
+                    &clean_payload,
+                    &mut restore_complete,
+                )
+                .await;
+                let replies = if still_observability {
+                    if !restore_ready {
+                        tracing::warn!(
+                            "ccteam-im: restore task ended before session-list readiness was signalled"
+                        );
+                    }
+                    let _ = ready_tx.send(true);
+                    completion.release();
+                    Gateway::handle_observability_shared(
+                        gateway,
+                        &msg.channel,
+                        &msg.reply_target,
+                        &msg.sender,
+                        &clean_payload,
+                    )
+                    .await
+                } else {
+                    if let Some(predecessor) = predecessor {
+                        predecessor.notified().await;
+                    }
+                    Gateway::handle_message_shared_with_ready(
+                        gateway,
+                        &msg.channel,
+                        &msg.reply_target,
+                        &msg.sender,
+                        &msg.id,
+                        &clean_payload,
+                        &msg.attachments,
+                        msg.selection.as_ref(),
+                        Some(ready_tx),
+                    )
+                    .await
+                };
+                deliver_gateway_replies(&cid, route_t0, &msg, channel.as_ref(), replies).await;
+            });
         }
+        while tasks.join_next().await.is_some() {}
         tracing::debug!("imd: inbound consumer exited (all senders closed)");
     })
+}
+
+/// A lexical `/sessions` is parked on startup recovery only after the prior
+/// same-chat routing mutation has confirmed it is still an observability
+/// command. If `/use` made those bytes a pending editor answer, return
+/// immediately; unrelated restore work must not stall the ordered chat lane.
+async fn wait_for_restore_after_reclassification(
+    still_observability: bool,
+    payload: &str,
+    restore_complete: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    if !still_observability
+        || payload.split_whitespace().next() != Some("/sessions")
+        || *restore_complete.borrow()
+    {
+        return true;
+    }
+    restore_complete
+        .wait_for(|complete| *complete)
+        .await
+        .is_ok()
 }
 
 /// Send the outcome of one `handle_message`/`handle_message_shared` call to
@@ -2036,7 +2102,11 @@ fn spawn_gateway_event_consumer(
                         evt.thread_ts,
                         evt.content,
                         evt.button_rows,
-                        evt.sid.clone(),
+                        // Telegram's live-draft bubble can monopolize mobile
+                        // chat input while a turn is active. Keep progress on
+                        // the ordinary send-once/edit-in-place path; the sid
+                        // remains on the gateway event for routing and logs.
+                        None,
                     )
                     .await;
                     if let (Some(sid), Some(_)) =
@@ -3369,6 +3439,33 @@ pub fn _link_check(_c: &Credentials) {}
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn restore_wait_is_skipped_after_sessions_text_becomes_pending_input() {
+        let (_complete, mut restore) = tokio::sync::watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            wait_for_restore_after_reclassification(false, "/sessions", &mut restore),
+        )
+        .await
+        .expect("reclassified pending input must not wait for startup restore");
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn restore_wait_holds_a_real_sessions_listing_until_the_batch_is_complete() {
+        let (complete, mut restore) = tokio::sync::watch::channel(false);
+        let wait = tokio::spawn(async move {
+            wait_for_restore_after_reclassification(true, "/sessions", &mut restore).await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "partial restored fleet must stay hidden"
+        );
+        complete.send(true).unwrap();
+        assert!(wait.await.unwrap());
+    }
+
     /// v0.8.20 F2 — one channel per tenant bot, keyed `"<platform>@<tenant_id>"`
     /// (the unique routing key); a tenant with no IM creds yields no channel.
     #[cfg(feature = "telegram")]
@@ -3571,76 +3668,8 @@ mod tests {
         task.abort();
     }
 
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test(start_paused = true)]
-    async fn draft_keepalive_refreshes_silent_session() {
-        let _g = env_lock();
-        std::env::set_var("CCTEAM_IM_DRAFT_KEEPALIVE_MS", "2000");
-        let mock = crate::transport::providers::mock::MockChannel::new()
-            .with_name("telegram")
-            .with_draft_support();
-        let mut channels = ChannelMap::new();
-        channels.insert("telegram".to_string(), Arc::new(mock.clone()));
-        let channels = Arc::new(RwLock::new(channels));
-        let routes = Arc::new(StdMutex::new(HashMap::new()));
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let consumer = spawn_gateway_event_consumer(rx, channels, routes);
-
-        tx.send(GatewayEvent {
-            id: "progress-keepalive".to_string(),
-            cid: None,
-            channel: "telegram".to_string(),
-            chat_id: "123".to_string(),
-            thread_ts: None,
-            content: "▶️ s42 работает · 0с".to_string(),
-            kind: GatewayEventKind::Progress {
-                status_key: "s42-1".to_string(),
-                done: false,
-            },
-            attachments: Vec::new(),
-            options: Vec::new(),
-            button_rows: Vec::new(),
-            sid: Some("s42".to_string()),
-            slug: None,
-        })
-        .unwrap();
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        let mut observed = 0;
-        let mut post_times = Vec::new();
-        let initial_drafts = mock.drafts().await;
-        while observed < initial_drafts.len() {
-            post_times.push(tokio::time::Instant::now());
-            observed += 1;
-        }
-        for _ in 0..20 {
-            tokio::time::advance(Duration::from_secs(2)).await;
-            tokio::task::yield_now().await;
-            let drafts = mock.drafts().await;
-            while observed < drafts.len() {
-                post_times.push(tokio::time::Instant::now());
-                observed += 1;
-            }
-        }
-
-        let drafts = mock.drafts().await;
-        consumer.abort();
-        std::env::remove_var("CCTEAM_IM_DRAFT_KEEPALIVE_MS");
-
-        assert!(
-            drafts.len() >= 3,
-            "silent draft must be refreshed, got {} posts: {drafts:?}",
-            drafts.len()
-        );
-        assert!(drafts.windows(2).all(|pair| pair[0].1 == pair[1].1));
-        assert!(post_times
-            .windows(2)
-            .all(|pair| pair[1].duration_since(pair[0]) <= Duration::from_secs(25)));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn draft_done_without_answer_sends_rich_final_card() {
+    async fn progress_done_without_answer_edits_the_seed_message() {
         let mock = crate::transport::providers::mock::MockChannel::new()
             .with_name("telegram")
             .with_rich_support()
@@ -3680,20 +3709,15 @@ mod tests {
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
-        tokio::time::advance(DRAFT_FINALIZATION_GRACE).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
         consumer.abort();
 
         let outbox = mock.outbox().await;
-        assert_eq!(outbox.len(), 1, "tool-only turn needs one final card");
-        assert!(outbox[0].content.starts_with("✅ готово · "));
-        assert_eq!(
-            outbox[0].rich_markdown.as_deref(),
-            Some(outbox[0].content.as_str())
-        );
-        assert!(mock.edits().await.is_empty());
+        assert_eq!(outbox.len(), 1, "progress needs one editable seed");
+        assert!(outbox[0].content.starts_with("▶️ s42 работает"));
+        let edits = mock.edits().await;
+        assert_eq!(edits.len(), 1);
+        assert!(edits[0].1.starts_with("✅ готово · "));
+        assert!(mock.drafts().await.is_empty());
     }
 
     #[tokio::test]

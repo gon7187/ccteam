@@ -48,7 +48,7 @@ fn config_set_get_round_trips_a_preference() {
         "config set should succeed; stdout={set_out}; stderr={set_err}",
     );
     assert!(
-        set_out.contains("set fallback.on_claude_quota = codex"),
+        set_out.contains("задано fallback.on_claude_quota = codex"),
         "set must confirm the write; got: {set_out}",
     );
 
@@ -130,7 +130,8 @@ fn config_bare_menu_refuses_without_a_tty() {
     );
     let combined = format!("{out}{err}");
     assert!(
-        combined.contains("needs a TTY") && combined.contains("ccteam config show"),
+        combined.contains("интерактивному меню нужен TTY")
+            && combined.contains("ccteam config show"),
         "refusal must mention the TTY requirement + the headless forms; got: {combined}",
     );
 }

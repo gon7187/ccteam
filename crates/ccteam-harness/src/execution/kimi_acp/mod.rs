@@ -82,8 +82,8 @@ use crate::execution::session_meta::read_session_meta;
 use crate::execution::session_status::read_status_file;
 use crate::{
     AgentSpecBrief, AgentVendor, ChoicePrompt, DetachOutcome, Directive, DirectiveOutcome,
-    ExecutionMode, HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent,
-    ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
+    ExecutionMode, HarnessAdapter, HarnessError, InterruptOutcome, PermissionMode, SpawnCtx,
+    ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
 use protocol::{
@@ -362,7 +362,10 @@ impl KimiAcpAdapter {
         routing: TurnRouting,
     ) -> Result<TurnSubmission, HarnessError> {
         let live = self.get_live(&h.identity).ok_or_else(|| {
-            HarnessError::ThreadDied(format!("kimi session {} not live", h.identity))
+            HarnessError::ThreadUnavailableBeforeDispatch(format!(
+                "kimi session {} not live",
+                h.identity
+            ))
         })?;
         let text = match input {
             TurnInput::UserText(t) => t,
@@ -650,7 +653,7 @@ impl HarnessAdapter for KimiAcpAdapter {
                     }),
                 )
                 .await
-                .map_err(|e| crate::execution::acp::spawn_pick_refused("model", model, e))?;
+                .map_err(|e| crate::execution::acp::spawn_pick_request_failed("model", model, e))?;
             if let Ok(mut st) = live.state.lock() {
                 st.model = Some(model.to_string());
             }
@@ -676,7 +679,9 @@ impl HarnessAdapter for KimiAcpAdapter {
                     }),
                 )
                 .await
-                .map_err(|e| crate::execution::acp::spawn_pick_refused("effort", effort, e))?;
+                .map_err(|e| {
+                    crate::execution::acp::spawn_pick_request_failed("effort", effort, e)
+                })?;
             if let Ok(mut st) = live.state.lock() {
                 st.effort = Some(effort.to_string());
             }
@@ -949,15 +954,15 @@ impl HarnessAdapter for KimiAcpAdapter {
         Ok(self.thread_status_inner(&live))
     }
 
-    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
         let Some(live) = self.get_live(&h.identity) else {
-            return Ok(());
+            return Ok(InterruptOutcome::AlreadyIdle);
         };
         live.transport
             .notify("session/cancel", json!({ "sessionId": live.session_id }))
             .await
             .map_err(|e| HarnessError::SubmitFailed(format!("session/cancel: {e}")))?;
-        Ok(())
+        Ok(InterruptOutcome::Requested)
     }
 
     fn thread_is_live(&self, h: &ThreadHandle) -> bool {
