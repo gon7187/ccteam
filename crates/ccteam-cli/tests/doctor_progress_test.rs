@@ -195,3 +195,51 @@ fn doctor_reports_and_repairs_progress_damage_idempotently() {
     );
     assert_eq!(backup_count(progress), 3);
 }
+
+/// A retired generation legitimately refuses journal writes while its config
+/// row is still being removed. `--repair-progress` must skip it instead of
+/// aborting the whole sweep before the healthy slugs are reached.
+#[test]
+fn doctor_repair_skips_retired_slugs_and_still_repairs_the_rest() {
+    let temp = tempfile::tempdir().unwrap();
+    let ccteam_home = temp.path().join("ccteam-home");
+
+    // Register both slugs before any progress state exists, the way a real
+    // install grows: `demo` becomes corrupt later, `alpha` gets retired.
+    for slug in ["alpha", "demo"] {
+        ccteam_core::config::upsert_project(
+            &ccteam_home,
+            ccteam_core::config::ProjectEntry {
+                slug: slug.to_string(),
+                path: temp.path().join(slug),
+                host: "local".to_string(),
+                remote_slug: None,
+                remote_path: None,
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+    }
+    write_fixture(temp.path());
+
+    // `alpha` sorts before `demo`, so a `?`-propagated retirement error would
+    // abort the sweep before `demo` is ever repaired.
+    let retired_active = ccteam_home.join("state/progress/alpha.jsonl");
+    ccteam_harness::execution::progress_bridge::mark_progress_retired(&retired_active).unwrap();
+
+    let repaired = doctor_command(temp.path(), true).output().unwrap();
+    let stdout = String::from_utf8_lossy(&repaired.stdout);
+    assert!(
+        stdout.contains("alpha: пропущено — поколение снято с эксплуатации (retired)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("demo.jsonl: сохранено 2, отброшено 1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("demo.1.jsonl: сохранено 1, отброшено 1"),
+        "{stdout}"
+    );
+}

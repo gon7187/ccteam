@@ -492,6 +492,8 @@ fn validate_project_progress_generation(
     slug: &str,
     already_registered: bool,
 ) -> Result<()> {
+    use ccteam_harness::execution::progress_bridge::ProgressSlugReservation;
+
     let progress_path = project_progress_path(ccteam_root, slug);
     if already_registered {
         if ccteam_harness::execution::progress_bridge::progress_state_is_retired(&progress_path)? {
@@ -499,13 +501,17 @@ fn validate_project_progress_generation(
                 "project slug `{slug}` is permanently retired; create the project under a fresh numeric slug"
             ));
         }
-    } else if ccteam_harness::execution::progress_bridge::progress_slug_is_reserved(&progress_path)?
-    {
-        return Err(anyhow!(
-            "project slug `{slug}` is permanently reserved by prior progress state; choose a fresh numeric slug"
-        ));
+        return Ok(());
     }
-    Ok(())
+    match ccteam_harness::execution::progress_bridge::progress_slug_reservation(&progress_path)? {
+        ProgressSlugReservation::Free => Ok(()),
+        ProgressSlugReservation::Retired => Err(anyhow!(
+            "project slug `{slug}` is permanently retired; choose a fresh numeric slug"
+        )),
+        ProgressSlugReservation::ActiveState => Err(anyhow!(
+            "project slug `{slug}` is reserved by existing progress state; choose a fresh numeric slug"
+        )),
+    }
 }
 
 /// Fail before a project scaffold/refresh touches project-local files when its
@@ -816,13 +822,31 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(
-            append_error.contains("permanently reserved"),
+            append_error.contains("permanently retired"),
             "{append_error}"
         );
     }
 
     #[test]
-    fn any_orphan_progress_lock_reserves_an_unregistered_slug() {
+    fn a_bare_legacy_progress_lock_does_not_reserve_a_slug() {
+        let tmp = TempDir::new().unwrap();
+        // Every pre-retirement install carries leftover empty `.lock` inodes
+        // for slugs that were removed the old way. They own no state and must
+        // not block reuse of the base slug.
+        let progress = project_progress_path(tmp.path(), "demo");
+        std::fs::create_dir_all(progress.parent().unwrap()).unwrap();
+        std::fs::write(progress.with_file_name("demo.lock"), b"").unwrap();
+
+        assert_eq!(
+            pick_unused_project_slug(tmp.path(), "demo").unwrap(),
+            "demo"
+        );
+        append_project(tmp.path(), sample_entry("demo", Path::new("/x/demo"))).unwrap();
+        assert!(lookup_project(tmp.path(), "demo").unwrap().is_some());
+    }
+
+    #[test]
+    fn orphan_progress_state_reserves_an_unregistered_slug() {
         let tmp = TempDir::new().unwrap();
         let progress = project_progress_path(tmp.path(), "demo");
         ccteam_harness::execution::progress_bridge::append_event(
@@ -838,7 +862,11 @@ mod tests {
         let error = append_project(tmp.path(), sample_entry("demo", Path::new("/x/demo")))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("permanently reserved"), "{error}");
+        assert!(
+            error.contains("reserved by existing progress state"),
+            "{error}"
+        );
+        assert!(!error.contains("retired"), "{error}");
     }
 
     #[test]

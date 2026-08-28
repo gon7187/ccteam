@@ -1005,30 +1005,64 @@ fn progress_slugs(paths: &CcteamPaths) -> BTreeSet<String> {
 }
 
 /// Repair every corrupt active/archive progress journal under this home.
+///
+/// The sweep is per-slug best effort: a retired generation is skipped (its
+/// tombstone legitimately refuses writes while the config row is still being
+/// removed) and any single slug's failure is reported without aborting the
+/// remaining slugs.
 pub fn repair_progress(paths: &CcteamPaths) -> Result<String> {
     let mut out = String::from("исправление progress\n");
     let mut repaired = 0_u64;
+    let mut failed = 0_u64;
     for slug in progress_slugs(paths) {
         let active = paths.progress_jsonl(&slug);
+        match progress_bridge::progress_state_is_retired_shared(&active) {
+            Ok(true) => {
+                out.push_str(&format!(
+                    "  {slug}: пропущено — поколение снято с эксплуатации (retired)\n"
+                ));
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                failed = failed.saturating_add(1);
+                out.push_str(&format!(
+                    "  {slug}: ОШИБКА — не удалось прочитать маркер поколения: {error:#}\n"
+                ));
+                continue;
+            }
+        }
         let targets = [
             active.clone(),
             progress_bridge::progress_archive_path(&active),
         ];
         for target in targets {
-            if let Some(report) = progress_bridge::repair_progress_journal(&active, &target)? {
-                repaired = repaired.saturating_add(1);
-                out.push_str(&format!(
-                    "  {slug} {}: сохранено {}, отброшено {}, резервная копия {}\n",
-                    target
-                        .file_name()
-                        .map(|name| name.to_string_lossy())
-                        .unwrap_or_default(),
-                    report.kept_count,
-                    report.dropped_count,
-                    report.backup_path.display()
-                ));
+            let name = target
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match progress_bridge::repair_progress_journal(&active, &target) {
+                Ok(Some(report)) => {
+                    repaired = repaired.saturating_add(1);
+                    out.push_str(&format!(
+                        "  {slug} {name}: сохранено {}, отброшено {}, резервная копия {}\n",
+                        report.kept_count,
+                        report.dropped_count,
+                        report.backup_path.display()
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failed = failed.saturating_add(1);
+                    out.push_str(&format!("  {slug} {name}: ОШИБКА — {error:#}\n"));
+                }
             }
         }
+    }
+    if failed > 0 {
+        out.push_str(&format!(
+            "  слагов с ошибками: {failed}; остальные обработаны\n"
+        ));
     }
     if repaired == 0 {
         out.push_str("  повреждённых строк progress не найдено; журналы не менялись\n");

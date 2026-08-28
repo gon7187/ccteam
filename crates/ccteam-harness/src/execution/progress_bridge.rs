@@ -1050,13 +1050,67 @@ pub fn progress_state_is_retired(active_path: &Path) -> Result<bool> {
     }
 }
 
-/// Return whether a slug has ever owned a progress generation.
+/// Read-only sibling of [`progress_state_is_retired`] that takes the stable
+/// lock in shared mode, so concurrent readers do not serialize against each
+/// other. Writer semantics are unchanged: this still blocks behind an
+/// exclusive holder, so it is NOT safe on hot async paths — callers on those
+/// paths must consult a cached fence instead.
+pub fn progress_state_is_retired_shared(active_path: &Path) -> Result<bool> {
+    let Some(lock_file) = open_existing_progress_lock(active_path, false)? else {
+        return Ok(false);
+    };
+    let _lock = ProgressFileLock::lock_shared(&lock_file)
+        .with_context(|| format!("lock {}", progress_lock_path(active_path).display()))?;
+    match read_progress_lock_state_locked(&lock_file, active_path)? {
+        ProgressLockState::LegacyEmpty | ProgressLockState::Active => Ok(false),
+        ProgressLockState::Retired => Ok(true),
+    }
+}
+
+/// Why a slug cannot host a fresh progress generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressSlugReservation {
+    /// Nothing owns the slug: no lock inode at all, or a bare legacy/active
+    /// lock whose generation left no journal, checkpoint, index or receipts.
+    Free,
+    /// A durable retired tombstone owns the slug permanently.
+    Retired,
+    /// A non-retired generation still owns durable state under this slug.
+    ActiveState,
+}
+
+/// Classify who owns a slug's progress generation.
 ///
-/// Any existing safe regular lock inode reserves the slug, including legacy,
-/// retired, and future-marker files. The check does not create or mutate state;
-/// unsafe lock types and metadata/open failures remain errors.
+/// A bare lock inode is *not* an owner: locks are created eagerly by readers,
+/// repair sweeps and probes, so pre-existing empty locks must not reserve
+/// slugs. Ownership is the retired tombstone, or surviving durable state. The
+/// check does not create or mutate state; unsafe lock types and metadata/open
+/// failures remain errors.
+pub fn progress_slug_reservation(active_path: &Path) -> Result<ProgressSlugReservation> {
+    let state_reservation = |active_path: &Path| -> Result<ProgressSlugReservation> {
+        if progress_state_exists(active_path)? {
+            Ok(ProgressSlugReservation::ActiveState)
+        } else {
+            Ok(ProgressSlugReservation::Free)
+        }
+    };
+    let Some(lock_file) = open_existing_progress_lock(active_path, false)? else {
+        return state_reservation(active_path);
+    };
+    let _lock = ProgressFileLock::lock_shared(&lock_file)
+        .with_context(|| format!("lock {}", progress_lock_path(active_path).display()))?;
+    match read_progress_lock_state_locked(&lock_file, active_path)? {
+        ProgressLockState::Retired => Ok(ProgressSlugReservation::Retired),
+        ProgressLockState::LegacyEmpty | ProgressLockState::Active => {
+            state_reservation(active_path)
+        }
+    }
+}
+
+/// Return whether a slug is owned by a retired tombstone or by surviving
+/// progress state. See [`progress_slug_reservation`] for the distinction.
 pub fn progress_slug_is_reserved(active_path: &Path) -> Result<bool> {
-    Ok(open_existing_progress_lock(active_path, false)?.is_some())
+    Ok(progress_slug_reservation(active_path)? != ProgressSlugReservation::Free)
 }
 
 /// Enumerate or delete every durable state surface owned by a retired progress
@@ -4565,8 +4619,18 @@ struct ProgressFileLock(std::os::fd::RawFd);
 #[cfg(unix)]
 impl ProgressFileLock {
     fn lock(file: &std::fs::File) -> std::io::Result<Self> {
+        Self::flock(file, libc::LOCK_EX)
+    }
+
+    /// Shared (reader) acquisition. Multiple holders coexist; an exclusive
+    /// holder still excludes them.
+    fn lock_shared(file: &std::fs::File) -> std::io::Result<Self> {
+        Self::flock(file, libc::LOCK_SH)
+    }
+
+    fn flock(file: &std::fs::File, operation: libc::c_int) -> std::io::Result<Self> {
         let fd = file.as_raw_fd();
-        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        let rc = unsafe { libc::flock(fd, operation) };
         if rc == 0 {
             Ok(Self(fd))
         } else {
@@ -4588,6 +4652,13 @@ struct ProgressFileLock;
 #[cfg(not(unix))]
 impl ProgressFileLock {
     fn lock(_file: &std::fs::File) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "progress state locking is unsupported on this platform",
+        ))
+    }
+
+    fn lock_shared(_file: &std::fs::File) -> std::io::Result<Self> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "progress state locking is unsupported on this platform",
@@ -7475,26 +7546,84 @@ mod tests {
     }
 
     #[test]
-    fn any_existing_regular_progress_lock_reserves_the_slug_without_mutation() {
+    fn progress_slug_reservation_tracks_ownership_not_bare_lock_inodes() {
         let tmp = tempfile::TempDir::new().unwrap();
         let absent = tmp.path().join("absent").join("alpha.jsonl");
+        assert_eq!(
+            progress_slug_reservation(&absent).unwrap(),
+            ProgressSlugReservation::Free
+        );
         assert!(!progress_slug_is_reserved(&absent).unwrap());
         assert!(!absent.parent().unwrap().exists());
 
+        // A bare lock inode is an artifact of readers/probes, not an owner: it
+        // must leave the slug free for a fresh generation.
         for (case, marker) in [
-            ("legacy", b"".as_slice()),
-            ("active", PROGRESS_LOCK_ACTIVE_MARKER.as_slice()),
-            ("retired", PROGRESS_LOCK_RETIRED_MARKER.as_slice()),
-            ("unknown", b"future-marker".as_slice()),
+            ("bare-legacy", b"".as_slice()),
+            ("bare-active", PROGRESS_LOCK_ACTIVE_MARKER.as_slice()),
         ] {
             let path = tmp.path().join(case).join("alpha.jsonl");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(progress_lock_path(&path), marker).unwrap();
             let before = std::fs::read(progress_lock_path(&path)).unwrap();
 
-            assert!(progress_slug_is_reserved(&path).unwrap(), "{case}");
+            assert_eq!(
+                progress_slug_reservation(&path).unwrap(),
+                ProgressSlugReservation::Free,
+                "{case}"
+            );
+            assert!(!progress_slug_is_reserved(&path).unwrap(), "{case}");
             assert_eq!(std::fs::read(progress_lock_path(&path)).unwrap(), before);
         }
+
+        // The same lock states reserve once their generation still owns state.
+        for (case, marker) in [
+            ("owning-legacy", b"".as_slice()),
+            ("owning-active", PROGRESS_LOCK_ACTIVE_MARKER.as_slice()),
+        ] {
+            let path = tmp.path().join(case).join("alpha.jsonl");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"{\"event\":\"orphan\"}\n").unwrap();
+            std::fs::write(progress_lock_path(&path), marker).unwrap();
+
+            assert_eq!(
+                progress_slug_reservation(&path).unwrap(),
+                ProgressSlugReservation::ActiveState,
+                "{case}"
+            );
+            assert!(progress_slug_is_reserved(&path).unwrap(), "{case}");
+        }
+
+        // State without any lock inode still reserves the slug.
+        let lockless = tmp.path().join("lockless").join("alpha.jsonl");
+        std::fs::create_dir_all(lockless.parent().unwrap()).unwrap();
+        std::fs::write(&lockless, b"{\"event\":\"orphan\"}\n").unwrap();
+        assert_eq!(
+            progress_slug_reservation(&lockless).unwrap(),
+            ProgressSlugReservation::ActiveState
+        );
+
+        // A tombstone reserves permanently, with or without surviving state.
+        let retired = tmp.path().join("retired").join("alpha.jsonl");
+        std::fs::create_dir_all(retired.parent().unwrap()).unwrap();
+        std::fs::write(
+            progress_lock_path(&retired),
+            PROGRESS_LOCK_RETIRED_MARKER.as_slice(),
+        )
+        .unwrap();
+        let before = std::fs::read(progress_lock_path(&retired)).unwrap();
+        assert_eq!(
+            progress_slug_reservation(&retired).unwrap(),
+            ProgressSlugReservation::Retired
+        );
+        assert!(progress_slug_is_reserved(&retired).unwrap());
+        assert_eq!(std::fs::read(progress_lock_path(&retired)).unwrap(), before);
+
+        // Unknown markers stay fail-closed rather than silently freeing a slug.
+        let unknown = tmp.path().join("unknown").join("alpha.jsonl");
+        std::fs::create_dir_all(unknown.parent().unwrap()).unwrap();
+        std::fs::write(progress_lock_path(&unknown), b"future-marker").unwrap();
+        assert!(progress_slug_reservation(&unknown).is_err());
 
         #[cfg(unix)]
         {
@@ -7508,6 +7637,47 @@ mod tests {
             assert!(progress_slug_is_reserved(&unsafe_path).is_err());
             assert_eq!(std::fs::read(outside).unwrap(), b"keep");
         }
+    }
+
+    #[test]
+    fn shared_retired_reads_report_both_marker_states_and_do_not_serialize() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let absent = tmp.path().join("absent").join("alpha.jsonl");
+        assert!(!progress_state_is_retired_shared(&absent).unwrap());
+
+        let active = tmp.path().join("active").join("alpha.jsonl");
+        append_event(&active, &json!({"event": "live"})).unwrap();
+        assert!(!progress_state_is_retired_shared(&active).unwrap());
+
+        let retired = tmp.path().join("retired").join("alpha.jsonl");
+        append_event(&retired, &json!({"event": "live"})).unwrap();
+        mark_progress_retired(&retired).unwrap();
+        assert!(progress_state_is_retired_shared(&retired).unwrap());
+
+        let torn = tmp.path().join("torn").join("alpha.jsonl");
+        std::fs::create_dir_all(torn.parent().unwrap()).unwrap();
+        std::fs::write(progress_lock_path(&torn), b"torn").unwrap();
+        assert!(progress_state_is_retired_shared(&torn)
+            .unwrap_err()
+            .to_string()
+            .contains("progress lock marker"));
+
+        // Hold one shared reader open; a second must not serialize behind it.
+        let held = open_existing_progress_lock(&retired, false)
+            .unwrap()
+            .unwrap();
+        let guard = ProgressFileLock::lock_shared(&held).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = retired.clone();
+        let reader = std::thread::spawn(move || {
+            let _ = tx.send(progress_state_is_retired_shared(&probe));
+        });
+        let observed = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a concurrent shared reader must not block behind another shared reader");
+        assert!(observed.unwrap());
+        drop(guard);
+        reader.join().unwrap();
     }
 
     #[test]
