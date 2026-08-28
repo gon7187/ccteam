@@ -1975,9 +1975,11 @@ impl std::fmt::Display for RemoveReport {
         for failure in &self.cleanup_failures {
             writeln!(f, "warning: {failure}")?;
         }
-        if !self.cleanup_failures.is_empty() {
+        if !self.cleanup_failures.is_empty() && !self.dry_run {
             // The exit code is non-zero (2) so scripted flows stop here; say
-            // plainly what a retry does and does not redo.
+            // plainly what a retry does and does not redo. A preview never
+            // reaches this branch: it mutates nothing, so there is nothing to
+            // redo and `cleanup_failures` stays empty.
             if self.retirement_committed {
                 writeln!(
                     f,
@@ -3516,12 +3518,24 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
         match project_dir.as_ref() {
             Some(dir) => {
                 if let Err(error) = purge_project_managed_paths(dir, opts.dry_run, &mut report) {
-                    let note = format!(
-                        "очистка {}: не удалось завершить ({error:#})",
-                        dir.display()
-                    );
-                    report.steps.push(note.clone());
-                    report.cleanup_failures.push(note);
+                    // The purge reads `settings.local.json` before it honours
+                    // `dry_run`, so a preview can fail here too. A preview
+                    // mutates nothing, so a read failure is an ordinary step —
+                    // `cleanup_failures` keeps its meaning of "post-ACK cleanup
+                    // that could not complete" (and its exit-2 mapping).
+                    if opts.dry_run {
+                        report.steps.push(format!(
+                            "очистка {}: не удалось проверить ({error:#})",
+                            dir.display()
+                        ));
+                    } else {
+                        let note = format!(
+                            "очистка {}: не удалось завершить ({error:#})",
+                            dir.display()
+                        );
+                        report.steps.push(note.clone());
+                        report.cleanup_failures.push(note);
+                    }
                 }
             }
             None => {
@@ -3547,10 +3561,16 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
         if let Err(error) =
             purge_imd_registry_for_slug(&paths.root, slug, opts.dry_run, &mut report)
         {
-            let note =
-                format!("очистка state/im/registry/{slug}/: не удалось завершить ({error:#})");
-            report.steps.push(note.clone());
-            report.cleanup_failures.push(note);
+            if opts.dry_run {
+                report.steps.push(format!(
+                    "очистка state/im/registry/{slug}/: не удалось проверить ({error:#})"
+                ));
+            } else {
+                let note =
+                    format!("очистка state/im/registry/{slug}/: не удалось завершить ({error:#})");
+                report.steps.push(note.clone());
+                report.cleanup_failures.push(note);
+            }
         }
     }
 
@@ -3569,10 +3589,25 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
                 .map(|dir| dir.display().to_string())
                 .unwrap_or_else(|| "неизвестен".to_string())
         ));
-    } else if ccteam_core::remove_project_from_config(&paths.root, slug)? {
-        report
-            .steps
-            .push(format!("удалена запись config.yaml::projects для `{slug}`"));
+    } else {
+        // The commit point runs AFTER the irreversible daemon ACK. Bailing here
+        // would discard the whole report and exit 1 ("nothing committed") for
+        // the one case where the generation IS permanently retired: report the
+        // failure like every other post-ACK step so the run prints and exits 2.
+        match ccteam_core::remove_project_from_config(&paths.root, slug) {
+            Ok(true) => report
+                .steps
+                .push(format!("удалена запись config.yaml::projects для `{slug}`")),
+            Ok(false) => {}
+            Err(error) => {
+                let note = format!(
+                    "запись config.yaml::projects для `{slug}` не удалена ({error:#}); \
+                     retirement уже зафиксирован, повторите `ccteam project rm {slug}`"
+                );
+                report.steps.push(note.clone());
+                report.cleanup_failures.push(note);
+            }
+        }
     }
 
     Ok(report)

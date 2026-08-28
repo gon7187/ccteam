@@ -740,7 +740,9 @@ fn main() -> Result<()> {
                 // `project rm … && …` must stop. Code 2 is distinct from the
                 // code-1 "removal refused / nothing committed" failures so a
                 // wrapper can tell a half-finished sweep from a no-op.
-                if !report.cleanup_failures.is_empty() {
+                // A preview mutates nothing, so it can never leave a
+                // half-finished sweep: never exit 2 for `--dry-run`.
+                if !report.dry_run && !report.cleanup_failures.is_empty() {
                     std::process::exit(2);
                 }
                 Ok(())

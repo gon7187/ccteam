@@ -2189,3 +2189,106 @@ fn t31_post_ack_cleanup_failure_exits_nonzero() {
         "the config row must still be dropped; stdout: {stdout}",
     );
 }
+
+/// t32: a preview mutates nothing, so it can never leave a half-finished
+/// sweep behind. The same EISDIR collision that makes the executing purge exit
+/// 2 (t31) must leave `--purge --dry-run` at exit 0 with no retry advice —
+/// otherwise the standard `rm --dry-run && rm` gate is broken exactly where the
+/// destructive command works (t23b, same contract for the mux sweep).
+#[test]
+#[cfg(unix)]
+fn t32_purge_dry_run_preview_failure_exits_zero_without_retry_advice() {
+    let fx = Fixture::new("dex-ui-t32");
+    fx.seed_closed_progress();
+    let settings = fx.project_dir.join(".claude").join("settings.local.json");
+    std::fs::create_dir_all(settings.join("collision")).unwrap();
+    // No daemon at all: a preview never needs one (t23b), and without a
+    // socket there is nothing it could retire even by mistake.
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug, "--purge", "--dry-run"])
+        .output()
+        .expect("spawn ccteam project rm --purge --dry-run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a preview cannot leave a half-finished sweep; stdout: {stdout}; stderr: {stderr}",
+    );
+    assert!(
+        stdout.contains(&settings.display().to_string()) && stdout.contains("не удалось"),
+        "the preview must still name what it could not read; stdout: {stdout}",
+    );
+    assert!(
+        !stdout.contains("warning:") && !stdout.contains("повторный запуск"),
+        "a dry run must not print cleanup warnings or retry advice; stdout: {stdout}",
+    );
+    assert!(
+        !ccteam_harness::execution::progress_bridge::progress_state_is_retired(
+            &fx.paths().progress_jsonl(&fx.slug)
+        )
+        .unwrap(),
+        "--dry-run must not retire the generation"
+    );
+    assert!(
+        settings.join("collision").is_dir(),
+        "--dry-run must not touch the project"
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .any(|entry| entry.slug == fx.slug),
+        "--dry-run must not drop the config row",
+    );
+}
+
+/// t33: the config drop is the commit point AFTER the irreversible daemon ACK.
+/// If it fails, the run must not bail with an empty report and exit 1 ("nothing
+/// committed"): the retirement is already permanent, so the report is printed
+/// with a retry note and the exit is the half-finished-sweep code 2.
+#[test]
+#[cfg(unix)]
+fn t33_commit_point_failure_after_ack_reports_and_exits_two() {
+    let fx = Fixture::new("dex-ui-t33");
+    fx.seed_closed_progress();
+    // `ConfigFileLock::acquire` opens `state/config.lock` for write with
+    // O_NOFOLLOW; a directory in its place fails with EISDIR — for root too.
+    // Reading the catalog does not take the lock, so the run reaches the daemon
+    // and only the commit point fails.
+    let lock = fx.ccteam_home.join("state").join("config.lock");
+    let _ = std::fs::remove_file(&lock);
+    std::fs::create_dir_all(&lock).unwrap();
+
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a committed retirement with a failed config drop is a half-finished sweep, \
+         not a refused removal; stdout: {stdout}; stderr: {stderr}",
+    );
+    assert!(
+        stdout.contains("retirement проекта подтверждено демоном"),
+        "the report must be printed, not discarded; stdout: {stdout}",
+    );
+    assert!(
+        stdout.contains(&format!(
+            "warning: запись config.yaml::projects для `{}` не удалена",
+            fx.slug
+        )) && stdout.contains("retirement уже зафиксирован"),
+        "the failed commit point must be named with retry advice; stdout: {stdout}",
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .any(|entry| entry.slug == fx.slug),
+        "the row survives only because the drop failed; stdout: {stdout}",
+    );
+}
