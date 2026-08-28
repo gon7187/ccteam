@@ -1139,9 +1139,20 @@ fn t05_refuses_with_running_claude_bg() {
 const TEST_ADMIN_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 #[cfg(unix)]
+/// Fake `ccteam/project-retire` daemon.
+///
+/// `response_error` turns the reply into a JSON-RPC error;
+/// `error_marker_committed` (when `Some`) attaches the wire's
+/// `error.data.marker_committed` flag, i.e. whether the daemon had already
+/// written the durable tombstone before it failed.
+///
+/// The success path mints the tombstone for **the slug the request names**, not
+/// for the fixture's slug — that is what makes an unregistered-slug request an
+/// irreversible burn, so a test can prove the CLI never sends one.
 fn seed_retire_daemon(
     fx: &Fixture,
     response_error: Option<&'static str>,
+    error_marker_committed: Option<bool>,
 ) -> std::thread::JoinHandle<Option<serde_json::Value>> {
     std::fs::create_dir_all(fx.paths().web_token_path().parent().unwrap()).unwrap();
     std::fs::write(fx.paths().web_token_path(), TEST_ADMIN_TOKEN).unwrap();
@@ -1149,8 +1160,7 @@ fn seed_retire_daemon(
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
     let listener = UnixListener::bind(socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let slug = fx.slug.clone();
-    let progress = fx.paths().progress_jsonl(&slug);
+    let paths = fx.paths();
     std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let stream = loop {
@@ -1170,11 +1180,21 @@ fn seed_retire_daemon(
             .read_line(&mut line)
             .unwrap();
         let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let slug = request
+            .pointer("/params/arguments/slug")
+            .and_then(serde_json::Value::as_str)
+            .expect("retirement request carries a slug")
+            .to_string();
+        let progress = paths.progress_jsonl(&slug);
         let response = if let Some(message) = response_error {
+            let mut error = json!({ "code": -32000, "message": message });
+            if let Some(committed) = error_marker_committed {
+                error["data"] = json!({ "slug": slug, "marker_committed": committed });
+            }
             json!({
                 "jsonrpc": "2.0",
                 "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                "error": { "code": -32000, "message": message },
+                "error": error,
             })
         } else {
             ccteam_harness::execution::progress_bridge::mark_progress_retired(&progress).unwrap();
@@ -1204,7 +1224,7 @@ fn seed_retire_daemon(
 
 #[cfg(unix)]
 fn run_remove_with_retire_daemon(fx: &Fixture, args: &[&str]) -> std::process::Output {
-    let daemon = seed_retire_daemon(fx, None);
+    let daemon = seed_retire_daemon(fx, None, None);
     let output = fx
         .cmd()
         .args(args)
@@ -1236,7 +1256,7 @@ fn run_remove_with_retire_daemon(fx: &Fixture, args: &[&str]) -> std::process::O
 fn t07_remove_requires_daemon_retire_ack() {
     let fx = Fixture::new("dex-ui-t07");
     fx.seed_closed_progress();
-    let daemon = seed_retire_daemon(&fx, None);
+    let daemon = seed_retire_daemon(&fx, None, None);
 
     let out = fx
         .cmd()
@@ -1290,7 +1310,7 @@ fn t08_remove_fails_closed_when_daemon_rejects_retirement() {
     let fx = Fixture::new("dex-ui-t08");
     fx.seed_closed_progress();
     let progress = fx.paths().progress_jsonl(&fx.slug);
-    let daemon = seed_retire_daemon(&fx, Some("retirement drain failed"));
+    let daemon = seed_retire_daemon(&fx, Some("retirement drain failed"), None);
 
     let out = fx
         .cmd()
@@ -1319,6 +1339,150 @@ fn t08_remove_fails_closed_when_daemon_rejects_retirement() {
     assert!(
         progress.exists(),
         "progress must survive a rejected retirement"
+    );
+}
+
+/// t21: an unregistered slug is refused locally. The daemon mints an
+/// irreversible tombstone for whatever slug it is handed, so a typo must never
+/// reach it — not even under `--dry-run`.
+#[test]
+#[cfg(unix)]
+fn t21_remove_refuses_unregistered_slug_before_contacting_daemon() {
+    let fx = Fixture::new("dex-ui-t21");
+    fx.seed_closed_progress();
+    let typo = "dex-ui-t21-typo";
+    let daemon = seed_retire_daemon(&fx, None, None);
+
+    let dry = fx
+        .cmd()
+        .args(["project", "rm", typo, "--dry-run"])
+        .output()
+        .expect("spawn ccteam project rm --dry-run");
+    assert!(
+        !dry.status.success(),
+        "--dry-run on an unregistered slug must refuse; stdout: {}",
+        String::from_utf8_lossy(&dry.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&dry.stderr).contains("не зарегистрирован"),
+        "refusal must name the cause; stderr: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", typo])
+        .output()
+        .expect("spawn ccteam project rm");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "unregistered slug must exit non-zero; stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        stderr.contains("не зарегистрирован"),
+        "refusal must name the cause; stderr: {stderr}",
+    );
+
+    // The burn we are preventing: no tombstone inode for the typo.
+    let burned = fx.paths().progress_dir().join(format!("{typo}.lock"));
+    assert!(
+        !burned.exists(),
+        "a typo must not reserve a progress generation: {}",
+        burned.display()
+    );
+    // And the daemon was never asked in the first place.
+    assert!(
+        daemon.join().expect("join fake daemon").is_none(),
+        "an unregistered slug must never reach the daemon retirement spine"
+    );
+    // The real project is untouched.
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .any(|entry| entry.slug == fx.slug),
+        "config must be untouched by a refused removal"
+    );
+}
+
+/// t22: a daemon failure that already committed the durable tombstone must be
+/// reported as such — telling the user the project survived would be a lie that
+/// hides a permanently retired generation.
+#[test]
+#[cfg(unix)]
+fn t22_remove_reports_committed_marker_from_daemon_error_data() {
+    let fx = Fixture::new("dex-ui-t22");
+    fx.seed_closed_progress();
+    let daemon = seed_retire_daemon(&fx, Some("session teardown failed"), Some(true));
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug])
+        .output()
+        .expect("spawn ccteam project rm");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a failed retirement must exit non-zero"
+    );
+    let _request = daemon.join().unwrap().expect("retirement request");
+    assert!(
+        stderr.contains("необратимо retired"),
+        "committed marker must be reported as permanent; stderr: {stderr}",
+    );
+    assert!(
+        stderr.contains("повторите"),
+        "the user must be told to rerun the command; stderr: {stderr}",
+    );
+    assert!(
+        stderr.contains("session teardown failed"),
+        "the daemon cause must be surfaced; stderr: {stderr}",
+    );
+    // Retrying is the documented fix, so the row must still be there.
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .any(|entry| entry.slug == fx.slug),
+        "config row must survive so the retry has something to remove"
+    );
+}
+
+/// t23: the legacy mux sweep runs AFTER the irreversible daemon ACK, so a dead
+/// mux control plane must not strand the registry row on an already-retired
+/// generation.
+#[test]
+#[cfg(unix)]
+fn t23_remove_survives_legacy_mux_failure_after_daemon_ack() {
+    let fx = Fixture::new("dex-ui-t23");
+    fx.seed_closed_progress();
+    // The rmux control socket lives at `$HOME/.ccteam/run/mux.sock`; a regular
+    // file at `$HOME/.ccteam` makes creating that parent fail with ENOTDIR, so
+    // every backend call errors deterministically (no mux binary needed).
+    std::fs::write(fx._tmp.path().join(".ccteam"), b"not a directory").unwrap();
+
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a dead mux must not fail a removal the daemon already committed; stderr: {stderr}",
+    );
+    assert!(
+        stdout.contains("legacy чат-сессии: не удалось проверить"),
+        "the mux failure must be reported, not swallowed; stdout: {stdout}",
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .all(|entry| entry.slug != fx.slug),
+        "config row must still be dropped after the irreversible ACK"
     );
 }
 

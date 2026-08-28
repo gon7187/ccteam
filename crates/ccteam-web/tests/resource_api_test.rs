@@ -665,6 +665,103 @@ async fn delete_project_retires_then_deregisters_with_truthful_ack() {
         .is_none());
 }
 
+/// A retirement that fails AFTER its durable tombstone must report
+/// `retired: true` — claiming the project survived would hide a permanently
+/// retired generation and invite a "retry later" that never comes. The row
+/// stays in `config.yaml`, so re-issuing the DELETE finishes the job.
+///
+/// The post-marker failure is staged by making the gateway's routing state file
+/// a non-empty directory: the marker, the session drain and the progress
+/// cleanup all succeed, then the final routing persist cannot rename onto it.
+#[tokio::test]
+async fn delete_project_post_marker_failure_reports_retired_true() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let root = paths.root.clone();
+    fixture_registered_project(&paths, "torm");
+    let mut gateway = Gateway::new(
+        Arc::new(ClaudeBgAdapter::new()),
+        "torm",
+        paths.project_dir("torm"),
+    );
+    gateway.enable_project_creation(paths.clone());
+    gateway.enable_persistence(&root).unwrap();
+
+    // Block the routing persist that runs at the tail of retirement.
+    let routing = ccteam_im::routing_state_path_in(&root);
+    std::fs::create_dir_all(routing.join("blocker")).unwrap();
+
+    let addr = spawn(AppState::new(paths).with_gateway_owned(gateway)).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .delete(format!("http://{addr}/api/v1/projects/torm"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["removed"], false);
+    assert_eq!(
+        v["retired"], true,
+        "a failure after the durable marker must report the project as retired: {v}"
+    );
+    assert_eq!(v["stage"], "post_marker", "{v}");
+    assert!(
+        ccteam_core::lookup_project_in_config(&root, "torm")
+            .unwrap()
+            .is_some(),
+        "config row must survive so the retry has something to remove"
+    );
+
+    // Retrying after the blocker is gone completes the removal.
+    std::fs::remove_dir_all(&routing).unwrap();
+    let resp = client
+        .delete(format!("http://{addr}/api/v1/projects/torm"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "retirement must be retryable: {}",
+        resp.text().await.unwrap()
+    );
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["removed"], true);
+    assert_eq!(v["retired"], true);
+    assert!(ccteam_core::lookup_project_in_config(&root, "torm")
+        .unwrap()
+        .is_none());
+}
+
+/// The pre-marker counterpart: nothing durable happened, so `retired` must stay
+/// false (and say so via `stage`).
+#[tokio::test]
+async fn delete_project_pre_marker_failure_reports_retired_false() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_registered_project(&paths, "torm");
+    // No `enable_project_creation`: the gateway has no path context, so the
+    // retirement cannot even commit its marker.
+    let gateway = Gateway::new(
+        Arc::new(ClaudeBgAdapter::new()),
+        "torm",
+        paths.project_dir("torm"),
+    );
+    let addr = spawn(AppState::new(paths).with_gateway_owned(gateway)).await;
+
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/v1/projects/torm"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["retired"], false);
+    assert_eq!(v["stage"], "pre_marker", "{v}");
+}
+
 #[tokio::test]
 async fn delete_unknown_project_404() {
     let tmp = TempDir::new().unwrap();

@@ -519,17 +519,24 @@ pub(crate) async fn handle_import_project(
 /// `DELETE /api/v1/projects/{slug}`
 ///
 /// Durably retire the project through the live gateway, then remove its row
-/// from `config.yaml`. A missing gateway or failed retirement leaves config
-/// untouched. 404 when the slug is not registered. Never file-purges.
+/// from `config.yaml`. A missing gateway leaves config untouched. 404 when the
+/// slug is not registered. Never file-purges.
+///
+/// Retirement commits a durable tombstone before it drains sessions, so a
+/// failure is reported truthfully: `retired` says whether that tombstone was
+/// committed, and `stage` says which side of it the failure landed on. Once
+/// `retired` is true the generation is permanently gone even though `removed`
+/// is false, and the fix is to retry the DELETE — never to assume the project
+/// still runs.
 #[utoipa::path(
     delete,
     path = "/api/v1/projects/{slug}",
     tag = "projects",
     params(("slug" = String, Path, description = "Project slug to deregister")),
     responses(
-        (status = 200, description = "Deregistered; `{removed, sessions_stopped[]}`", body = serde_json::Value),
+        (status = 200, description = "Deregistered; `{removed, retired, sessions_stopped[]}`", body = serde_json::Value),
         (status = 404, description = "Slug not registered"),
-        (status = 500, description = "Retirement or deregistration failed"),
+        (status = 500, description = "Retirement or deregistration failed; `retired` reports whether the durable tombstone was committed (`stage` = `pre_marker` | `post_marker` | `deregister`) and `removed` is false", body = serde_json::Value),
         (status = 503, description = "No live gateway; config left untouched"),
     ),
 )]
@@ -580,13 +587,24 @@ pub(crate) async fn handle_delete_project(
     let outcome = match Gateway::retire_project_shared(Arc::clone(gateway), &slug).await {
         Ok(outcome) => outcome,
         Err(err) => {
-            tracing::error!(%slug, %err, "project retirement failed");
+            // The durable tombstone is committed before sessions are drained, so
+            // a failure after it means the generation is permanently retired
+            // even though this call failed. Reporting `retired: false` there
+            // would tell the caller the project still runs, which is wrong and
+            // invites a "retry later" that never happens. Absent the typed
+            // error we fail closed on the conservative side (not committed).
+            let marker_committed = err
+                .downcast_ref::<ccteam_im::gateway::ProjectRetireError>()
+                .is_some_and(|typed| typed.marker_committed);
+            tracing::error!(%slug, %err, marker_committed, "project retirement failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": format!("project retirement failed: {err}"),
                     "removed": false,
-                    "retired": false,
+                    "retired": marker_committed,
+                    "stage": if marker_committed { "post_marker" } else { "pre_marker" },
+                    "slug": &slug,
                 })),
             )
                 .into_response();
@@ -606,6 +624,7 @@ pub(crate) async fn handle_delete_project(
                     "error": format!("project retired but deregistration failed: {err}"),
                     "removed": false,
                     "retired": true,
+                    "stage": "deregister",
                     "slug": &outcome.slug,
                     "sessions_stopped": &outcome.sessions_stopped,
                     "progress_removed": &outcome.progress_removed,

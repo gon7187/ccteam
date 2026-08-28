@@ -1888,10 +1888,15 @@ fn request_daemon_project_retire(paths: &CcteamPaths, slug: &str) -> Result<Daem
         .await
     })?
     .map_err(|_| {
+        // The daemon may have committed the durable tombstone and simply be
+        // slow to answer, so this must NOT claim the project survived.
         anyhow::anyhow!(
-            "daemon не подтвердил retirement проекта `{slug}` за 65 с; config не изменён"
+            "daemon не подтвердил retirement проекта `{slug}` за 65 с; состояние retirement \
+             неизвестно (проект уже мог стать необратимо retired); проверьте daemon и повторите \
+             `ccteam project rm {slug}`"
         )
-    })??;
+    })?
+    .with_context(|| format!("daemon не принял retirement проекта `{slug}`; config не изменён"))?;
 
     if let Some(error) = response.get("error").filter(|value| !value.is_null()) {
         let message = error
@@ -1899,7 +1904,22 @@ fn request_daemon_project_retire(paths: &CcteamPaths, slug: &str) -> Result<Daem
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| error.to_string());
-        bail!("daemon отклонил retirement проекта `{slug}`: {message}");
+        // Wire contract with the daemon (`ccteam/project-retire`): a failure
+        // that already wrote the durable tombstone reports it as
+        // `error.data.marker_committed`. An absent field means "not committed"
+        // — the conservative shape for a daemon that failed before the marker.
+        let marker_committed = error
+            .get("data")
+            .and_then(|data| data.get("marker_committed"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if marker_committed {
+            bail!(
+                "проект `{slug}` уже необратимо retired, но retirement не завершён: {message}; \
+                 config не изменён; повторите `ccteam project rm {slug}`"
+            );
+        }
+        bail!("daemon отклонил retirement проекта `{slug}`: {message}; config не изменён");
     }
     let result = response
         .get("result")
@@ -3249,6 +3269,19 @@ pub fn run_skill_migrate_project(paths: &CcteamPaths, project: Option<&str>) -> 
 /// grouped `ccteam project rm` both route here (the structured
 /// [`RemoveReport`] doubles as the dry-run plan).
 pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Result<RemoveReport> {
+    // 0. Shape + registration are validated before ANY other work, including
+    // the daemon call. The daemon mints an irreversible tombstone for whatever
+    // slug it is handed, so a typo must never reach it: an unregistered slug is
+    // refused here, exactly like the web route's 404. `--dry-run` takes the same
+    // refusal and therefore also mutates nothing.
+    ccteam_core::validate_slug_format(slug)?;
+    let registered =
+        ccteam_core::lookup_project_in_config(&paths.root, slug)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "проект `{slug}` не зарегистрирован в config.yaml::projects; ничего не изменено"
+            )
+        })?;
+
     let mut report = RemoveReport {
         slug: slug.to_string(),
         purge: opts.purge,
@@ -3276,17 +3309,10 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
         }
     }
 
-    // 2. Resolve project_dir via the config registry (so V0.4.2
-    // arbitrary-path installs are deleted correctly even when the
-    // slug doesn't sit under `paths.projects_root`).
-    let registered = ccteam_core::lookup_project_in_config(&paths.root, slug)?;
-    let project_dir = match &registered {
-        Some(entry) => entry.path.clone(),
-        // Fall back to `paths.project_dir(slug)` so `--purge` still
-        // works on orphan slugs (state.json present but config entry
-        // missing — the V0.4.5 ghost-entry case the PRD references).
-        None => paths.project_dir(slug),
-    };
+    // 2. The registry row resolved in step 0 owns the project directory, so an
+    // arbitrary-path install is deleted correctly even when the slug does not
+    // sit under `paths.projects_root`.
+    let project_dir = registered.path.clone();
 
     // 3. Dry-run previews the exact destructive surfaces but never contacts
     // the daemon or creates the stable progress lock.
@@ -3328,11 +3354,10 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
             }
         }
     } else {
-        let outcome = request_daemon_project_retire(paths, slug).with_context(|| {
-            format!(
-                "project rm `{slug}` требует живой daemon и полного retirement ACK; config не изменён"
-            )
-        })?;
+        // No outer context here: `request_daemon_project_retire` already words
+        // each failure truthfully, and a blanket "config не изменён" would lie
+        // about a generation whose tombstone the daemon already committed.
+        let outcome = request_daemon_project_retire(paths, slug)?;
         report
             .steps
             .push("retirement проекта подтверждено демоном".to_string());
@@ -3349,11 +3374,22 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
 
         // The gateway owns managed stdio/ACP sessions. Keep the old mux pass
         // after its ACK solely for terminal-protocol leftovers.
-        let chat_stop = stop_project_chat_sessions(backend.as_ref(), slug, false)?;
-        for name in &chat_stop.stopped {
-            report
-                .steps
-                .push(format!("остановлена legacy чат-сессия `{name}`"));
+        //
+        // This runs AFTER the irreversible daemon ACK, so a backend failure
+        // (absent tmux, unreachable rmux socket) must never strand the registry
+        // row on a generation that is already retired. Report it and continue to
+        // the config drop.
+        match stop_project_chat_sessions(backend.as_ref(), slug, false) {
+            Ok(chat_stop) => {
+                for name in &chat_stop.stopped {
+                    report
+                        .steps
+                        .push(format!("остановлена legacy чат-сессия `{name}`"));
+                }
+            }
+            Err(error) => report.steps.push(format!(
+                "legacy чат-сессии: не удалось проверить ({error:#})"
+            )),
         }
     }
 
@@ -3401,21 +3437,15 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
     }
 
     // 6. Config registry drop is the commit point and therefore always last.
-    if registered.is_some() {
-        if opts.dry_run {
-            report.steps.push(format!(
-                "будет удалена запись config.yaml::projects для `{slug}` (путь: {})",
-                project_dir.display()
-            ));
-        } else if ccteam_core::remove_project_from_config(&paths.root, slug)? {
-            report
-                .steps
-                .push(format!("удалена запись config.yaml::projects для `{slug}`"));
-        }
-    } else {
+    if opts.dry_run {
         report.steps.push(format!(
-            "в config.yaml::projects нет записи для `{slug}` (сирота / установка до V0.4.2)"
+            "будет удалена запись config.yaml::projects для `{slug}` (путь: {})",
+            project_dir.display()
         ));
+    } else if ccteam_core::remove_project_from_config(&paths.root, slug)? {
+        report
+            .steps
+            .push(format!("удалена запись config.yaml::projects для `{slug}`"));
     }
 
     Ok(report)
