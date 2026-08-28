@@ -1104,6 +1104,10 @@ export default function SessionView({
                         <span className="scheduled-error" title={item.fail_reason ?? ""}>
                           {t("scheduleFailed")}
                         </span>
+                      ) : item.status === "dispatching" ? (
+                        <span className="scheduled-error" title={item.fail_reason ?? ""}>
+                          {t("scheduleUnknown")}
+                        </span>
                       ) : null}
                       <button
                         type="button"

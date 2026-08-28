@@ -1385,7 +1385,7 @@ pub struct CreateScheduledRequest {
     tag = "sessions",
     params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
     responses(
-        (status = 200, description = "Pending and retained failed scheduled messages", body = serde_json::Value),
+        (status = 200, description = "Pending, dispatching/unknown, and retained failed scheduled messages", body = serde_json::Value),
         (status = 404, description = "Unknown or invisible session"),
         (status = 503, description = "No live gateway"),
     ),
@@ -1506,7 +1506,7 @@ pub(crate) async fn handle_create_scheduled(
 }
 
 /// `DELETE /api/v1/sessions/{sid}/scheduled/{id}` — cancel a pending row or
-/// dismiss a retained failure.
+/// dismiss an inactive dispatching/retained failed row.
 #[utoipa::path(
     delete,
     path = "/api/v1/sessions/{sid}/scheduled/{id}",
@@ -1517,6 +1517,7 @@ pub(crate) async fn handle_create_scheduled(
     ),
     responses(
         (status = 200, description = "Cancelled/dismissed", body = serde_json::Value),
+        (status = 409, description = "Delivery already started; cancellation would be ambiguous"),
         (status = 404, description = "Unknown item, session, or invisible session"),
         (status = 503, description = "No live gateway"),
     ),
@@ -1535,6 +1536,11 @@ pub(crate) async fn handle_cancel_scheduled(
     match gw.lock().await.cancel_scheduled_message(&sid, &id) {
         Ok(_) => Json(json!({"cancelled": true, "id": id})).into_response(),
         Err(err) if err.to_string().contains("unknown scheduled") => unknown_session(&id),
+        Err(err) if err.to_string().contains("already being delivered") => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
         Err(err) => {
             tracing::warn!(%sid, %id, error = %err, "cancel scheduled message failed");
             (
@@ -1607,12 +1613,9 @@ pub(crate) async fn handle_session_resolve(
             mode,
         );
     }
-    let result = {
-        // resolve_web_selection takes &self (the pending registry is behind its
-        // own inner lock), so a shared guard suffices.
-        let guard = gw.lock().await;
-        guard.resolve_web_selection(token, selection).await
-    };
+    let result =
+        ccteam_im::gateway::Gateway::resolve_web_selection_shared(Arc::clone(gw), token, selection)
+            .await;
     match result {
         Ok(()) => Json(json!({"resolved": true})).into_response(),
         Err(err) => {
@@ -1979,9 +1982,12 @@ pub(crate) async fn handle_session_history_list(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    let metas = {
-        let guard = ccteam_im::latency::gateway_lock(gw, "web.sessions.history_list").await;
-        guard.list_history_sessions(&slug)
+    let metas = match Gateway::list_history_sessions_shared(Arc::clone(gw), &slug).await {
+        Ok(metas) => metas,
+        Err(error) => {
+            tracing::warn!(%slug, %error, "history session scan failed");
+            return project_not_visible(&slug);
+        }
     };
     let views: Vec<serde_json::Value> = metas
         .into_iter()

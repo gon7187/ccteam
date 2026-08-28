@@ -24,12 +24,18 @@ pub const MAX_PENDING_PER_SID: usize = 20;
 pub const MAX_PENDING_VISIBLE: usize = 100;
 
 /// Lifecycle of a stored scheduled message. Successful fires and cancellations
-/// are removed; only pending and short-lived failures remain on disk.
+/// are removed; a durable dispatching fence closes the crash window between
+/// vendor acceptance and terminal queue persistence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduledStatus {
     /// Waiting for `send_at`.
     Pending,
+    /// Vendor dispatch may already have happened. This state is persisted
+    /// before crossing the submit boundary and is never automatically retried
+    /// after a daemon restart; cold recovery turns it into a visible failure
+    /// requiring manual reconciliation.
+    Dispatching,
     /// Dispatch failed; retained for 24 hours or until cancelled.
     Failed,
 }
@@ -51,7 +57,7 @@ pub struct ScheduledItem {
     pub created_at: DateTime<Utc>,
     /// Human owner tag (`channel:chat_id` / `user:<tenant>`).
     pub created_by: String,
-    /// Pending or failed.
+    /// Pending, dispatching (outcome not yet terminal), or failed.
     pub status: ScheduledStatus,
     /// Human-readable dispatch failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]

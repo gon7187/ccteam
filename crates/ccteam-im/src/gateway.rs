@@ -1007,6 +1007,12 @@ pub struct Gateway {
     next_scheduled: u64,
     /// Durable scheduled rows indexed by globally unique short id.
     scheduled_items: BTreeMap<String, ScheduledEntry>,
+    /// Due rows already owned by a cleanup-tracked fire worker. Keeping this
+    /// claim under the registry lock prevents the startup catch-up and the
+    /// wakeable scheduler from dispatching the same one-shot concurrently,
+    /// while the row itself remains durable until the worker records a
+    /// terminal fired/failed state.
+    scheduled_in_flight: HashSet<String>,
     /// Wakes the lightweight next-fire timer after create/cancel/GC.
     scheduled_notify: Arc<tokio::sync::Notify>,
     event_sink: Option<GatewayEventSink>,
@@ -2587,6 +2593,7 @@ impl Gateway {
             next_session: 0,
             next_scheduled: 0,
             scheduled_items: BTreeMap::new(),
+            scheduled_in_flight: HashSet::new(),
             scheduled_notify: Arc::new(tokio::sync::Notify::new()),
             event_sink: None,
             events_broadcast,
@@ -3541,13 +3548,23 @@ impl Gateway {
         Self::recover_and_report_shared(gateway, &d.sid, &d.slug, &d.cwd, d.body.pid, "exited")
             .await;
         Self::restore_one_shared(gateway, &d.sid).await;
-        let mut g = gateway.lock().await;
-        if g.sessions.contains_key(&d.sid) {
-            g.emit_session_lifecycle(&d.sid, &d.slug, "resumed", "body_exited");
-            if let Err(error) = g.persist_routing() {
-                tracing::warn!(%error, "ccteam-im: persist routing after body exit failed");
+        let restored = {
+            let g = gateway.lock().await;
+            if !g.sessions.contains_key(&d.sid) {
+                false
+            } else {
+                g.emit_session_lifecycle(&d.sid, &d.slug, "resumed", "body_exited");
+                if let Err(error) = g.persist_routing() {
+                    tracing::warn!(%error, "ccteam-im: persist routing after body exit failed");
+                }
+                true
             }
-            g.drain_and_dispatch_pending_turns(&d.sid).await;
+        };
+        if restored {
+            // File drain + vendor submission run through the shared per-sid
+            // turn lane. A hung resumed vendor must not freeze the body watcher
+            // registry or every unrelated `/status` request.
+            Self::drain_and_dispatch_pending_turns_shared(Arc::clone(gateway), &d.sid).await;
         }
     }
 
@@ -6394,6 +6411,12 @@ impl Gateway {
                     .format("%Y-%m-%d %H:%M");
                 let state = match item.status {
                     crate::scheduled::ScheduledStatus::Pending => String::new(),
+                    crate::scheduled::ScheduledStatus::Dispatching => format!(
+                        " [результат отправки требует ручной сверки: {}]",
+                        item.fail_reason
+                            .as_deref()
+                            .unwrap_or("автоматический повтор отключён")
+                    ),
                     crate::scheduled::ScheduledStatus::Failed => format!(
                         " [ошибка: {}]",
                         item.fail_reason.as_deref().unwrap_or("неизвестная ошибка")
@@ -9452,6 +9475,10 @@ impl Gateway {
             }
         }
         self.scheduled_items.clear();
+        // In-flight ownership is process-local. Durable `Dispatching` rows are
+        // recovered below as explicit unknown outcomes and never made Pending
+        // again, so a crash after vendor acceptance cannot blind-resend them.
+        self.scheduled_in_flight.clear();
         for (project_dir, item) in crate::scheduled::scan_scheduled(&self.projects) {
             if let Some(number) = item
                 .id
@@ -9462,6 +9489,24 @@ impl Gateway {
             }
             self.scheduled_items
                 .insert(item.id.clone(), ScheduledEntry { project_dir, item });
+        }
+        let interrupted = self
+            .scheduled_items
+            .iter()
+            .filter(|(_, entry)| {
+                entry.item.status == crate::scheduled::ScheduledStatus::Dispatching
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in interrupted {
+            let reason = "Результат отправки неизвестен после перезапуска daemon; автоматический повтор отключён, нужна ручная сверка"
+                .to_string();
+            if let Err(err) = self.fail_scheduled(&id, reason) {
+                // The durable row remains Dispatching on write failure, which
+                // is still fail-closed: neither scheduler ingress considers it
+                // eligible for automatic delivery.
+                tracing::error!(id = %id, error = %err, "persist interrupted scheduled recovery failed");
+            }
         }
         // If a surviving queue proves the counter file was stale/missing, repair
         // it before accepting another create. Fired ids still rely on the
@@ -9524,7 +9569,7 @@ impl Gateway {
             .count()
     }
 
-    /// List pending and short-lived failed rows for one sid.
+    /// List pending, dispatching/unknown, and short-lived failed rows for one sid.
     pub fn scheduled_items_for_sid(
         &mut self,
         sid: &str,
@@ -9650,7 +9695,8 @@ impl Gateway {
         Ok(item)
     }
 
-    /// Cancel/dismiss one pending or failed row. The sid is part of the REST
+    /// Cancel/dismiss one pending, inactive dispatching, or failed row. An
+    /// actively-owned dispatching row rejects cancellation. The sid is part of the REST
     /// resource address and prevents a globally-valid id being cancelled under
     /// another session path.
     pub fn cancel_scheduled_message(
@@ -9658,6 +9704,11 @@ impl Gateway {
         sid: &str,
         id: &str,
     ) -> Result<crate::scheduled::ScheduledItem> {
+        if self.scheduled_in_flight.contains(id) {
+            return Err(anyhow!(
+                "scheduled message {id} is already being delivered and cannot be cancelled"
+            ));
+        }
         let entry = self
             .scheduled_items
             .get(id)
@@ -9741,62 +9792,178 @@ impl Gateway {
 
     fn next_scheduled_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.scheduled_items
-            .values()
-            .filter_map(|entry| match entry.item.status {
-                crate::scheduled::ScheduledStatus::Pending => Some(entry.item.send_at),
-                crate::scheduled::ScheduledStatus::Failed => entry
-                    .item
-                    .failed_at
-                    .map(|at| at + crate::scheduled::FAILED_RETENTION),
+            .iter()
+            .filter_map(|(id, entry)| {
+                if self.scheduled_in_flight.contains(id) {
+                    return None;
+                }
+                match entry.item.status {
+                    crate::scheduled::ScheduledStatus::Pending => Some(entry.item.send_at),
+                    crate::scheduled::ScheduledStatus::Dispatching => None,
+                    crate::scheduled::ScheduledStatus::Failed => entry
+                        .item
+                        .failed_at
+                        .map(|at| at + crate::scheduled::FAILED_RETENTION),
+                }
             })
             .min()
     }
 
-    async fn fire_due_scheduled(&mut self, now: chrono::DateTime<chrono::Utc>) {
+    /// Atomically snapshot due one-shots in deterministic order, persist each
+    /// as `Dispatching`, then claim it for one cleanup-owned worker. The
+    /// durable transition happens before any vendor future starts: after a
+    /// crash the row is unknown/manual-reconciliation, never Pending/retried.
+    fn claim_due_scheduled(&mut self, now: chrono::DateTime<chrono::Utc>) -> Vec<ScheduledEntry> {
         let mut due = self
             .scheduled_items
-            .values()
-            .filter(|entry| {
+            .iter()
+            .filter(|(id, entry)| {
                 entry.item.status == crate::scheduled::ScheduledStatus::Pending
                     && entry.item.send_at <= now
+                    && !self.scheduled_in_flight.contains(*id)
             })
-            .cloned()
+            .map(|(_, entry)| entry.clone())
             .collect::<Vec<_>>();
         due.sort_by(|a, b| crate::scheduled::scheduled_order(&a.item, &b.item));
-        for entry in due {
-            if now.signed_duration_since(entry.item.send_at) > crate::scheduled::MAX_CATCH_UP_AGE {
-                self.fail_scheduled(
-                    &entry.item.id,
-                    "Отложенная отправка просрочена более чем на 24 часа".to_string(),
+        let mut claimed = Vec::with_capacity(due.len());
+        for pending in due {
+            if now.signed_duration_since(pending.item.send_at) > crate::scheduled::MAX_CATCH_UP_AGE
+            {
+                let reason = "Отложенная отправка просрочена более чем на 24 часа".to_string();
+                if let Err(err) = self.fail_scheduled(&pending.item.id, reason) {
+                    tracing::error!(id = %pending.item.id, error = %err, "persist overdue scheduled failure failed");
+                }
+                continue;
+            }
+
+            let mut dispatching = pending.clone();
+            dispatching.item.status = crate::scheduled::ScheduledStatus::Dispatching;
+            dispatching.item.fail_reason = Some(
+                "Отправка начата; при аварийном перезапуске автоматический повтор отключён"
+                    .to_string(),
+            );
+            dispatching.item.failed_at = None;
+            self.scheduled_items
+                .insert(dispatching.item.id.clone(), dispatching.clone());
+            if let Err(err) =
+                self.persist_scheduled_sid(&dispatching.project_dir, &dispatching.item.sid)
+            {
+                self.scheduled_items
+                    .insert(pending.item.id.clone(), pending.clone());
+                let reason = format!("Не удалось зафиксировать начало отправки: {err:#}");
+                if let Err(fail_err) = self.fail_scheduled(&pending.item.id, reason) {
+                    tracing::error!(
+                        id = %pending.item.id,
+                        error = %fail_err,
+                        "persist pre-dispatch scheduled failure failed"
+                    );
+                }
+                continue;
+            }
+            self.scheduled_in_flight.insert(dispatching.item.id.clone());
+            self.emit_scheduled_changed(&dispatching.item);
+            claimed.push(dispatching);
+        }
+        claimed
+    }
+
+    /// Own one sid's claimed items all the way through vendor submit and durable
+    /// fired/failed persistence. This future is always spawned in
+    /// [`CleanupTaskTracker`], so aborting the scheduler/catch-up caller after
+    /// dispatch cannot cancel terminal persistence. One worker per sid keeps
+    /// that sid's deterministic due order; independent sids run in parallel.
+    async fn fire_due_scheduled_owned(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        entries: Vec<ScheduledEntry>,
+    ) {
+        for entry in entries {
+            let outcome =
+                Self::submit_scheduled_user_turn_shared(Arc::clone(&gateway), &entry.item).await;
+
+            let mut guard = gateway.lock().await;
+            // The process claim rejects too-late cancellation. The durable
+            // Dispatching state is the stronger crash/restart fence.
+            if !guard.scheduled_in_flight.remove(&entry.item.id) {
+                tracing::error!(
+                    id = %entry.item.id,
+                    sid = %entry.item.sid,
+                    "scheduled fire lost its in-flight ownership claim"
                 );
                 continue;
             }
-            let result = self.submit_scheduled_user_turn(&entry.item).await;
-            match result {
-                Ok(()) => self.complete_scheduled_fire(&entry),
-                Err(err) => self.fail_scheduled(&entry.item.id, format!("{err:#}")),
+            let terminal = match outcome {
+                Ok(()) => guard.complete_scheduled_fire(&entry),
+                Err(err) => guard.fail_scheduled(&entry.item.id, format!("{err:#}")),
+            };
+            if let Err(err) = terminal {
+                // Both terminal helpers restore the previous durable-safe
+                // Dispatching row on persistence failure. Surface the storage
+                // fault, but never turn it back into a retryable Pending row.
+                tracing::error!(
+                    id = %entry.item.id,
+                    sid = %entry.item.sid,
+                    error = %err,
+                    "scheduled terminal persistence failed; row remains dispatching"
+                );
             }
+            // A scheduler that ignored this item (startup catch-up launches
+            // and returns) may be sleeping with every other row claimed.
+            guard.scheduled_notify.notify_one();
         }
     }
 
-    async fn submit_scheduled_user_turn(
-        &mut self,
+    /// Claim due rows under the short registry lock, durably fence them, and
+    /// hand each item to the gateway cleanup tracker before returning.
+    async fn launch_due_scheduled_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> usize {
+        let (due, cleanup_tasks) = {
+            let mut guard = gateway.lock().await;
+            guard.gc_failed_scheduled(now);
+            let due = guard.claim_due_scheduled(now);
+            (due, guard.cleanup_tasks.clone())
+        };
+        let count = due.len();
+        let mut per_sid: Vec<(String, Vec<ScheduledEntry>)> = Vec::new();
+        for entry in due {
+            if let Some((_, entries)) = per_sid.iter_mut().find(|(sid, _)| sid == &entry.item.sid) {
+                entries.push(entry);
+            } else {
+                per_sid.push((entry.item.sid.clone(), vec![entry]));
+            }
+        }
+        for (_, entries) in per_sid {
+            let gateway = Arc::clone(&gateway);
+            cleanup_tasks.spawn(async move {
+                Self::fire_due_scheduled_owned(gateway, entries).await;
+            });
+        }
+        count
+    }
+
+    async fn submit_scheduled_user_turn_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
         item: &crate::scheduled::ScheduledItem,
     ) -> Result<()> {
         let chat = match (&item.reply_channel, &item.reply_chat_id) {
             (Some(channel), Some(chat_id)) => ChatKey::new(channel, chat_id, chat_id),
             _ => web_api_chat(),
         };
-        match self
-            .submit_resolved(
-                &chat,
-                &item.sid,
-                "",
-                item.text.clone(),
-                TurnOrigin::User,
-                true,
-            )
-            .await?
+        match Self::submit_to_sid_shared_result_with_ready(
+            gateway,
+            &item.sid,
+            item.text.clone(),
+            TurnOrigin::User,
+            Some(ImSubmitContext {
+                reply_to: chat,
+                message_id: String::new(),
+            }),
+            GatewayDeadline::start(),
+            None,
+            false,
+        )
+        .await?
         {
             SubmitResult::Turn { .. } | SubmitResult::Queued { .. } => Ok(()),
             SubmitResult::Directive(_) => Err(anyhow!(
@@ -9805,10 +9972,14 @@ impl Gateway {
         }
     }
 
-    fn complete_scheduled_fire(&mut self, entry: &ScheduledEntry) {
-        self.scheduled_items.remove(&entry.item.id);
+    fn complete_scheduled_fire(&mut self, entry: &ScheduledEntry) -> Result<()> {
+        let current = self
+            .scheduled_items
+            .remove(&entry.item.id)
+            .ok_or_else(|| anyhow!("scheduled row disappeared: {}", entry.item.id))?;
         if let Err(err) = self.persist_scheduled_sid(&entry.project_dir, &entry.item.sid) {
-            tracing::warn!(id = %entry.item.id, error = %err, "persist fired scheduled removal failed");
+            self.scheduled_items.insert(entry.item.id.clone(), current);
+            return Err(err);
         }
         self.emit_scheduled_progress(
             &entry.item,
@@ -9816,18 +9987,23 @@ impl Gateway {
             None,
         );
         self.emit_scheduled_changed(&entry.item);
+        Ok(())
     }
 
-    fn fail_scheduled(&mut self, id: &str, reason: String) {
-        let Some(mut entry) = self.scheduled_items.get(id).cloned() else {
-            return;
-        };
+    fn fail_scheduled(&mut self, id: &str, reason: String) -> Result<()> {
+        let prior = self
+            .scheduled_items
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("scheduled row disappeared: {id}"))?;
+        let mut entry = prior.clone();
         entry.item.status = crate::scheduled::ScheduledStatus::Failed;
         entry.item.fail_reason = Some(reason.clone());
         entry.item.failed_at = Some(chrono::Utc::now());
         self.scheduled_items.insert(id.to_string(), entry.clone());
         if let Err(err) = self.persist_scheduled_sid(&entry.project_dir, &entry.item.sid) {
-            tracing::warn!(id = %id, error = %err, "persist scheduled failure failed");
+            self.scheduled_items.insert(id.to_string(), prior);
+            return Err(err);
         }
         self.emit_scheduled_progress(
             &entry.item,
@@ -9856,6 +10032,7 @@ impl Gateway {
                 slug: Some(entry.item.project.clone()),
             });
         }
+        Ok(())
     }
 
     /// Lightweight wakeable next-fire task. It sleeps until the earliest UTC
@@ -9864,13 +10041,15 @@ impl Gateway {
     pub async fn run_scheduled_scheduler(gateway: Arc<tokio::sync::Mutex<Self>>) {
         let notify = { Arc::clone(&gateway.lock().await.scheduled_notify) };
         loop {
+            let now = chrono::Utc::now();
+            if Self::launch_due_scheduled_shared(Arc::clone(&gateway), now).await > 0 {
+                // Each claimed row now has its own cleanup-owned worker and a
+                // durable Dispatching fence. Loop immediately to compute the
+                // next unclaimed deadline without waiting on any vendor.
+                continue;
+            }
             let next = {
-                let mut guard = gateway.lock().await;
-                let now = chrono::Utc::now();
-                guard.gc_failed_scheduled(now);
-                if guard.next_scheduled_at().is_some_and(|at| at <= now) {
-                    guard.fire_due_scheduled(now).await;
-                }
+                let guard = gateway.lock().await;
                 guard.next_scheduled_at()
             };
             match next {
@@ -9889,14 +10068,15 @@ impl Gateway {
         }
     }
 
-    /// Process restart catch-up before the general live-session restore. A due
-    /// target cold-resumes itself through `submit_resolved`; the subsequent
-    /// restore sees it in the live map and skips a duplicate spawn.
+    /// Process restart catch-up launcher. Due rows are claimed synchronously,
+    /// then a cleanup-tracked worker owns delivery and terminal persistence.
+    /// Returning immediately is intentional: a hung vendor must not hold the
+    /// startup restore-complete barrier or the gateway registry. The worker's
+    /// shared submit and the general restore serialize on the same per-sid turn
+    /// claim, so whichever reaches a target first makes the other re-plan.
     pub async fn catch_up_scheduled(gateway: Arc<tokio::sync::Mutex<Self>>) {
-        let mut guard = gateway.lock().await;
         let now = chrono::Utc::now();
-        guard.gc_failed_scheduled(now);
-        guard.fire_due_scheduled(now).await;
+        let _ = Self::launch_due_scheduled_shared(gateway, now).await;
     }
 
     /// v0.8.8 bug-fix — persist the USER side of a turn to
@@ -11562,13 +11742,21 @@ impl Gateway {
                 mut directive,
             } => {
                 directive.choice = Some(selection);
+                let deadline = GatewayDeadline::start();
+                let claims = Arc::clone(&deadline.lock(&gateway).await?.spawn_claims);
+                let _turn_claim = tokio::time::timeout_at(
+                    deadline.expires_at.into(),
+                    claims.lock_for_turn(&session_id),
+                )
+                .await
+                .map_err(|_| GatewayRequestError::QueueDeadline)?;
                 Self::dispatch_directive_shared(
                     gateway,
                     &session_id,
                     directive,
                     TurnOrigin::User,
                     Some(chat),
-                    GatewayDeadline::start(),
+                    deadline,
                 )
                 .await
             }
@@ -13154,6 +13342,60 @@ impl Gateway {
             .into_iter()
             .filter(|m| !live_sids.contains(m.sid.as_str()))
             .collect()
+    }
+
+    /// Lock-narrowed history scan for HTTP. The project binding and catalog
+    /// handle are snapshotted under the registry lock, all `meta.json` IO runs
+    /// on the blocking pool, then the binding and current live set are checked
+    /// again before stopped-session filtering.
+    pub async fn list_history_sessions_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        slug: &str,
+    ) -> Result<Vec<SessionMeta>> {
+        Self::list_history_sessions_shared_with_scan(gateway, slug, |cwd| list_session_metas(&cwd))
+            .await
+    }
+
+    async fn list_history_sessions_shared_with_scan<F>(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        slug: &str,
+        scan: F,
+    ) -> Result<Vec<SessionMeta>>
+    where
+        F: FnOnce(PathBuf) -> Vec<SessionMeta> + Send + 'static,
+    {
+        let (cwd, catalog) = {
+            let guard = gateway.lock().await;
+            let cwd = guard
+                .projects
+                .get(slug)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown project: {slug}"))?;
+            (cwd, Arc::clone(&guard.session_catalog))
+        };
+        let scan_dir = cwd.clone();
+        let metas = tokio::task::spawn_blocking(move || {
+            let metas = scan(scan_dir.clone());
+            for meta in &metas {
+                catalog.insert(&scan_dir, meta);
+            }
+            metas
+        })
+        .await
+        .map_err(|error| anyhow!("history session scan failed: {error}"))?;
+        let live_sids = {
+            let guard = gateway.lock().await;
+            if guard.projects.get(slug) != Some(&cwd) {
+                return Err(
+                    GatewayRequestError::SessionGenerationConflict(slug.to_string()).into(),
+                );
+            }
+            guard.sessions.keys().cloned().collect::<HashSet<_>>()
+        };
+        Ok(metas
+            .into_iter()
+            .filter(|meta| !live_sids.contains(&meta.sid))
+            .collect())
     }
 
     /// Discover external Claude sessions under `~/.claude/projects/` whose
@@ -15674,8 +15916,13 @@ impl Gateway {
                         .map(|context| context.reply_to.clone())
                         .or_else(|| ChatKey::from_identity(&identity))
                         .unwrap_or_else(web_api_chat);
-                    let (receipt, id) =
-                        guard.queue_behind_detached_body(sid, &text, &reply_to, false, origin)?;
+                    let (receipt, id) = guard.queue_behind_detached_body(
+                        sid,
+                        &text,
+                        &reply_to,
+                        !parse_directives,
+                        origin,
+                    )?;
                     if let Some(ready) = ready.take() {
                         let _ = ready.send(true);
                     }
@@ -16594,6 +16841,51 @@ impl Gateway {
             free_text: p.prompt.options.is_empty().then(|| option_id.to_string()),
         };
         self.apply_pending(&web_api_chat(), p, selection).await?;
+        Ok(())
+    }
+
+    /// Lock-narrowed web HITL resolution. Token take/validation happens under
+    /// the pending registry's own lock; a Directive-origin choice then enters
+    /// the ordinary shared directive path under its per-sid turn claim. No
+    /// vendor await owns the daemon-wide gateway registry.
+    pub async fn resolve_web_selection_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        token: &str,
+        option_id: &str,
+    ) -> Result<()> {
+        let pending_handle = Arc::clone(&gateway.lock().await.pending);
+        let taken = {
+            let mut pending = pending_handle.lock().await;
+            pending.drain_expired(Instant::now());
+            pending.take_by_token(token)
+        };
+        let Some(pending) = taken else {
+            return Err(anyhow!("Неизвестный или истёкший токен"));
+        };
+        if !pending.prompt.options.is_empty()
+            && !pending
+                .prompt
+                .options
+                .iter()
+                .any(|option| option.id == option_id)
+        {
+            return Err(anyhow!(
+                "Некорректный идентификатор варианта для этого запроса"
+            ));
+        }
+        let selection = ChoiceSelection {
+            token: token.to_string(),
+            ids: (!pending.prompt.options.is_empty())
+                .then(|| option_id.to_string())
+                .into_iter()
+                .collect(),
+            free_text: pending
+                .prompt
+                .options
+                .is_empty()
+                .then(|| option_id.to_string()),
+        };
+        Self::apply_pending_shared(gateway, &web_api_chat(), pending, selection).await?;
         Ok(())
     }
 
@@ -20290,6 +20582,42 @@ mod tests {
             ccteam_harness::execution::session_body::BodyProbe::Absent,
             "the old record is gone; the new body's record is the fake's business"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn body_exit_pending_submit_does_not_hold_the_gateway_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let sid;
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+            gateway.enable_persistence(tmp.path()).unwrap();
+            sid = spawn_managed(&mut gateway).await;
+        }
+        let mut body = plant_body(&project_dir, &sid);
+        let submit = Arc::new(TestStartBarrier::default());
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude).with_submit_barrier(Arc::clone(&submit)),
+        );
+        let mut restarted = Gateway::new(fake, "alpha", &project_dir);
+        restarted.enable_persistence(tmp.path()).unwrap();
+        restarted.resume_restored_sessions().await;
+        restarted
+            .submit_to_sid(&sid, "queued while detached".into())
+            .await
+            .unwrap();
+        body_gone(&mut body);
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        submit.arm();
+        let tick_gateway = Arc::clone(&gateway);
+        let tick = tokio::spawn(async move { Gateway::body_watch_tick(&tick_gateway).await });
+        submit.wait_until_entered(1).await;
+
+        assert_other_chat_observability_is_prompt(&gateway).await;
+        submit.release_all();
+        tick.await.unwrap();
     }
 
     /// `/stop` / `session_stop` / project stop on a detached sid ENDS the body
@@ -27183,6 +27511,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_web_pending_directive_does_not_hold_the_gateway_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let barrier = Arc::new(TestStartBarrier::default());
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude).with_directive_barrier(Arc::clone(&barrier)),
+        );
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway
+            .handle_text("telegram", "chat-a", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway.pending.lock().await.register(
+            "web-pick-token".to_string(),
+            ChoicePrompt {
+                token: "web-pick-token".to_string(),
+                title: "pick".to_string(),
+                options: vec![ChoiceOption {
+                    id: "opus".to_string(),
+                    label: "Opus".to_string(),
+                }],
+                multi: false,
+            },
+            InteractionOrigin::Directive {
+                session_id: "s1".to_string(),
+                directive: Directive {
+                    name: "model".to_string(),
+                    args: String::new(),
+                    choice: None,
+                },
+            },
+            Instant::now() + Duration::from_secs(60),
+        );
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        barrier.arm();
+        let resolve_gateway = Arc::clone(&gateway);
+        let resolve = tokio::spawn(async move {
+            Gateway::resolve_web_selection_shared(resolve_gateway, "web-pick-token", "opus").await
+        });
+        barrier.wait_until_entered(1).await;
+        assert_other_chat_observability_is_prompt(&gateway).await;
+        barrier.release_all();
+        resolve.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_bulk_stop_choice_closes_sessions_off_the_gateway_lock() {
         let tmp = tempfile::TempDir::new().unwrap();
         let barrier = Arc::new(TestStartBarrier::default());
@@ -31057,6 +31430,38 @@ mod tests {
             gateway.session_views().iter().any(|v| v.sid == "s1"),
             "owner cold-resumed s1 from meta.json"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_history_scan_does_not_hold_the_gateway_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(Gateway::new(
+            Arc::new(FakeAdapter::new(AgentVendor::Claude)),
+            "alpha",
+            tmp.path(),
+        )));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let scan_gateway = Arc::clone(&gateway);
+        let scan = tokio::spawn(async move {
+            Gateway::list_history_sessions_shared_with_scan(scan_gateway, "alpha", move |_cwd| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Vec::new()
+            })
+            .await
+        });
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("blocking history scan entered")
+        })
+        .await
+        .unwrap();
+
+        assert_other_chat_observability_is_prompt(&gateway).await;
+        release_tx.send(()).unwrap();
+        assert!(scan.await.unwrap().unwrap().is_empty());
     }
 
     /// Send-resume symmetry (the architectural twin of the web-turn fix) — the
@@ -35355,6 +35760,385 @@ mod tests {
         assert!(!listed[0].contains("foreign-message"), "{listed:?}");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduled_catch_up_releases_registry_and_claims_one_shot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let submit = Arc::new(TestStartBarrier::default());
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude).with_submit_barrier(Arc::clone(&submit)),
+        );
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let item = gateway
+            .create_scheduled_message(
+                &sid,
+                "fire once".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        gateway
+            .scheduled_items
+            .get_mut(&item.id)
+            .unwrap()
+            .item
+            .send_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let gateway = Arc::new(Mutex::new(gateway));
+        submit.arm();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            Gateway::catch_up_scheduled(Arc::clone(&gateway)),
+        )
+        .await
+        .expect("startup catch-up launches delivery without waiting on the vendor");
+        submit.wait_until_entered(1).await;
+        let durable = crate::scheduled::read_scheduled(tmp.path(), &sid).unwrap();
+        assert_eq!(durable.len(), 1);
+        assert_eq!(
+            durable[0].status,
+            crate::scheduled::ScheduledStatus::Dispatching,
+            "the crash fence is durable before vendor acceptance can happen"
+        );
+
+        // The accepted submit is parked inside the adapter, yet status/list
+        // ingress can still take the registry lock immediately.
+        let cancel_error = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            let mut guard = gateway.lock().await;
+            assert!(guard.scheduled_in_flight.contains(&item.id));
+            guard.cancel_scheduled_message(&sid, &item.id).unwrap_err()
+        })
+        .await
+        .expect("scheduled vendor await never owns the gateway registry");
+        assert!(
+            cancel_error.to_string().contains("already being delivered"),
+            "a post-claim cancel must not leave a delivered row pending: {cancel_error:#}"
+        );
+
+        // A racing scheduler/catch-up sees the in-flight claim and cannot
+        // launch a duplicate vendor submit.
+        Gateway::catch_up_scheduled(Arc::clone(&gateway)).await;
+        assert_eq!(submit.entered.load(Ordering::SeqCst), 1);
+
+        submit.release_all();
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        assert_eq!(fake.submissions.lock().await.len(), 1);
+        let mut guard = gateway.lock().await;
+        assert!(guard.scheduled_in_flight.is_empty());
+        assert!(guard.scheduled_items_for_sid(&sid).unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduled_hung_sid_does_not_delay_another_due_sid() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let submit = Arc::new(TestStartBarrier::default());
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude).with_submit_barrier(Arc::clone(&submit)),
+        );
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let mut sids = Vec::new();
+        for _ in 0..2 {
+            sids.push(
+                gateway
+                    .create_session_api(
+                        "alpha".into(),
+                        "reviewer".into(),
+                        AgentVendor::Claude,
+                        PermissionMode::Skip,
+                    )
+                    .await
+                    .unwrap()
+                    .sid,
+            );
+        }
+        for (index, sid) in sids.iter().enumerate() {
+            let item = gateway
+                .create_scheduled_message(
+                    sid,
+                    format!("sid-{index}"),
+                    chrono::Utc::now() + chrono::Duration::minutes(5),
+                    "user:web-api".into(),
+                    None,
+                )
+                .unwrap();
+            gateway
+                .scheduled_items
+                .get_mut(&item.id)
+                .unwrap()
+                .item
+                .send_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        }
+        let gateway = Arc::new(Mutex::new(gateway));
+        submit.arm();
+
+        Gateway::catch_up_scheduled(Arc::clone(&gateway)).await;
+        submit.wait_until_entered(2).await;
+        assert_other_chat_observability_is_prompt(&gateway).await;
+
+        submit.release_all();
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        assert_eq!(fake.submissions.lock().await.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_scheduler_cannot_cancel_an_accepted_scheduled_fire() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let submit = Arc::new(TestStartBarrier::default());
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude).with_submit_barrier(Arc::clone(&submit)),
+        );
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let item = gateway
+            .create_scheduled_message(
+                &sid,
+                "survive scheduler abort".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        gateway
+            .scheduled_items
+            .get_mut(&item.id)
+            .unwrap()
+            .item
+            .send_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let gateway = Arc::new(Mutex::new(gateway));
+        submit.arm();
+
+        let scheduler = tokio::spawn(Gateway::run_scheduled_scheduler(Arc::clone(&gateway)));
+        submit.wait_until_entered(1).await;
+        scheduler.abort();
+        let _ = scheduler.await;
+
+        submit.release_all();
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        assert_eq!(fake.submissions.lock().await.len(), 1);
+        let mut guard = gateway.lock().await;
+        assert!(guard.scheduled_in_flight.is_empty());
+        assert!(guard.scheduled_items_for_sid(&sid).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_shared_fire_preserves_due_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let now = chrono::Utc::now();
+        let mut ids = Vec::new();
+        for text in ["last", "first", "second"] {
+            ids.push(
+                gateway
+                    .create_scheduled_message(
+                        &sid,
+                        text.into(),
+                        now + chrono::Duration::minutes(5),
+                        "user:web-api".into(),
+                        None,
+                    )
+                    .unwrap()
+                    .id,
+            );
+        }
+        gateway
+            .scheduled_items
+            .get_mut(&ids[0])
+            .unwrap()
+            .item
+            .send_at = now - chrono::Duration::seconds(1);
+        gateway
+            .scheduled_items
+            .get_mut(&ids[1])
+            .unwrap()
+            .item
+            .send_at = now - chrono::Duration::seconds(3);
+        gateway
+            .scheduled_items
+            .get_mut(&ids[2])
+            .unwrap()
+            .item
+            .send_at = now - chrono::Duration::seconds(3);
+        let gateway = Arc::new(Mutex::new(gateway));
+
+        Gateway::catch_up_scheduled(Arc::clone(&gateway)).await;
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+
+        let delivered = fake
+            .submissions
+            .lock()
+            .await
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(delivered, ["first", "second", "last"]);
+    }
+
+    #[tokio::test]
+    async fn cold_restart_never_retries_a_durable_dispatching_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        seed_role(&project_dir, "reviewer");
+        let root = tmp.path().join("home");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let item = gateway
+            .create_scheduled_message(
+                &sid,
+                "unknown after crash".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        let entry = gateway.scheduled_items.get_mut(&item.id).unwrap();
+        entry.item.status = crate::scheduled::ScheduledStatus::Dispatching;
+        entry.item.fail_reason = Some("dispatch boundary crossed".into());
+        gateway.persist_scheduled_sid(&project_dir, &sid).unwrap();
+        drop(gateway);
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restored = Gateway::new(fake.clone(), "alpha", &project_dir);
+        restored.enable_persistence(&root).unwrap();
+        let recovered = restored.scheduled_items_for_sid(&sid).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].status,
+            crate::scheduled::ScheduledStatus::Failed
+        );
+        assert!(recovered[0]
+            .fail_reason
+            .as_deref()
+            .unwrap()
+            .contains("автоматический повтор отключён"));
+        let gateway = Arc::new(Mutex::new(restored));
+        Gateway::catch_up_scheduled(Arc::clone(&gateway)).await;
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        assert!(fake.submissions.lock().await.is_empty());
+        assert_eq!(
+            crate::scheduled::read_scheduled(&project_dir, &sid).unwrap()[0].status,
+            crate::scheduled::ScheduledStatus::Failed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_persist_failure_keeps_the_durable_dispatching_fence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role(tmp.path(), "reviewer");
+        let submit = Arc::new(TestStartBarrier::default());
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude).with_submit_barrier(Arc::clone(&submit)),
+        );
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let item = gateway
+            .create_scheduled_message(
+                &sid,
+                "persist me".into(),
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        gateway
+            .scheduled_items
+            .get_mut(&item.id)
+            .unwrap()
+            .item
+            .send_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let gateway = Arc::new(Mutex::new(gateway));
+        submit.arm();
+        Gateway::catch_up_scheduled(Arc::clone(&gateway)).await;
+        submit.wait_until_entered(1).await;
+
+        let scheduled_path = crate::scheduled::scheduled_path(tmp.path(), &sid);
+        let sid_dir = scheduled_path.parent().unwrap().to_path_buf();
+        let backup = tmp.path().join("scheduled-sid-backup");
+        std::fs::rename(&sid_dir, &backup).unwrap();
+        std::fs::write(&sid_dir, b"block directory recreation").unwrap();
+
+        submit.release_all();
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        {
+            let guard = gateway.lock().await;
+            assert!(!guard.scheduled_in_flight.contains(&item.id));
+            assert_eq!(
+                guard.scheduled_items[&item.id].item.status,
+                crate::scheduled::ScheduledStatus::Dispatching,
+                "failed terminal persistence must never restore Pending"
+            );
+        }
+
+        std::fs::remove_file(&sid_dir).unwrap();
+        std::fs::rename(&backup, &sid_dir).unwrap();
+        assert_eq!(
+            crate::scheduled::read_scheduled(tmp.path(), &sid).unwrap()[0].status,
+            crate::scheduled::ScheduledStatus::Dispatching,
+            "the last durable state remains the pre-dispatch crash fence"
+        );
+        gateway
+            .lock()
+            .await
+            .cancel_scheduled_message(&sid, &item.id)
+            .unwrap();
+        assert!(crate::scheduled::read_scheduled(tmp.path(), &sid)
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn scheduled_slash_body_fires_as_literal_user_turn() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -35390,12 +36174,19 @@ mod tests {
         // survive enqueue/drain rather than turning `/model` into a directive.
         fake.live.store(false, Ordering::SeqCst);
 
-        gateway.fire_due_scheduled(chrono::Utc::now()).await;
+        let gateway = Arc::new(Mutex::new(gateway));
+        Gateway::catch_up_scheduled(Arc::clone(&gateway)).await;
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
 
         let submissions = fake.submissions.lock().await.clone();
         assert!(submissions.iter().any(|(_, text)| text == "/model opus"));
         assert!(fake.directives.lock().await.is_empty());
-        assert!(gateway.scheduled_items_for_sid(&sid).unwrap().is_empty());
+        assert!(gateway
+            .lock()
+            .await
+            .scheduled_items_for_sid(&sid)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -35478,8 +36269,10 @@ mod tests {
             .item
             .send_at = chrono::Utc::now() - chrono::Duration::hours(25);
 
-        gateway.fire_due_scheduled(chrono::Utc::now()).await;
-        let failed = gateway.scheduled_items_for_sid(&sid).unwrap();
+        let gateway = Arc::new(Mutex::new(gateway));
+        Gateway::catch_up_scheduled(Arc::clone(&gateway)).await;
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        let failed = gateway.lock().await.scheduled_items_for_sid(&sid).unwrap();
         assert_eq!(failed[0].status, crate::scheduled::ScheduledStatus::Failed);
         assert!(failed[0]
             .fail_reason
@@ -35489,11 +36282,18 @@ mod tests {
         assert!(fake.submissions.lock().await.is_empty());
 
         gateway
+            .lock()
+            .await
             .scheduled_items
             .get_mut(&item.id)
             .unwrap()
             .item
             .failed_at = Some(chrono::Utc::now() - chrono::Duration::hours(25));
-        assert!(gateway.scheduled_items_for_sid(&sid).unwrap().is_empty());
+        assert!(gateway
+            .lock()
+            .await
+            .scheduled_items_for_sid(&sid)
+            .unwrap()
+            .is_empty());
     }
 }

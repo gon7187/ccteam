@@ -163,7 +163,7 @@ export interface SessionStatus {
   status_line: string | null;
 }
 
-/** One pending or short-lived failed delayed user message. */
+/** One pending, dispatching/unknown, or short-lived failed delayed user message. */
 export interface ScheduledItem {
   id: string;
   sid: string;
@@ -172,7 +172,7 @@ export interface ScheduledItem {
   send_at: string;
   created_at: string;
   created_by: string;
-  status: "pending" | "failed";
+  status: "pending" | "dispatching" | "failed";
   fail_reason?: string | null;
 }
 
