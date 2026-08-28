@@ -18,11 +18,17 @@
 //! rather than publishing partial aggregates.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(all(unix, not(target_os = "linux")))]
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -197,26 +203,22 @@ pub fn read_all_experience_detailed(
 /// First 12 hex of sha256 of `.claude/agents/<role>.md`.
 /// `None` for roleless (empty role) or a missing file.
 pub fn role_fingerprint(project_dir: &Path, role: &str) -> Option<String> {
+    let role = valid_fingerprint_role(role)?;
+    #[cfg(target_os = "linux")]
+    let bytes = linux_role_bytes(project_dir, role).ok()?;
+    #[cfg(not(target_os = "linux"))]
+    let bytes = portable_role_bytes(project_dir, role).ok()?;
+    Some(short_sha256(&bytes))
+}
+
+fn valid_fingerprint_role(role: &str) -> Option<&str> {
     let role = role.trim();
-    if role.is_empty()
-        || !matches!(
+    (!role.is_empty()
+        && matches!(
             Path::new(role).components().collect::<Vec<_>>().as_slice(),
             [std::path::Component::Normal(_)]
-        )
-    {
-        return None;
-    }
-    let claude_dir = project_dir.join(".claude");
-    let agents_dir = claude_dir.join("agents");
-    for dir in [&claude_dir, &agents_dir] {
-        let metadata = fs::symlink_metadata(dir).ok()?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return None;
-        }
-    }
-    let path = agents_dir.join(format!("{role}.md"));
-    let bytes = read_regular_file_bounded(&path, MAX_ROLE_FINGERPRINT_BYTES).ok()?;
-    Some(short_sha256(&bytes))
+        ))
+    .then_some(role)
 }
 
 /// Per-skill digests under `.claude/skills/<id>/`.
@@ -225,68 +227,53 @@ pub fn role_fingerprint(project_dir: &Path, role: &str) -> Option<String> {
 /// lines `"<relpath>:<sha256(content)>"` of every regular file under that
 /// skill (recursive, deterministic). Returns `None` when no skill directories
 /// exist; `Some(map)` when at least one skill dir is present (values may
-/// still hash empty dirs as the digest of zero lines).
+/// still hash empty dirs as the digest of zero lines). One aggregate budget
+/// covers every root/nested entry and byte across the whole operation. Linux
+/// traversal is relative to pinned directory descriptors and refuses symlinks.
 pub fn skills_fingerprint(project_dir: &Path) -> Option<BTreeMap<String, String>> {
-    let project_root = fs::canonicalize(project_dir).ok()?;
-    let claude_dir = project_dir.join(".claude");
-    let claude_metadata = fs::symlink_metadata(&claude_dir).ok()?;
-    if claude_metadata.file_type().is_symlink() || !claude_metadata.is_dir() {
-        return None;
+    skills_fingerprint_with_hook(project_dir, || {})
+}
+
+fn skills_fingerprint_with_hook(
+    project_dir: &Path,
+    after_claude_open: impl FnOnce(),
+) -> Option<BTreeMap<String, String>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_skills_fingerprint(project_dir, after_claude_open)
+            .ok()
+            .flatten()
     }
-    let skills_root = claude_dir.join("skills");
-    let root_metadata = fs::symlink_metadata(&skills_root).ok()?;
-    if root_metadata.file_type().is_symlink() {
-        let agents_dir = project_dir.join(".agents");
-        let agents_metadata = fs::symlink_metadata(&agents_dir).ok()?;
-        if agents_metadata.file_type().is_symlink() || !agents_metadata.is_dir() {
-            return None;
-        }
-        let managed_root = agents_dir.join("skills");
-        let managed_metadata = fs::symlink_metadata(&managed_root).ok()?;
-        let managed_real = fs::canonicalize(&managed_root).ok()?;
-        if managed_metadata.file_type().is_symlink()
-            || !managed_metadata.is_dir()
-            || !managed_real.starts_with(&project_root)
-            || fs::canonicalize(&skills_root).ok()? != managed_real
-        {
-            return None;
-        }
-    } else if !root_metadata.is_dir() {
-        return None;
-    }
-    let entries = read_dir_bounded_sorted(&skills_root, MAX_SKILL_FINGERPRINT_FILES).ok()?;
-    let mut map = BTreeMap::new();
-    let mut budget = SkillFingerprintBudget::default();
-    for entry in entries {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        // The `.claude/skills` root itself is intentionally allowed to be the
-        // project-managed link to `.agents/skills`. Entries below it are not:
-        // following one could escape the project tree or recurse through a
-        // cycle and take the daemon down during session spawn.
-        if file_type.is_symlink() || !file_type.is_dir() {
-            continue;
-        }
-        let Some(id) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        map.insert(id, skill_dir_digest(&path, &mut budget));
-    }
-    if map.is_empty() {
-        None
-    } else {
-        Some(map)
+    #[cfg(not(target_os = "linux"))]
+    {
+        portable_skills_fingerprint(project_dir, after_claude_open)
+            .ok()
+            .flatten()
     }
 }
 
-/// Digest of one skill directory: sha256 over sorted `"relpath:content_sha"` lines.
-fn skill_dir_digest(skill_dir: &Path, budget: &mut SkillFingerprintBudget) -> String {
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    if collect_skill_files(skill_dir, skill_dir, 0, budget, &mut pairs).is_err() {
-        return "unavailable".to_string();
+const MAX_SKILL_FINGERPRINT_DEPTH: usize = 16;
+const MAX_SKILL_FINGERPRINT_ENTRIES: usize = 4_096;
+const MAX_SKILL_FINGERPRINT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ROLE_FINGERPRINT_BYTES: u64 = 1024 * 1024;
+
+#[derive(Default)]
+struct SkillFingerprintBudget {
+    entries: usize,
+    bytes: u64,
+}
+
+impl SkillFingerprintBudget {
+    fn spend_entry(&mut self) -> Result<()> {
+        self.entries = self.entries.saturating_add(1);
+        if self.entries > MAX_SKILL_FINGERPRINT_ENTRIES {
+            anyhow::bail!("skill fingerprint directory entry limit exceeded");
+        }
+        Ok(())
     }
+}
+
+fn digest_skill_pairs(mut pairs: Vec<(String, String)>) -> String {
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut hasher = Sha256::new();
     for (rel, content_sha) in &pairs {
@@ -298,30 +285,295 @@ fn skill_dir_digest(skill_dir: &Path, budget: &mut SkillFingerprintBudget) -> St
     hex12(hasher.finalize())
 }
 
-const MAX_SKILL_FINGERPRINT_DEPTH: usize = 16;
-const MAX_SKILL_FINGERPRINT_FILES: usize = 4_096;
-const MAX_SKILL_FINGERPRINT_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_ROLE_FINGERPRINT_BYTES: u64 = 1024 * 1024;
-
-#[derive(Default)]
-struct SkillFingerprintBudget {
-    files: usize,
-    bytes: u64,
+fn read_regular_handle_bounded(file: fs::File, max_bytes: u64) -> Result<Vec<u8>> {
+    let metadata = file.metadata().context("stat fingerprint file")?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        anyhow::bail!("fingerprint file exceeds limit or is not regular");
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .context("read fingerprint file")?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        anyhow::bail!("fingerprint file exceeds limit");
+    }
+    Ok(bytes)
 }
 
-fn read_dir_bounded_sorted(dir: &Path, max_entries: usize) -> Result<Vec<fs::DirEntry>> {
+#[cfg(target_os = "linux")]
+fn linux_role_bytes(project_dir: &Path, role: &str) -> Result<Vec<u8>> {
+    let root = linux_open_project_root(project_dir)?;
+    let claude = linux_open_child(&root, OsStr::new(".claude"), libc::O_DIRECTORY)?;
+    let agents = linux_open_child(&claude, OsStr::new("agents"), libc::O_DIRECTORY)?;
+    let role_name = format!("{role}.md");
+    let file = linux_open_child(&agents, OsStr::new(&role_name), 0)?;
+    read_regular_handle_bounded(file, MAX_ROLE_FINGERPRINT_BYTES)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_skills_fingerprint(
+    project_dir: &Path,
+    after_claude_open: impl FnOnce(),
+) -> Result<Option<BTreeMap<String, String>>> {
+    let root = linux_open_project_root(project_dir)?;
+    let claude = linux_open_child(&root, OsStr::new(".claude"), libc::O_DIRECTORY)?;
+    after_claude_open();
+    let skills_meta = fs::symlink_metadata(linux_fd_path(&claude).join("skills"))?;
+    let skills = if skills_meta.file_type().is_symlink() {
+        let target = fs::read_link(linux_fd_path(&claude).join("skills"))?;
+        if target != Path::new("../.agents/skills") {
+            anyhow::bail!("unmanaged skills root symlink");
+        }
+        let agents = linux_open_child(&root, OsStr::new(".agents"), libc::O_DIRECTORY)?;
+        linux_open_child(&agents, OsStr::new("skills"), libc::O_DIRECTORY)?
+    } else if skills_meta.is_dir() {
+        linux_open_child(&claude, OsStr::new("skills"), libc::O_DIRECTORY)?
+    } else {
+        return Ok(None);
+    };
+
+    let mut budget = SkillFingerprintBudget::default();
+    let names = linux_read_dir_names(&skills, &mut budget)?;
+    let mut map = BTreeMap::new();
+    for name in names {
+        let metadata = fs::symlink_metadata(linux_fd_path(&skills).join(&name))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let Some(id) = name.to_str().map(str::to_owned) else {
+            continue;
+        };
+        let skill = linux_open_child(&skills, &name, libc::O_DIRECTORY)?;
+        map.insert(id, linux_skill_digest(&skill, &mut budget));
+    }
+    Ok((!map.is_empty()).then_some(map))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_skill_digest(skill: &fs::File, budget: &mut SkillFingerprintBudget) -> String {
+    let mut pairs = Vec::new();
+    if linux_collect_skill_files(skill, Path::new(""), 0, budget, &mut pairs).is_err() {
+        return "unavailable".to_string();
+    }
+    digest_skill_pairs(pairs)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_collect_skill_files(
+    dir: &fs::File,
+    relative_dir: &Path,
+    depth: usize,
+    budget: &mut SkillFingerprintBudget,
+    out: &mut Vec<(String, String)>,
+) -> Result<()> {
+    if depth > MAX_SKILL_FINGERPRINT_DEPTH {
+        anyhow::bail!("skill fingerprint depth limit exceeded");
+    }
+    for name in linux_read_dir_names(dir, budget)? {
+        let metadata = fs::symlink_metadata(linux_fd_path(dir).join(&name))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let relative = relative_dir.join(&name);
+        if metadata.is_dir() {
+            let child = linux_open_child(dir, &name, libc::O_DIRECTORY)?;
+            linux_collect_skill_files(&child, &relative, depth + 1, budget, out)?;
+        } else if metadata.is_file() {
+            let remaining = MAX_SKILL_FINGERPRINT_BYTES.saturating_sub(budget.bytes);
+            let file = linux_open_child(dir, &name, 0)?;
+            let bytes = read_regular_handle_bounded(file, remaining)?;
+            budget.bytes = budget
+                .bytes
+                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            if budget.bytes > MAX_SKILL_FINGERPRINT_BYTES {
+                anyhow::bail!("skill fingerprint byte limit exceeded");
+            }
+            out.push((
+                relative.to_string_lossy().replace('\\', "/"),
+                full_sha256_hex(&bytes),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_read_dir_names(
+    dir: &fs::File,
+    budget: &mut SkillFingerprintBudget,
+) -> Result<Vec<OsString>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(linux_fd_path(dir)).context("read pinned skill directory")? {
+        budget.spend_entry()?;
+        names.push(
+            entry
+                .context("read pinned skill directory entry")?
+                .file_name(),
+        );
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fd_path(file: &fs::File) -> PathBuf {
+    PathBuf::from("/proc/self/fd").join(file.as_raw_fd().to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_open_project_root(project_dir: &Path) -> Result<fs::File> {
+    let canonical = fs::canonicalize(project_dir)
+        .with_context(|| format!("resolve project root {}", project_dir.display()))?;
+    linux_openat2(
+        libc::AT_FDCWD,
+        canonical.as_os_str(),
+        libc::O_DIRECTORY,
+        libc::RESOLVE_NO_SYMLINKS,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_open_child(parent: &fs::File, name: &OsStr, extra_flags: i32) -> Result<fs::File> {
+    linux_openat2(
+        parent.as_raw_fd(),
+        name,
+        extra_flags,
+        libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_openat2(dirfd: i32, path: &OsStr, extra_flags: i32, resolve: u64) -> Result<fs::File> {
+    let path = CString::new(path.as_bytes()).context("fingerprint path contains NUL")?;
+    // SAFETY: Linux defines `open_how` as three integer fields and requires
+    // unknown/future fields to be zero for forward-compatible calls.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_RDONLY | libc::O_CLOEXEC | extra_flags) as u64;
+    how.resolve = resolve;
+    // SAFETY: `path` is NUL-terminated, `how` points to an initialized
+    // `open_how`, and a successful descriptor is transferred exactly once.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dirfd,
+            path.as_ptr(),
+            &how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open fingerprint path safely");
+    }
+    // SAFETY: the successful syscall returned a new owned descriptor.
+    Ok(unsafe { fs::File::from_raw_fd(fd as i32) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn portable_role_bytes(project_dir: &Path, role: &str) -> Result<Vec<u8>> {
+    let project_root = fs::canonicalize(project_dir)?;
+    let claude_dir = project_dir.join(".claude");
+    let claude_metadata = fs::symlink_metadata(&claude_dir)?;
+    if claude_metadata.file_type().is_symlink() || !claude_metadata.is_dir() {
+        anyhow::bail!("refuse non-directory role parent");
+    }
+    let agents_dir = claude_dir.join("agents");
+    let agents_metadata = fs::symlink_metadata(&agents_dir)?;
+    if agents_metadata.file_type().is_symlink() || !agents_metadata.is_dir() {
+        anyhow::bail!("refuse non-directory role parent");
+    }
+    let path = agents_dir.join(format!("{role}.md"));
+    portable_read_regular(&project_root, &path, MAX_ROLE_FINGERPRINT_BYTES)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn portable_skills_fingerprint(
+    project_dir: &Path,
+    after_claude_open: impl FnOnce(),
+) -> Result<Option<BTreeMap<String, String>>> {
+    let project_root = fs::canonicalize(project_dir)?;
+    let claude_dir = project_dir.join(".claude");
+    let claude_metadata = fs::symlink_metadata(&claude_dir)?;
+    if claude_metadata.file_type().is_symlink() || !claude_metadata.is_dir() {
+        return Ok(None);
+    }
+    after_claude_open();
+    if fs::canonicalize(&claude_dir)? != project_root.join(".claude") {
+        anyhow::bail!("fingerprint parent changed during scan");
+    }
+    let skills_root = claude_dir.join("skills");
+    let root_metadata = fs::symlink_metadata(&skills_root)?;
+    if root_metadata.file_type().is_symlink() {
+        let agents_dir = project_dir.join(".agents");
+        let agents_metadata = fs::symlink_metadata(&agents_dir)?;
+        if agents_metadata.file_type().is_symlink() || !agents_metadata.is_dir() {
+            return Ok(None);
+        }
+        let managed_root = agents_dir.join("skills");
+        let managed_metadata = fs::symlink_metadata(&managed_root)?;
+        let managed_real = fs::canonicalize(&managed_root)?;
+        if managed_metadata.file_type().is_symlink()
+            || !managed_metadata.is_dir()
+            || !managed_real.starts_with(&project_root)
+            || fs::canonicalize(&skills_root)? != managed_real
+        {
+            return Ok(None);
+        }
+    } else if !root_metadata.is_dir() {
+        return Ok(None);
+    }
+    let skills_real = fs::canonicalize(&skills_root)?;
+    if !skills_real.starts_with(&project_root) {
+        anyhow::bail!("skills root escaped project root");
+    }
+    let mut budget = SkillFingerprintBudget::default();
+    let entries = portable_read_dir(&skills_root, &mut budget)?;
+    if fs::canonicalize(&skills_root)? != skills_real {
+        anyhow::bail!("skills root changed during scan");
+    }
+    let mut map = BTreeMap::new();
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let Some(id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        map.insert(id, portable_skill_digest(&project_root, &path, &mut budget));
+    }
+    Ok((!map.is_empty()).then_some(map))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn portable_skill_digest(
+    project_root: &Path,
+    skill_dir: &Path,
+    budget: &mut SkillFingerprintBudget,
+) -> String {
+    let mut pairs = Vec::new();
+    if portable_collect_skill_files(project_root, skill_dir, skill_dir, 0, budget, &mut pairs)
+        .is_err()
+    {
+        return "unavailable".to_string();
+    }
+    digest_skill_pairs(pairs)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn portable_read_dir(dir: &Path, budget: &mut SkillFingerprintBudget) -> Result<Vec<fs::DirEntry>> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(dir).with_context(|| format!("read directory {}", dir.display()))? {
-        if entries.len() >= max_entries {
-            anyhow::bail!("skill fingerprint directory entry limit exceeded");
-        }
+        budget.spend_entry()?;
         entries.push(entry.with_context(|| format!("read directory entry in {}", dir.display()))?);
     }
     entries.sort_by_key(std::fs::DirEntry::file_name);
     Ok(entries)
 }
 
-fn collect_skill_files(
+#[cfg(not(target_os = "linux"))]
+fn portable_collect_skill_files(
+    project_root: &Path,
     root: &Path,
     dir: &Path,
     depth: usize,
@@ -331,32 +583,25 @@ fn collect_skill_files(
     if depth > MAX_SKILL_FINGERPRINT_DEPTH {
         anyhow::bail!("skill fingerprint depth limit exceeded");
     }
-    let mut entries = fs::read_dir(dir)
-        .with_context(|| format!("read skill directory {}", dir.display()))?
-        .collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
+    let before = fs::canonicalize(dir)?;
+    if !before.starts_with(project_root) {
+        anyhow::bail!("skill directory escaped project root");
+    }
+    for entry in portable_read_dir(dir, budget)? {
         let path = entry.path();
-        let meta = entry
-            .file_type()
-            .with_context(|| format!("read skill entry type {}", path.display()))?;
+        let meta = entry.file_type()?;
         if meta.is_symlink() {
             continue;
         }
         if meta.is_dir() {
-            collect_skill_files(root, &path, depth + 1, budget, out)?;
+            portable_collect_skill_files(project_root, root, &path, depth + 1, budget, out)?;
         } else if meta.is_file() {
-            budget.files = budget.files.saturating_add(1);
-            if budget.files > MAX_SKILL_FINGERPRINT_FILES {
-                anyhow::bail!("skill fingerprint file limit exceeded");
-            }
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
             };
             let relpath = rel.to_string_lossy().replace('\\', "/");
             let remaining = MAX_SKILL_FINGERPRINT_BYTES.saturating_sub(budget.bytes);
-            let bytes = read_regular_file_bounded(&path, remaining)
-                .with_context(|| format!("read skill file {}", path.display()))?;
+            let bytes = portable_read_regular(project_root, &path, remaining)?;
             budget.bytes = budget
                 .bytes
                 .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
@@ -366,13 +611,21 @@ fn collect_skill_files(
             out.push((relpath, full_sha256_hex(&bytes)));
         }
     }
+    if fs::canonicalize(dir)? != before {
+        anyhow::bail!("skill directory changed during scan");
+    }
     Ok(())
 }
 
-fn read_regular_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+#[cfg(not(target_os = "linux"))]
+fn portable_read_regular(project_root: &Path, path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    let before = fs::canonicalize(path)?;
+    if !before.starts_with(project_root) {
+        anyhow::bail!("fingerprint file escaped project root");
+    }
     let mut options = fs::OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     options.custom_flags(libc::O_NOFOLLOW);
     #[cfg(not(unix))]
     if fs::symlink_metadata(path)
@@ -382,21 +635,14 @@ fn read_regular_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
     {
         anyhow::bail!("refuse symlink {}", path.display());
     }
-    let file = options
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("stat {}", path.display()))?;
-    if !metadata.is_file() || metadata.len() > max_bytes {
-        anyhow::bail!("fingerprint file exceeds limit or is not regular");
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read {}", path.display()))?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
-        anyhow::bail!("fingerprint file exceeds limit");
+    let bytes = read_regular_handle_bounded(
+        options
+            .open(path)
+            .with_context(|| format!("open {}", path.display()))?,
+        max_bytes,
+    )?;
+    if fs::canonicalize(path)? != before {
+        anyhow::bail!("fingerprint file changed during scan");
     }
     Ok(bytes)
 }
@@ -872,12 +1118,11 @@ mod tests {
         let skill = tmp.path().join(".claude/skills/bounded");
         fs::create_dir_all(&skill).unwrap();
         fs::write(skill.join("one.md"), b"one").unwrap();
-        let mut pairs = Vec::new();
-        let mut exhausted_files = SkillFingerprintBudget {
-            files: MAX_SKILL_FINGERPRINT_FILES,
+        let mut exhausted_entries = SkillFingerprintBudget {
+            entries: MAX_SKILL_FINGERPRINT_ENTRIES,
             bytes: 0,
         };
-        assert!(collect_skill_files(&skill, &skill, 0, &mut exhausted_files, &mut pairs).is_err());
+        assert!(exhausted_entries.spend_entry().is_err());
 
         fs::File::create(skill.join("huge.bin"))
             .unwrap()
@@ -898,10 +1143,10 @@ mod tests {
         let second = skills.join("b-second");
         fs::create_dir_all(&first).unwrap();
         fs::create_dir_all(&second).unwrap();
-        for index in 0..(MAX_SKILL_FINGERPRINT_FILES / 2) {
+        for index in 0..(MAX_SKILL_FINGERPRINT_ENTRIES / 2) {
             fs::write(first.join(format!("{index:04}.md")), b"a").unwrap();
         }
-        for index in 0..=(MAX_SKILL_FINGERPRINT_FILES / 2) {
+        for index in 0..=(MAX_SKILL_FINGERPRINT_ENTRIES / 2) {
             fs::write(second.join(format!("{index:04}.md")), b"b").unwrap();
         }
 
@@ -947,7 +1192,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let skills = tmp.path().join(".claude/skills");
         fs::create_dir_all(&skills).unwrap();
-        for index in 0..=MAX_SKILL_FINGERPRINT_FILES {
+        for index in 0..=MAX_SKILL_FINGERPRINT_ENTRIES {
             fs::create_dir(skills.join(format!("skill-{index:04}"))).unwrap();
         }
 
@@ -955,6 +1200,74 @@ mod tests {
             skills_fingerprint(tmp.path()).is_none(),
             "top-level skill enumeration must be bounded before hashing"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn skills_fingerprint_counts_nested_empty_dirs_and_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let skill = tmp.path().join(".claude/skills/bounded");
+        fs::create_dir_all(&skill).unwrap();
+        let half = MAX_SKILL_FINGERPRINT_ENTRIES / 2;
+        for index in 0..half {
+            fs::create_dir(skill.join(format!("dir-{index:04}"))).unwrap();
+            symlink("missing", skill.join(format!("link-{index:04}"))).unwrap();
+        }
+
+        let fingerprints = skills_fingerprint(tmp.path()).unwrap();
+        assert_eq!(
+            fingerprints.get("bounded").map(String::as_str),
+            Some("unavailable"),
+            "every root and nested entry must spend the aggregate traversal budget"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn skills_fingerprint_keeps_scanning_the_pinned_parent_after_a_swap() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        let inside = claude.join("skills/inside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::write(inside.join("SKILL.md"), b"inside project").unwrap();
+        let outside_claude = tmp.path().join("outside-claude");
+        let outside = outside_claude.join("skills/outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("SKILL.md"), b"must never be hashed").unwrap();
+        let displaced = tmp.path().join(".claude-pinned");
+
+        let fingerprints = skills_fingerprint_with_hook(tmp.path(), || {
+            fs::rename(&claude, &displaced).unwrap();
+            symlink(&outside_claude, &claude).unwrap();
+        })
+        .unwrap();
+
+        assert!(fingerprints.contains_key("inside"));
+        assert!(!fingerprints.contains_key("outside"));
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn skills_fingerprint_fails_closed_after_a_parent_swap_on_portable_unix() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        fs::create_dir_all(claude.join("skills/inside")).unwrap();
+        let outside_claude = tmp.path().join("outside-claude");
+        fs::create_dir_all(outside_claude.join("skills/outside")).unwrap();
+        let displaced = tmp.path().join(".claude-displaced");
+
+        let fingerprints = skills_fingerprint_with_hook(tmp.path(), || {
+            fs::rename(&claude, &displaced).unwrap();
+            symlink(&outside_claude, &claude).unwrap();
+        });
+
+        assert!(fingerprints.is_none());
     }
 
     #[cfg(unix)]

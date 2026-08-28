@@ -834,6 +834,7 @@ pub fn append_chat_turn_completed_if_absent(
     let lock_file = open_progress_lock(path)?;
     let lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
+    settle_pending_progress_write_locked(path)?;
     if read_verdict_index_locked(path)?.is_none() {
         if path.exists()
             || progress_archive_path(path).exists()
@@ -1013,6 +1014,7 @@ pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Res
     let lock_file = open_progress_lock(path)?;
     let lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
+    settle_pending_progress_write_locked(path)?;
     if read_verdict_index_locked(path)?.is_none() {
         if path.exists()
             || progress_archive_path(path).exists()
@@ -1451,6 +1453,7 @@ fn append_serialized(path: &Path, line: &[u8]) -> Result<bool> {
 }
 
 fn append_serialized_locked(path: &Path, line: &[u8]) -> Result<bool> {
+    settle_pending_progress_write_locked(path)?;
     if !path.exists()
         && !progress_archive_path(path).exists()
         && !progress_checkpoint_path(path).exists()
@@ -1511,6 +1514,7 @@ fn open_progress_lock(active_path: &Path) -> Result<File> {
 }
 
 fn rotate_progress_locked(active_path: &Path) -> Result<()> {
+    settle_pending_progress_write_locked(active_path)?;
     // Upgrade/backfill the retained archive and materialize the verdict index
     // before `.1` is replaced. In particular, a v1 checkpoint covered `.1`
     // aggregates but carried no verdict/completion projection.
@@ -1537,6 +1541,24 @@ fn rotate_progress_locked(active_path: &Path) -> Result<()> {
     // these operations leaves a marker mismatch that startup hydration repairs.
     recover_progress_checkpoint_locked(active_path)?;
     File::create(active_path).with_context(|| format!("create {}", active_path.display()))?;
+    Ok(())
+}
+
+fn settle_pending_progress_write_locked(path: &Path) -> Result<()> {
+    let index_path = progress_verdict_index_path(path);
+    match std::fs::metadata(&index_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("stat {}", index_path.display()));
+        }
+    }
+    if read_verdict_index_locked(path)?.is_none() {
+        anyhow::bail!(
+            "cannot mutate {} while its progress verdict index is invalid",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -1755,6 +1777,7 @@ pub fn repair_progress_journal(
     let lock_file = open_progress_lock(active_path)?;
     let _lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(active_path).display()))?;
+    settle_pending_progress_write_locked(active_path)?;
     repair_progress_journal_locked(active_path, target_path)
 }
 
@@ -2969,6 +2992,105 @@ mod tests {
 
         assert!(error.contains("ambiguous pending terminal append"));
         assert_eq!(std::fs::read(&path).unwrap(), unrelated);
+    }
+
+    #[test]
+    fn ordinary_append_resolves_absent_or_torn_terminal_pending_first() {
+        for torn in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let path = tmp.path().join("progress.jsonl");
+            let existing = json!({"event": "session_started", "sid": "s1"});
+            let mut existing_line = serde_json::to_vec(&existing).unwrap();
+            existing_line.push(b'\n');
+            let active_offset = existing_line.len() as u64;
+            let pending_event = json!({
+                "event": CHAT_TURN_COMPLETED,
+                "sid": "s1",
+                "turn_id": "turn-1",
+                "ts": "2026-08-28T00:00:00Z",
+            });
+            let mut pending_line = serde_json::to_vec(&pending_event).unwrap();
+            pending_line.push(b'\n');
+            let mut active = existing_line;
+            if torn {
+                active.extend_from_slice(&pending_line[..pending_line.len() / 2]);
+            }
+            std::fs::write(&path, active).unwrap();
+            let active_file_identity =
+                pending_active_file_identity(&std::fs::metadata(&path).unwrap());
+            let index = ProgressVerdictIndex {
+                pending: Some(PendingProgressIndexWrite::TerminalTurn {
+                    event: pending_event,
+                    active_offset,
+                    line_len: pending_line.len() as u64,
+                    line_sha256: hex_digest(Sha256::digest(&pending_line).as_slice()),
+                    active_file_identity,
+                }),
+                ..ProgressVerdictIndex::default()
+            };
+            write_verdict_index(&path, &index).unwrap();
+
+            let ordinary = json!({"event": "ordinary_fact", "sid": "s1"});
+            append_event(&path, &ordinary).unwrap();
+            let replay = json!({
+                "event": CHAT_TURN_COMPLETED,
+                "sid": "s1",
+                "turn_id": "turn-1",
+                "ts": "2026-08-28T01:00:00Z",
+            });
+            let admitted = append_chat_turn_completed_if_absent(&path, &replay).unwrap();
+
+            assert!(admitted.appended);
+            assert_eq!(read_rows(&path), vec![existing, ordinary, replay]);
+        }
+    }
+
+    #[test]
+    fn repair_settles_a_torn_terminal_pending_write_before_replacing_active() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let existing = json!({"event": "session_started", "sid": "s1"});
+        let mut existing_line = serde_json::to_vec(&existing).unwrap();
+        existing_line.push(b'\n');
+        let corrupt_line = b"not-json\n";
+        let pending_event = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T00:00:00Z",
+        });
+        let mut pending_line = serde_json::to_vec(&pending_event).unwrap();
+        pending_line.push(b'\n');
+        let active_offset = (existing_line.len() + corrupt_line.len()) as u64;
+        let mut active = existing_line;
+        active.extend_from_slice(corrupt_line);
+        active.extend_from_slice(&pending_line[..pending_line.len() / 2]);
+        std::fs::write(&path, active).unwrap();
+        let active_file_identity = pending_active_file_identity(&std::fs::metadata(&path).unwrap());
+        let index = ProgressVerdictIndex {
+            pending: Some(PendingProgressIndexWrite::TerminalTurn {
+                event: pending_event,
+                active_offset,
+                line_len: pending_line.len() as u64,
+                line_sha256: hex_digest(Sha256::digest(&pending_line).as_slice()),
+                active_file_identity,
+            }),
+            ..ProgressVerdictIndex::default()
+        };
+        write_verdict_index(&path, &index).unwrap();
+
+        let report = repair_progress_journal(&path, &path).unwrap().unwrap();
+
+        assert_eq!(report.dropped_count, 1);
+        let replay = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T01:00:00Z",
+        });
+        let admitted = append_chat_turn_completed_if_absent(&path, &replay).unwrap();
+        assert!(admitted.appended);
+        assert_eq!(read_rows(&path), vec![existing, replay]);
     }
 
     #[test]
