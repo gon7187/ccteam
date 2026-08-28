@@ -734,6 +734,15 @@ fn main() -> Result<()> {
                     },
                 )?;
                 print!("{report}");
+                // Best-effort must not mean fail-open (same decision as
+                // `doctor --repair-progress`): a post-ACK cleanup that could not
+                // complete leaves ccteam state on disk, so a scripted
+                // `project rm … && …` must stop. Code 2 is distinct from the
+                // code-1 "removal refused / nothing committed" failures so a
+                // wrapper can tell a half-finished sweep from a no-op.
+                if !report.cleanup_failures.is_empty() {
+                    std::process::exit(2);
+                }
                 Ok(())
             }
             ProjectCommand::Stop { slug } => {

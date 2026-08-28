@@ -1848,6 +1848,10 @@ pub struct RemoveReport {
     /// its commit point (never strand a retired generation in the catalog), so
     /// these are surfaced as warnings the operator must clean up by hand.
     pub cleanup_failures: Vec<String>,
+    /// True once the daemon acknowledged the durable retirement. A retry after
+    /// a `cleanup_failures` warning is then a file sweep only — the generation
+    /// is already permanently retired and cannot be retired again.
+    pub retirement_committed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1970,6 +1974,24 @@ impl std::fmt::Display for RemoveReport {
         }
         for failure in &self.cleanup_failures {
             writeln!(f, "warning: {failure}")?;
+        }
+        if !self.cleanup_failures.is_empty() {
+            // The exit code is non-zero (2) so scripted flows stop here; say
+            // plainly what a retry does and does not redo.
+            if self.retirement_committed {
+                writeln!(
+                    f,
+                    "warning: retirement уже зафиксирован демоном и запись config.yaml снята; \
+                     повторный запуск — только до-очистка файлов, повторное retirement \
+                     невозможно (exit 2)"
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "warning: retirement через daemon не выполнялся; повторный запуск — \
+                     только до-очистка файлов (exit 2)"
+                )?;
+            }
         }
         Ok(())
     }
@@ -3333,12 +3355,15 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
 
     // 2. The registry row resolved in step 0 owns the project directory, so an
     // arbitrary-path install is deleted correctly even when the slug does not
-    // sit under `paths.projects_root`. Without a row the only honest guess is
-    // the conventional location under `projects_root`.
-    let project_dir = registered
-        .as_ref()
-        .map(|entry| entry.path.clone())
-        .unwrap_or_else(|| paths.project_dir(slug));
+    // sit under `paths.projects_root`. Without a row there is NO guess: the
+    // conventional `projects_root/<slug>` location is someone else's directory
+    // as easily as this slug's, so it is accepted only against on-disk evidence
+    // (see `prove_unregistered_project_dir`). `None` = no provable project
+    // directory; the ccteam-home footprint (keyed by slug) is swept regardless.
+    let project_dir: Option<std::path::PathBuf> = match registered.as_ref() {
+        Some(entry) => Some(entry.path.clone()),
+        None => prove_unregistered_project_dir(paths, slug),
+    };
 
     // 3. Dry-run previews the exact destructive surfaces but never contacts
     // the daemon or creates the stable progress lock.
@@ -3402,6 +3427,9 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
         // each failure truthfully, and a blanket "config не изменён" would lie
         // about a generation whose tombstone the daemon already committed.
         let outcome = request_daemon_project_retire(paths, slug)?;
+        // From here on the generation is permanently retired: every later
+        // failure is a file sweep to redo, never a reason to re-retire.
+        report.retirement_committed = true;
         report
             .steps
             .push("retirement проекта подтверждено демоном".to_string());
@@ -3431,9 +3459,13 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
                         .push(format!("остановлена legacy чат-сессия `{name}`"));
                 }
             }
-            Err(error) => report.steps.push(format!(
-                "legacy чат-сессии: не удалось проверить ({error:#})"
-            )),
+            Err(error) => {
+                // Post-ACK like every other sweep below: report it, carry on to
+                // the commit point, and let it colour the exit code.
+                let note = format!("legacy чат-сессии: не удалось проверить ({error:#})");
+                report.steps.push(note.clone());
+                report.cleanup_failures.push(note);
+            }
         }
     }
 
@@ -3481,13 +3513,31 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
     // 5. Optional project-local cleanup happens after daemon ACK and before
     // config deletion, so any partial failure remains visible and retryable.
     if opts.purge {
-        if let Err(error) = purge_project_managed_paths(&project_dir, opts.dry_run, &mut report) {
-            let note = format!(
-                "очистка {}: не удалось завершить ({error:#})",
-                project_dir.display()
-            );
-            report.steps.push(note.clone());
-            report.cleanup_failures.push(note);
+        match project_dir.as_ref() {
+            Some(dir) => {
+                if let Err(error) = purge_project_managed_paths(dir, opts.dry_run, &mut report) {
+                    let note = format!(
+                        "очистка {}: не удалось завершить ({error:#})",
+                        dir.display()
+                    );
+                    report.steps.push(note.clone());
+                    report.cleanup_failures.push(note);
+                }
+            }
+            None => {
+                // No catalog row and no directory that proves it belongs to this
+                // slug: acting on `projects_root/<slug>` here would purge whatever
+                // happens to sit there. Say so instead of touching it — the
+                // ccteam-home footprint below is keyed by slug and still swept.
+                report.steps.push(format!(
+                    "нечего чистить в каталоге проектов: путь неизвестен \
+                     (запись config.yaml для `{slug}` отсутствует, а \
+                     {}/.ccteam/state.json не подтверждает принадлежность slug); \
+                     каталог проекта не тронут — при необходимости удалите \
+                     `<dir>/.ccteam` вручную",
+                    paths.projects_root.join(slug).display()
+                ));
+            }
         }
         // V0.6.5 F151 — also clean `~/.ccteam/state/im/registry/<slug>/`. The
         // F146 registry is the daemon's bot lifecycle SoT, so without
@@ -3514,7 +3564,10 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
     } else if opts.dry_run {
         report.steps.push(format!(
             "будет удалена запись config.yaml::projects для `{slug}` (путь: {})",
-            project_dir.display()
+            project_dir
+                .as_ref()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_else(|| "неизвестен".to_string())
         ));
     } else if ccteam_core::remove_project_from_config(&paths.root, slug)? {
         report
@@ -3523,6 +3576,40 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
     }
 
     Ok(report)
+}
+
+/// Resolve the project directory of a slug that has NO `config.yaml` row,
+/// using on-disk evidence only.
+///
+/// `CcteamPaths::project_dir` falls back to `projects_root/<slug>` when the
+/// catalog holds no row — for a deregistered slug that fallback is a pure
+/// guess, and handing it to the `--purge` sweep either silently no-ops (the
+/// V0.4.2 arbitrary-path install this branch exists for) or strips a DIFFERENT
+/// project's ccteam footprint (`~/projects/<slug>` registered under another
+/// slug, or any unrelated repo).
+///
+/// The candidate is therefore accepted only when it proves it belongs to this
+/// slug:
+/// 1. `<candidate>/.ccteam/state.json` parses, and
+/// 2. its `slug` field equals `slug`, and
+/// 3. no surviving catalog row owns that same path (a live project's directory
+///    is never collateral, even if its `state.json` still carries the old slug).
+///
+/// Returns `None` when nothing is provable — the caller then skips the
+/// project-local purge entirely instead of acting on a guess.
+fn prove_unregistered_project_dir(paths: &CcteamPaths, slug: &str) -> Option<std::path::PathBuf> {
+    let candidate = paths.projects_root.join(slug);
+    let state = ccteam_core::ProjectState::load(&CcteamPaths::project_state_in(&candidate)).ok()?;
+    if state.slug != slug {
+        return None;
+    }
+    let owned_by_another_row = ccteam_core::config::load(&paths.root)
+        .map(|cfg| cfg.projects.iter().any(|entry| entry.path == candidate))
+        .unwrap_or(true);
+    if owned_by_another_row {
+        return None;
+    }
+    Some(candidate)
 }
 
 /// Outcome of enumerating + (optionally) killing a project's live

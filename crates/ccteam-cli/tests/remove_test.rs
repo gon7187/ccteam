@@ -64,6 +64,14 @@ impl Fixture {
     ///   <tmp>/jobs/                           -- `CCTEAM_CLAUDE_JOBS_DIR`
     /// Registers the slug in `~/.ccteam/config.yaml::projects[]`.
     fn new(slug: &str) -> Self {
+        Self::new_at(slug, None)
+    }
+
+    /// Same layout, but the project directory may sit OUTSIDE
+    /// `projects_root` (`dir_name = Some(..)` puts it at
+    /// `<tmp>/<dir_name>`) — the V0.4.2 arbitrary-path install, where
+    /// `projects_root/<slug>` is NOT this project's directory.
+    fn new_at(slug: &str, dir_name: Option<&str>) -> Self {
         let tmp = TempDir::new().unwrap();
         let ccteam_home = tmp.path().join("ccteam-home");
         let projects_root = tmp.path().join("projects");
@@ -71,7 +79,10 @@ impl Fixture {
         std::fs::create_dir_all(&ccteam_home).unwrap();
         std::fs::create_dir_all(&projects_root).unwrap();
         std::fs::create_dir_all(&claude_jobs_dir).unwrap();
-        let project_dir = projects_root.join(slug);
+        let project_dir = match dir_name {
+            Some(name) => tmp.path().join(name),
+            None => projects_root.join(slug),
+        };
         std::fs::create_dir_all(project_dir.join(".ccteam")).unwrap();
         std::fs::create_dir_all(project_dir.join(".claude").join("agents")).unwrap();
         // Drop a state.json so `project_dir` resolution works under
@@ -1470,9 +1481,13 @@ fn t23_remove_survives_legacy_mux_failure_after_daemon_ack() {
     let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "a dead mux must not fail a removal the daemon already committed; stderr: {stderr}",
+    // The removal still runs to its commit point (row dropped below), but the
+    // mux sweep did not complete, so the exit code is the post-ACK-cleanup
+    // code 2 — never 0, which would tell a script the teardown was clean.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a dead mux is an incomplete cleanup, not a clean run; stderr: {stderr}",
     );
     assert!(
         stdout.contains("legacy чат-сессии: не удалось проверить"),
@@ -2025,5 +2040,152 @@ fn t28_init_reports_a_reserved_slug_without_claiming_retirement() {
     assert!(
         !stderr.contains("retired"),
         "a reservation must never be reported as a retirement; stderr: {stderr}",
+    );
+}
+
+/// t29: an arbitrary-path install whose row is already gone has NO provable
+/// project directory, so `--purge` must not act on the conventional
+/// `projects_root/<slug>` guess — that path routinely belongs to a different
+/// project (registered under another slug) or to an unrelated repo. The
+/// ccteam-home footprint is keyed by slug and is still swept.
+#[test]
+#[cfg(unix)]
+fn t29_deregistered_arbitrary_path_purge_never_touches_the_guessed_dir() {
+    let fx = Fixture::new_at("dex-ui-t29", Some("work/dex-ui"));
+    fx.seed_closed_progress();
+    let (reg_path, _hb) = seed_imd_registry(&fx, "helper");
+
+    // The decoy: a live, unrelated project sitting exactly where the guess
+    // points, carrying a DIFFERENT slug in its state.json.
+    let decoy = fx.projects_root.join(&fx.slug);
+    std::fs::create_dir_all(decoy.join(".claude")).unwrap();
+    ProjectState::initial_for_team("ui-v2".into(), "dev".into())
+        .save(&CcteamPaths::project_state_in(&decoy))
+        .unwrap();
+    let decoy_settings = decoy.join(".claude").join("settings.local.json");
+    std::fs::write(
+        &decoy_settings,
+        r#"{"hooks": {"SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": "/h/hook.sh chat-progress session-start"}]}]}}
+"#,
+    )
+    .unwrap();
+
+    // The state a plain `project rm` (or a web-console delete) leaves behind.
+    assert!(ccteam_core::remove_project_from_config(&fx.ccteam_home, &fx.slug).unwrap());
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug, "--purge"])
+        .output()
+        .expect("spawn ccteam project rm --purge");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "an unprovable project dir is not a failure; stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        stdout.contains("путь неизвестен"),
+        "the report must say the project dir could not be proven; stdout: {stdout}",
+    );
+    // The decoy project is untouched — this is the collateral destruction.
+    assert!(
+        decoy.join(".ccteam").join("state.json").is_file(),
+        "another project's .ccteam must survive; stdout: {stdout}",
+    );
+    assert!(
+        std::fs::read_to_string(&decoy_settings)
+            .unwrap()
+            .contains("chat-progress"),
+        "another project's hook section must survive; stdout: {stdout}",
+    );
+    // The real (arbitrary-path) footprint is not silently reported as purged
+    // either — it is simply out of reach without a row.
+    assert!(
+        fx.project_dir.join(".ccteam").is_dir(),
+        "the unprovable directory must not be touched either",
+    );
+    // The slug-keyed ccteam-home footprint is safe and still swept.
+    assert!(
+        !reg_path.exists(),
+        "state/im/registry/<slug>/ is keyed by slug and must still be cleaned; stdout: {stdout}",
+    );
+}
+
+/// t30: the mirror of t29 — when the conventional directory DOES prove it
+/// belongs to this slug (`.ccteam/state.json::slug` matches and no surviving
+/// row owns the path), a deregistered `--purge` still cleans it.
+#[test]
+#[cfg(unix)]
+fn t30_deregistered_conventional_path_purge_still_cleans_a_proven_dir() {
+    let fx = Fixture::new("dex-ui-t30");
+    fx.seed_closed_progress();
+    let settings = fx.project_dir.join(".claude").join("settings.local.json");
+    std::fs::write(
+        &settings,
+        r#"{"hooks": {"SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": "/h/hook.sh chat-progress session-start"}]}]}}
+"#,
+    )
+    .unwrap();
+    assert!(ccteam_core::remove_project_from_config(&fx.ccteam_home, &fx.slug).unwrap());
+
+    let out = fx
+        .cmd()
+        .args(["project", "rm", &fx.slug, "--purge"])
+        .output()
+        .expect("spawn ccteam project rm --purge");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "purge of a proven dir must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !stdout.contains("путь неизвестен"),
+        "a proven directory must not be reported as unknown; stdout: {stdout}",
+    );
+    assert!(
+        !fx.project_dir.join(".ccteam").exists(),
+        "a proven directory must still be purged; stdout: {stdout}",
+    );
+    assert!(
+        !std::fs::read_to_string(&settings)
+            .unwrap_or_default()
+            .contains("chat-progress"),
+        "a proven directory's hook section must still be stripped; stdout: {stdout}",
+    );
+}
+
+/// t31: a post-ACK cleanup failure must be visible to scripts. `project rm`
+/// exits 2 (distinct from the code-1 "refused / nothing committed" failures),
+/// while the retirement itself stays committed and the row stays dropped.
+#[test]
+#[cfg(unix)]
+fn t31_post_ack_cleanup_failure_exits_nonzero() {
+    let fx = Fixture::new("dex-ui-t31");
+    fx.seed_closed_progress();
+    // Same deterministic EISDIR collision as t26.
+    let settings = fx.project_dir.join(".claude").join("settings.local.json");
+    std::fs::create_dir_all(settings.join("collision")).unwrap();
+
+    let out = run_remove_with_retire_daemon(&fx, &["project", "rm", &fx.slug, "--purge"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an incomplete post-ACK cleanup must not exit 0; stdout: {stdout}",
+    );
+    assert!(
+        stdout.contains("retirement уже зафиксирован демоном"),
+        "the report must state the retirement committed so a retry is a file sweep; \
+         stdout: {stdout}",
+    );
+    assert!(
+        config::load(&fx.ccteam_home)
+            .unwrap()
+            .projects
+            .iter()
+            .all(|entry| entry.slug != fx.slug),
+        "the config row must still be dropped; stdout: {stdout}",
     );
 }
