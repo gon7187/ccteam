@@ -161,11 +161,11 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
             ));
         }
     }
-    ccteam_core::preflight_project_upsert(&paths.root, &target_slug).with_context(|| {
-        format!(
-            "project slug `{target_slug}` cannot be initialized because its prior generation is retired"
-        )
-    })?;
+    // `preflight_project_upsert` distinguishes a permanently retired generation
+    // from a slug merely reserved by surviving progress state, and words each
+    // case truthfully. Stamping a retirement-flavoured context over both would
+    // misreport the reservation, so only a neutral command prefix is added.
+    ccteam_core::preflight_project_upsert(&paths.root, &target_slug).context("ccteam init")?;
 
     // -- 4. Project install pass ------------------------------------
     let project_report = install_project_at(paths, &target, &target_slug, &target_team, &opts)?;
@@ -1844,6 +1844,10 @@ pub struct RemoveReport {
     /// Set when the refusal gate fired (and `--force` was not passed).
     /// `--dry-run` still reports the refusal so users can rehearse.
     pub refusal: Option<ccteam_core::ActiveSessionRefusal>,
+    /// Post-ACK cleanup steps that could not complete. The removal still ran to
+    /// its commit point (never strand a retired generation in the catalog), so
+    /// these are surfaced as warnings the operator must clean up by hand.
+    pub cleanup_failures: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1896,7 +1900,18 @@ fn request_daemon_project_retire(paths: &CcteamPaths, slug: &str) -> Result<Daem
              `ccteam project rm {slug}`"
         )
     })?
-    .with_context(|| format!("daemon не принял retirement проекта `{slug}`; config не изменён"))?;
+    .map_err(|error| {
+        // `forward_to_socket` fails both when the socket cannot be reached AND
+        // when the daemon accepted the request and died before answering
+        // ("mcp.sock closed before responding"). `mark_progress_retired` is the
+        // daemon's FIRST durable act, so this branch must not claim the project
+        // survived — the generation may already be permanently retired.
+        anyhow::anyhow!(
+            "связь с daemon по retirement проекта `{slug}` оборвалась: {error:#}; \
+             состояние retirement неизвестно (проект уже мог стать необратимо retired); \
+             config не изменён; повторите `ccteam project rm {slug}`"
+        )
+    })?;
 
     if let Some(error) = response.get("error").filter(|value| !value.is_null()) {
         let message = error
@@ -1952,6 +1967,9 @@ impl std::fmt::Display for RemoveReport {
         }
         if let Some(refusal) = &self.refusal {
             writeln!(f, "refusal: {}", refusal.message(&self.slug))?;
+        }
+        for failure in &self.cleanup_failures {
+            writeln!(f, "warning: {failure}")?;
         }
         Ok(())
     }
@@ -3248,10 +3266,13 @@ pub fn run_skill_migrate_project(paths: &CcteamPaths, project: Option<&str>) -> 
 ///    it returns `Some(refusal)` and `opts.force` is false, the command
 ///    halts before any mutation.
 /// 2. Resolve project_dir via `~/.ccteam/config.yaml::projects[]` so
-///    arbitrary-path installs are honoured.
+///    arbitrary-path installs are honoured (falling back to the conventional
+///    location under `projects_root` when the row is already gone).
 /// 3. Ask the live daemon to durably retire the slug, fence every admission
 ///    path, stop and join its sessions/writers, then clean progress state.
 ///    Missing/failed acknowledgement is fatal and leaves config untouched.
+///    Skipped entirely for a slug with no catalog row: there is no generation
+///    to retire and a tombstone must never be minted for a typo.
 /// 4. Stop any legacy mux sessions and remove legacy global state directories.
 /// 5. `--purge`: delete exactly ccteam's project footprint —
 ///    `rm -rf <project>/.ccteam/` and ccteam's hook section inside
@@ -3261,7 +3282,10 @@ pub fn run_skill_migrate_project(paths: &CcteamPaths, project: Option<&str>) -> 
 ///    ANY `.claude/agents/*.md` (all user files — ccteam seeds no
 ///    role), `CLAUDE.md` / `AGENTS.md`, or the user's `settings.json`
 ///    (CLAUDE.md §三 red line).
-/// 6. Drop the config registry row last. A failure before this point leaves a
+/// 6. Drop the config registry row last (a no-op when there was none). Every
+///    step between the daemon ACK and this commit point reports its failures
+///    and continues, so a retired generation is never stranded in the catalog.
+///    A failure before this point leaves a
 ///    durable retired generation which daemon startup and spawn paths reject;
 ///    retrying the command is safe. The same slug is never reused.
 ///
@@ -3269,18 +3293,16 @@ pub fn run_skill_migrate_project(paths: &CcteamPaths, project: Option<&str>) -> 
 /// grouped `ccteam project rm` both route here (the structured
 /// [`RemoveReport`] doubles as the dry-run plan).
 pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Result<RemoveReport> {
-    // 0. Shape + registration are validated before ANY other work, including
-    // the daemon call. The daemon mints an irreversible tombstone for whatever
-    // slug it is handed, so a typo must never reach it: an unregistered slug is
-    // refused here, exactly like the web route's 404. `--dry-run` takes the same
-    // refusal and therefore also mutates nothing.
+    // 0. Shape is validated before ANY other work, and registration decides
+    // whether the daemon is contacted at all. The daemon mints an irreversible
+    // tombstone for whatever slug it is handed, so a typo must never reach it —
+    // but refusing the whole command would also destroy the only way to clean
+    // an already-deregistered project's leftovers (`--purge` after a plain
+    // `project rm`, or after a web-console delete). An unregistered slug
+    // therefore skips the daemon retire and the config drop, and runs the file
+    // sweeps only. `--dry-run` previews exactly that shape.
     ccteam_core::validate_slug_format(slug)?;
-    let registered =
-        ccteam_core::lookup_project_in_config(&paths.root, slug)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "проект `{slug}` не зарегистрирован в config.yaml::projects; ничего не изменено"
-            )
-        })?;
+    let registered = ccteam_core::lookup_project_in_config(&paths.root, slug)?;
 
     let mut report = RemoveReport {
         slug: slug.to_string(),
@@ -3311,8 +3333,12 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
 
     // 2. The registry row resolved in step 0 owns the project directory, so an
     // arbitrary-path install is deleted correctly even when the slug does not
-    // sit under `paths.projects_root`.
-    let project_dir = registered.path.clone();
+    // sit under `paths.projects_root`. Without a row the only honest guess is
+    // the conventional location under `projects_root`.
+    let project_dir = registered
+        .as_ref()
+        .map(|entry| entry.path.clone())
+        .unwrap_or_else(|| paths.project_dir(slug));
 
     // 3. Dry-run previews the exact destructive surfaces but never contacts
     // the daemon or creates the stable progress lock.
@@ -3322,12 +3348,30 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
     let global_inbox_slug_dir = paths.inbox_dir().join(slug);
     let global_control_slug_dir = paths.control_dir().join(slug);
 
-    if opts.dry_run {
-        let chat_stop = stop_project_chat_sessions(backend.as_ref(), slug, true)?;
-        for name in &chat_stop.would_stop {
-            report
-                .steps
-                .push(format!("будет остановлена чат-сессия `{name}`"));
+    if registered.is_none() {
+        // Nothing to retire: no catalog row means no live generation the daemon
+        // owns, and minting a tombstone here is exactly the typo burn step 0
+        // protects against. Fall through to the file sweeps.
+        report.steps.push(format!(
+            "проект `{slug}` не зарегистрирован в config.yaml::projects; \
+             retirement через daemon пропущен (tombstone не создаётся), \
+             выполняется только очистка файлов"
+        ));
+    } else if opts.dry_run {
+        // Same tolerance as the executing path below: `stop_project_chat_sessions`
+        // contacts the backend before it honours `dry_run`, so a dead mux control
+        // plane must not make the preview of a working command unavailable.
+        match stop_project_chat_sessions(backend.as_ref(), slug, true) {
+            Ok(chat_stop) => {
+                for name in &chat_stop.would_stop {
+                    report
+                        .steps
+                        .push(format!("будет остановлена чат-сессия `{name}`"));
+                }
+            }
+            Err(error) => report.steps.push(format!(
+                "legacy чат-сессии: не удалось проверить ({error:#})"
+            )),
         }
         report
             .steps
@@ -3411,33 +3455,63 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
             report
                 .steps
                 .push(format!("будет удалён {label} {}", path.display()));
-        } else if is_dir {
-            std::fs::remove_dir_all(&path).with_context(|| format!("rm -rf {}", path.display()))?;
-            report
-                .steps
-                .push(format!("удалён {label} {}", path.display()));
+            continue;
+        }
+        // Everything from here to the config drop runs AFTER the irreversible
+        // daemon ACK. A cleanup failure must never strand the registry row on a
+        // generation that is already permanently retired: report it and carry on
+        // to the commit point, exactly like the legacy mux sweep above.
+        let removed = if is_dir {
+            std::fs::remove_dir_all(&path).with_context(|| format!("rm -rf {}", path.display()))
         } else {
-            std::fs::remove_file(&path).with_context(|| format!("rm {}", path.display()))?;
-            report
+            std::fs::remove_file(&path).with_context(|| format!("rm {}", path.display()))
+        };
+        match removed {
+            Ok(()) => report
                 .steps
-                .push(format!("удалён {label} {}", path.display()));
+                .push(format!("удалён {label} {}", path.display())),
+            Err(error) => {
+                let note = format!("{label} {}: не удалось удалить ({error:#})", path.display());
+                report.steps.push(note.clone());
+                report.cleanup_failures.push(note);
+            }
         }
     }
 
     // 5. Optional project-local cleanup happens after daemon ACK and before
     // config deletion, so any partial failure remains visible and retryable.
     if opts.purge {
-        purge_project_managed_paths(&project_dir, opts.dry_run, &mut report)?;
+        if let Err(error) = purge_project_managed_paths(&project_dir, opts.dry_run, &mut report) {
+            let note = format!(
+                "очистка {}: не удалось завершить ({error:#})",
+                project_dir.display()
+            );
+            report.steps.push(note.clone());
+            report.cleanup_failures.push(note);
+        }
         // V0.6.5 F151 — also clean `~/.ccteam/state/im/registry/<slug>/`. The
         // F146 registry is the daemon's bot lifecycle SoT, so without
         // this cleanup `list_bots()` still surfaces stale BotRegistration
         // entries after the workflow.yaml is gone → daemon can spawn an
         // orphan tmux session.
-        purge_imd_registry_for_slug(&paths.root, slug, opts.dry_run, &mut report)?;
+        if let Err(error) =
+            purge_imd_registry_for_slug(&paths.root, slug, opts.dry_run, &mut report)
+        {
+            let note =
+                format!("очистка state/im/registry/{slug}/: не удалось завершить ({error:#})");
+            report.steps.push(note.clone());
+            report.cleanup_failures.push(note);
+        }
     }
 
     // 6. Config registry drop is the commit point and therefore always last.
-    if opts.dry_run {
+    // An unregistered slug has nothing to commit — the file sweeps above were
+    // the whole job.
+    if registered.is_none() {
+        report.steps.push(format!(
+            "запись config.yaml::projects для `{slug}` отсутствует; удалять нечего"
+        ));
+    } else if opts.dry_run {
         report.steps.push(format!(
             "будет удалена запись config.yaml::projects для `{slug}` (путь: {})",
             project_dir.display()
@@ -4873,10 +4947,13 @@ mod tests {
                 ..InitOptions::default()
             },
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        // `{:#}` renders the whole chain: the neutral `ccteam init` prefix plus
+        // `preflight_project_upsert`'s own, case-accurate reason.
+        let error = format!("{error:#}");
 
-        assert!(error.contains("prior generation is retired"), "{error}");
+        assert!(error.contains("permanently retired"), "{error}");
+        assert!(error.starts_with("ccteam init"), "{error}");
         assert_eq!(
             std::fs::read_to_string(workflow).unwrap(),
             "USER SENTINEL\n"

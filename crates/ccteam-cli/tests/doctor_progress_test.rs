@@ -243,3 +243,100 @@ fn doctor_repair_skips_retired_slugs_and_still_repairs_the_rest() {
         "{stdout}"
     );
 }
+
+/// Best effort must not mean fail-open: a slug the sweep could not process has
+/// to reach the exit code, or `ccteam doctor --repair-progress && ccteam start`
+/// proceeds over an unswept home.
+#[test]
+fn doctor_repair_exits_non_zero_when_a_slug_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let ccteam_home = temp.path().join("ccteam-home");
+    for slug in ["alpha", "demo"] {
+        ccteam_core::config::upsert_project(
+            &ccteam_home,
+            ccteam_core::config::ProjectEntry {
+                slug: slug.to_string(),
+                path: temp.path().join(slug),
+                host: "local".to_string(),
+                remote_slug: None,
+                remote_path: None,
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+    }
+    write_fixture(temp.path());
+    // A crash can leave the generation marker torn; reading it then fails.
+    let torn_lock = ccteam_home.join("state/progress/alpha.lock");
+    std::fs::write(&torn_lock, b"torn").unwrap();
+
+    let failed = doctor_command(temp.path(), true).output().unwrap();
+    let stdout = String::from_utf8_lossy(&failed.stdout);
+    assert!(
+        stdout.contains("alpha: ОШИБКА — не удалось прочитать маркер поколения"),
+        "the full report must still be printed; {stdout}"
+    );
+    assert!(
+        stdout.contains("demo.jsonl: сохранено 2, отброшено 1"),
+        "the remaining slugs must still be swept; {stdout}"
+    );
+    assert_ne!(
+        failed.status.code(),
+        Some(0),
+        "a failed slug must not exit 0; {stdout}"
+    );
+
+    // Control: the same home without the torn marker exits 0, so the assertion
+    // above is about the failure and not about the readiness checkup.
+    std::fs::remove_file(&torn_lock).unwrap();
+    let clean = doctor_command(temp.path(), true).output().unwrap();
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "a clean sweep must exit 0; {}",
+        String::from_utf8_lossy(&clean.stdout)
+    );
+}
+
+/// The durable projection sidecars live next to the journals. Suffix-stripping
+/// them mints phantom slugs (`demo.terminals`) that the sweep would lock and
+/// rewrite as if they were progress journals.
+#[test]
+fn doctor_repair_ignores_projection_sidecars() {
+    let temp = tempfile::tempdir().unwrap();
+    write_fixture(temp.path());
+    let progress = temp.path().join("ccteam-home/state/progress");
+    for sidecar in [
+        "demo.terminals.jsonl",
+        "demo.turn-verdicts.jsonl",
+        "demo.verdicts.json",
+        "demo.checkpoint.json.tmp",
+        "demo.jsonl.bak-fixture",
+        "demo.jsonl.repair-tmp-fixture",
+    ] {
+        std::fs::write(progress.join(sidecar), b"{broken sidecar}\n").unwrap();
+    }
+
+    let repaired = doctor_command(temp.path(), true).output().unwrap();
+    let stdout = String::from_utf8_lossy(&repaired.stdout);
+    assert!(
+        stdout.contains("demo.jsonl: сохранено 2, отброшено 1"),
+        "the real generation must still be repaired; {stdout}"
+    );
+    assert!(
+        !stdout.contains("demo.terminals") && !stdout.contains("demo.turn-verdicts"),
+        "projection sidecars must never be enumerated as slugs; {stdout}"
+    );
+    for phantom in ["demo.terminals.lock", "demo.turn-verdicts.lock"] {
+        assert!(
+            !progress.join(phantom).exists(),
+            "the sweep locked a phantom slug: {phantom}; {stdout}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(progress.join("demo.terminals.jsonl")).unwrap(),
+        "{broken sidecar}\n",
+        "a projection sidecar must never be rewritten by the journal repair"
+    );
+}

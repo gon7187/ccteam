@@ -993,12 +993,39 @@ fn progress_slugs(paths: &CcteamPaths) -> BTreeSet<String> {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        let slug = name
+        // A generation owns exactly three enumerable file shapes:
+        // `<slug>.jsonl`, `<slug>.1.jsonl` and `<slug>.checkpoint.json`.
+        // Every other name in this directory is a durable projection
+        // sidecar (`<slug>.terminals.jsonl`, `<slug>.turn-verdicts.jsonl`,
+        // `<slug>.verdicts.json`), a lock marker or a repair/backup
+        // artifact. Suffix-stripping alone mints phantom slugs out of them
+        // (`demo.terminals`), which the repair sweep would then lock and
+        // rewrite as if they were journals. Accept a candidate only when it
+        // is a well-formed slug AND the canonical path builders reproduce
+        // this exact entry.
+        let Some(stem) = name
             .strip_suffix(".checkpoint.json")
             .or_else(|| name.strip_suffix(".1.jsonl"))
-            .or_else(|| name.strip_suffix(".jsonl"));
-        if let Some(slug) = slug.filter(|slug| !slug.is_empty()) {
-            slugs.insert(slug.to_string());
+            .or_else(|| name.strip_suffix(".jsonl"))
+            .filter(|stem| !stem.is_empty())
+        else {
+            continue;
+        };
+        if ccteam_core::validate_slug_format(stem).is_err() {
+            continue;
+        }
+        let active = paths.progress_jsonl(stem);
+        let round_trips = [
+            active.clone(),
+            progress_bridge::progress_archive_path(&active),
+            progress_bridge::progress_checkpoint_path(&active),
+        ]
+        .iter()
+        .any(|candidate| {
+            candidate.file_name().and_then(|name| name.to_str()) == Some(name.as_str())
+        });
+        if round_trips {
+            slugs.insert(stem.to_string());
         }
     }
     slugs
@@ -1010,10 +1037,16 @@ fn progress_slugs(paths: &CcteamPaths) -> BTreeSet<String> {
 /// tombstone legitimately refuses writes while the config row is still being
 /// removed) and any single slug's failure is reported without aborting the
 /// remaining slugs.
-pub fn repair_progress(paths: &CcteamPaths) -> Result<String> {
+///
+/// Returns the full report plus the number of slugs that failed. Best-effort
+/// must not mean fail-open: the caller turns a non-zero count into a non-zero
+/// exit code, so `ccteam doctor --repair-progress && ccteam start` cannot
+/// proceed over an unswept home.
+pub fn repair_progress(paths: &CcteamPaths) -> Result<(String, u64)> {
     let mut out = String::from("исправление progress\n");
     let mut repaired = 0_u64;
     let mut failed = 0_u64;
+    let mut failed_slugs: BTreeSet<String> = BTreeSet::new();
     for slug in progress_slugs(paths) {
         let active = paths.progress_jsonl(&slug);
         match progress_bridge::progress_state_is_retired_shared(&active) {
@@ -1026,6 +1059,7 @@ pub fn repair_progress(paths: &CcteamPaths) -> Result<String> {
             Ok(false) => {}
             Err(error) => {
                 failed = failed.saturating_add(1);
+                failed_slugs.insert(slug.clone());
                 out.push_str(&format!(
                     "  {slug}: ОШИБКА — не удалось прочитать маркер поколения: {error:#}\n"
                 ));
@@ -1054,6 +1088,7 @@ pub fn repair_progress(paths: &CcteamPaths) -> Result<String> {
                 Ok(None) => {}
                 Err(error) => {
                     failed = failed.saturating_add(1);
+                    failed_slugs.insert(slug.clone());
                     out.push_str(&format!("  {slug} {name}: ОШИБКА — {error:#}\n"));
                 }
             }
@@ -1061,18 +1096,19 @@ pub fn repair_progress(paths: &CcteamPaths) -> Result<String> {
     }
     if failed > 0 {
         out.push_str(&format!(
-            "  слагов с ошибками: {failed}; остальные обработаны\n"
+            "  слагов с ошибками: {}; целей с ошибками: {failed}; остальные обработаны\n",
+            failed_slugs.len()
         ));
     }
-    if repaired == 0 {
+    if repaired == 0 && failed == 0 {
         out.push_str("  повреждённых строк progress не найдено; журналы не менялись\n");
-    } else {
+    } else if repaired > 0 {
         out.push_str(
             "  примечание: оборванная строка обычно теряет 2 записи (обрезанную и следующую, склеенную с ней)\n",
         );
     }
     out.push('\n');
-    Ok(out)
+    Ok((out, failed_slugs.len() as u64))
 }
 
 #[cfg(test)]
