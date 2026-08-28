@@ -19,7 +19,8 @@ export interface EvolutionBucket extends EvolutionMetrics {
   id: string;
   sha: string;
   turn_count: number;
-  avg_cost_usd?: number | null;
+  priced_avg_cost_usd?: number | null;
+  known_cost_usd?: number | null;
   total_cost_usd?: number | null;
 }
 

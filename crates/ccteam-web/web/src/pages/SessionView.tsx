@@ -35,6 +35,7 @@ import {
   listScheduled,
   createScheduled,
   cancelScheduled,
+  createSession,
   interruptSession as apiInterruptSession,
   projectUploadUrl,
   putTurnVerdict,
@@ -195,6 +196,7 @@ export default function SessionView({
   session,
   lang = "zh",
   onRename,
+  onOpenSession,
 }: {
   sid: string;
   session: SessionSummary | null;
@@ -203,6 +205,8 @@ export default function SessionView({
    *  rail and this header stay in lockstep). Omitted ⇒ the title is plain
    *  text, no edit affordance. */
   onRename?: (sid: string, title: string) => void | Promise<void>;
+  /** Open a newly-created related session in the shell. */
+  onOpenSession?: (sid: string) => void;
 }) {
   const t = makeT(lang);
   const [view, setView] = useState<"chat" | "terminal">("chat");
@@ -693,18 +697,50 @@ export default function SessionView({
 
   const requestImprovement = useCallback(
     (row: TranscriptRow, feedback: string) => {
-      if (!row.turnId) return;
-      submitText(
-        [
-          `Human feedback for completed turn ${row.turnId}:`,
-          feedback,
-          "",
-          "Propose concrete role, skill, or instruction changes that would prevent this issue.",
-          "Do not apply, edit, install, or persist any change. Wait for explicit user approval of a specific proposal in a later message.",
-        ].join("\n"),
-      );
+      if (!row.turnId || !session) return;
+      const protocol = ["stream-json", "terminal", "acp"].includes(session.protocol ?? "")
+        ? (session.protocol as "stream-json" | "terminal" | "acp")
+        : undefined;
+      void createSession(session.project, {
+        role: session.role,
+        vendor: session.vendor,
+        permission_mode: "hitl",
+        ...(protocol ? { protocol } : {}),
+      })
+        .then(async ({ sid: proposalSid }) => {
+          const prompt = [
+            `Human feedback for completed turn ${row.turnId}:`,
+            feedback,
+            "",
+            "This is a proposal-only turn. Analyze the feedback and propose concrete role, skill, or instruction changes that would prevent this issue.",
+            "Do not claim that any change was applied. This dedicated session uses HITL: ccteam auto-approves nothing, and any write/apply tool request must wait for explicit human approval.",
+          ].join("\n");
+          await submitTurn(proposalSid, prompt);
+          pushRow({
+            kind: "system",
+            content: tr(
+              lang,
+              `已创建 HITL 提案会话 ${proposalSid}。ccteam 不会自动批准;任何写入/应用操作都必须等待你的明确批准。正在打开该会话。`,
+              `Created HITL proposal session ${proposalSid}. ccteam auto-approves nothing; any write/apply action must wait for your explicit approval. Opening it now.`,
+              `Создана HITL-сессия предложений ${proposalSid}. ccteam ничего не одобряет автоматически; любая запись или применение ждёт вашего явного подтверждения. Открываю её.`,
+            ),
+          });
+          onOpenSession?.(proposalSid);
+        })
+        .catch((error) => {
+          const detail = error instanceof Error ? error.message : "unknown";
+          pushRow({
+            kind: "system",
+            content: tr(
+              lang,
+              `启动 HITL 提案会话失败:${detail}`,
+              `Failed to start the HITL proposal session: ${detail}`,
+              `Не удалось запустить HITL-сессию предложений: ${detail}`,
+            ),
+          });
+        });
     },
-    [submitText],
+    [lang, onOpenSession, pushRow, session],
   );
 
   // ---- resolve a HITL approval prompt (gateway pending machinery) ----------

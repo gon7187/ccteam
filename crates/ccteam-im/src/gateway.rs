@@ -4754,7 +4754,7 @@ impl Gateway {
             Arc::clone(&plan.spawn.adapter),
             thread,
         );
-        let (catalog, cwd, mut meta) = {
+        let (catalog, cwd, mut meta, installed_generation) = {
             let mut guard = gateway.lock().await;
             let matches = guard
                 .sessions
@@ -4810,7 +4810,6 @@ impl Gateway {
                 .write()
                 .unwrap()
                 .insert(chat.clone(), sid.clone());
-            guard.spawn_event_pump(&sid);
             let meta = guard
                 .session_catalog
                 .find_or_load(&sid, &guard.projects)
@@ -4819,6 +4818,7 @@ impl Gateway {
                 Arc::clone(&guard.session_catalog),
                 plan.spawn.cwd.clone(),
                 meta,
+                generation,
             )
         };
         if let Some(meta) = meta.as_mut() {
@@ -4831,6 +4831,19 @@ impl Gateway {
             meta.skills_sha = ccteam_harness::execution::experience::skills_fingerprint(&cwd);
             meta.last_active = chrono::Utc::now().to_rfc3339();
             let _ = catalog.write(&cwd, meta);
+        }
+        {
+            let mut guard = gateway.lock().await;
+            if guard
+                .sessions
+                .get(&sid)
+                .is_some_and(|session| session.generation == installed_generation)
+            {
+                // The pump snapshots role/skill fingerprints from the durable
+                // catalog at spawn. Start it only after `/role` published the
+                // new fingerprint generation above.
+                guard.spawn_event_pump(&sid);
+            }
         }
         Self::persist_latest_routing_shared(&gateway).await?;
         Ok(sid)
@@ -8570,74 +8583,126 @@ impl Gateway {
                                     *act = None;
                                 }
                             }
-                            terminal_completion_metadata = Some(
+                            let terminal_metadata =
                                 ccteam_core::progress::ChatTurnCompletionMetadata {
                                     outcome: Some(terminal.outcome.to_string()),
                                     duration_ms,
                                     role_sha: pump_role_sha.clone(),
                                     skills_sha: pump_skills_sha.clone(),
-                                },
-                            );
-
-                            if let Some(dir) = project_dir.as_ref() {
-                                let model_owned = terminal
-                                    .model
-                                    .as_deref()
-                                    .filter(|model| !model.is_empty())
-                                    .map(str::to_string);
-                                let cost_usd = {
-                                    let m = model_owned.as_deref().unwrap_or("");
-                                    ccteam_cost::resolve_turn_cost(
-                                        &terminal.usage,
-                                        session.vendor.cost_vendor(),
-                                        m,
-                                    )
-                                };
-                                let usage_opt = if terminal.usage.total() == 0
-                                    && terminal.usage.reported_cost_usd.is_none()
-                                    && model_owned.is_none()
-                                {
-                                    None
-                                } else {
-                                    Some(terminal.usage)
-                                };
-                                let record = ccteam_harness::execution::experience::ExperienceRecord::Turn(
-                                    ccteam_harness::execution::experience::TurnExperience {
-                                        sid: session_id.clone(),
-                                        turn_id: terminal.turn_id.clone(),
-                                        ts: chrono::Utc::now(),
-                                        vendor: vendor_str(session.vendor).to_string(),
-                                        model: model_owned,
-                                        role: session.role.clone(),
-                                        usage: usage_opt,
-                                        cost_usd,
-                                        outcome: Some(terminal.outcome.to_string()),
-                                        duration_ms,
-                                        role_sha: pump_role_sha.clone(),
-                                        skills_sha: pump_skills_sha.clone(),
-                                        signals: ccteam_harness::execution::experience::TurnSignals {
+                                    signals: Some(
+                                        ccteam_core::progress::TurnSignals {
                                             tool_calls,
                                             steered,
                                             error_recovered: None,
                                         },
-                                    },
-                                );
-                                if let Err(err) = ccteam_harness::execution::experience::append_experience(
-                                    dir, &record,
-                                ) {
-                                    tracing::warn!(
-                                        session = %session_id,
-                                        error = %err,
-                                        "ccteam-im: failed to append experience.jsonl"
-                                    );
-                                }
+                                    ),
+                                };
+                            terminal_completion_metadata = Some(terminal_metadata.clone());
 
-                                // The message was mirrored provisionally when it
-                                // arrived so delegation ordering remained durable.
-                                // At the vendor boundary append one terminal row
-                                // under the adapter's canonical id. History hides
-                                // provisional rows and exposes this exact row to the
-                                // verdict API, Experience and progress joins.
+                            let experience_lock = project_dir.as_ref().and_then(|dir| {
+                                match ccteam_harness::execution::experience::lock_experience(dir) {
+                                    Ok(lock) => Some(lock),
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "ccteam-im: failed to lock derived terminal projection"
+                                        );
+                                        None
+                                    }
+                                }
+                            });
+                            // Terminal protocol's Stop hook owns its canonical
+                            // progress row. A paneless progress path is independent
+                            // of the registered project directory: losing the
+                            // directory degrades turns/Experience only, never the
+                            // progress SoT. When a directory exists, the derived
+                            // lock remains held across canonical and projection
+                            // writes.
+                            let mut canonical_progress_ready = session.protocol.is_terminal();
+                            if !session.protocol.is_terminal() {
+                                if let Some(ppath) = progress_path.as_ref() {
+                                    let event = ccteam_core::progress::build_chat_turn_completed_event_with_metadata(
+                                        &session.role,
+                                        &session_id,
+                                        &terminal.turn_id,
+                                        &terminal.usage,
+                                        terminal.model.as_deref(),
+                                        Some(vendor_str(session.vendor)),
+                                        &terminal_metadata,
+                                    );
+                                    match ccteam_core::progress::append_chat_turn_completed_if_absent(
+                                        ppath, &event,
+                                    ) {
+                                        Ok(admission)
+                                            if !admission.appended && !terminal_closes_active =>
+                                        {
+                                            tracing::debug!(
+                                                session = %session_id,
+                                                turn_id = %terminal.turn_id,
+                                                "pump: ignored durable duplicate terminal boundary"
+                                            );
+                                            continue;
+                                        }
+                                        Ok(_) => canonical_progress_ready = true,
+                                        Err(err) => tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "stream-json pump: failed to mirror canonical chat_turn_completed"
+                                        ),
+                                    }
+                                }
+                            }
+                            let model_owned = terminal
+                                .model
+                                .as_deref()
+                                .filter(|model| !model.is_empty())
+                                .map(str::to_string);
+                            let cost_usd = {
+                                let m = model_owned.as_deref().unwrap_or("");
+                                ccteam_cost::resolve_turn_cost(
+                                    &terminal.usage,
+                                    session.vendor.cost_vendor(),
+                                    m,
+                                )
+                            };
+                            let usage_opt = if terminal.usage.total() == 0
+                                && terminal.usage.reported_cost_usd.is_none()
+                                && model_owned.is_none()
+                            {
+                                None
+                            } else {
+                                Some(terminal.usage)
+                            };
+                            let record = ccteam_harness::execution::experience::ExperienceRecord::Turn(
+                                ccteam_harness::execution::experience::TurnExperience {
+                                    sid: session_id.clone(),
+                                    turn_id: terminal.turn_id.clone(),
+                                    ts: chrono::Utc::now(),
+                                    vendor: vendor_str(session.vendor).to_string(),
+                                    model: model_owned,
+                                    role: session.role.clone(),
+                                    usage: usage_opt,
+                                    cost_usd,
+                                    outcome: Some(terminal.outcome.to_string()),
+                                    duration_ms,
+                                    role_sha: pump_role_sha.clone(),
+                                    skills_sha: pump_skills_sha.clone(),
+                                    signals: ccteam_harness::execution::experience::TurnSignals {
+                                        tool_calls,
+                                        steered,
+                                        error_recovered: None,
+                                    },
+                                },
+                            );
+                            // The message was mirrored provisionally when it
+                            // arrived so delegation ordering remained durable.
+                            // At the vendor boundary append one terminal row
+                            // under the adapter's canonical id. History hides
+                            // provisional rows and exposes this exact row to the
+                            // verdict API, Experience and progress joins.
+                            let mut canonical_turn_ready = false;
+                            if let Some(dir) = project_dir.as_ref() {
                                 if is_completed {
                                     let final_text = turn_last_answer
                                         .as_ref()
@@ -8664,13 +8729,35 @@ impl Gateway {
                                         &session_id,
                                         &record,
                                     ) {
-                                        Ok(_) => turn_covered.push(terminal.turn_id.clone()),
+                                        Ok(_) => {
+                                            canonical_turn_ready = true;
+                                            turn_covered.push(terminal.turn_id.clone());
+                                        }
                                         Err(err) => tracing::warn!(
                                             session = %session_id,
                                             error = %err,
                                             "ccteam-im: failed to mirror canonical terminal turn"
                                         ),
                                     }
+                                }
+                                if let Some(experience_lock) = experience_lock.as_ref().filter(|_| {
+                                    canonical_progress_ready || canonical_turn_ready
+                                }) {
+                                    if let Err(err) = ccteam_harness::execution::experience::append_experience_locked(
+                                        dir, experience_lock, &record,
+                                    ) {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "ccteam-im: failed to append experience.jsonl"
+                                        );
+                                    }
+                                } else if experience_lock.is_some() {
+                                    tracing::warn!(
+                                        session = %session_id,
+                                        turn_id = %terminal.turn_id,
+                                        "ccteam-im: skipped derived experience without a canonical terminal write"
+                                    );
                                 }
                             }
 
@@ -8730,49 +8817,19 @@ impl Gateway {
                         // sessions previously never accrued a ledger row on the
                         // acp path). Tmux sessions get this from their Stop
                         // hook → gate on protocol to avoid a double-write.
-                        if !session.protocol.is_terminal() {
-                            if let (Some(terminal), Some(ppath)) =
-                                (terminal_accounting.as_ref(), progress_path.as_ref())
-                            {
-                                let metadata = terminal_completion_metadata
-                                    .as_ref()
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let ev = ccteam_core::progress::build_chat_turn_completed_event_with_metadata(
-                                    &session.role,
+                        if terminal_completion_metadata.is_some() {
+                            // Fold the canonical row just appended into meta.json
+                            // now; a one-turn session has no later answer on which
+                            // to piggyback this accounting refresh.
+                            if let Some(dir) = project_dir.as_ref() {
+                                refresh_session_activity_meta(
+                                    dir,
+                                    &session.project,
                                     &session_id,
-                                    &terminal.turn_id,
-                                    &terminal.usage,
-                                    terminal.model.as_deref(),
-                                    Some(vendor_str(session.vendor)),
-                                    &metadata,
+                                    session.vendor,
+                                    progress_projection.as_deref(),
+                                    &session_catalog,
                                 );
-                                if let Err(err) =
-                                    ccteam_core::progress::append_event(ppath, &ev)
-                                {
-                                    tracing::warn!(
-                                        session = %session_id,
-                                        error = %err,
-                                        "stream-json pump: failed to mirror chat_turn_completed"
-                                    );
-                                }
-                                // Fold the row just appended into meta.json NOW.
-                                // The other refresh rides the ANSWER mirror, which
-                                // precedes this event — so a one-turn session has
-                                // no later answer to piggyback on, and its
-                                // cost/tokens/observed_model stayed blank forever
-                                // (the team view's empty 模型/成本 columns for
-                                // every quick probe).
-                                if let Some(dir) = project_dir.as_ref() {
-                                    refresh_session_activity_meta(
-                                        dir,
-                                        &session.project,
-                                        &session_id,
-                                        session.vendor,
-                                        progress_projection.as_deref(),
-                                        &session_catalog,
-                                    );
-                                }
                             }
                         }
                         let event_text = async_event_text(&evt);
@@ -26666,6 +26723,170 @@ mod tests {
         close.release_all();
         role.await.unwrap().unwrap();
         assert_eq!(gateway.lock().await.sessions["s1"].role, "helper");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_role_switch_updates_fingerprint_before_the_new_pump_snapshots_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        for role in ["reviewer", "helper"] {
+            seed_role(&project_dir, role);
+        }
+        let expected =
+            ccteam_harness::execution::experience::role_fingerprint(&project_dir, "helper");
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        gateway
+            .handle_text("telegram", "chat-a", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-a",
+            "alice",
+            "role-switch",
+            "/role helper",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-a",
+            "alice",
+            "turn-after-switch",
+            "work",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let record = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let records =
+                    ccteam_harness::execution::experience::read_all_experience(&project_dir)
+                        .unwrap();
+                if let Some(record) = records.into_iter().find_map(|record| match record {
+                    ccteam_harness::execution::experience::ExperienceRecord::Turn(turn) => {
+                        Some(turn)
+                    }
+                    _ => None,
+                }) {
+                    break record;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("terminal experience row after role switch");
+        assert_eq!(record.role, "helper");
+        assert_eq!(record.role_sha, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_canonical_writes_survive_an_unopenable_experience_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        std::fs::create_dir_all(project_dir.join(".ccteam/experience.lock")).unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        gateway
+            .handle_text("telegram", "chat-a", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("telegram", "chat-a", "alice", "work")
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let events = ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha"))
+                    .unwrap_or_default();
+                if events.iter().any(|event| {
+                    event.get("event").and_then(serde_json::Value::as_str)
+                        == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("canonical progress survives derived lock failure");
+
+        assert!(
+            !ccteam_harness::execution::experience::experience_jsonl_path(&project_dir).exists(),
+            "derived projection must not bypass its failed lock"
+        );
+        assert!(
+            ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, "s1")
+                .unwrap()
+                .iter()
+                .any(|turn| turn.outcome.as_deref() == Some("completed")),
+            "canonical turns mirror is independent of the derived lock"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn paneless_canonical_progress_survives_a_missing_registered_project_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        gateway
+            .handle_text("telegram", "chat-a", "alice", "/new claude")
+            .await
+            .unwrap();
+        let sid = gateway.sessions.keys().next().unwrap().clone();
+
+        // Spawn the detached pump only after removing the runtime directory
+        // registration. The canonical progress path comes from CcteamPaths and
+        // must remain writable even though turns/Experience cannot be mirrored.
+        assert!(gateway.projects.remove("alpha").is_some());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        gateway.submit_to_sid(&sid, "work".into()).await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let events = ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha"))
+                    .unwrap_or_default();
+                if events.iter().any(|event| {
+                    event.get("event").and_then(serde_json::Value::as_str)
+                        == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("canonical progress survives a missing registered project directory");
+
+        assert!(
+            ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &sid)
+                .unwrap()
+                .is_empty(),
+            "turns projection must degrade when the pump has no project directory"
+        );
+        assert!(
+            !ccteam_harness::execution::experience::experience_jsonl_path(&project_dir).exists(),
+            "derived Experience must degrade when the pump has no project directory"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

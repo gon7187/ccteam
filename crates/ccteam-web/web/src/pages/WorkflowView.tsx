@@ -66,9 +66,11 @@ export default function WorkflowView({
     slug: string;
     data: EvolutionSummary | null;
     loading: boolean;
-  }>({ slug: "", data: null, loading: false });
+    error: string | null;
+  }>({ slug: "", data: null, loading: false, error: null });
   const evolutionRequestRef = useRef(0);
   const evolution = evolutionState.slug === slug ? evolutionState.data : null;
+  const evolutionError = evolutionState.slug === slug ? evolutionState.error : null;
   const evolutionLoading =
     tab === "evolution" &&
     Boolean(slug) &&
@@ -115,17 +117,18 @@ export default function WorkflowView({
     }
     queueMicrotask(() => {
       if (cancelled || request !== evolutionRequestRef.current) return;
-      setEvolutionState({ slug, data: null, loading: true });
+      setEvolutionState({ slug, data: null, loading: true, error: null });
     });
     getEvolution(slug)
       .then((data) => {
         if (cancelled || request !== evolutionRequestRef.current) return;
-        setEvolutionState({ slug, data, loading: false });
+        setEvolutionState({ slug, data, loading: false, error: null });
       })
       .catch((error) => {
         if (cancelled || request !== evolutionRequestRef.current) return;
-        setEvolutionState({ slug, data: null, loading: false });
-        toastBus.handler?.error(error instanceof Error ? error.message : String(error));
+        const detail = error instanceof Error ? error.message : String(error);
+        setEvolutionState({ slug, data: null, loading: false, error: detail });
+        toastBus.handler?.error(detail);
       });
     return () => {
       cancelled = true;
@@ -521,12 +524,17 @@ export default function WorkflowView({
                 t("evolve"),
                 tr(
                   lang,
-                  "人工评价闭合反馈循环:接受/需修改会被记录,并按 role / skill 指纹版本展示。只有你确认后才会请求 agent 提出改进;不会自动修改任何内容。",
-                  "Human verdicts close the feedback loop: accepted/revised results are recorded by role and skill fingerprint revision. Improve asks the agent for a proposal only after your confirmation. Nothing changes automatically.",
-                  "Оценки человека замыкают обратную связь: принятое и отправленное на доработку учитывается по ревизиям отпечатков ролей и навыков. Улучшение запрашивает у агента только предложение и только после вашего подтверждения. Ничего не меняется автоматически.",
+                  "人工评价闭合反馈循环:接受/需修改会被记录,并按 role / skill 指纹版本展示。改进会打开独立的 HITL 提案会话;ccteam 不会自动批准,写入/应用请求必须等待你的明确批准。",
+                  "Human verdicts close the feedback loop: accepted/revised results are recorded by role and skill fingerprint revision. Improve opens a dedicated HITL proposal session. Nothing changes automatically: ccteam auto-approves nothing, and write/apply requests wait for your explicit approval.",
+                  "Оценки человека замыкают обратную связь: принятое и отправленное на доработку учитывается по ревизиям отпечатков ролей и навыков. Улучшение открывает отдельную HITL-сессию предложений; ccteam ничего не одобряет автоматически, а запись и применение ждут вашего явного подтверждения.",
                 ),
               )}
-              <EvolutionPanel lang={lang} evolution={evolution} loading={evolutionLoading} />
+              <EvolutionPanel
+                lang={lang}
+                evolution={evolution}
+                loading={evolutionLoading}
+                error={evolutionError}
+              />
             </>
           ) : null}
 

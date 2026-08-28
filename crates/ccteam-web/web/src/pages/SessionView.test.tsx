@@ -309,6 +309,8 @@ describe("SessionView human verdict flow", () => {
       changed: true,
     }),
     submit = vi.fn().mockResolvedValue({ accepted: true }),
+    create = vi.fn().mockResolvedValue({ sid: "s-proposal" }),
+    onOpenSession = vi.fn(),
     stream = {
       events: [],
       connected: true,
@@ -320,6 +322,8 @@ describe("SessionView human verdict flow", () => {
     history: ReturnType<typeof vi.fn>;
     putVerdict?: ReturnType<typeof vi.fn>;
     submit?: ReturnType<typeof vi.fn>;
+    create?: ReturnType<typeof vi.fn>;
+    onOpenSession?: ReturnType<typeof vi.fn>;
     stream?: {
       events: SessionEvent[];
       connected: boolean;
@@ -353,10 +357,14 @@ describe("SessionView human verdict flow", () => {
       listScheduled: vi.fn().mockResolvedValue([]),
       putTurnVerdict: putVerdict,
       submitTurn: submit,
+      createSession: create,
     }));
     const View = (await import("./SessionView")).default;
-    const renderView = () => harness.render(() => View({ sid: "s9", session: SESSION, lang: "en" }));
-    return { renderView, putVerdict, submit };
+    const renderView = () =>
+      harness.render(() =>
+        View({ sid: "s9", session: SESSION, lang: "en", onOpenSession }),
+      );
+    return { renderView, putVerdict, submit, create, onOpenSession };
   }
 
   function unmountVerdictView() {
@@ -518,24 +526,43 @@ describe("SessionView human verdict flow", () => {
     }
   });
 
-  it("sends Improve as an ordinary turn with an explicit proposal-only gate", async () => {
+  it("creates a dedicated HITL proposal session and opens it", async () => {
     const submit = vi.fn().mockResolvedValue({ accepted: true });
+    const create = vi.fn().mockResolvedValue({ sid: "s-proposal" });
+    const onOpenSession = vi.fn();
     const history = vi.fn().mockResolvedValue(reviewedHistory("revise"));
 
     try {
-      const { renderView } = await mountVerdictView({ history, submit });
+      const { renderView } = await mountVerdictView({
+        history,
+        submit,
+        create,
+        onOpenSession,
+      });
       renderView();
       await flushPromises();
       const controls = findVerdictControls(renderView());
       (controls?.props.onImprove as (feedback: string) => void)("Cover the failure path");
+      await flushPromises();
 
+      expect(create).toHaveBeenCalledWith("demo", {
+        role: "cto",
+        vendor: "claude",
+        permission_mode: "hitl",
+      });
       expect(submit).toHaveBeenCalledOnce();
-      expect(submit.mock.calls[0]?.[0]).toBe("s9");
+      expect(submit.mock.calls[0]?.[0]).toBe("s-proposal");
       const prompt = String(submit.mock.calls[0]?.[1]);
       expect(prompt).toContain("role, skill, or instruction changes");
-      expect(prompt).toContain("Do not apply, edit, install, or persist any change");
-      expect(prompt).toContain("explicit user approval");
+      expect(prompt).toContain("proposal-only turn");
+      expect(prompt).toContain("auto-approves nothing");
+      expect(prompt).toContain("explicit human approval");
       expect(prompt).toContain("Cover the failure path");
+      expect(submit.mock.calls[0]?.[0]).not.toBe("s9");
+      expect(onOpenSession).toHaveBeenCalledWith("s-proposal");
+      expect(collectElementText(renderView()).join(" ")).toContain(
+        "Created HITL proposal session s-proposal",
+      );
     } finally {
       unmountVerdictView();
     }

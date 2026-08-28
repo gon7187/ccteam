@@ -11,12 +11,19 @@
 //! `ccteam internal experience rebuild <slug>` regenerates both projections
 //! offline (disaster recovery).
 //!
-//! Append is atomic (POSIX `O_APPEND` + one `write_all`; record bodies fit
-//! under PIPE_BUF). Reads tolerate half-flushed / corrupt lines.
+//! On Unix, ccteam-owned appends, reads, and rebuild replacement share the
+//! project `experience.lock` flock, so their record and snapshot writes cannot
+//! interleave. The compatibility reader returns intact rows, while the detailed
+//! analytics/rebuild path reports every corrupt non-empty line and fails closed
+//! rather than publishing partial aggregates.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -25,10 +32,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub use super::progress_bridge::Verdict;
+pub use super::progress_bridge::{TurnSignals, Verdict};
 
 /// Relative path of the project-level experience index.
 const EXPERIENCE_REL: &str = ".ccteam/experience.jsonl";
+const EXPERIENCE_LOCK_REL: &str = ".ccteam/experience.lock";
 
 /// One line in `experience.jsonl` — tagged by `kind`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,21 +78,6 @@ pub struct TurnExperience {
     pub signals: TurnSignals,
 }
 
-/// Lightweight turn signals (approximations — not a full telemetry SoT).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnSignals {
-    /// Delta of the session's `activity_events` counter across the turn
-    /// (counts every pump event — assistant deltas, tool-use, progress —
-    /// not a precise tool-call count). Rebuild fills 0 when unknown.
-    pub tool_calls: u64,
-    /// True when a user message was mirrored while a prior turn was still
-    /// in flight (mid-turn steer). Always `false` after rebuild.
-    pub steered: bool,
-    /// Reserved for a future error-recovery detector; always `null` in v1.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_recovered: Option<bool>,
-}
-
 /// Human accept/revise on a completed turn (schema only in this task).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerdictExperience {
@@ -101,9 +94,68 @@ pub fn experience_jsonl_path(project_dir: &Path) -> PathBuf {
     project_dir.join(EXPERIENCE_REL)
 }
 
+/// Cross-process exclusion shared by canonical terminal persistence,
+/// projection append, and projection rebuild.
+pub struct ExperienceLock {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl Drop for ExperienceLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+pub fn lock_experience(project_dir: &Path) -> Result<ExperienceLock> {
+    let path = project_dir.join(EXPERIENCE_LOCK_REL);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("lock {}", path.display()));
+        }
+    }
+    Ok(ExperienceLock { file, path })
+}
+
 /// Append `record` as one JSONL line. Creates parent dir + file when missing.
 /// Returns the absolute path written for caller logging.
 pub fn append_experience(project_dir: &Path, record: &ExperienceRecord) -> Result<PathBuf> {
+    let lock = lock_experience(project_dir)?;
+    append_experience_locked(project_dir, &lock, record)
+}
+
+/// Append while holding [`lock_experience`]. This lets the live gateway cover
+/// canonical progress/turn writes and the derived append with one exclusion
+/// window, so a concurrent rebuild cannot duplicate or lose the boundary.
+pub fn append_experience_locked(
+    project_dir: &Path,
+    lock: &ExperienceLock,
+    record: &ExperienceRecord,
+) -> Result<PathBuf> {
+    let expected_lock = project_dir.join(EXPERIENCE_LOCK_REL);
+    if lock.path != expected_lock {
+        anyhow::bail!(
+            "experience lock {} does not guard {}",
+            lock.path.display(),
+            project_dir.display()
+        );
+    }
     let path = experience_jsonl_path(project_dir);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -119,11 +171,25 @@ pub fn append_experience(project_dir: &Path, record: &ExperienceRecord) -> Resul
     Ok(path)
 }
 
-/// Read every parseable record. Returns empty when the file is absent.
-/// Corrupt / half-flushed / torn lines are skipped one line at a time
-/// ([`super::fs_atomic::read_jsonl`]).
+/// Compatibility reader returning every parseable record. Analytics must use
+/// [`read_all_experience_detailed`] and reject a non-zero corruption count.
 pub fn read_all_experience(project_dir: &Path) -> Result<Vec<ExperienceRecord>> {
-    super::fs_atomic::read_jsonl(&experience_jsonl_path(project_dir))
+    Ok(read_all_experience_detailed(project_dir)?.records)
+}
+
+pub fn read_all_experience_detailed(
+    project_dir: &Path,
+) -> Result<super::fs_atomic::JsonlRead<ExperienceRecord>> {
+    let path = experience_jsonl_path(project_dir);
+    let lock_path = project_dir.join(EXPERIENCE_LOCK_REL);
+    if !path.exists() && !lock_path.exists() {
+        return Ok(super::fs_atomic::JsonlRead {
+            records: Vec::new(),
+            corrupt_line_count: 0,
+        });
+    }
+    let _lock = lock_experience(project_dir)?;
+    super::fs_atomic::read_jsonl_detailed(&path)
 }
 
 // ── fingerprints ─────────────────────────────────────────────────────────────
@@ -132,14 +198,24 @@ pub fn read_all_experience(project_dir: &Path) -> Result<Vec<ExperienceRecord>> 
 /// `None` for roleless (empty role) or a missing file.
 pub fn role_fingerprint(project_dir: &Path, role: &str) -> Option<String> {
     let role = role.trim();
-    if role.is_empty() {
+    if role.is_empty()
+        || !matches!(
+            Path::new(role).components().collect::<Vec<_>>().as_slice(),
+            [std::path::Component::Normal(_)]
+        )
+    {
         return None;
     }
-    let path = project_dir
-        .join(".claude")
-        .join("agents")
-        .join(format!("{role}.md"));
-    let bytes = fs::read(&path).ok()?;
+    let claude_dir = project_dir.join(".claude");
+    let agents_dir = claude_dir.join("agents");
+    for dir in [&claude_dir, &agents_dir] {
+        let metadata = fs::symlink_metadata(dir).ok()?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return None;
+        }
+    }
+    let path = agents_dir.join(format!("{role}.md"));
+    let bytes = read_regular_file_bounded(&path, MAX_ROLE_FINGERPRINT_BYTES).ok()?;
     Some(short_sha256(&bytes))
 }
 
@@ -151,12 +227,45 @@ pub fn role_fingerprint(project_dir: &Path, role: &str) -> Option<String> {
 /// exist; `Some(map)` when at least one skill dir is present (values may
 /// still hash empty dirs as the digest of zero lines).
 pub fn skills_fingerprint(project_dir: &Path) -> Option<BTreeMap<String, String>> {
-    let skills_root = project_dir.join(".claude").join("skills");
+    let project_root = fs::canonicalize(project_dir).ok()?;
+    let claude_dir = project_dir.join(".claude");
+    let claude_metadata = fs::symlink_metadata(&claude_dir).ok()?;
+    if claude_metadata.file_type().is_symlink() || !claude_metadata.is_dir() {
+        return None;
+    }
+    let skills_root = claude_dir.join("skills");
+    let root_metadata = fs::symlink_metadata(&skills_root).ok()?;
+    if root_metadata.file_type().is_symlink() {
+        let agents_dir = project_dir.join(".agents");
+        let agents_metadata = fs::symlink_metadata(&agents_dir).ok()?;
+        if agents_metadata.file_type().is_symlink() || !agents_metadata.is_dir() {
+            return None;
+        }
+        let managed_root = agents_dir.join("skills");
+        let managed_metadata = fs::symlink_metadata(&managed_root).ok()?;
+        let managed_real = fs::canonicalize(&managed_root).ok()?;
+        if managed_metadata.file_type().is_symlink()
+            || !managed_metadata.is_dir()
+            || !managed_real.starts_with(&project_root)
+            || fs::canonicalize(&skills_root).ok()? != managed_real
+        {
+            return None;
+        }
+    } else if !root_metadata.is_dir() {
+        return None;
+    }
     let entries = fs::read_dir(&skills_root).ok()?;
     let mut map = BTreeMap::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // The `.claude/skills` root itself is intentionally allowed to be the
+        // project-managed link to `.agents/skills`. Entries below it are not:
+        // following one could escape the project tree or recurse through a
+        // cycle and take the daemon down during session spawn.
+        if file_type.is_symlink() || !file_type.is_dir() {
             continue;
         }
         let Some(id) = entry.file_name().to_str().map(str::to_string) else {
@@ -174,7 +283,10 @@ pub fn skills_fingerprint(project_dir: &Path) -> Option<BTreeMap<String, String>
 /// Digest of one skill directory: sha256 over sorted `"relpath:content_sha"` lines.
 fn skill_dir_digest(skill_dir: &Path) -> String {
     let mut pairs: Vec<(String, String)> = Vec::new();
-    collect_skill_files(skill_dir, skill_dir, &mut pairs);
+    let mut budget = SkillFingerprintBudget::default();
+    if collect_skill_files(skill_dir, skill_dir, 0, &mut budget, &mut pairs).is_err() {
+        return "unavailable".to_string();
+    }
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut hasher = Sha256::new();
     for (rel, content_sha) in &pairs {
@@ -186,28 +298,95 @@ fn skill_dir_digest(skill_dir: &Path) -> String {
     hex12(hasher.finalize())
 }
 
-fn collect_skill_files(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+const MAX_SKILL_FINGERPRINT_DEPTH: usize = 16;
+const MAX_SKILL_FINGERPRINT_FILES: usize = 4_096;
+const MAX_SKILL_FINGERPRINT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ROLE_FINGERPRINT_BYTES: u64 = 1024 * 1024;
+
+#[derive(Default)]
+struct SkillFingerprintBudget {
+    files: usize,
+    bytes: u64,
+}
+
+fn collect_skill_files(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    budget: &mut SkillFingerprintBudget,
+    out: &mut Vec<(String, String)>,
+) -> Result<()> {
+    if depth > MAX_SKILL_FINGERPRINT_DEPTH {
+        anyhow::bail!("skill fingerprint depth limit exceeded");
+    }
+    let mut entries = fs::read_dir(dir)
+        .with_context(|| format!("read skill directory {}", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
         let path = entry.path();
-        let Ok(meta) = entry.metadata() else {
+        let meta = entry
+            .file_type()
+            .with_context(|| format!("read skill entry type {}", path.display()))?;
+        if meta.is_symlink() {
             continue;
-        };
+        }
         if meta.is_dir() {
-            collect_skill_files(root, &path, out);
+            collect_skill_files(root, &path, depth + 1, budget, out)?;
         } else if meta.is_file() {
+            budget.files = budget.files.saturating_add(1);
+            if budget.files > MAX_SKILL_FINGERPRINT_FILES {
+                anyhow::bail!("skill fingerprint file limit exceeded");
+            }
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
             };
             let relpath = rel.to_string_lossy().replace('\\', "/");
-            let Ok(bytes) = fs::read(&path) else {
-                continue;
-            };
+            let remaining = MAX_SKILL_FINGERPRINT_BYTES.saturating_sub(budget.bytes);
+            let bytes = read_regular_file_bounded(&path, remaining)
+                .with_context(|| format!("read skill file {}", path.display()))?;
+            budget.bytes = budget
+                .bytes
+                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            if budget.bytes > MAX_SKILL_FINGERPRINT_BYTES {
+                anyhow::bail!("skill fingerprint byte limit exceeded");
+            }
             out.push((relpath, full_sha256_hex(&bytes)));
         }
     }
+    Ok(())
+}
+
+fn read_regular_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(not(unix))]
+    if fs::symlink_metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .file_type()
+        .is_symlink()
+    {
+        anyhow::bail!("refuse symlink {}", path.display());
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        anyhow::bail!("fingerprint file exceeds limit or is not regular");
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        anyhow::bail!("fingerprint file exceeds limit");
+    }
+    Ok(bytes)
 }
 
 fn short_sha256(bytes: &[u8]) -> String {
@@ -238,16 +417,17 @@ fn hex12(digest: impl AsRef<[u8]>) -> String {
 /// retained `progress.jsonl` `chat_turn_completed` and `turn_verdict` events.
 /// Existing derived rows are ignored. Writes atomically (tmp + rename).
 ///
-/// **Offline / disaster use only** — a live daemon may still be appending
-/// concurrent turn rows; pre-v1.0 this is acceptable for recovery, not for
-/// concurrent online rebuild.
+/// The shared experience lock excludes the live canonical+projection writer
+/// for the full read/replace window, so the generated snapshot is lossless.
 ///
 /// Returns `(turns_written, verdicts_written)`.
 pub fn rebuild_experience(
     project_dir: &Path,
     progress_path: Option<&Path>,
 ) -> Result<(usize, usize)> {
-    // Index retained progress events by (sid, turn_id). Later rows win.
+    let _lock = lock_experience(project_dir)?;
+    // Index retained progress events by (sid, turn_id). The first canonical
+    // terminal fact wins across checkpoint/archive/active generations.
     let mut progress_by_key: BTreeMap<(String, String), serde_json::Value> = BTreeMap::new();
     let mut verdicts: Vec<ExperienceRecord> = Vec::new();
     if let Some(pp) = progress_path {
@@ -261,7 +441,9 @@ pub fn rebuild_experience(
             let Some(turn_id) = ev.get("turn_id").and_then(|v| v.as_str()) else {
                 continue;
             };
-            progress_by_key.insert((sid.to_string(), turn_id.to_string()), ev);
+            progress_by_key
+                .entry((sid.to_string(), turn_id.to_string()))
+                .or_insert(ev);
         }
         verdicts = super::progress_bridge::latest_turn_verdicts(pp)?
             .into_values()
@@ -278,7 +460,8 @@ pub fn rebuild_experience(
     }
     let verdicts_written = verdicts.len();
 
-    let mut turns: Vec<ExperienceRecord> = Vec::new();
+    let mut canonical_turns: BTreeMap<(String, String), super::turns_mirror::TurnRecord> =
+        BTreeMap::new();
     let chat_base = project_dir.join(".ccteam").join("chat");
     if let Ok(entries) = fs::read_dir(&chat_base) {
         let mut sids: Vec<String> = entries
@@ -294,84 +477,91 @@ pub fn rebuild_experience(
             .collect();
         sids.sort();
         for sid in sids {
-            let Ok(turn_records) = super::turns_mirror::read_all_turns(project_dir, &sid) else {
-                continue;
-            };
+            let turn_read = super::turns_mirror::read_all_turns_detailed(project_dir, &sid)
+                .with_context(|| format!("read canonical turns for {sid}"))?;
+            if turn_read.corrupt_line_count > 0 {
+                anyhow::bail!(
+                    "canonical turns for {sid} contain {} corrupt line(s)",
+                    turn_read.corrupt_line_count
+                );
+            }
             // Only canonical terminal rows are rebuild authority. User-only,
             // interim, and legacy rows without an explicit outcome are skipped:
             // guessing their boundary would resurrect drafts as completed work.
-            let mut by_id: BTreeMap<String, super::turns_mirror::TurnRecord> = BTreeMap::new();
-            for tr in turn_records {
+            for tr in turn_read.records {
                 if matches!(tr.outcome.as_deref(), Some("completed" | "failed")) {
-                    by_id.insert(tr.turn_id.clone(), tr);
+                    canonical_turns
+                        .entry((sid.clone(), tr.turn_id.clone()))
+                        .or_insert(tr);
                 }
             }
-            for (turn_id, tr) in by_id {
-                let progress = progress_by_key.get(&(sid.clone(), turn_id.clone()));
-                let vendor = tr.vendor.clone();
-                let role = tr.role.clone();
-                let usage = progress
-                    .and_then(|ev| ev.get("usage"))
-                    .and_then(|u| serde_json::from_value::<UnifiedTokenUsage>(u.clone()).ok())
-                    .or_else(|| {
-                        if tr.usage.is_null() {
-                            None
-                        } else {
-                            serde_json::from_value::<UnifiedTokenUsage>(tr.usage.clone()).ok()
-                        }
-                    });
-                let model = progress
-                    .and_then(|ev| ev.get("model"))
-                    .and_then(|m| m.as_str())
-                    .map(str::to_string);
-                let cost_usd = usage.as_ref().and_then(|usage| {
-                    cost_vendor_from_label(&vendor).and_then(|cost_vendor| {
-                        ccteam_cost::resolve_turn_cost(
-                            usage,
-                            cost_vendor,
-                            model.as_deref().unwrap_or(""),
-                        )
-                    })
-                });
-                let outcome = progress
-                    .and_then(|ev| ev.get("outcome"))
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned)
-                    .or_else(|| tr.outcome.clone());
-                let duration_ms = progress
-                    .and_then(|ev| ev.get("duration_ms"))
-                    .and_then(|value| value.as_u64());
-                let role_sha = progress
-                    .and_then(|ev| ev.get("role_sha"))
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned);
-                let skills_sha = progress
-                    .and_then(|ev| ev.get("skills_sha"))
-                    .and_then(|value| {
-                        serde_json::from_value::<BTreeMap<String, String>>(value.clone()).ok()
-                    });
-                let tool_calls = tr.tool_calls.len() as u64;
-                turns.push(ExperienceRecord::Turn(TurnExperience {
-                    sid: sid.clone(),
-                    turn_id,
-                    ts: tr.ts,
-                    vendor: vendor.clone(),
-                    model,
-                    role: role.clone(),
-                    usage,
-                    cost_usd,
-                    outcome,
-                    duration_ms,
-                    role_sha,
-                    skills_sha,
-                    signals: TurnSignals {
-                        tool_calls,
-                        steered: false,
-                        error_recovered: None,
-                    },
-                }));
-            }
         }
+    }
+
+    let keys = canonical_turns
+        .keys()
+        .chain(progress_by_key.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut turns: Vec<ExperienceRecord> = Vec::with_capacity(keys.len());
+    for (sid, turn_id) in keys {
+        let tr = canonical_turns.get(&(sid.clone(), turn_id.clone()));
+        let progress = progress_by_key.get(&(sid.clone(), turn_id.clone()));
+        let vendor = progress_field::<String>(progress, "vendor", &sid, &turn_id)?
+            .or_else(|| tr.map(|turn| turn.vendor.clone()))
+            .with_context(|| format!("terminal turn {sid}/{turn_id} has no vendor"))?;
+        let role = progress_field::<String>(progress, "role", &sid, &turn_id)?
+            .or_else(|| tr.map(|turn| turn.role.clone()))
+            .with_context(|| format!("terminal turn {sid}/{turn_id} has no role"))?;
+        let ts = progress_field::<String>(progress, "ts", &sid, &turn_id)?
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()
+            .with_context(|| format!("terminal turn {sid}/{turn_id} has invalid ts"))?
+            .map(|value| value.with_timezone(&Utc))
+            .or_else(|| tr.map(|turn| turn.ts))
+            .with_context(|| format!("terminal turn {sid}/{turn_id} has no ts"))?;
+        let usage = progress_field::<UnifiedTokenUsage>(progress, "usage", &sid, &turn_id)?
+            .or_else(|| {
+                tr.and_then(|turn| {
+                    (!turn.usage.is_null())
+                        .then(|| serde_json::from_value(turn.usage.clone()).ok())
+                        .flatten()
+                })
+            });
+        let model = progress_field::<String>(progress, "model", &sid, &turn_id)?;
+        let cost_usd = usage.as_ref().and_then(|usage| {
+            cost_vendor_from_label(&vendor).and_then(|cost_vendor| {
+                ccteam_cost::resolve_turn_cost(usage, cost_vendor, model.as_deref().unwrap_or(""))
+            })
+        });
+        let outcome = progress_field::<String>(progress, "outcome", &sid, &turn_id)?
+            .or_else(|| tr.and_then(|turn| turn.outcome.clone()));
+        let duration_ms = progress_field::<u64>(progress, "duration_ms", &sid, &turn_id)?;
+        let role_sha = progress_field::<String>(progress, "role_sha", &sid, &turn_id)?;
+        let skills_sha =
+            progress_field::<BTreeMap<String, String>>(progress, "skills_sha", &sid, &turn_id)?;
+        let signals = progress_field::<TurnSignals>(progress, "signals", &sid, &turn_id)?
+            .unwrap_or_else(|| TurnSignals {
+                tool_calls: tr.map_or(0, |turn| turn.tool_calls.len() as u64),
+                steered: false,
+                error_recovered: None,
+            });
+        turns.push(ExperienceRecord::Turn(TurnExperience {
+            sid,
+            turn_id,
+            ts,
+            vendor,
+            model,
+            role,
+            usage,
+            cost_usd,
+            outcome,
+            duration_ms,
+            role_sha,
+            skills_sha,
+            signals,
+        }));
     }
 
     let turns_written = turns.len();
@@ -393,14 +583,27 @@ pub fn rebuild_experience(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    // Atomic replace (tmp + rename). Not fsync-durable — recovery index,
-    // not a hard SoT (see module docs).
-    let tmp = path.with_file_name("experience.jsonl.tmp");
-    fs::write(&tmp, body.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, &path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    super::fs_atomic::atomic_write_durable(&path, body.as_bytes())
+        .with_context(|| format!("replace {}", path.display()))?;
 
     Ok((turns_written, verdicts_written))
+}
+
+fn progress_field<T: serde::de::DeserializeOwned>(
+    event: Option<&serde_json::Value>,
+    field: &str,
+    sid: &str,
+    turn_id: &str,
+) -> Result<Option<T>> {
+    let Some(value) = event.and_then(|event| event.get(field)) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .with_context(|| format!("terminal turn {sid}/{turn_id} has invalid {field}"))
 }
 
 fn cost_vendor_from_label(vendor: &str) -> Option<ccteam_cost::Vendor> {
@@ -418,12 +621,25 @@ fn cost_vendor_from_label(vendor: &str) -> Option<ccteam_cost::Vendor> {
 
 fn read_retained_progress_events(path: &Path) -> Result<Vec<serde_json::Value>> {
     let checkpoint = super::progress_bridge::load_or_recover_progress_checkpoint(path)?;
+    if checkpoint
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.corrupt_line_count > 0)
+    {
+        anyhow::bail!("canonical progress history contains corrupt lines");
+    }
     let mut events = checkpoint
         .into_iter()
         .flat_map(|checkpoint| checkpoint.terminal_turns.into_values())
         .flat_map(|turns| turns.into_values())
         .collect::<Vec<_>>();
-    events.extend(super::fs_atomic::read_jsonl(path)?);
+    let active = super::fs_atomic::read_jsonl_detailed(path)?;
+    if active.corrupt_line_count > 0 {
+        anyhow::bail!(
+            "canonical progress contains {} corrupt line(s)",
+            active.corrupt_line_count
+        );
+    }
+    events.extend(active.records);
     Ok(events)
 }
 
@@ -520,6 +736,10 @@ mod tests {
             ExperienceRecord::Turn(t) => assert_eq!(t.turn_id, "s1-2"),
             _ => panic!("expected turn"),
         }
+
+        let detailed = read_all_experience_detailed(tmp.path()).unwrap();
+        assert_eq!(detailed.records.len(), 2);
+        assert_eq!(detailed.corrupt_line_count, 1);
     }
 
     #[test]
@@ -544,6 +764,35 @@ mod tests {
         assert_ne!(a, c);
         assert!(role_fingerprint(tmp.path(), "").is_none());
         assert!(role_fingerprint(tmp.path(), "missing").is_none());
+        assert!(role_fingerprint(tmp.path(), "../../outside").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn role_fingerprint_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let agents = tmp.path().join(".claude/agents");
+        fs::create_dir_all(&agents).unwrap();
+        let outside = tmp.path().join("outside.md");
+        fs::write(&outside, b"outside role").unwrap();
+        symlink(&outside, agents.join("cto.md")).unwrap();
+
+        assert!(role_fingerprint(tmp.path(), "cto").is_none());
+    }
+
+    #[test]
+    fn role_fingerprint_refuses_oversized_files() {
+        let tmp = TempDir::new().unwrap();
+        let agents = tmp.path().join(".claude/agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::File::create(agents.join("cto.md"))
+            .unwrap()
+            .set_len(MAX_ROLE_FINGERPRINT_BYTES + 1)
+            .unwrap();
+
+        assert!(role_fingerprint(tmp.path(), "cto").is_none());
     }
 
     #[test]
@@ -562,6 +811,203 @@ mod tests {
         fs::write(skill.join("SKILL.md"), b"watch ci harder").unwrap();
         let c = skills_fingerprint(tmp.path()).unwrap();
         assert_ne!(a.get("ci-watcher"), c.get("ci-watcher"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skills_fingerprint_ignores_nested_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let skill = tmp.path().join(".claude").join("skills").join("safe");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), b"stable body").unwrap();
+        let outside = tmp.path().join("outside-secret");
+        fs::write(&outside, b"secret-v1").unwrap();
+        symlink(&outside, skill.join("linked-secret")).unwrap();
+
+        let before = skills_fingerprint(tmp.path()).unwrap();
+        fs::write(&outside, b"secret-v2-with-different-content").unwrap();
+        let after = skills_fingerprint(tmp.path()).unwrap();
+
+        assert_eq!(
+            before, after,
+            "skill digests must neither follow nor hash nested symlinks"
+        );
+    }
+
+    #[test]
+    fn skills_fingerprint_fails_closed_at_the_depth_limit() {
+        let tmp = TempDir::new().unwrap();
+        let skill = tmp.path().join(".claude/skills/deep");
+        let mut nested = skill.clone();
+        for index in 0..=MAX_SKILL_FINGERPRINT_DEPTH {
+            nested = nested.join(format!("d{index}"));
+        }
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("SKILL.md"), b"too deep").unwrap();
+
+        let fingerprint = skills_fingerprint(tmp.path()).unwrap();
+        assert_eq!(
+            fingerprint.get("deep").map(String::as_str),
+            Some("unavailable")
+        );
+    }
+
+    #[test]
+    fn skills_fingerprint_fails_closed_at_file_and_byte_limits() {
+        let tmp = TempDir::new().unwrap();
+        let skill = tmp.path().join(".claude/skills/bounded");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("one.md"), b"one").unwrap();
+        let mut pairs = Vec::new();
+        let mut exhausted_files = SkillFingerprintBudget {
+            files: MAX_SKILL_FINGERPRINT_FILES,
+            bytes: 0,
+        };
+        assert!(collect_skill_files(&skill, &skill, 0, &mut exhausted_files, &mut pairs).is_err());
+
+        fs::File::create(skill.join("huge.bin"))
+            .unwrap()
+            .set_len(MAX_SKILL_FINGERPRINT_BYTES + 1)
+            .unwrap();
+        let fingerprints = skills_fingerprint(tmp.path()).unwrap();
+        assert_eq!(
+            fingerprints.get("bounded").map(String::as_str),
+            Some("unavailable")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skills_fingerprint_allows_root_link_but_skips_linked_skill_entries() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let agents_skills = tmp.path().join(".agents").join("skills");
+        let real = agents_skills.join("real");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("SKILL.md"), b"real skill").unwrap();
+        let outside = tmp.path().join("outside-skill");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("SKILL.md"), b"must not be attributed").unwrap();
+        symlink(&outside, agents_skills.join("linked")).unwrap();
+        let claude = tmp.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        symlink("../.agents/skills", claude.join("skills")).unwrap();
+
+        let fingerprints = skills_fingerprint(tmp.path()).unwrap();
+
+        assert!(fingerprints.contains_key("real"));
+        assert!(!fingerprints.contains_key("linked"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skills_fingerprint_refuses_an_unmanaged_root_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside-skills");
+        fs::create_dir_all(outside.join("leak")).unwrap();
+        fs::write(outside.join("leak/SKILL.md"), b"outside").unwrap();
+        let claude = tmp.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        symlink(&outside, claude.join("skills")).unwrap();
+
+        assert!(skills_fingerprint(tmp.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skills_fingerprint_refuses_symlinked_managed_parent_directories() {
+        use std::os::unix::fs::symlink;
+
+        let claude_parent = TempDir::new().unwrap();
+        let outside_claude = claude_parent.path().join("outside-claude");
+        fs::create_dir_all(outside_claude.join("skills/leak")).unwrap();
+        fs::write(outside_claude.join("skills/leak/SKILL.md"), b"outside").unwrap();
+        symlink(&outside_claude, claude_parent.path().join(".claude")).unwrap();
+        assert!(skills_fingerprint(claude_parent.path()).is_none());
+
+        let agents_parent = TempDir::new().unwrap();
+        let outside_agents = agents_parent.path().join("outside-agents");
+        fs::create_dir_all(outside_agents.join("skills/leak")).unwrap();
+        fs::write(outside_agents.join("skills/leak/SKILL.md"), b"outside").unwrap();
+        symlink(&outside_agents, agents_parent.path().join(".agents")).unwrap();
+        fs::create_dir_all(agents_parent.path().join(".claude")).unwrap();
+        symlink(
+            "../.agents/skills",
+            agents_parent.path().join(".claude/skills"),
+        )
+        .unwrap();
+        assert!(skills_fingerprint(agents_parent.path()).is_none());
+    }
+
+    #[test]
+    fn rebuild_fails_closed_when_a_canonical_turn_line_is_corrupt() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        let turns = super::super::turns_mirror::turns_jsonl_path(project, "s1");
+        fs::create_dir_all(turns.parent().unwrap()).unwrap();
+        fs::write(&turns, b"{torn-canonical-turn\n").unwrap();
+
+        let error = rebuild_experience(project, None).unwrap_err().to_string();
+        assert!(error.contains("corrupt") && error.contains("s1"), "{error}");
+    }
+
+    #[test]
+    fn rebuild_is_lossless_from_a_rich_canonical_terminal_fact_alone() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        let progress = project.join("progress.jsonl");
+        let usage = UnifiedTokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            ..Default::default()
+        };
+        let event = super::super::progress_bridge::build_chat_turn_completed_event_with_metadata(
+            "reviewer",
+            "s1",
+            "turn-1",
+            &usage,
+            Some("claude-sonnet-4-6"),
+            Some("claude"),
+            &super::super::progress_bridge::ChatTurnCompletionMetadata {
+                outcome: Some("completed".into()),
+                duration_ms: Some(321),
+                role_sha: Some("role-sha".into()),
+                skills_sha: Some(BTreeMap::from([("research".into(), "skill-sha".into())])),
+                signals: Some(TurnSignals {
+                    tool_calls: 9,
+                    steered: true,
+                    error_recovered: None,
+                }),
+            },
+        );
+        super::super::progress_bridge::append_event(&progress, &event).unwrap();
+
+        assert_eq!(
+            rebuild_experience(project, Some(&progress)).unwrap(),
+            (1, 0)
+        );
+        let record = read_all_experience(project).unwrap().remove(0);
+        let ExperienceRecord::Turn(turn) = record else {
+            panic!("expected rebuilt turn");
+        };
+        assert_eq!(turn.sid, "s1");
+        assert_eq!(turn.role, "reviewer");
+        assert_eq!(turn.role_sha.as_deref(), Some("role-sha"));
+        assert_eq!(
+            turn.skills_sha
+                .as_ref()
+                .and_then(|map| map.get("research"))
+                .map(String::as_str),
+            Some("skill-sha")
+        );
+        assert_eq!(turn.signals.tool_calls, 9);
+        assert!(turn.signals.steered);
+        assert_eq!(turn.duration_ms, Some(321));
     }
 
     #[test]
@@ -719,6 +1165,7 @@ mod tests {
                         "research".into(),
                         "turn-skill-sha".into(),
                     )])),
+                    signals: None,
                 },
             );
         super::super::progress_bridge::append_event(&progress_path, &completion).unwrap();

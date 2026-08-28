@@ -34,8 +34,9 @@ const SUMMARY: EvolutionSummary = {
       priced_turns: 4,
       unpriced_turns: 3,
       avg_duration_ms: 2200,
-      avg_cost_usd: 0.25,
-      total_cost_usd: 1,
+      priced_avg_cost_usd: 0.25,
+      known_cost_usd: 1,
+      total_cost_usd: null,
     },
   ],
   skills: [],
@@ -56,7 +57,7 @@ describe("EvolutionPanel", () => {
     expect(html).toContain("role:reviewer");
     expect(html).toContain("abcdef0123");
     expect(html).toContain("3 accepted · 2 revised · 2 unrated");
-    expect(html).toContain("$1.00 total · $0.25 avg");
+    expect(html).toContain("≥$1.00 known · total — · $0.25 priced avg");
     expect(html).toContain("Skills are attributed to what was available when the session spawned");
     expect(html).not.toContain("read-only");
   });
@@ -112,7 +113,7 @@ describe("EvolutionPanel", () => {
     expect(html).toContain(">—<");
     expect(html).not.toContain("0 ms");
     expect(html).not.toContain("$0.00");
-    expect(html).toContain("— total · — avg");
+    expect(html).toContain("— known · total — · — priced avg");
     expect(html).toContain("Skill attribution is unavailable on this daemon");
   });
 
@@ -121,6 +122,20 @@ describe("EvolutionPanel", () => {
     expect(
       renderToString(<EvolutionPanel lang="ru" evolution={empty} loading={false} />),
     ).toContain("Данных об опыте пока нет");
+  });
+
+  it("renders storage degradation instead of an empty state", () => {
+    const html = renderToString(
+      <EvolutionPanel
+        lang="en"
+        evolution={null}
+        loading={false}
+        error="evolution experience is corrupt"
+      />,
+    );
+    expect(html).toContain('data-testid="evolution-degraded"');
+    expect(html).toContain("Partial analytics are not shown as an empty dataset");
+    expect(html).not.toContain('data-testid="evolution-empty"');
   });
 
   it("labels the honest empty role id as the default role bucket", () => {

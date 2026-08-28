@@ -29,8 +29,8 @@ static PERSIST_OBSERVER: OnceLock<Box<PersistObserver>> = OnceLock::new();
 
 /// Default active progress journal size before single-level rotation.
 pub const DEFAULT_PROGRESS_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
-const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
-const VERDICT_INDEX_SCHEMA_VERSION: u32 = 1;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+const VERDICT_INDEX_SCHEMA_VERSION: u32 = 2;
 
 pub const CHAT_SESSION_RESET: &str = "chat_session_reset";
 pub const CHAT_SESSION_STARTED: &str = "chat_session_started";
@@ -302,6 +302,19 @@ pub enum Verdict {
     Revise,
 }
 
+/// Lightweight terminal-turn signals captured at the canonical boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnSignals {
+    /// Delta of the session activity counter across the turn. This is an
+    /// approximation, not a precise tool-call count.
+    pub tool_calls: u64,
+    /// Whether a user message steered a turn already in flight.
+    pub steered: bool,
+    /// Reserved for a future error-recovery detector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_recovered: Option<bool>,
+}
+
 /// Optional facts captured at the exact completion boundary.
 ///
 /// Missing fields stay unknown; callers must not backfill them from current
@@ -316,6 +329,8 @@ pub struct ChatTurnCompletionMetadata {
     pub role_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills_sha: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals: Option<TurnSignals>,
 }
 
 /// Classify every schema-owned kind. Deliberately no wildcard: a new
@@ -383,8 +398,13 @@ pub struct KindStat {
 pub struct ArchiveCoverage {
     /// Exact archive byte length.
     pub byte_size: u64,
-    /// SHA-256 of the first raw line, including its newline when present.
+    /// Legacy v1/v2 marker. Retained only so an existing covered archive can
+    /// be upgraded without folding its aggregates twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_line_sha256: Option<String>,
+    /// SHA-256 of the complete immutable archive generation (v3+ identity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_file_sha256: Option<String>,
 }
 
 /// Cumulative lifetime aggregates for data no longer present in the active
@@ -443,11 +463,20 @@ impl Default for ProgressCheckpoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct PendingVerdictIndexWrite {
-    verdict: TurnVerdict,
-    active_offset: u64,
-    line_len: u64,
-    line_sha256: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PendingProgressIndexWrite {
+    Verdict {
+        verdict: TurnVerdict,
+        active_offset: u64,
+        line_len: u64,
+        line_sha256: String,
+    },
+    TerminalTurn {
+        event: Value,
+        active_offset: u64,
+        line_len: u64,
+        line_sha256: String,
+    },
 }
 
 /// Small durable projection used by verdict GET/PUT. `progress.jsonl` remains
@@ -458,8 +487,10 @@ struct ProgressVerdictIndex {
     schema_version: u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     verdicts: BTreeMap<String, BTreeMap<String, TurnVerdict>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    terminal_turns: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pending: Option<PendingVerdictIndexWrite>,
+    pending: Option<PendingProgressIndexWrite>,
 }
 
 impl Default for ProgressVerdictIndex {
@@ -467,9 +498,26 @@ impl Default for ProgressVerdictIndex {
         Self {
             schema_version: VERDICT_INDEX_SCHEMA_VERSION,
             verdicts: BTreeMap::new(),
+            terminal_turns: BTreeMap::new(),
             pending: None,
         }
     }
+}
+
+/// Result of atomically admitting one canonical terminal turn fact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanonicalTerminalAppend {
+    /// `true` only when this call durably appended the first fact.
+    pub appended: bool,
+    /// The first canonical fact, whether written now or recovered earlier.
+    pub event: Value,
+}
+
+/// Canonical verdict projection with an explicit progress data-quality signal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnVerdictRead {
+    pub verdicts: BTreeMap<(String, String), TurnVerdict>,
+    pub corrupt_line_count: u64,
 }
 
 /// Shared cost fields extracted from one canonical progress event.
@@ -625,7 +673,7 @@ pub fn read_progress_checkpoint(active_path: &Path) -> Result<Option<ProgressChe
     };
     let checkpoint = serde_json::from_slice::<ProgressCheckpoint>(&bytes)
         .with_context(|| format!("parse {}", path.display()))?;
-    if !matches!(checkpoint.schema_version, 1 | CHECKPOINT_SCHEMA_VERSION) {
+    if !matches!(checkpoint.schema_version, 1 | 2 | CHECKPOINT_SCHEMA_VERSION) {
         anyhow::bail!(
             "unsupported progress checkpoint schema {} in {}",
             checkpoint.schema_version,
@@ -645,7 +693,15 @@ pub fn checkpoint_covers_archive(
     checkpoint: &ProgressCheckpoint,
     archive: Option<&ArchiveCoverage>,
 ) -> bool {
-    checkpoint.coverage.as_ref() == archive
+    match (checkpoint.coverage.as_ref(), archive) {
+        (None, None) => true,
+        (Some(checkpoint), Some(archive)) => {
+            checkpoint.byte_size == archive.byte_size
+                && checkpoint.full_file_sha256.is_some()
+                && checkpoint.full_file_sha256 == archive.full_file_sha256
+        }
+        _ => false,
+    }
 }
 
 /// Load the lifetime checkpoint and close the crash window where active was
@@ -736,7 +792,129 @@ pub fn append_event(path: &Path, event: &Value) -> Result<()> {
         append_turn_verdict_if_changed(path, &verdict)?;
         return Ok(());
     }
+    if event_kind_name(event) == Some(CHAT_TURN_COMPLETED) {
+        append_chat_turn_completed_if_absent(path, event)?;
+        return Ok(());
+    }
     append_event_at(path, event, Instant::now(), None)
+}
+
+/// Durably append the first canonical terminal fact for `(sid, turn_id)`.
+///
+/// `progress.jsonl` remains authoritative. The compact projection only makes
+/// the identity check bounded and crash-recoverable across daemon restarts.
+/// A later replay returns the original fact and never overwrites its receipt
+/// timestamp or payload.
+pub fn append_chat_turn_completed_if_absent(
+    path: &Path,
+    event: &Value,
+) -> Result<CanonicalTerminalAppend> {
+    let (sid, turn_id) =
+        terminal_turn_identity(event).context("malformed canonical chat_turn_completed event")?;
+    let sid = sid.to_string();
+    let turn_id = turn_id.to_string();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+
+    let mut line = serde_json::to_vec(event).context("serialize chat_turn_completed event")?;
+    line.push(b'\n');
+    let byte_count = u64::try_from(line.len()).unwrap_or(u64::MAX);
+
+    let lock_file = open_progress_lock(path)?;
+    let lock = ProgressFileLock::lock(&lock_file)
+        .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
+    if read_verdict_index_locked(path)?.is_none() {
+        if path.exists()
+            || progress_archive_path(path).exists()
+            || progress_checkpoint_path(path).exists()
+        {
+            let checkpoint = recover_progress_checkpoint_locked(path)?;
+            ensure_verdict_index_locked(path, checkpoint.as_ref())?;
+        } else {
+            write_verdict_index(path, &ProgressVerdictIndex::default())?;
+        }
+    }
+
+    let mut index = read_verdict_index_locked(path)?.ok_or_else(|| {
+        anyhow::anyhow!("progress verdict index disappeared for {}", path.display())
+    })?;
+    if let Some(first) = index
+        .terminal_turns
+        .get(&sid)
+        .and_then(|turns| turns.get(&turn_id))
+        .cloned()
+    {
+        drop(lock);
+        record_suppressed(CHAT_TURN_COMPLETED, false, byte_count);
+        return Ok(CanonicalTerminalAppend {
+            appended: false,
+            event: first,
+        });
+    }
+
+    let current_size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let mut rotated = false;
+    if current_size > 0 && current_size.saturating_add(byte_count) > progress_rotate_bytes() {
+        rotate_progress_locked(path)?;
+        rotated = true;
+        index = read_verdict_index_locked(path)?.ok_or_else(|| {
+            anyhow::anyhow!("progress verdict index disappeared for {}", path.display())
+        })?;
+    }
+    let active_offset = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    index.pending = Some(PendingProgressIndexWrite::TerminalTurn {
+        event: event.clone(),
+        active_offset,
+        line_len: byte_count,
+        line_sha256: hex_digest(Sha256::digest(&line).as_slice()),
+    });
+    write_verdict_index(path, &index)?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    file.write_all(&line)
+        .with_context(|| format!("write terminal turn event to {}", path.display()))?;
+    let size = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    file.sync_data()
+        .with_context(|| format!("sync terminal turn event to {}", path.display()))?;
+    drop(file);
+
+    index
+        .terminal_turns
+        .entry(sid)
+        .or_default()
+        .insert(turn_id, event.clone());
+    index.pending = None;
+    write_verdict_index(path, &index)?;
+    if size > progress_rotate_bytes() {
+        rotate_progress_locked(path)?;
+        rotated = true;
+    }
+    drop(lock);
+    record_appended(CHAT_TURN_COMPLETED, false, byte_count);
+    if let Some(observer) = PERSIST_OBSERVER.get() {
+        observer(path, rotated);
+    }
+    Ok(CanonicalTerminalAppend {
+        appended: true,
+        event: event.clone(),
+    })
+}
+
+fn terminal_turn_identity(event: &Value) -> Option<(&str, &str)> {
+    if event_kind_name(event) != Some(CHAT_TURN_COMPLETED) {
+        return None;
+    }
+    let sid = event.get("sid")?.as_str()?.trim();
+    let turn_id = event.get("turn_id")?.as_str()?.trim();
+    (!sid.is_empty() && !turn_id.is_empty()).then_some((sid, turn_id))
 }
 
 /// Parse one canonical `turn_verdict` event. Other or malformed events are
@@ -755,21 +933,44 @@ pub fn parse_turn_verdict_event(event: &Value) -> Option<TurnVerdict> {
 /// Read the latest verdict for every `(sid, turn_id)` across the retained
 /// archive followed by the active progress journal.
 pub fn latest_turn_verdicts(path: &Path) -> Result<BTreeMap<(String, String), TurnVerdict>> {
+    Ok(latest_turn_verdicts_detailed(path)?.verdicts)
+}
+
+/// Read canonical verdicts and corruption quality from one locked progress
+/// snapshot, so analytics cannot race a concurrent append between checks.
+pub fn latest_turn_verdicts_detailed(path: &Path) -> Result<TurnVerdictRead> {
     if !path.exists()
         && !progress_archive_path(path).exists()
         && !progress_checkpoint_path(path).exists()
         && !progress_verdict_index_path(path).exists()
     {
-        return Ok(BTreeMap::new());
+        return Ok(TurnVerdictRead {
+            verdicts: BTreeMap::new(),
+            corrupt_line_count: 0,
+        });
     }
     let lock_file = open_progress_lock(path)?;
     let _lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
+    let checkpoint = recover_progress_checkpoint_locked(path)?;
     if read_verdict_index_locked(path)?.is_none() {
-        let checkpoint = recover_progress_checkpoint_locked(path)?;
         ensure_verdict_index_locked(path, checkpoint.as_ref())?;
     }
-    latest_turn_verdicts_locked(path)
+    let active = super::fs_atomic::read_jsonl_detailed::<Value>(path)?;
+    Ok(TurnVerdictRead {
+        verdicts: latest_turn_verdicts_locked(path)?,
+        corrupt_line_count: checkpoint
+            .map(|checkpoint| checkpoint.corrupt_line_count)
+            .unwrap_or(0)
+            .saturating_add(active.corrupt_line_count),
+    })
+}
+
+/// Count known corrupt canonical progress rows across checkpointed history and
+/// the active journal. Callers that present analytics use this to fail closed
+/// instead of silently aggregating a partial history.
+pub fn progress_corrupt_line_count(path: &Path) -> Result<u64> {
+    Ok(latest_turn_verdicts_detailed(path)?.corrupt_line_count)
 }
 
 /// Append a canonical verdict only when its semantic payload changed.
@@ -826,7 +1027,7 @@ pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Res
     let mut index = read_verdict_index_locked(path)?.ok_or_else(|| {
         anyhow::anyhow!("progress verdict index disappeared for {}", path.display())
     })?;
-    index.pending = Some(PendingVerdictIndexWrite {
+    index.pending = Some(PendingProgressIndexWrite::Verdict {
         verdict: verdict.clone(),
         active_offset,
         line_len: byte_count,
@@ -900,7 +1101,10 @@ fn read_verdict_index_locked(path: &Path) -> Result<Option<ProgressVerdictIndex>
         // startup) down; callers holding the journal lock rebuild it below.
         Err(_) => return Ok(None),
     };
-    if index.schema_version != VERDICT_INDEX_SCHEMA_VERSION {
+    if index.schema_version < VERDICT_INDEX_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    if index.schema_version > VERDICT_INDEX_SCHEMA_VERSION {
         anyhow::bail!(
             "unsupported progress verdict index schema {} in {}",
             index.schema_version,
@@ -911,25 +1115,64 @@ fn read_verdict_index_locked(path: &Path) -> Result<Option<ProgressVerdictIndex>
     let Some(pending) = index.pending.take() else {
         return Ok(Some(index));
     };
-    let line_len = usize::try_from(pending.line_len).context("verdict pending line too large")?;
-    let mut raw = vec![0_u8; line_len];
-    let committed = File::open(path)
-        .and_then(|mut file| {
-            file.seek(SeekFrom::Start(pending.active_offset))?;
-            file.read_exact(&mut raw)
-        })
-        .is_ok()
-        && hex_digest(Sha256::digest(&raw).as_slice()) == pending.line_sha256
-        && serde_json::from_slice::<Value>(trim_ascii_line(&raw))
-            .ok()
-            .and_then(|event| parse_turn_verdict_event(&event))
-            .is_some_and(|verdict| verdict == pending.verdict);
-    if committed {
-        index
-            .verdicts
-            .entry(pending.verdict.sid.clone())
-            .or_default()
-            .insert(pending.verdict.turn_id.clone(), pending.verdict);
+    match pending {
+        PendingProgressIndexWrite::Verdict {
+            verdict,
+            active_offset,
+            line_len,
+            line_sha256,
+        } => {
+            let line_len = usize::try_from(line_len).context("verdict pending line too large")?;
+            let mut raw = vec![0_u8; line_len];
+            let committed = File::open(path)
+                .and_then(|mut file| {
+                    file.seek(SeekFrom::Start(active_offset))?;
+                    file.read_exact(&mut raw)
+                })
+                .is_ok()
+                && hex_digest(Sha256::digest(&raw).as_slice()) == line_sha256
+                && serde_json::from_slice::<Value>(trim_ascii_line(&raw))
+                    .ok()
+                    .and_then(|event| parse_turn_verdict_event(&event))
+                    .is_some_and(|candidate| candidate == verdict);
+            if committed {
+                index
+                    .verdicts
+                    .entry(verdict.sid.clone())
+                    .or_default()
+                    .insert(verdict.turn_id.clone(), verdict);
+            }
+        }
+        PendingProgressIndexWrite::TerminalTurn {
+            event,
+            active_offset,
+            line_len,
+            line_sha256,
+        } => {
+            let (sid, turn_id) = terminal_turn_identity(&event)
+                .context("malformed terminal turn in pending progress index")?;
+            let sid = sid.to_string();
+            let turn_id = turn_id.to_string();
+            let line_len = usize::try_from(line_len).context("terminal pending line too large")?;
+            let mut raw = vec![0_u8; line_len];
+            let committed = File::open(path)
+                .and_then(|mut file| {
+                    file.seek(SeekFrom::Start(active_offset))?;
+                    file.read_exact(&mut raw)
+                })
+                .is_ok()
+                && hex_digest(Sha256::digest(&raw).as_slice()) == line_sha256
+                && serde_json::from_slice::<Value>(trim_ascii_line(&raw))
+                    .is_ok_and(|candidate| candidate == event);
+            if committed {
+                index
+                    .terminal_turns
+                    .entry(sid)
+                    .or_default()
+                    .entry(turn_id)
+                    .or_insert(event);
+            }
+        }
     }
     write_verdict_index(path, &index)?;
     Ok(Some(index))
@@ -958,6 +1201,7 @@ fn ensure_verdict_index_locked(path: &Path, checkpoint: Option<&ProgressCheckpoi
     let mut index = ProgressVerdictIndex::default();
     if let Some(checkpoint) = checkpoint {
         index.verdicts = checkpoint.turn_verdicts.clone();
+        index.terminal_turns = checkpoint.terminal_turns.clone();
     }
     // Recovery folds the retained archive into the checkpoint first. Only the
     // active journal remains to backfill, once, outside GET/PUT request paths.
@@ -968,6 +1212,14 @@ fn ensure_verdict_index_locked(path: &Path, checkpoint: Option<&ProgressCheckpoi
                 .entry(verdict.sid.clone())
                 .or_default()
                 .insert(verdict.turn_id.clone(), verdict);
+        }
+        if let Some((sid, turn_id)) = terminal_turn_identity(&event) {
+            index
+                .terminal_turns
+                .entry(sid.to_string())
+                .or_default()
+                .entry(turn_id.to_string())
+                .or_insert(event);
         }
     })?;
     write_verdict_index(path, &index)
@@ -1174,7 +1426,7 @@ fn recover_progress_checkpoint_locked(active_path: &Path) -> Result<Option<Progr
         .is_some_and(|checkpoint| checkpoint.schema_version == 1)
     {
         let mut upgraded = checkpoint.take().expect("checked above");
-        if upgraded.coverage.as_ref() == archive.as_ref() {
+        if coverage_matches_legacy(upgraded.coverage.as_ref(), archive.as_ref()) {
             if archive.is_some() {
                 journal::scan_stream(&archive_path, |event| {
                     fold_checkpoint_projection(&mut upgraded, event);
@@ -1183,10 +1435,32 @@ fn recover_progress_checkpoint_locked(active_path: &Path) -> Result<Option<Progr
             // This archive was already included in v1 lifetime aggregates.
             // Backfill only the state projections or costs/counts double.
             upgraded.schema_version = CHECKPOINT_SCHEMA_VERSION;
+            upgraded.coverage = archive.clone();
             write_progress_checkpoint(active_path, &upgraded)?;
             checkpoint = Some(upgraded);
         } else {
             // The current archive is new and will be folded normally below.
+            upgraded.schema_version = CHECKPOINT_SCHEMA_VERSION;
+            checkpoint = Some(upgraded);
+        }
+    }
+
+    if checkpoint
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.schema_version == 2)
+    {
+        let mut upgraded = checkpoint.take().expect("checked above");
+        if coverage_matches_legacy(upgraded.coverage.as_ref(), archive.as_ref()) {
+            // v2 already contains lifetime aggregates and both projections.
+            // Its marker cannot distinguish a same-size/same-first-line
+            // generation, so refolding here would corrupt every healthy
+            // production checkpoint. Upgrade the covered generation in place;
+            // v3's full digest makes every later replacement unambiguous.
+            upgraded.schema_version = CHECKPOINT_SCHEMA_VERSION;
+            upgraded.coverage = archive.clone();
+            write_progress_checkpoint(active_path, &upgraded)?;
+            checkpoint = Some(upgraded);
+        } else {
             upgraded.schema_version = CHECKPOINT_SCHEMA_VERSION;
             checkpoint = Some(upgraded);
         }
@@ -1236,6 +1510,20 @@ fn recover_progress_checkpoint_locked(active_path: &Path) -> Result<Option<Progr
     Ok(Some(next))
 }
 
+fn coverage_matches_legacy(
+    checkpoint: Option<&ArchiveCoverage>,
+    archive: Option<&ArchiveCoverage>,
+) -> bool {
+    match (checkpoint, archive) {
+        (None, None) => true,
+        (Some(checkpoint), Some(archive)) => {
+            checkpoint.byte_size == archive.byte_size
+                && checkpoint.first_line_sha256 == archive.first_line_sha256
+        }
+        _ => false,
+    }
+}
+
 fn fold_checkpoint_projection(checkpoint: &mut ProgressCheckpoint, event: Value) {
     if let Some(verdict) = parse_turn_verdict_event(&event) {
         checkpoint
@@ -1257,7 +1545,8 @@ fn fold_checkpoint_projection(checkpoint: &mut ProgressCheckpoint, event: Value)
                     .terminal_turns
                     .entry(sid)
                     .or_default()
-                    .insert(turn_id, event);
+                    .entry(turn_id)
+                    .or_insert(event);
             }
         }
     }
@@ -1269,7 +1558,7 @@ fn write_progress_checkpoint(active_path: &Path, checkpoint: &ProgressCheckpoint
 }
 
 fn archive_coverage_for_path(path: &Path) -> Result<Option<ArchiveCoverage>> {
-    let file = match File::open(path) {
+    let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
@@ -1278,32 +1567,34 @@ fn archive_coverage_for_path(path: &Path) -> Result<Option<ArchiveCoverage>> {
         .metadata()
         .with_context(|| format!("stat {}", path.display()))?
         .len();
-    let mut reader = BufReader::new(file);
-    let mut hasher = Sha256::new();
+    let mut full_hasher = Sha256::new();
+    let mut first_hasher = Sha256::new();
+    let mut first_line_open = true;
     let mut found_bytes = false;
+    let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let buffer = reader
-            .fill_buf()
-            .with_context(|| format!("read first line from {}", path.display()))?;
-        if buffer.is_empty() {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("hash archive {}", path.display()))?;
+        if read == 0 {
             break;
         }
         found_bytes = true;
-        let take = buffer
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(buffer.len(), |index| index + 1);
-        hasher.update(&buffer[..take]);
-        let ended = buffer[take - 1] == b'\n';
-        reader.consume(take);
-        if ended {
-            break;
+        let chunk = &buffer[..read];
+        full_hasher.update(chunk);
+        if first_line_open {
+            let take = chunk
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(chunk.len(), |index| index + 1);
+            first_hasher.update(&chunk[..take]);
+            first_line_open = take == chunk.len() && chunk.last() != Some(&b'\n');
         }
     }
-    let first_line_sha256 = found_bytes.then(|| hex_digest(hasher.finalize().as_slice()));
     Ok(Some(ArchiveCoverage {
         byte_size,
-        first_line_sha256,
+        first_line_sha256: found_bytes.then(|| hex_digest(first_hasher.finalize().as_slice())),
+        full_file_sha256: Some(hex_digest(full_hasher.finalize().as_slice())),
     }))
 }
 
@@ -1366,9 +1657,13 @@ fn repair_progress_journal_locked(
         None
     };
     let checkpoint_covered_old = old_coverage.as_ref().is_some_and(|coverage| {
-        checkpoint
-            .as_ref()
-            .is_some_and(|checkpoint| checkpoint.coverage.as_ref() == Some(coverage))
+        checkpoint.as_ref().is_some_and(|checkpoint| {
+            if checkpoint.schema_version >= CHECKPOINT_SCHEMA_VERSION {
+                checkpoint_covers_archive(checkpoint, Some(coverage))
+            } else {
+                coverage_matches_legacy(checkpoint.coverage.as_ref(), Some(coverage))
+            }
+        })
     });
 
     let tmp_path = unique_maintenance_path(target_path, "repair-tmp");
@@ -1440,6 +1735,7 @@ fn repair_progress_journal_locked(
 
     if checkpoint_covered_old {
         let mut checkpoint = checkpoint.expect("coverage match requires a checkpoint");
+        checkpoint.corrupt_line_count = checkpoint.corrupt_line_count.saturating_sub(dropped_count);
         checkpoint.coverage = archive_coverage_for_path(target_path)?;
         write_progress_checkpoint(active_path, &checkpoint)?;
     }
@@ -1828,6 +2124,9 @@ pub fn build_chat_turn_completed_event_with_metadata(
     }
     if let Some(skills_sha) = &metadata.skills_sha {
         ev["skills_sha"] = serde_json::to_value(skills_sha).unwrap_or(Value::Null);
+    }
+    if let Some(signals) = &metadata.signals {
+        ev["signals"] = serde_json::to_value(signals).unwrap_or(Value::Null);
     }
     ev
 }
@@ -2326,6 +2625,156 @@ mod tests {
     }
 
     #[test]
+    fn terminal_turn_identity_is_durable_and_first_canonical_fact_wins() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let first = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T00:00:00Z",
+            "vendor": "claude",
+            "outcome": "failed",
+            "usage": {},
+        });
+        let stale_replay = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T01:00:00Z",
+            "vendor": "claude",
+            "outcome": "completed",
+            "usage": {},
+        });
+
+        append_event(&path, &first).unwrap();
+        append_event(&path, &stale_replay).unwrap();
+
+        let rows = read_rows(&path);
+        assert_eq!(
+            rows,
+            vec![first],
+            "a restart replay must not replace the first terminal fact"
+        );
+    }
+
+    #[test]
+    fn terminal_first_wins_across_archive_active_and_index_rebuild() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let archive = progress_archive_path(&path);
+        let first = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T00:00:00Z",
+            "outcome": "failed",
+        });
+        let stale_active = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T01:00:00Z",
+            "outcome": "completed",
+        });
+        std::fs::write(
+            &archive,
+            format!("{}\n", serde_json::to_string(&first).unwrap()),
+        )
+        .unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&stale_active).unwrap()),
+        )
+        .unwrap();
+
+        load_or_recover_progress_checkpoint(&path).unwrap();
+        std::fs::remove_file(progress_verdict_index_path(&path)).unwrap();
+
+        let replay = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T02:00:00Z",
+            "outcome": "completed",
+        });
+        let admitted = append_chat_turn_completed_if_absent(&path, &replay).unwrap();
+
+        assert!(!admitted.appended);
+        assert_eq!(admitted.event, first);
+        assert_eq!(read_rows(&path), vec![stale_active]);
+    }
+
+    #[test]
+    fn terminal_pending_index_recovers_only_an_exact_landed_line() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let first = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T00:00:00Z",
+        });
+        let mut line = serde_json::to_vec(&first).unwrap();
+        line.push(b'\n');
+        let index = ProgressVerdictIndex {
+            pending: Some(PendingProgressIndexWrite::TerminalTurn {
+                event: first.clone(),
+                active_offset: 0,
+                line_len: line.len() as u64,
+                line_sha256: hex_digest(Sha256::digest(&line).as_slice()),
+            }),
+            ..ProgressVerdictIndex::default()
+        };
+        write_verdict_index(&path, &index).unwrap();
+        std::fs::write(&path, &line).unwrap();
+
+        let replay = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T01:00:00Z",
+        });
+        let recovered = append_chat_turn_completed_if_absent(&path, &replay).unwrap();
+        assert!(!recovered.appended);
+        assert_eq!(recovered.event, first);
+        assert_eq!(read_rows(&path).len(), 1);
+
+        let missing_path = tmp.path().join("missing-line.jsonl");
+        let missing = ProgressVerdictIndex {
+            pending: Some(PendingProgressIndexWrite::TerminalTurn {
+                event: first,
+                active_offset: 0,
+                line_len: line.len() as u64,
+                line_sha256: hex_digest(Sha256::digest(&line).as_slice()),
+            }),
+            ..ProgressVerdictIndex::default()
+        };
+        write_verdict_index(&missing_path, &missing).unwrap();
+        let admitted = append_chat_turn_completed_if_absent(&missing_path, &replay).unwrap();
+        assert!(admitted.appended);
+        assert_eq!(read_rows(&missing_path), vec![replay]);
+    }
+
+    #[test]
+    fn archive_coverage_hashes_the_entire_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let active = tmp.path().join("progress.jsonl");
+        let archive = progress_archive_path(&active);
+        std::fs::write(&archive, b"same-first-line\ntail-generation-a\n").unwrap();
+        let first = progress_archive_coverage(&active).unwrap().unwrap();
+
+        std::fs::write(&archive, b"same-first-line\ntail-generation-b\n").unwrap();
+        let second = progress_archive_coverage(&active).unwrap().unwrap();
+
+        assert_eq!(first.byte_size, second.byte_size);
+        assert_ne!(
+            first, second,
+            "same-size archives with the same first line are distinct"
+        );
+    }
+
+    #[test]
     fn chat_turn_completed_contributes_priced_cost_to_project_ledger() {
         let event = json!({
             "event": CHAT_TURN_COMPLETED,
@@ -2381,7 +2830,13 @@ mod tests {
             Some("gpt-5.5"),
             Some("codex"),
         );
-        for key in ["outcome", "duration_ms", "role_sha", "skills_sha"] {
+        for key in [
+            "outcome",
+            "duration_ms",
+            "role_sha",
+            "skills_sha",
+            "signals",
+        ] {
             assert!(legacy.get(key).is_none(), "{key} must remain unknown");
         }
 
@@ -2390,6 +2845,11 @@ mod tests {
             duration_ms: Some(1_234),
             role_sha: Some("abc123".into()),
             skills_sha: Some(BTreeMap::from([("research".into(), "def456".into())])),
+            signals: Some(TurnSignals {
+                tool_calls: 7,
+                steered: true,
+                error_recovered: None,
+            }),
         };
         let enriched = build_chat_turn_completed_event_with_metadata(
             "worker",
@@ -2405,6 +2865,8 @@ mod tests {
         assert_eq!(enriched["duration_ms"], 1_234);
         assert_eq!(enriched["role_sha"], "abc123");
         assert_eq!(enriched["skills_sha"]["research"], "def456");
+        assert_eq!(enriched["signals"]["tool_calls"], 7);
+        assert_eq!(enriched["signals"]["steered"], true);
     }
 
     #[test]

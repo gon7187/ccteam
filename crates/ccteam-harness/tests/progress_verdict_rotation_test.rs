@@ -5,6 +5,7 @@ use ccteam_harness::execution::progress_bridge::{
     Verdict,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::io::Write;
 
 #[test]
@@ -108,7 +109,7 @@ fn v1_checkpoint_is_backfilled_before_its_covered_archive_is_replaced() {
     append_event(&active, &json!({"event": "rotate_now"})).unwrap();
 
     let checkpoint = read_progress_checkpoint(&active).unwrap().unwrap();
-    assert_eq!(checkpoint.schema_version, 2);
+    assert_eq!(checkpoint.schema_version, 3);
     assert_eq!(
         checkpoint.event_count, 3,
         "v1 aggregate must not be folded twice"
@@ -119,6 +120,58 @@ fn v1_checkpoint_is_backfilled_before_its_covered_archive_is_replaced() {
             .get(&(verdict.sid.clone(), verdict.turn_id.clone(),)),
         Some(&verdict)
     );
+}
+
+#[test]
+fn v2_legacy_archive_marker_upgrades_without_double_folding() {
+    let temp = tempfile::tempdir().unwrap();
+    let active = temp.path().join("legacy-v2.jsonl");
+    let archive = progress_archive_path(&active);
+    let line = format!(
+        "{}\n",
+        json!({
+            "event": "agent_done",
+            "sid": "s1",
+            "vendor": "claude",
+            "cost_usd": 7.0,
+        })
+    );
+    std::fs::write(&archive, line.as_bytes()).unwrap();
+    let first_line_sha256 = format!("{:x}", Sha256::digest(line.as_bytes()));
+    std::fs::write(
+        progress_checkpoint_path(&active),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 2,
+            "rotation_sequence": 1,
+            "event_count": 1,
+            "corrupt_line_count": 0,
+            "cost_total_usd": 7.0,
+            "cost_total_by_vendor": {"claude": 7.0},
+            "cost_total_by_sid": {"s1": 7.0},
+            "turn_verdicts": {},
+            "terminal_turns": {},
+            "coverage": {
+                "byte_size": line.len(),
+                "first_line_sha256": first_line_sha256,
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let upgraded = load_or_recover_progress_checkpoint(&active)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(upgraded.schema_version, 3);
+    assert_eq!(upgraded.rotation_sequence, 1);
+    assert_eq!(upgraded.event_count, 1);
+    assert_eq!(upgraded.cost_total_usd, 7.0);
+    assert!(upgraded
+        .coverage
+        .as_ref()
+        .and_then(|coverage| coverage.full_file_sha256.as_deref())
+        .is_some());
 }
 
 #[test]

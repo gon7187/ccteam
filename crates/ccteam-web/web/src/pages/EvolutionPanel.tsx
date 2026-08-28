@@ -65,13 +65,23 @@ function pricingLine(lang: Lang, metrics: EvolutionMetrics): string {
 }
 
 function costLine(lang: Lang, bucket: EvolutionBucket): string {
+  const known = usd(bucket.known_cost_usd);
   const total = usd(bucket.total_cost_usd);
-  const average = usd(bucket.avg_cost_usd);
+  const average = usd(bucket.priced_avg_cost_usd);
+  const mixed = typeof bucket.unpriced_turns === "number" && bucket.unpriced_turns > 0;
+  if (mixed && known) {
+    return tr(
+      lang,
+      `≥${known} 已知 · 总计 — · ${average ?? "—"} 已计价平均`,
+      `≥${known} known · total — · ${average ?? "—"} priced avg`,
+      `≥${known} известно · всего — · ${average ?? "—"} среднее с ценой`,
+    );
+  }
   return tr(
     lang,
-    `${total ?? "—"} 总计 · ${average ?? "—"} 平均`,
-    `${total ?? "—"} total · ${average ?? "—"} avg`,
-    `${total ?? "—"} всего · ${average ?? "—"} в среднем`,
+    `${known ?? "—"} 已知 · 总计 ${total ?? "—"} · ${average ?? "—"} 已计价平均`,
+    `${known ?? "—"} known · total ${total ?? "—"} · ${average ?? "—"} priced avg`,
+    `${known ?? "—"} известно · всего ${total ?? "—"} · ${average ?? "—"} среднее с ценой`,
   );
 }
 
@@ -91,11 +101,25 @@ export default function EvolutionPanel({
   lang,
   evolution,
   loading,
+  error,
 }: {
   lang: Lang;
   evolution: EvolutionSummary | null;
   loading: boolean;
+  error?: string | null;
 }) {
+  if (error && !loading) {
+    return (
+      <p style={{ fontSize: 13, color: "var(--danger)" }} data-testid="evolution-degraded">
+        {tr(
+          lang,
+          `自进化数据不可用:${error}。为避免显示不完整统计,此处不会伪装成空数据。`,
+          `Evolution data is unavailable: ${error}. Partial analytics are not shown as an empty dataset.`,
+          `Данные самообучения недоступны: ${error}. Неполная аналитика не выдаётся за пустой набор.`,
+        )}
+      </p>
+    );
+  }
   if (!evolution || evolution.empty) {
     return !loading ? (
       <p style={{ fontSize: 13, color: "var(--text-faint)" }} data-testid="evolution-empty">

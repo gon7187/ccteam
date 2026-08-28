@@ -108,6 +108,8 @@ describe("TurnVerdictControls", () => {
 
     confirm.mockReturnValueOnce(false);
     (improve?.props.onClick as () => void)();
+    expect(confirm).toHaveBeenLastCalledWith(expect.stringContaining("HITL"));
+    expect(confirm).toHaveBeenLastCalledWith(expect.stringContaining("отдельную"));
     expect(onImprove).not.toHaveBeenCalled();
     confirm.mockReturnValueOnce(true);
     (improve?.props.onClick as () => void)();

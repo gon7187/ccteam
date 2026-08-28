@@ -174,14 +174,18 @@ pub fn append_turn(project_dir: &Path, sid: &str, record: &TurnRecord) -> Result
 /// Read every parseable record from the session's turns.jsonl. Returns an
 /// empty Vec when the file is absent (V0.6.0 F108 first-turn case).
 pub fn read_all_turns(project_dir: &Path, sid: &str) -> Result<Vec<TurnRecord>> {
+    Ok(read_all_turns_detailed(project_dir, sid)?.records)
+}
+
+pub fn read_all_turns_detailed(
+    project_dir: &Path,
+    sid: &str,
+) -> Result<super::fs_atomic::JsonlRead<TurnRecord>> {
     let path = turns_jsonl_path(project_dir, sid);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
     // Skip half-flushed / older-shape / torn rows defensively — F118 recovery
     // has to work on whatever survived, so damage must cost one LINE, not the
     // whole transcript ([`super::fs_atomic::read_jsonl`]).
-    super::fs_atomic::read_jsonl(&path)
+    super::fs_atomic::read_jsonl_detailed(&path)
 }
 
 /// Return the last `n` parseable turns, in chronological order. F118

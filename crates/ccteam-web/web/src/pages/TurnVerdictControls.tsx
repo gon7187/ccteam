@@ -58,9 +58,9 @@ export default function TurnVerdictControls({
     const confirmed = window.confirm(
       tr(
         lang,
-        "向同一会话发送普通消息,请 agent 根据这条反馈提出 role / skill / instruction 改进方案?agent 不得在你明确批准前应用任何更改。",
-        "Send one ordinary message asking this session to propose role, skill, or instruction improvements from the feedback? The agent must not apply changes without your explicit approval.",
-        "Отправить в эту сессию обычное сообщение с просьбой предложить улучшения ролей, навыков или инструкций по отзыву? Агент не должен применять изменения без вашего явного одобрения.",
+        "创建一个独立的 HITL 会话,并发送普通的提案请求?ccteam 不会自动批准;任何写入/应用操作都必须等待你的明确批准。",
+        "Create a dedicated HITL session and send it an ordinary proposal request? ccteam auto-approves nothing; any write/apply action must wait for your explicit approval.",
+        "Создать отдельную HITL-сессию и отправить ей обычный запрос на предложение? ccteam ничего не одобряет автоматически; любая запись или применение ждёт вашего явного подтверждения.",
       ),
     );
     if (confirmed) onImprove(feedback);

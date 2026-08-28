@@ -305,13 +305,15 @@ async fn evolution_joins_latest_canonical_verdicts_and_keeps_unknowns_honest() {
     assert_eq!(cto["priced_turns"], 1);
     assert_eq!(cto["unpriced_turns"], 1);
     assert_eq!(cto["avg_duration_ms"], 200.0);
-    assert_eq!(cto["avg_cost_usd"], 2.0);
-    assert_eq!(cto["total_cost_usd"], 2.0);
+    assert_eq!(cto["priced_avg_cost_usd"], 2.0);
+    assert_eq!(cto["known_cost_usd"], 2.0);
+    assert!(cto["total_cost_usd"].is_null());
 
     let worker = roles.iter().find(|row| row["id"] == "worker").unwrap();
     assert_eq!(worker["priced_turns"], 1);
     assert_eq!(worker["unpriced_turns"], 0);
-    assert_eq!(worker["avg_cost_usd"], 0.0);
+    assert_eq!(worker["priced_avg_cost_usd"], 0.0);
+    assert_eq!(worker["known_cost_usd"], 0.0);
     assert_eq!(worker["total_cost_usd"], 0.0);
     assert!(worker["avg_duration_ms"].is_null());
 
@@ -342,7 +344,7 @@ async fn evolution_joins_latest_canonical_verdicts_and_keeps_unknowns_honest() {
 }
 
 #[tokio::test]
-async fn evolution_counts_only_the_latest_record_for_a_replayed_turn() {
+async fn evolution_counts_only_the_first_record_for_a_replayed_turn() {
     let tmp = tempfile::TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     std::fs::create_dir_all(&paths.root).unwrap();
@@ -350,8 +352,8 @@ async fn evolution_counts_only_the_latest_record_for_a_replayed_turn() {
     let dir = paths.project_dir("alpha");
     let now = chrono::Utc::now();
 
-    // Append the revised record first, then replay an older copy. Selection is
-    // by the canonical (sid, turn_id) key and timestamp, not file order.
+    // Append the canonical record first, then replay a newer receipt. Selection
+    // is by first durable (sid, turn_id), never by the replay timestamp.
     append_experience(
         &dir,
         &turn(
@@ -372,7 +374,7 @@ async fn evolution_counts_only_the_latest_record_for_a_replayed_turn() {
         &turn(
             "s1",
             "replayed",
-            now - chrono::Duration::hours(1),
+            now + chrono::Duration::hours(1),
             "worker",
             Some("role-old"),
             &[("research", "skill-old")],
@@ -403,10 +405,94 @@ async fn evolution_counts_only_the_latest_record_for_a_replayed_turn() {
     assert_eq!(roles.len(), 1);
     assert_eq!(roles[0]["id"], "reviewer");
     assert_eq!(roles[0]["sha"], "role-new");
+    assert_eq!(roles[0]["known_cost_usd"], 3.0);
     assert_eq!(roles[0]["total_cost_usd"], 3.0);
     let skills = body["skills"].as_array().unwrap();
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0]["sha"], "skill-new");
+}
+
+#[tokio::test]
+async fn evolution_fails_closed_when_experience_contains_a_corrupt_row() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    seed_project(&paths, "alpha");
+    let dir = paths.project_dir("alpha");
+    append_experience(
+        &dir,
+        &turn(
+            "s1",
+            "t1",
+            chrono::Utc::now(),
+            "cto",
+            Some("role-a"),
+            &[],
+            Some(1.0),
+            Some("completed"),
+            None,
+        ),
+    )
+    .unwrap();
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join(".ccteam/experience.jsonl"))
+        .unwrap();
+    file.write_all(b"{not-json}\n").unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let response = fetch_evolution(addr, "alpha").await;
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data_quality"], "degraded");
+    assert_eq!(body["source"], "experience");
+    assert_eq!(body["corrupt_line_count"], 1);
+}
+
+#[tokio::test]
+async fn evolution_fails_closed_when_progress_contains_a_corrupt_row() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    seed_project(&paths, "alpha");
+    let dir = paths.project_dir("alpha");
+    append_experience(
+        &dir,
+        &turn(
+            "s1",
+            "t1",
+            chrono::Utc::now(),
+            "cto",
+            Some("role-a"),
+            &[],
+            Some(1.0),
+            Some("completed"),
+            None,
+        ),
+    )
+    .unwrap();
+    let progress = paths.progress_jsonl("alpha");
+    std::fs::create_dir_all(progress.parent().unwrap()).unwrap();
+    std::fs::write(&progress, b"{not-json}\n").unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let response = fetch_evolution(addr, "alpha").await;
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data_quality"], "degraded");
+    assert_eq!(body["source"], "progress");
+    assert_eq!(body["corrupt_line_count"], 1);
 }
 
 #[tokio::test]

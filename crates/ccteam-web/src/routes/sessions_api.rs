@@ -3123,6 +3123,8 @@ mod tests {
 
         let stale_completed = serde_json::json!({
             "event": ccteam_core::progress::CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "stale-completed",
             "ts": (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339(),
         });
         ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &stale_completed)
@@ -3133,6 +3135,7 @@ mod tests {
 
         let timeout = serde_json::json!({
             "event": ccteam_core::progress::CHAT_TURN_TIMEOUT,
+            "sid": "s1",
             "stuck": true,
             "ts": chrono::Utc::now().to_rfc3339(),
         });
@@ -3203,6 +3206,7 @@ mod tests {
             &serde_json::json!({
                 "event": ccteam_core::progress::CHAT_TURN_COMPLETED,
                 "sid": "s1",
+                "turn_id": "s1-completed",
                 "ts": (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339(),
             }),
         )
