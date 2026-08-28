@@ -1540,6 +1540,41 @@ pub struct ProjectRetireOutcome {
     pub progress_removed: Vec<String>,
 }
 
+/// Failure of one project retirement, carrying whether the durable RETIRED
+/// marker was already committed.  Once `marker_committed` is `true` the
+/// generation is permanently retired regardless of the error: callers must
+/// report that truthfully and the only forward path is retrying the retire.
+#[derive(Debug)]
+pub struct ProjectRetireError {
+    pub slug: String,
+    pub marker_committed: bool,
+    pub source: anyhow::Error,
+}
+
+impl std::fmt::Display for ProjectRetireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.marker_committed {
+            write!(
+                f,
+                "project `{}` is permanently retired but retirement did not finish: {:#}",
+                self.slug, self.source
+            )
+        } else {
+            write!(
+                f,
+                "project `{}` retirement did not start: {:#}",
+                self.slug, self.source
+            )
+        }
+    }
+}
+
+impl std::error::Error for ProjectRetireError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// The gateway's emit endpoint (V0.8.6 — fix #2). Every [`GatewayEvent`] the
 /// gateway produces (pump answers + progress, turn-timeout watchdog, choice
 /// prompts) is sent through this, which **tees** to two consumers:
@@ -5410,18 +5445,31 @@ impl Gateway {
     /// then drain all process and writer ownership before cleaning progress.
     /// Config deletion is intentionally caller-owned and may happen only after
     /// this method returns `Ok`.
+    ///
+    /// Every error is a [`ProjectRetireError`] (downcast via
+    /// `anyhow::Error::downcast_ref`) so callers can tell a failure before the
+    /// durable marker from one after it.
     pub async fn retire_project_shared(
         gateway: Arc<tokio::sync::Mutex<Self>>,
         slug: &str,
     ) -> Result<ProjectRetireOutcome> {
         let slug = slug.to_string();
+        let not_started = |source: anyhow::Error| {
+            anyhow::Error::new(ProjectRetireError {
+                slug: slug.clone(),
+                marker_committed: false,
+                source,
+            })
+        };
         let progress_path = gateway
             .lock()
             .await
             .project_paths
             .as_ref()
             .map(|paths| paths.progress_jsonl(&slug))
-            .ok_or_else(|| anyhow!("project retirement requires daemon path context"))?;
+            .ok_or_else(|| {
+                not_started(anyhow!("project retirement requires daemon path context"))
+            })?;
 
         // The marker is first and durable.  If the daemon dies after this
         // point, the next daemon refuses the stale config/bot row before it can
@@ -5431,8 +5479,26 @@ impl Gateway {
             ccteam_harness::execution::progress_bridge::mark_progress_retired(&mark_path)
         })
         .await
-        .context("project retirement marker worker failed")??;
+        .context("project retirement marker worker failed")
+        .and_then(|result| result)
+        .map_err(not_started)?;
 
+        Self::retire_project_after_marker(gateway, slug.clone(), progress_path)
+            .await
+            .map_err(|source| {
+                anyhow::Error::new(ProjectRetireError {
+                    slug: slug.clone(),
+                    marker_committed: true,
+                    source,
+                })
+            })
+    }
+
+    async fn retire_project_after_marker(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        slug: String,
+        progress_path: PathBuf,
+    ) -> Result<ProjectRetireOutcome> {
         let initial_sids = {
             let mut guard = gateway.lock().await;
             guard.retiring_projects.insert(slug.clone());
