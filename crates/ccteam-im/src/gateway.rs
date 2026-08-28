@@ -1027,6 +1027,11 @@ pub struct Gateway {
     /// while that disk work runs. Compiled out of production builds.
     #[cfg(test)]
     orphan_scan_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Test hook fired on the blocking worker that re-probes unknown
+    /// retirement markers, so a test can move the world between the probe and
+    /// the apply phase. Compiled out of production builds.
+    #[cfg(test)]
+    retirement_refresh_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     /// The chats that speak for the box OWNER, per platform (`"telegram"` →
     /// `{"339498819"}`, `"lark"` → `{"ou_…"}`). Fed from each global bot's
     /// credential allowlist by the daemon (see [`Self::bind_operator_chats`]).
@@ -1596,6 +1601,31 @@ pub struct ProjectRetireOutcome {
     /// Durable progress-state paths removed after all writers drained.
     pub progress_removed: Vec<String>,
 }
+
+/// Admission refused because the project's durable retirement marker could
+/// not be read. Neither verdict is known, so the gate is fail-CLOSED — but the
+/// condition is transient by nature (EMFILE, EACCES, a clobbered lock path),
+/// so callers on the submit/resume hot path downcast this to re-probe the
+/// marker off-lock once and retry the admission.
+#[derive(Debug, Clone)]
+pub struct RetirementUnknownError {
+    /// Canonical project slug whose marker is unreadable.
+    pub slug: String,
+}
+
+impl std::fmt::Display for RetirementUnknownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "project `{}` retirement state unreadable; retry, or fix the permissions of \
+             `~/.ccteam/state/progress/{}.lock` (`ccteam doctor --repair-progress` rewrites it), \
+             or finish the removal with `ccteam project rm {}`",
+            self.slug, self.slug, self.slug
+        )
+    }
+}
+
+impl std::error::Error for RetirementUnknownError {}
 
 /// Failure of one project retirement, carrying whether the durable RETIRED
 /// marker was already committed.  Once `marker_committed` is `true` the
@@ -2794,6 +2824,8 @@ impl Gateway {
             retirement_unknown: BTreeSet::new(),
             #[cfg(test)]
             orphan_scan_probe: None,
+            #[cfg(test)]
+            retirement_refresh_probe: None,
             operator_chats: BTreeMap::new(),
             current_project: BTreeMap::new(),
             pending_prefix: BTreeMap::new(),
@@ -4278,6 +4310,26 @@ impl Gateway {
         self.orphan_scan_probe = Some(probe);
     }
 
+    /// Blocking-worker hook of the unknown-retirement re-probe. Always `None`
+    /// in production; see [`Self::retirement_refresh_probe`] the field.
+    fn retirement_refresh_probe(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        #[cfg(test)]
+        {
+            self.retirement_refresh_probe.clone()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    /// Test-only: install the blocking-worker probe used by the
+    /// unknown-retirement re-probe.
+    #[cfg(test)]
+    fn set_retirement_refresh_probe(&mut self, probe: Arc<dyn Fn() + Send + Sync>) {
+        self.retirement_refresh_probe = Some(probe);
+    }
+
     fn project_admission_blocked(&self, slug: &str) -> bool {
         self.retiring_projects.contains(slug)
             || self.retired_projects.contains(slug)
@@ -4297,9 +4349,11 @@ impl Gateway {
             anyhow::bail!("project `{slug}` is retired");
         }
         if self.retirement_unknown.contains(slug) {
-            anyhow::bail!(
-                "project `{slug}` retirement state unreadable; run ccteam doctor / retry"
-            );
+            // Typed so the submit/resume entries can tell this transient,
+            // self-healable refusal apart from a real tombstone.
+            return Err(anyhow::Error::new(RetirementUnknownError {
+                slug: slug.to_string(),
+            }));
         }
         Ok(())
     }
@@ -5661,12 +5715,27 @@ impl Gateway {
     /// promotes it to `retired_projects`, an error leaves it unknown.
     ///
     /// Pass `Some(slug)` to probe one project, `None` to sweep the whole set.
+    ///
+    /// The caller's queue budget owns the whole helper: both lock acquisitions
+    /// go through [`GatewayDeadline::lock`] and the blocking probe is bounded
+    /// by the same instant, because `progress_state_is_retired_shared` parks
+    /// on an exclusive `flock` with no timeout of its own. Running out of
+    /// budget leaves the slug unknown — already the fail-closed outcome — so a
+    /// contended lock can never stall the caller past its own deadline.
+    ///
+    /// The apply phase RE-VALIDATES: the probe runs off the lock, so the world
+    /// may have moved. A slug that left `retirement_unknown` meanwhile had its
+    /// state decided by somebody else, and a slug whose retire is in flight
+    /// owns its own teardown — neither may be overwritten by a stale verdict.
     async fn refresh_unknown_retirement_shared(
         gateway: &Arc<tokio::sync::Mutex<Self>>,
         slug: Option<&str>,
+        deadline: GatewayDeadline,
     ) {
-        let (targets, paths) = {
-            let guard = gateway.lock().await;
+        let (targets, paths, probe) = {
+            let Ok(guard) = deadline.lock(gateway).await else {
+                return;
+            };
             if guard.retirement_unknown.is_empty() {
                 return;
             }
@@ -5678,11 +5747,16 @@ impl Gateway {
             let Some(paths) = guard.project_paths.clone() else {
                 return;
             };
-            (targets, paths)
+            (targets, paths, guard.retirement_refresh_probe())
         };
         let probe_targets = targets.clone();
-        let Ok(verdicts) = tokio::task::spawn_blocking(move || {
-            probe_targets
+        let Ok(Ok(verdicts)) = tokio::time::timeout_at(
+            deadline.expires_at.into(),
+            tokio::task::spawn_blocking(move || {
+                if let Some(probe) = probe {
+                    probe();
+                }
+                probe_targets
                 .into_iter()
                 .map(|slug| {
                     let retired =
@@ -5692,13 +5766,21 @@ impl Gateway {
                     (slug, retired)
                 })
                 .collect::<Vec<_>>()
-        })
+            }),
+        )
         .await
         else {
             return;
         };
-        let mut guard = gateway.lock().await;
+        let Ok(mut guard) = deadline.lock(gateway).await else {
+            return;
+        };
         for (slug, verdict) in verdicts {
+            // The probe ran off the lock: a slug that is no longer unknown was
+            // decided while it was in flight, and this verdict is stale.
+            if !guard.retirement_unknown.contains(&slug) {
+                continue;
+            }
             match verdict {
                 Ok(false) => {
                     guard.retirement_unknown.remove(&slug);
@@ -5710,6 +5792,17 @@ impl Gateway {
                 Ok(true) => {
                     guard.retirement_unknown.remove(&slug);
                     guard.retired_projects.insert(slug.clone());
+                    // An in-flight retire owns the teardown ORDER: it still has
+                    // to snapshot `delegations`/`projects` to cancel orphaned
+                    // delegations. Dropping the routes here would wipe that
+                    // snapshot and strand every one of them.
+                    if guard.retiring_projects.contains(&slug) {
+                        tracing::info!(
+                            %slug,
+                            "ccteam-im: project retirement marker became readable during its own retire; leaving teardown to it"
+                        );
+                        continue;
+                    }
                     guard.remove_project_routes(&slug);
                     tracing::info!(
                         %slug,
@@ -5723,6 +5816,33 @@ impl Gateway {
                 ),
             }
         }
+    }
+
+    /// Self-heal one `retirement_unknown` admission refusal.
+    ///
+    /// The fence is fail-closed, so an EMFILE/EACCES blip while probing a
+    /// marker would otherwise wedge a healthy project for the whole daemon
+    /// lifetime: nothing on the submit/resume path ever re-reads the marker,
+    /// and `ensure_project_loaded` skips the slug precisely because admission
+    /// is blocked. So the re-probe belongs where the fence actually bites.
+    ///
+    /// Returns `true` when the slug left `retirement_unknown` and the caller
+    /// should retry its admission ONCE; `false` for any other error, for a
+    /// still-unreadable marker, and for an exhausted queue budget.
+    async fn heal_unknown_retirement(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        error: &anyhow::Error,
+        deadline: GatewayDeadline,
+    ) -> bool {
+        let Some(unknown) = error.downcast_ref::<RetirementUnknownError>() else {
+            return false;
+        };
+        let slug = unknown.slug.clone();
+        Self::refresh_unknown_retirement_shared(gateway, Some(&slug), deadline).await;
+        let Ok(guard) = deadline.lock(gateway).await else {
+            return false;
+        };
+        !guard.retirement_unknown.contains(&slug)
     }
 
     /// Commit a durable project tombstone, fence every daemon admission path,
@@ -5751,7 +5871,8 @@ impl Gateway {
         ccteam_core::validate_slug_format(&slug).map_err(&not_started)?;
         // Resolve an unreadable marker before deciding anything about this
         // slug: an EMFILE blip must not make a retire look like a fresh one.
-        Self::refresh_unknown_retirement_shared(&gateway, Some(&slug)).await;
+        Self::refresh_unknown_retirement_shared(&gateway, Some(&slug), GatewayDeadline::start())
+            .await;
         let (progress_path, catalog_root, rostered) = {
             let guard = gateway.lock().await;
             let paths = guard.project_paths.as_ref().ok_or_else(|| {
@@ -5947,6 +6068,18 @@ impl Gateway {
             }));
         }
         for orphan in orphaned {
+            // Take the SAME per-child claim every other writer of this mirror
+            // takes (dispatch registration, completion delivery, disarm). The
+            // boundary signal of a task that finished microseconds before the
+            // retire is already queued in the notifier channel and needs no
+            // live child to be delivered, so without this claim the parent can
+            // receive BOTH the real completion and "this will never complete".
+            // Holding it across the re-read, the submit and the disarm makes
+            // the two mutually exclusive.
+            let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+            let _claim = claims
+                .lock_for(&Self::delegation_watch_claim_key(&orphan.child_sid))
+                .await;
             // A still-live parent outside the retired project would otherwise
             // wait forever: the child's pump dies at the very turn boundary
             // that produces the completion turn. Tell it the task is dead
@@ -5954,6 +6087,9 @@ impl Gateway {
             // turn (never a prompt injection). `notify: off` watches are
             // ledger-only by contract, so they stay silent here too.
             if orphan.notify_parent {
+                // Re-read under the claim: a mirror that is gone was SPENT by
+                // the notifier, which already delivered the real answer to
+                // this parent. Saying anything more would contradict it.
                 let notify = {
                     let guard = gateway.lock().await;
                     guard
@@ -5996,8 +6132,9 @@ impl Gateway {
                 }
             }
             // Same terminal persistence a cancelled delegation gets: mirror +
-            // watch set + the durable `delegation.json` all go away.
-            Self::disarm_delegation_watch_shared(Arc::clone(&gateway), &orphan.child_sid).await;
+            // watch set + the durable `delegation.json` all go away. The claim
+            // is still held, so this must be the inner, claim-free body.
+            Self::disarm_delegation_watch_claimed(Arc::clone(&gateway), &orphan.child_sid).await;
         }
 
         // Barrier on THIS project's cleanup work only. The global tracker is
@@ -15451,7 +15588,20 @@ impl Gateway {
                     expected_slug.unwrap_or_default()
                 );
             }
-            guard.plan_session_rebuild(&slug, cwd, &meta, &caller)?
+            match guard.plan_session_rebuild(&slug, cwd.clone(), &meta, &caller) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    // An unreadable retirement marker is transient and nothing
+                    // else on the resume path ever re-reads it: probe off-lock
+                    // once, then retry the admission.
+                    drop(guard);
+                    if !Self::heal_unknown_retirement(&gateway, &error, deadline).await {
+                        return Err(error);
+                    }
+                    let mut guard = deadline.lock(&gateway).await?;
+                    guard.plan_session_rebuild(&slug, cwd, &meta, &caller)?
+                }
+            }
         };
         let reservation = SpawnReservationProof::Rebuild {
             generation: plan.generation,
@@ -15628,7 +15778,7 @@ impl Gateway {
             .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
         // Load-time entry: give an unreadable retirement marker a fresh,
         // off-lock read before this project is rostered or spawned into.
-        Self::refresh_unknown_retirement_shared(&gateway, Some(slug)).await;
+        Self::refresh_unknown_retirement_shared(&gateway, Some(slug), deadline).await;
         let cwd = {
             let mut guard = deadline.lock(&gateway).await?;
             guard.ensure_project_loaded(slug);
@@ -16149,7 +16299,7 @@ impl Gateway {
     ) -> Result<CreateSessionOutcome> {
         // Load-time entry: give an unreadable retirement marker a fresh,
         // off-lock read before this project is rostered or spawned into.
-        Self::refresh_unknown_retirement_shared(&gateway, Some(&project)).await;
+        Self::refresh_unknown_retirement_shared(&gateway, Some(&project), deadline).await;
         let (host, wire_slug, root, proxy) = {
             let mut guard = deadline.lock(&gateway).await?;
             guard.ensure_project_loaded(&project);
@@ -16820,7 +16970,7 @@ impl Gateway {
     ) -> Result<CreateSessionOutcome> {
         // Load-time entry: give an unreadable retirement marker a fresh,
         // off-lock read before this project is rostered or spawned into.
-        Self::refresh_unknown_retirement_shared(&gateway, Some(&project)).await;
+        Self::refresh_unknown_retirement_shared(&gateway, Some(&project), deadline).await;
         let (host, wire_slug, root, proxy) = {
             let mut guard = deadline.lock(&gateway).await?;
             guard.ensure_project_loaded(&project);
@@ -17157,7 +17307,7 @@ impl Gateway {
         deadline: GatewayDeadline,
     ) -> Result<bool> {
         let claims = Arc::clone(&deadline.lock(&gateway).await?.spawn_claims);
-        let claim_key = ChatKey::new("delegation-watch", child_sid, child_sid);
+        let claim_key = Self::delegation_watch_claim_key(child_sid);
         let _claim =
             tokio::time::timeout_at(deadline.expires_at.into(), claims.lock_for(&claim_key))
                 .await
@@ -17293,14 +17443,30 @@ impl Gateway {
         }
     }
 
+    /// Per-child claim key that serializes every writer of a delegation
+    /// mirror: dispatch/watch registration, completion delivery, disarm and
+    /// the retire's cancellation. One key, one writer at a time.
+    fn delegation_watch_claim_key(child_sid: &str) -> ChatKey {
+        ChatKey::new("delegation-watch", child_sid, child_sid)
+    }
+
     /// Remove a watch without holding the gateway mutex across filesystem IO.
     pub async fn disarm_delegation_watch_shared(
         gateway: Arc<tokio::sync::Mutex<Self>>,
         child_sid: &str,
     ) {
         let claims = Arc::clone(&gateway.lock().await.spawn_claims);
-        let claim_key = ChatKey::new("delegation-watch", child_sid, child_sid);
+        let claim_key = Self::delegation_watch_claim_key(child_sid);
         let _claim = claims.lock_for(&claim_key).await;
+        Self::disarm_delegation_watch_claimed(gateway, child_sid).await;
+    }
+
+    /// Disarm body for a caller that ALREADY holds the per-child claim.
+    /// Re-acquiring it here would deadlock against its own holder.
+    async fn disarm_delegation_watch_claimed(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        child_sid: &str,
+    ) {
         let project_dir = {
             let mut guard = gateway.lock().await;
             guard
@@ -17401,7 +17567,7 @@ impl Gateway {
                 .await
                 .spawn_claims,
         );
-        let claim_key = ChatKey::new("delegation-watch", &signal.child_sid, &signal.child_sid);
+        let claim_key = Self::delegation_watch_claim_key(&signal.child_sid);
         let _claim = claims.lock_for(&claim_key).await;
         let Some(plan) = crate::latency::gateway_lock(&gateway, "notifier.plan")
             .await
@@ -17956,24 +18122,29 @@ impl Gateway {
         loop {
             attempt += 1;
             let plan = {
-                let mut guard = deadline.lock(&gateway).await?;
-                let needs_resume = guard
+                let needs_resume = deadline
+                    .lock(&gateway)
+                    .await?
                     .sessions
                     .get(sid)
                     .is_some_and(|session| !session.adapter.thread_is_live(&session.thread));
                 if needs_resume {
-                    drop(guard);
                     Self::resume_dead_session_shared_with_deadline(
                         Arc::clone(&gateway),
                         sid,
                         deadline,
                     )
                     .await?;
-                    let mut guard = deadline.lock(&gateway).await?;
-                    guard.plan_unlocked_turn(sid, text.clone(), origin, context.as_ref())?
-                } else {
-                    guard.plan_unlocked_turn(sid, text.clone(), origin, context.as_ref())?
                 }
+                Self::plan_unlocked_turn_shared(
+                    &gateway,
+                    sid,
+                    text.clone(),
+                    origin,
+                    context.as_ref(),
+                    deadline,
+                )
+                .await?
             };
             let mut rollback = UnlockedTurnRollbackGuard::new(&gateway, &plan);
             if let Some(ready) = ready.take() {
@@ -18249,6 +18420,38 @@ impl Gateway {
                 }
             }
         }
+    }
+
+    /// Plan one turn, re-probing an unreadable retirement marker once.
+    ///
+    /// `plan_unlocked_turn` runs its admission gate before any of its side
+    /// effects, so a refusal is side-effect free and safe to retry after the
+    /// off-lock re-probe resolved the marker.
+    async fn plan_unlocked_turn_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        user_text: String,
+        origin: TurnOrigin,
+        context: Option<&ImSubmitContext>,
+        deadline: GatewayDeadline,
+    ) -> Result<UnlockedTurnPlan> {
+        let planned = deadline.lock(gateway).await?.plan_unlocked_turn(
+            sid,
+            user_text.clone(),
+            origin,
+            context,
+        );
+        let error = match planned {
+            Ok(plan) => return Ok(plan),
+            Err(error) => error,
+        };
+        if !Self::heal_unknown_retirement(gateway, &error, deadline).await {
+            return Err(error);
+        }
+        deadline
+            .lock(gateway)
+            .await?
+            .plan_unlocked_turn(sid, user_text, origin, context)
     }
 
     fn plan_unlocked_turn(
@@ -39910,7 +40113,12 @@ mod tests {
         // again without a daemon restart.
         let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
         std::fs::remove_dir(&lock_path).unwrap();
-        Gateway::refresh_unknown_retirement_shared(&gateway, Some("alpha")).await;
+        Gateway::refresh_unknown_retirement_shared(
+            &gateway,
+            Some("alpha"),
+            GatewayDeadline::start(),
+        )
+        .await;
         {
             let guard = gateway.lock().await;
             assert!(guard.retirement_unknown.is_empty());
@@ -39928,7 +40136,12 @@ mod tests {
             &paths.progress_jsonl("alpha"),
         )
         .unwrap();
-        Gateway::refresh_unknown_retirement_shared(&gateway, Some("alpha")).await;
+        Gateway::refresh_unknown_retirement_shared(
+            &gateway,
+            Some("alpha"),
+            GatewayDeadline::start(),
+        )
+        .await;
         {
             let guard = gateway.lock().await;
             assert!(guard.retirement_unknown.is_empty());
@@ -40136,6 +40349,345 @@ mod tests {
         assert!(cancellation.contains("wave 3"), "{cancellation}");
     }
 
+    /// W4 [0] — the retire's cancellation turn and the notifier's completion
+    /// turn are MUTUALLY EXCLUSIVE. A boundary signal queued microseconds
+    /// before the retire needs no live child to be delivered, so an unfenced
+    /// retire could tell an orchestrating parent "this task is dead" while the
+    /// notifier handed it the finished answer. The per-child claim — the same
+    /// one dispatch registration, delivery and disarm take — makes the parent
+    /// receive exactly ONE of the two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn project_retire_cancellation_never_contradicts_a_delivered_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let beta_dir = paths.projects_root.join("beta");
+        std::fs::create_dir_all(&beta_dir).unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        gateway.register_project("beta", &beta_dir);
+
+        let parent = gateway
+            .create_session_api(
+                "beta".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let child = "s9102";
+        ccteam_harness::execution::delegation::write_delegation_watch(
+            &project_dir,
+            child,
+            &ccteam_harness::execution::delegation::DelegationWatch::armed(
+                parent.clone(),
+                ccteam_harness::NotifyMode::Final,
+                Some("wave 4".to_string()),
+                None,
+            ),
+        )
+        .unwrap();
+        gateway.delegations.insert(
+            child.to_string(),
+            DelegationMirror {
+                generation: 0,
+                parent_sid: parent.clone(),
+                notify: ccteam_harness::NotifyMode::Final,
+                title: Some("wave 4".to_string()),
+                slug: "alpha".to_string(),
+                project_dir: project_dir.clone(),
+                notified_turns: Vec::new(),
+            },
+        );
+        gateway
+            .delegation_watch_set
+            .write()
+            .unwrap()
+            .insert(child.to_string());
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        // Stand in for `deliver_delegation_signal_shared`, which holds this
+        // very claim across plan, spend and parent submit.
+        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+        let claim = claims
+            .lock_for(&Gateway::delegation_watch_claim_key(child))
+            .await;
+
+        let retire = tokio::spawn({
+            let gateway = Arc::clone(&gateway);
+            async move { Gateway::retire_project_shared(gateway, "alpha").await }
+        });
+        // Give an unfenced retire every chance to reach its notify block.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The notifier wins the race: it spends the watch and delivers the
+        // real answer to the parent.
+        {
+            let mut guard = gateway.lock().await;
+            guard.delegations.remove(child);
+            guard.delegation_watch_set.write().unwrap().remove(child);
+        }
+        Gateway::submit_to_sid_shared_with_origin(
+            Arc::clone(&gateway),
+            &parent,
+            format!("[ccteam] delegated session {child} finished"),
+            TurnOrigin::DelegationCompletion,
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+        drop(claim);
+
+        retire.await.unwrap().unwrap();
+
+        let submitted = fake.submissions.lock().await.clone();
+        assert_eq!(
+            submitted.len(),
+            1,
+            "the parent must receive exactly one turn about this delegation: {submitted:?}"
+        );
+        assert!(
+            submitted[0].1.contains("finished"),
+            "the delivered completion must stand alone: {submitted:?}"
+        );
+        assert!(
+            !submitted[0].1.contains("делегирование отменено"),
+            "a spent watch must not also be cancelled: {submitted:?}"
+        );
+    }
+
+    /// W4 [1] — `retirement_unknown` is fail-closed, and nothing on the submit
+    /// path used to re-read the marker: one transient EMFILE while probing it
+    /// wedged every message to every live session of that project for the
+    /// daemon's lifetime. The submit entry now re-probes off-lock once and
+    /// retries the admission.
+    #[tokio::test]
+    async fn submit_self_heals_a_transient_unknown_retirement_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        // A transient probe failure closed the fence; the marker itself is
+        // readable and says the project is ACTIVE.
+        gateway.retirement_unknown.insert("alpha".to_string());
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        Gateway::submit_to_sid_shared(
+            Arc::clone(&gateway),
+            &sid,
+            "ping".to_string(),
+            GatewayDeadline::start(),
+        )
+        .await
+        .expect("the first submit must clear the stale unknown and go through");
+
+        assert!(!gateway.lock().await.retirement_unknown.contains("alpha"));
+        assert_eq!(fake.submissions.lock().await.len(), 1);
+    }
+
+    /// W4 [1] — the same self-heal on the cold resume entry: a stopped session
+    /// of a wrongly-unknown project must come back instead of being refused
+    /// forever.
+    #[tokio::test]
+    async fn resume_self_heals_a_transient_unknown_retirement_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway.sessions.remove(&sid);
+        gateway.retirement_unknown.insert("alpha".to_string());
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        let resumed = Gateway::resume_stopped_session_shared(
+            Arc::clone(&gateway),
+            &sid,
+            &web_api_chat().identity(),
+            None,
+            GatewayDeadline::start(),
+        )
+        .await
+        .expect("resume must re-probe the marker instead of refusing forever");
+        assert_eq!(resumed, sid);
+        assert!(!gateway.lock().await.retirement_unknown.contains("alpha"));
+    }
+
+    /// W4 [1] — the refusal must name remedies that can actually clear it.
+    /// `ccteam doctor` alone never touches the daemon's in-memory set.
+    #[test]
+    fn unknown_retirement_refusal_names_a_remedy_that_exists() {
+        let error = RetirementUnknownError {
+            slug: "alpha".to_string(),
+        };
+        let text = error.to_string();
+        assert!(text.contains("retry"), "{text}");
+        assert!(text.contains("ccteam project rm alpha"), "{text}");
+        assert!(text.contains("progress/alpha.lock"), "{text}");
+    }
+
+    /// W4 [2] — the re-probe runs OFF the lock, so its verdict can be stale by
+    /// the time it applies. A slug that left `retirement_unknown` meanwhile had
+    /// its state decided by somebody else and must not be overwritten.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_retirement_refresh_drops_a_verdict_decided_while_it_probed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        let progress = paths.progress_jsonl("alpha");
+        gateway.enable_project_creation(paths);
+        ccteam_harness::execution::progress_bridge::mark_progress_retired(&progress).unwrap();
+        gateway.retirement_unknown.insert("alpha".to_string());
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        {
+            let probe_gateway = Arc::clone(&gateway);
+            gateway
+                .lock()
+                .await
+                .set_retirement_refresh_probe(Arc::new(move || {
+                    probe_gateway
+                        .blocking_lock()
+                        .retirement_unknown
+                        .remove("alpha");
+                }));
+        }
+        Gateway::refresh_unknown_retirement_shared(
+            &gateway,
+            Some("alpha"),
+            GatewayDeadline::start(),
+        )
+        .await;
+
+        let guard = gateway.lock().await;
+        assert!(
+            !guard.retired_projects.contains("alpha"),
+            "a verdict for a slug decided elsewhere must be dropped"
+        );
+        assert!(
+            guard.projects.contains_key("alpha"),
+            "and its routes must survive"
+        );
+    }
+
+    /// W4 [2] — an in-flight retire owns the teardown ORDER: it still has to
+    /// snapshot `delegations`/`projects` to cancel orphaned delegations. A
+    /// concurrent refresh that promoted the slug used to call
+    /// `remove_project_routes` mid-retire, wiping exactly that snapshot and
+    /// stranding every delegation it was about to cancel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_retirement_refresh_leaves_routes_to_an_in_flight_retire() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        let progress = paths.progress_jsonl("alpha");
+        gateway.enable_project_creation(paths);
+        ccteam_harness::execution::progress_bridge::mark_progress_retired(&progress).unwrap();
+        gateway.retirement_unknown.insert("alpha".to_string());
+        gateway.delegations.insert(
+            "s9202".to_string(),
+            DelegationMirror {
+                generation: 0,
+                parent_sid: "s9201".to_string(),
+                notify: ccteam_harness::NotifyMode::Final,
+                title: None,
+                slug: "alpha".to_string(),
+                project_dir: project_dir.clone(),
+                notified_turns: Vec::new(),
+            },
+        );
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        {
+            let probe_gateway = Arc::clone(&gateway);
+            gateway
+                .lock()
+                .await
+                .set_retirement_refresh_probe(Arc::new(move || {
+                    probe_gateway
+                        .blocking_lock()
+                        .retiring_projects
+                        .insert("alpha".to_string());
+                }));
+        }
+        Gateway::refresh_unknown_retirement_shared(
+            &gateway,
+            Some("alpha"),
+            GatewayDeadline::start(),
+        )
+        .await;
+
+        let guard = gateway.lock().await;
+        assert!(guard.retired_projects.contains("alpha"));
+        assert!(
+            guard.projects.contains_key("alpha"),
+            "the retire still needs the roster row to attribute delegation parents"
+        );
+        assert!(
+            guard.delegations.contains_key("s9202"),
+            "the retire still needs the mirror to cancel the delegation"
+        );
+    }
+
+    /// W4 [3] — the re-probe blocks on an exclusive `flock` with no timeout of
+    /// its own, so it must live inside the caller's queue budget. Out of
+    /// budget it leaves the slug unknown (already the fail-closed outcome)
+    /// instead of stalling the request past its own deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_retirement_refresh_stays_inside_the_queue_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        gateway.retirement_unknown.insert("alpha".to_string());
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        gateway
+            .lock()
+            .await
+            .set_retirement_refresh_probe(Arc::new(|| {
+                std::thread::sleep(Duration::from_secs(3));
+            }));
+
+        let deadline = GatewayDeadline {
+            expires_at: Instant::now() + Duration::from_millis(100),
+        };
+        let started = Instant::now();
+        Gateway::refresh_unknown_retirement_shared(&gateway, Some("alpha"), deadline).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the probe must not outlive the caller's budget: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            gateway.lock().await.retirement_unknown.contains("alpha"),
+            "an unfinished probe must leave the fence closed"
+        );
+    }
     /// G5c — resolving a delegation parent that is neither live nor in the
     /// retired project falls through to `SessionCatalog`, one blocking
     /// `open`+`read`+`parse` per rostered project per miss. Doing that under
