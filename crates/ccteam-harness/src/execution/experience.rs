@@ -254,9 +254,10 @@ pub fn skills_fingerprint(project_dir: &Path) -> Option<BTreeMap<String, String>
     } else if !root_metadata.is_dir() {
         return None;
     }
-    let entries = fs::read_dir(&skills_root).ok()?;
+    let entries = read_dir_bounded_sorted(&skills_root, MAX_SKILL_FINGERPRINT_FILES).ok()?;
     let mut map = BTreeMap::new();
-    for entry in entries.flatten() {
+    let mut budget = SkillFingerprintBudget::default();
+    for entry in entries {
         let path = entry.path();
         let Ok(file_type) = entry.file_type() else {
             continue;
@@ -271,7 +272,7 @@ pub fn skills_fingerprint(project_dir: &Path) -> Option<BTreeMap<String, String>
         let Some(id) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        map.insert(id, skill_dir_digest(&path));
+        map.insert(id, skill_dir_digest(&path, &mut budget));
     }
     if map.is_empty() {
         None
@@ -281,10 +282,9 @@ pub fn skills_fingerprint(project_dir: &Path) -> Option<BTreeMap<String, String>
 }
 
 /// Digest of one skill directory: sha256 over sorted `"relpath:content_sha"` lines.
-fn skill_dir_digest(skill_dir: &Path) -> String {
+fn skill_dir_digest(skill_dir: &Path, budget: &mut SkillFingerprintBudget) -> String {
     let mut pairs: Vec<(String, String)> = Vec::new();
-    let mut budget = SkillFingerprintBudget::default();
-    if collect_skill_files(skill_dir, skill_dir, 0, &mut budget, &mut pairs).is_err() {
+    if collect_skill_files(skill_dir, skill_dir, 0, budget, &mut pairs).is_err() {
         return "unavailable".to_string();
     }
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -307,6 +307,18 @@ const MAX_ROLE_FINGERPRINT_BYTES: u64 = 1024 * 1024;
 struct SkillFingerprintBudget {
     files: usize,
     bytes: u64,
+}
+
+fn read_dir_bounded_sorted(dir: &Path, max_entries: usize) -> Result<Vec<fs::DirEntry>> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("read directory {}", dir.display()))? {
+        if entries.len() >= max_entries {
+            anyhow::bail!("skill fingerprint directory entry limit exceeded");
+        }
+        entries.push(entry.with_context(|| format!("read directory entry in {}", dir.display()))?);
+    }
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    Ok(entries)
 }
 
 fn collect_skill_files(
@@ -875,6 +887,73 @@ mod tests {
         assert_eq!(
             fingerprints.get("bounded").map(String::as_str),
             Some("unavailable")
+        );
+    }
+
+    #[test]
+    fn skills_fingerprint_enforces_aggregate_limits_across_skills() {
+        let file_tmp = TempDir::new().unwrap();
+        let skills = file_tmp.path().join(".claude/skills");
+        let first = skills.join("a-first");
+        let second = skills.join("b-second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        for index in 0..(MAX_SKILL_FINGERPRINT_FILES / 2) {
+            fs::write(first.join(format!("{index:04}.md")), b"a").unwrap();
+        }
+        for index in 0..=(MAX_SKILL_FINGERPRINT_FILES / 2) {
+            fs::write(second.join(format!("{index:04}.md")), b"b").unwrap();
+        }
+
+        let fingerprints = skills_fingerprint(file_tmp.path()).unwrap();
+        assert_ne!(
+            fingerprints.get("a-first").map(String::as_str),
+            Some("unavailable")
+        );
+        assert_eq!(
+            fingerprints.get("b-second").map(String::as_str),
+            Some("unavailable"),
+            "the file budget must not reset for each top-level skill"
+        );
+
+        let byte_tmp = TempDir::new().unwrap();
+        let first = byte_tmp.path().join(".claude/skills/a-first");
+        let second = byte_tmp.path().join(".claude/skills/b-second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::File::create(first.join("half.bin"))
+            .unwrap()
+            .set_len(MAX_SKILL_FINGERPRINT_BYTES / 2)
+            .unwrap();
+        fs::File::create(second.join("over-half.bin"))
+            .unwrap()
+            .set_len(MAX_SKILL_FINGERPRINT_BYTES / 2 + 1)
+            .unwrap();
+
+        let fingerprints = skills_fingerprint(byte_tmp.path()).unwrap();
+        assert_ne!(
+            fingerprints.get("a-first").map(String::as_str),
+            Some("unavailable")
+        );
+        assert_eq!(
+            fingerprints.get("b-second").map(String::as_str),
+            Some("unavailable"),
+            "the byte budget must not reset for each top-level skill"
+        );
+    }
+
+    #[test]
+    fn skills_fingerprint_bounds_top_level_enumeration() {
+        let tmp = TempDir::new().unwrap();
+        let skills = tmp.path().join(".claude/skills");
+        fs::create_dir_all(&skills).unwrap();
+        for index in 0..=MAX_SKILL_FINGERPRINT_FILES {
+            fs::create_dir(skills.join(format!("skill-{index:04}"))).unwrap();
+        }
+
+        assert!(
+            skills_fingerprint(tmp.path()).is_none(),
+            "top-level skill enumeration must be bounded before hashing"
         );
     }
 

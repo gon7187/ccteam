@@ -9,6 +9,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -476,7 +478,15 @@ enum PendingProgressIndexWrite {
         active_offset: u64,
         line_len: u64,
         line_sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_file_identity: Option<PendingActiveFileIdentity>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PendingActiveFileIdentity {
+    device: u64,
+    inode: u64,
 }
 
 /// Small durable projection used by verdict GET/PUT. `progress.jsonl` remains
@@ -862,20 +872,25 @@ pub fn append_chat_turn_completed_if_absent(
             anyhow::anyhow!("progress verdict index disappeared for {}", path.display())
         })?;
     }
-    let active_offset = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let active_metadata = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?;
+    let active_offset = active_metadata.len();
     index.pending = Some(PendingProgressIndexWrite::TerminalTurn {
         event: event.clone(),
         active_offset,
         line_len: byte_count,
         line_sha256: hex_digest(Sha256::digest(&line).as_slice()),
+        active_file_identity: pending_active_file_identity(&active_metadata),
     });
     write_verdict_index(path, &index)?;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
     file.write_all(&line)
         .with_context(|| format!("write terminal turn event to {}", path.display()))?;
     let size = file
@@ -1148,34 +1163,143 @@ fn read_verdict_index_locked(path: &Path) -> Result<Option<ProgressVerdictIndex>
             active_offset,
             line_len,
             line_sha256,
+            active_file_identity,
         } => {
             let (sid, turn_id) = terminal_turn_identity(&event)
                 .context("malformed terminal turn in pending progress index")?;
             let sid = sid.to_string();
             let turn_id = turn_id.to_string();
-            let line_len = usize::try_from(line_len).context("terminal pending line too large")?;
-            let mut raw = vec![0_u8; line_len];
-            let committed = File::open(path)
-                .and_then(|mut file| {
-                    file.seek(SeekFrom::Start(active_offset))?;
-                    file.read_exact(&mut raw)
-                })
-                .is_ok()
-                && hex_digest(Sha256::digest(&raw).as_slice()) == line_sha256
-                && serde_json::from_slice::<Value>(trim_ascii_line(&raw))
-                    .is_ok_and(|candidate| candidate == event);
-            if committed {
-                index
-                    .terminal_turns
-                    .entry(sid)
-                    .or_default()
-                    .entry(turn_id)
-                    .or_insert(event);
+            match recover_pending_terminal_append(
+                path,
+                &event,
+                active_offset,
+                line_len,
+                &line_sha256,
+                active_file_identity.as_ref(),
+            )? {
+                PendingTerminalAppendState::Committed => {
+                    index
+                        .terminal_turns
+                        .entry(sid)
+                        .or_default()
+                        .entry(turn_id)
+                        .or_insert(event);
+                }
+                PendingTerminalAppendState::Absent => {}
             }
         }
     }
     write_verdict_index(path, &index)?;
     Ok(Some(index))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingTerminalAppendState {
+    Committed,
+    Absent,
+}
+
+fn recover_pending_terminal_append(
+    path: &Path,
+    event: &Value,
+    active_offset: u64,
+    line_len: u64,
+    line_sha256: &str,
+    expected_identity: Option<&PendingActiveFileIdentity>,
+) -> Result<PendingTerminalAppendState> {
+    let expected_len = usize::try_from(line_len).context("terminal pending line too large")?;
+    let mut expected =
+        serde_json::to_vec(event).context("serialize terminal turn from pending progress index")?;
+    expected.push(b'\n');
+    if expected.len() != expected_len
+        || hex_digest(Sha256::digest(&expected).as_slice()) != line_sha256
+    {
+        anyhow::bail!("ambiguous pending terminal append: index line identity mismatch");
+    }
+
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && active_offset == 0
+                && expected_identity.is_none() =>
+        {
+            return Ok(PendingTerminalAppendState::Absent);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "ambiguous pending terminal append: active file is absent before offset {active_offset}"
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("open {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?;
+    let active_len = metadata.len();
+    if active_len < active_offset {
+        anyhow::bail!(
+            "ambiguous pending terminal append: active file ends before offset {active_offset}"
+        );
+    }
+
+    let available = active_len.saturating_sub(active_offset);
+    if available == 0 {
+        ensure_pending_file_identity(expected_identity, &metadata)?;
+        return Ok(PendingTerminalAppendState::Absent);
+    }
+
+    let read_len =
+        usize::try_from(available.min(line_len)).context("pending terminal tail is too large")?;
+    let mut raw = vec![0_u8; read_len];
+    file.seek(SeekFrom::Start(active_offset))
+        .with_context(|| format!("seek {}", path.display()))?;
+    file.read_exact(&mut raw)
+        .with_context(|| format!("read pending terminal tail from {}", path.display()))?;
+
+    if available >= line_len && raw == expected {
+        return Ok(PendingTerminalAppendState::Committed);
+    }
+    if available < line_len && raw == expected[..read_len] {
+        ensure_pending_file_identity(expected_identity, &metadata)?;
+        file.set_len(active_offset)
+            .with_context(|| format!("truncate torn terminal tail in {}", path.display()))?;
+        file.sync_data()
+            .with_context(|| format!("sync truncated terminal tail in {}", path.display()))?;
+        return Ok(PendingTerminalAppendState::Absent);
+    }
+
+    anyhow::bail!("ambiguous pending terminal append: active bytes do not match the recorded line");
+}
+
+fn ensure_pending_file_identity(
+    expected: Option<&PendingActiveFileIdentity>,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        anyhow::bail!("ambiguous pending terminal append: active file identity is unavailable");
+    };
+    if pending_active_file_identity(metadata).as_ref() != Some(expected) {
+        anyhow::bail!("ambiguous pending terminal append: active file identity changed");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn pending_active_file_identity(metadata: &std::fs::Metadata) -> Option<PendingActiveFileIdentity> {
+    Some(PendingActiveFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn pending_active_file_identity(
+    _metadata: &std::fs::Metadata,
+) -> Option<PendingActiveFileIdentity> {
+    None
 }
 
 fn trim_ascii_line(mut raw: &[u8]) -> &[u8] {
@@ -2723,6 +2847,7 @@ mod tests {
                 active_offset: 0,
                 line_len: line.len() as u64,
                 line_sha256: hex_digest(Sha256::digest(&line).as_slice()),
+                active_file_identity: None,
             }),
             ..ProgressVerdictIndex::default()
         };
@@ -2747,6 +2872,7 @@ mod tests {
                 active_offset: 0,
                 line_len: line.len() as u64,
                 line_sha256: hex_digest(Sha256::digest(&line).as_slice()),
+                active_file_identity: None,
             }),
             ..ProgressVerdictIndex::default()
         };
@@ -2754,6 +2880,95 @@ mod tests {
         let admitted = append_chat_turn_completed_if_absent(&missing_path, &replay).unwrap();
         assert!(admitted.appended);
         assert_eq!(read_rows(&missing_path), vec![replay]);
+    }
+
+    #[test]
+    fn terminal_pending_index_truncates_an_exact_torn_tail_before_retry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let pending_event = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T00:00:00Z",
+        });
+        let mut pending_line = serde_json::to_vec(&pending_event).unwrap();
+        pending_line.push(b'\n');
+        let existing = json!({"event": "session_started", "sid": "s1"});
+        let mut existing_line = serde_json::to_vec(&existing).unwrap();
+        existing_line.push(b'\n');
+        let active_offset = existing_line.len() as u64;
+        let mut torn_file = existing_line.clone();
+        torn_file.extend_from_slice(&pending_line[..pending_line.len() / 2]);
+        std::fs::write(&path, &torn_file).unwrap();
+        let active_file_identity = pending_active_file_identity(&std::fs::metadata(&path).unwrap());
+        let index = ProgressVerdictIndex {
+            pending: Some(PendingProgressIndexWrite::TerminalTurn {
+                event: pending_event,
+                active_offset,
+                line_len: pending_line.len() as u64,
+                line_sha256: hex_digest(Sha256::digest(&pending_line).as_slice()),
+                active_file_identity,
+            }),
+            ..ProgressVerdictIndex::default()
+        };
+        write_verdict_index(&path, &index).unwrap();
+
+        let replay = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T01:00:00Z",
+        });
+        let admitted = append_chat_turn_completed_if_absent(&path, &replay).unwrap();
+
+        assert!(admitted.appended);
+        assert_eq!(admitted.event, replay);
+        let mut expected_file = existing_line;
+        expected_file.extend_from_slice(&serde_json::to_vec(&replay).unwrap());
+        expected_file.push(b'\n');
+        assert_eq!(std::fs::read(&path).unwrap(), expected_file);
+    }
+
+    #[test]
+    fn terminal_pending_index_preserves_an_ambiguous_tail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let pending_event = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T00:00:00Z",
+        });
+        let mut pending_line = serde_json::to_vec(&pending_event).unwrap();
+        pending_line.push(b'\n');
+        let unrelated = b"unrelated later bytes";
+        std::fs::write(&path, unrelated).unwrap();
+        let active_file_identity = pending_active_file_identity(&std::fs::metadata(&path).unwrap());
+        let index = ProgressVerdictIndex {
+            pending: Some(PendingProgressIndexWrite::TerminalTurn {
+                event: pending_event,
+                active_offset: 0,
+                line_len: pending_line.len() as u64,
+                line_sha256: hex_digest(Sha256::digest(&pending_line).as_slice()),
+                active_file_identity,
+            }),
+            ..ProgressVerdictIndex::default()
+        };
+        write_verdict_index(&path, &index).unwrap();
+        let replay = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T01:00:00Z",
+        });
+
+        let error = append_chat_turn_completed_if_absent(&path, &replay)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("ambiguous pending terminal append"));
+        assert_eq!(std::fs::read(&path).unwrap(), unrelated);
     }
 
     #[test]
