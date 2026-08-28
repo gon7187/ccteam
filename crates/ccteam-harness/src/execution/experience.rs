@@ -878,27 +878,7 @@ fn cost_vendor_from_label(vendor: &str) -> Option<ccteam_cost::Vendor> {
 }
 
 fn read_retained_progress_events(path: &Path) -> Result<Vec<serde_json::Value>> {
-    let checkpoint = super::progress_bridge::load_or_recover_progress_checkpoint(path)?;
-    if checkpoint
-        .as_ref()
-        .is_some_and(|checkpoint| checkpoint.corrupt_line_count > 0)
-    {
-        anyhow::bail!("canonical progress history contains corrupt lines");
-    }
-    let mut events = checkpoint
-        .into_iter()
-        .flat_map(|checkpoint| checkpoint.terminal_turns.into_values())
-        .flat_map(|turns| turns.into_values())
-        .collect::<Vec<_>>();
-    let active = super::fs_atomic::read_jsonl_detailed(path)?;
-    if active.corrupt_line_count > 0 {
-        anyhow::bail!(
-            "canonical progress contains {} corrupt line(s)",
-            active.corrupt_line_count
-        );
-    }
-    events.extend(active.records);
-    Ok(events)
+    super::progress_bridge::terminal_turns_for_rebuild(path)
 }
 
 #[cfg(test)]

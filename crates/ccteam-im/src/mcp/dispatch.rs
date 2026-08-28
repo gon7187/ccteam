@@ -121,6 +121,12 @@ impl McpDispatch {
     /// same-uid trust the socket already implies, not a route ccteam drives.
     pub async fn dispatch(&self, req: Value) -> Option<Value> {
         let (req, caller) = self.promote_local_admin(req);
+        if is_project_retire_call(&req) {
+            if caller != McpCaller::Admin {
+                return Some(internal_bus_not_exposed(&req));
+            }
+            return Some(execute_project_retire(&req, self.gateway.as_ref()).await);
+        }
         self.dispatch_as(req, caller).await
     }
 
@@ -187,7 +193,12 @@ impl McpDispatch {
         if caller.user_id().is_some() {
             strip_untrusted_caller_args(&mut req);
         }
-        if is_interaction_ask_call(&req) {
+        if is_project_retire_call(&req) {
+            // This method is deliberately absent from every HTTP/ambient/user
+            // surface.  Even a direct Admin tier cannot invoke it: only
+            // `dispatch()` proves the local mcp.sock token and intercepts it.
+            Some(internal_bus_not_exposed(&req))
+        } else if is_interaction_ask_call(&req) {
             if caller.is_front_door() || self.caller_is_external_node(&req).await {
                 return Some(internal_bus_not_exposed(&req));
             }
@@ -1114,6 +1125,43 @@ fn is_permission_ask_call(req: &serde_json::Value) -> bool {
 /// IM channel listeners without restarting any agent session or the daemon.
 fn is_reload_call(req: &serde_json::Value) -> bool {
     req.get("method").and_then(|m| m.as_str()) == Some("ccteam/reload")
+}
+
+fn is_project_retire_call(req: &serde_json::Value) -> bool {
+    req.get("method").and_then(|method| method.as_str()) == Some("ccteam/project-retire")
+}
+
+async fn execute_project_retire(
+    req: &serde_json::Value,
+    gateway: Option<&GatewayHandle>,
+) -> serde_json::Value {
+    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let error = |message: String| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id.clone(),
+            "error": { "code": -32000, "message": message },
+        })
+    };
+    let Some(slug) = req
+        .pointer("/params/arguments/slug")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())
+    else {
+        return error("ccteam/project-retire: missing `slug`".to_string());
+    };
+    let Some(gateway) = gateway else {
+        return error("ccteam/project-retire: gateway is not available".to_string());
+    };
+    match Gateway::retire_project_shared(Arc::clone(gateway), slug).await {
+        Ok(outcome) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": outcome,
+        }),
+        Err(error_value) => error(format!("ccteam/project-retire: {error_value:#}")),
+    }
 }
 
 /// v0.8.7 W2 (DB.3/DB.4) — handle one `permission/ask` request from a HITL
@@ -2509,9 +2557,13 @@ async fn run_session_dispatch(
             .lock(gateway)
             .await
             .map_err(|error| mcp_gateway_error("session_dispatch", &error))?;
-        gw.session_vendor_host_slug(&sid)
+        let project = gw
+            .session_vendor_host_slug(&sid)
             .map(|(_, _, project)| project)
-            .ok_or_else(|| format!("session_dispatch: unknown session `{sid}`"))?
+            .ok_or_else(|| format!("session_dispatch: unknown session `{sid}`"))?;
+        gw.ensure_project_active(&project)
+            .map_err(|error| format!("session_dispatch: {error:#}"))?;
+        project
     };
     let parent = resolve_call_origin(
         "session_dispatch",
@@ -4687,6 +4739,77 @@ mod session_tool_tests {
         {
             Ok(ccteam_harness::ThreadStatus::default())
         }
+    }
+
+    #[tokio::test]
+    async fn local_admin_socket_can_retire_project_and_get_truthful_outcome() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let project_dir = paths.projects_root.join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        write_web_token(&paths.root, "retire-token");
+        ccteam_core::progress::append_event(
+            &paths.progress_jsonl("alpha"),
+            &json!({"event":"fixture"}),
+        )
+        .unwrap();
+        let mut gateway = Gateway::new(Arc::new(StubAdapter::default()), "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        let dispatch = McpDispatch {
+            paths: paths.clone(),
+            sink: None,
+            pending: None,
+            gateway: Some(Arc::new(Mutex::new(gateway))),
+        };
+        let response = dispatch
+            .dispatch(json!({
+                "jsonrpc":"2.0",
+                "id":41,
+                "method":"ccteam/project-retire",
+                "params":{"arguments":{
+                    "slug":"alpha",
+                    "_caller_admin_token":"retire-token"
+                }}
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(response["id"], 41);
+        assert_eq!(response["result"]["slug"], "alpha");
+        assert_eq!(response["result"]["sessions_stopped"], json!([]));
+        assert!(response["result"]["progress_removed"]
+            .as_array()
+            .is_some_and(|paths| !paths.is_empty()));
+        assert!(
+            ccteam_harness::execution::progress_bridge::progress_state_is_retired(
+                &paths.progress_jsonl("alpha")
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn project_retire_is_not_exposed_without_socket_admin_promotion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_web_token(tmp.path(), "retire-token");
+        let dispatch = dispatch_with_root(tmp.path());
+        let request = json!({
+            "jsonrpc":"2.0",
+            "id":42,
+            "method":"ccteam/project-retire",
+            "params":{"arguments":{"slug":"alpha"}}
+        });
+
+        let ambient = dispatch.dispatch(request.clone()).await.unwrap();
+        assert_eq!(ambient["error"]["code"], -32601);
+        let direct_admin = dispatch
+            .dispatch_as(request, McpCaller::Admin)
+            .await
+            .unwrap();
+        assert_eq!(direct_admin["error"]["code"], -32601);
     }
 
     /// Build a real `Gateway` (stub adapter) with a cto session in `alpha` and

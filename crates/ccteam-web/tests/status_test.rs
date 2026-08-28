@@ -244,7 +244,15 @@ agents:
 ",
     );
 
-    let addr = spawn(AppState::new(paths)).await;
+    // The route intentionally exposes warming snapshots while startup
+    // hydration runs. Pin this aggregate assertion to a fully hydrated
+    // projection so target scheduling cannot make it observe only one slug.
+    let state = AppState::new(paths);
+    state
+        .progress_projection
+        .hydrate_now(&["team-a".to_string(), "team-b".to_string()])
+        .unwrap();
+    let addr = spawn(state).await;
     let resp = client()
         .get(format!("http://{addr}/api/v1/status"))
         .send()

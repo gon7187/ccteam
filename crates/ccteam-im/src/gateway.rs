@@ -965,6 +965,11 @@ pub struct Gateway {
     /// Wakes the body watcher early (a new detached sid, a post-mortem).
     body_watch_notify: Arc<tokio::sync::Notify>,
     projects: BTreeMap<String, PathBuf>,
+    /// Projects whose durable progress generation has been retired.  The
+    /// on-disk marker is authoritative across daemon restarts; these sets are
+    /// the hot admission fence while a retire request drains in-flight work.
+    retiring_projects: BTreeSet<String>,
+    retired_projects: BTreeSet<String>,
     /// The chats that speak for the box OWNER, per platform (`"telegram"` →
     /// `{"339498819"}`, `"lark"` → `{"ou_…"}`). Fed from each global bot's
     /// credential allowlist by the daemon (see [`Self::bind_operator_chats`]).
@@ -993,6 +998,10 @@ pub struct Gateway {
     /// the reservation and observe no live replacement before installing.
     rebuild_reservations: BTreeMap<String, u64>,
     new_session_reservations: BTreeMap<String, u64>,
+    /// Project ownership for every plan/apply reservation.  Keeping this next
+    /// to the historical generation maps lets retirement wait for all vendor
+    /// startups without changing their race-proof payload shape.
+    spawn_reservation_projects: BTreeMap<String, String>,
     /// In-flight delegated plans count toward fan-out/project guardrails even
     /// before their concurrently-starting vendor processes enter `sessions`.
     delegation_spawn_reservations: BTreeMap<String, DelegationSpawnReservation>,
@@ -1516,6 +1525,19 @@ pub struct GatewayEvent {
     /// where the emitting session's project is cheaply known; `None`
     /// elsewhere (additive field, never blocks IM delivery which ignores it).
     pub slug: Option<String>,
+}
+
+/// Truthful daemon acknowledgement for one project retirement.  Config and
+/// project-directory deletion are deliberately outside this lifecycle spine;
+/// callers may mutate those only after receiving this result.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProjectRetireOutcome {
+    /// Canonical project slug whose generation was retired.
+    pub slug: String,
+    /// Managed and detached session ids whose process teardown completed.
+    pub sessions_stopped: Vec<String>,
+    /// Durable progress-state paths removed after all writers drained.
+    pub progress_removed: Vec<String>,
 }
 
 /// The gateway's emit endpoint (V0.8.6 — fix #2). Every [`GatewayEvent`] the
@@ -2670,6 +2692,8 @@ impl Gateway {
             post_mortem_pending: Vec::new(),
             body_watch_notify: Arc::new(tokio::sync::Notify::new()),
             projects,
+            retiring_projects: BTreeSet::new(),
+            retired_projects: BTreeSet::new(),
             operator_chats: BTreeMap::new(),
             current_project: BTreeMap::new(),
             pending_prefix: BTreeMap::new(),
@@ -2678,6 +2702,7 @@ impl Gateway {
             next_session_generation: 0,
             rebuild_reservations: BTreeMap::new(),
             new_session_reservations: BTreeMap::new(),
+            spawn_reservation_projects: BTreeMap::new(),
             delegation_spawn_reservations: BTreeMap::new(),
             session_catalog: Arc::new(crate::session_catalog::SessionCatalog::default()),
             external_nodes: BTreeMap::new(),
@@ -2831,6 +2856,18 @@ impl Gateway {
             paths.clone(),
         ));
         self.project_paths = Some(paths);
+        // A daemon may restart between committing a retirement marker and the
+        // CLI/web removing config.yaml.  Never roster that stale catalog row.
+        let stale = self
+            .projects
+            .keys()
+            .filter(|slug| self.durable_project_is_retired(slug).unwrap_or(true))
+            .cloned()
+            .collect::<Vec<_>>();
+        for slug in stale {
+            self.retired_projects.insert(slug.clone());
+            self.remove_project_routes(&slug);
+        }
     }
 
     /// Clone the daemon's shared progress projection when path context exists.
@@ -2878,6 +2915,7 @@ impl Gateway {
         meta: &SessionMeta,
         reply_to: &ChatKey,
     ) -> Result<MetaRebuildPlan> {
+        self.ensure_project_active(slug)?;
         // Every rebuild path funnels through here (cold-start restore, `/use`
         // resume, external adopt), so the "ccteam never drives an external
         // node" line is drawn once: a rebuild would spawn a NEW vendor process
@@ -2935,6 +2973,8 @@ impl Gateway {
         let generation = self.next_live_generation();
         self.rebuild_reservations
             .insert(meta.sid.clone(), generation);
+        self.spawn_reservation_projects
+            .insert(meta.sid.clone(), slug.to_string());
         Ok(MetaRebuildPlan {
             generation,
             sid: meta.sid.clone(),
@@ -3043,6 +3083,16 @@ impl Gateway {
         capacity_checked: bool,
     ) -> Result<()> {
         let sid = plan.sid.clone();
+        if let Err(error) = self.ensure_project_active(&plan.slug) {
+            self.rebuild_reservations.remove(&sid);
+            self.spawn_reservation_projects.remove(&sid);
+            self.principals.forget_if_secret(&sid, &plan.secret);
+            let adapter = Arc::clone(&plan.adapter);
+            self.cleanup_tasks.spawn(async move {
+                let _ = adapter.close_thread(&thread).await;
+            });
+            return Err(error);
+        }
         let post_mortem = plan
             .post_mortem
             .clone()
@@ -3059,6 +3109,7 @@ impl Gateway {
             return Err(GatewayRequestError::SessionGenerationConflict(sid).into());
         }
         self.rebuild_reservations.remove(&sid);
+        self.spawn_reservation_projects.remove(&sid);
         if !capacity_checked {
             let excluded = self.live_capacity_exclusions(&sid, plan.parent_sid.as_deref());
             self.ensure_live_capacity(&excluded).await;
@@ -3342,9 +3393,19 @@ impl Gateway {
         };
         let path = paths.progress_jsonl(slug);
         let slug = slug.to_string();
-        tokio::task::spawn_blocking(move || {
-            if let Err(error) = ccteam_core::progress::append_event(&path, &event) {
-                tracing::warn!(%slug, %error, "ccteam-im: failed to append progress event");
+        self.cleanup_tasks.spawn(async move {
+            let append = tokio::task::spawn_blocking(move || {
+                ccteam_core::progress::append_event(&path, &event)
+            })
+            .await;
+            match append {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%slug, %error, "ccteam-im: failed to append progress event");
+                }
+                Err(error) => {
+                    tracing::warn!(%slug, %error, "ccteam-im: progress append worker failed");
+                }
             }
         });
     }
@@ -4020,7 +4081,54 @@ impl Gateway {
 
     /// Register or update a project root addressable by `/cd <slug>`.
     pub fn register_project(&mut self, slug: impl Into<String>, dir: impl Into<PathBuf>) {
-        self.projects.insert(slug.into(), dir.into());
+        let slug = slug.into();
+        if self.project_admission_blocked(&slug) {
+            return;
+        }
+        self.projects.insert(slug, dir.into());
+    }
+
+    fn durable_project_is_retired(&self, slug: &str) -> Result<bool> {
+        let Some(paths) = self.project_paths.as_ref() else {
+            return Ok(false);
+        };
+        ccteam_harness::execution::progress_bridge::progress_state_is_retired(
+            &paths.progress_jsonl(slug),
+        )
+    }
+
+    fn project_admission_blocked(&self, slug: &str) -> bool {
+        self.retiring_projects.contains(slug)
+            || self.retired_projects.contains(slug)
+            || self.durable_project_is_retired(slug).unwrap_or(true)
+    }
+
+    /// One fail-closed admission gate shared by spawn, rebuild, resume,
+    /// dispatch and scheduled delivery.  A malformed marker is not treated as
+    /// active state: operators must repair or finish retirement explicitly.
+    pub(crate) fn ensure_project_active(&self, slug: &str) -> Result<()> {
+        if self.retiring_projects.contains(slug) || self.retired_projects.contains(slug) {
+            anyhow::bail!("project `{slug}` is retired");
+        }
+        match self.durable_project_is_retired(slug) {
+            Ok(false) => Ok(()),
+            Ok(true) => anyhow::bail!("project `{slug}` is retired"),
+            Err(error) => Err(error).with_context(|| {
+                format!("project `{slug}` retirement state is unreadable; admission denied")
+            }),
+        }
+    }
+
+    fn remove_project_routes(&mut self, slug: &str) {
+        self.projects.remove(slug);
+        self.templates.retain(|template| template.project != slug);
+        self.current_project.retain(|_, project| project != slug);
+        self.post_mortem_pending
+            .retain(|(_, project, _, _)| project != slug);
+        self.delegations.retain(|_, watch| watch.slug != slug);
+        if let Ok(mut watched) = self.delegation_watch_set.write() {
+            watched.retain(|sid| self.delegations.contains_key(sid));
+        }
     }
 
     /// Dynamically load one project from `config.yaml` into the in-memory map
@@ -4033,6 +4141,9 @@ impl Gateway {
     /// No-op when `project_paths` isn't wired (unit tests) or the slug isn't
     /// registered.
     fn ensure_project_loaded(&mut self, slug: &str) {
+        if self.project_admission_blocked(slug) {
+            return;
+        }
         if self.projects.contains_key(slug) {
             return;
         }
@@ -4158,6 +4269,9 @@ impl Gateway {
         bot: &BotRegistration,
         project_dir: impl Into<PathBuf>,
     ) {
+        if self.project_admission_blocked(&bot.workflow_slug) {
+            return;
+        }
         self.register_project(bot.workflow_slug.clone(), project_dir);
         let template = GatewayRouteTemplate {
             channel: bot.im_platform.clone(),
@@ -4798,6 +4912,7 @@ impl Gateway {
         if old.role == role {
             return Ok(None);
         }
+        self.ensure_project_active(&old.project)?;
         self.ensure_project_loaded(&old.project);
         let cwd = self
             .projects
@@ -4924,6 +5039,16 @@ impl Gateway {
         );
         let (catalog, cwd, mut meta, installed_generation) = {
             let mut guard = gateway.lock().await;
+            if let Err(error) = guard.ensure_project_active(&plan.spawn.project) {
+                principal_rollback.disarm();
+                guard.principals.forget_if_secret(&sid, &plan.spawn.secret);
+                let thread = uninstalled.take_for_install();
+                let adapter = Arc::clone(&plan.spawn.adapter);
+                guard.cleanup_tasks.spawn(async move {
+                    let _ = adapter.close_thread(&thread).await;
+                });
+                return Err(error);
+            }
             let matches = guard
                 .sessions
                 .get(&sid)
@@ -5033,26 +5158,35 @@ impl Gateway {
         sid: &str,
     ) -> Result<()> {
         enum StopPlan {
-            Live(Box<GatewaySession>),
+            Live {
+                session: Box<GatewaySession>,
+                pump: Option<tokio::task::JoinHandle<()>>,
+            },
             Detached(DetachedBody),
         }
 
         let claims = Arc::clone(&gateway.lock().await.spawn_claims);
         let turn_claim = claims.lock_for_turn(sid).await;
+        // Submit paths use the same turn -> resume lock order.  Holding both
+        // prevents a cold/dead resume from installing a replacement body while
+        // close is in flight, which is required for a failed close to remain
+        // genuinely retryable under the original sid.
+        let resume_claim = claims.lock_for_sid(sid).await;
         let (plan, cleanup_tasks) = {
             let mut guard = gateway.lock().await;
             let plan = if guard.sessions.contains_key(sid) {
                 guard.principals.forget(sid);
-                if let Some(pump) = guard.event_pumps.remove(sid) {
-                    pump.abort();
-                }
+                let pump = guard.event_pumps.remove(sid);
                 let removed = guard.sessions.remove(sid).expect("checked live session");
                 guard
                     .current_session
                     .write()
                     .unwrap()
                     .retain(|_, current| current != sid);
-                StopPlan::Live(Box::new(removed))
+                StopPlan::Live {
+                    session: Box::new(removed),
+                    pump,
+                }
             } else if let Some(detached) = guard.detached.get(sid).cloned() {
                 StopPlan::Detached(detached)
             } else {
@@ -5064,11 +5198,43 @@ impl Gateway {
         let sid = sid.to_string();
         let completion = cleanup_tasks.spawn_result(async move {
             let _turn_claim = turn_claim;
+            let _resume_claim = resume_claim;
             match plan {
-                StopPlan::Live(removed) => {
-                    let persist = Self::persist_latest_routing_shared(&completion_gateway).await;
+                StopPlan::Live {
+                    session: removed,
+                    pump,
+                } => {
+                    let pump_join_error = if let Some(pump) = pump {
+                        pump.abort();
+                        match pump.await {
+                            Ok(()) => None,
+                            Err(error) if error.is_cancelled() => None,
+                            Err(error) => Some(error),
+                        }
+                    } else {
+                        None
+                    };
                     if let Err(error) = removed.adapter.close_thread(&removed.thread).await {
-                        tracing::warn!(%sid, %error, "ccteam-im: stopped session close reported an error");
+                        // A failed close is not a stopped session.  Keep the
+                        // handle retryable (without a pump or principal) so a
+                        // retire retry can prove teardown instead of losing
+                        // the only process handle and faking success.
+                        completion_gateway
+                            .lock()
+                            .await
+                            .sessions
+                            .entry(sid.clone())
+                            .or_insert(*removed);
+                        return match pump_join_error {
+                            Some(pump_error) => Err(anyhow!(
+                                "session {sid} close failed: {error}; event pump join also failed: {pump_error}"
+                            )),
+                            None => Err(anyhow!("session {sid} close failed: {error}")),
+                        };
+                    }
+                    let persist = Self::persist_latest_routing_shared(&completion_gateway).await;
+                    if let Some(error) = pump_join_error {
+                        return Err(anyhow!("session {sid} event pump join failed: {error}"));
                     }
                     persist
                 }
@@ -5144,6 +5310,222 @@ impl Gateway {
             }
         }))
         .await
+    }
+
+    fn project_session_snapshot(&self, slug: &str) -> Vec<String> {
+        let mut sids = self
+            .sessions
+            .values()
+            .filter(|session| session.project == slug)
+            .map(|session| session.id.clone())
+            .chain(
+                self.detached
+                    .values()
+                    .filter(|body| body.slug == slug)
+                    .map(|body| body.sid.clone()),
+            )
+            .collect::<Vec<_>>();
+        sids.sort();
+        sids.dedup();
+        sids
+    }
+
+    fn project_has_spawn_reservations(&self, slug: &str) -> bool {
+        self.spawn_reservation_projects
+            .values()
+            .any(|project| project == slug)
+            || self
+                .delegation_spawn_reservations
+                .values()
+                .any(|reservation| reservation.project == slug)
+    }
+
+    async fn wait_for_project_reservations_to_drain(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        slug: &str,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if !gateway.lock().await.project_has_spawn_reservations(slug) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for project `{slug}` spawn reservations to drain");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn remove_project_scheduled_rows(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        slug: &str,
+    ) -> Result<()> {
+        let (queues, persistence) = {
+            let guard = gateway.lock().await;
+            if guard.scheduled_items.iter().any(|(id, entry)| {
+                entry.item.project == slug && guard.scheduled_in_flight.contains(id)
+            }) {
+                anyhow::bail!("project `{slug}` still has an in-flight scheduled delivery");
+            }
+            let queues = guard
+                .scheduled_items
+                .values()
+                .filter(|entry| entry.item.project == slug)
+                .map(|entry| (entry.item.sid.clone(), entry.project_dir.clone()))
+                .collect::<BTreeMap<_, _>>();
+            (queues, Arc::clone(&guard.scheduled_persistence))
+        };
+        for (sid, project_dir) in queues {
+            Self::write_scheduled_snapshot_off_lock(
+                Arc::clone(&persistence),
+                project_dir,
+                sid,
+                Vec::new(),
+            )
+            .await?;
+        }
+        let mut guard = gateway.lock().await;
+        if guard
+            .scheduled_items
+            .iter()
+            .any(|(id, entry)| entry.item.project == slug && guard.scheduled_in_flight.contains(id))
+        {
+            anyhow::bail!("project `{slug}` gained an in-flight scheduled delivery during retire");
+        }
+        let removed = guard
+            .scheduled_items
+            .iter()
+            .filter(|(_, entry)| entry.item.project == slug)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in removed {
+            guard.scheduled_items.remove(&id);
+            guard.scheduled_retry.remove(&id);
+        }
+        guard.scheduled_notify.notify_one();
+        Ok(())
+    }
+
+    /// Commit a durable project tombstone, fence every daemon admission path,
+    /// then drain all process and writer ownership before cleaning progress.
+    /// Config deletion is intentionally caller-owned and may happen only after
+    /// this method returns `Ok`.
+    pub async fn retire_project_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        slug: &str,
+    ) -> Result<ProjectRetireOutcome> {
+        let slug = slug.to_string();
+        let progress_path = gateway
+            .lock()
+            .await
+            .project_paths
+            .as_ref()
+            .map(|paths| paths.progress_jsonl(&slug))
+            .ok_or_else(|| anyhow!("project retirement requires daemon path context"))?;
+
+        // The marker is first and durable.  If the daemon dies after this
+        // point, the next daemon refuses the stale config/bot row before it can
+        // roster or spawn anything for the slug.
+        let mark_path = progress_path.clone();
+        tokio::task::spawn_blocking(move || {
+            ccteam_harness::execution::progress_bridge::mark_progress_retired(&mark_path)
+        })
+        .await
+        .context("project retirement marker worker failed")??;
+
+        let initial_sids = {
+            let mut guard = gateway.lock().await;
+            guard.retiring_projects.insert(slug.clone());
+            guard.retired_projects.insert(slug.clone());
+            let external = guard
+                .external_nodes
+                .iter()
+                .filter(|(_, meta)| meta.slug == slug)
+                .map(|(sid, _)| sid.clone())
+                .collect::<Vec<_>>();
+            for sid in external {
+                guard.external_nodes.remove(&sid);
+                guard.principals.forget(&sid);
+            }
+            guard.project_session_snapshot(&slug)
+        };
+
+        let mut stopped = Vec::new();
+        let mut failures = Vec::new();
+        for (sid, result) in
+            Self::stop_sessions_shared(Arc::clone(&gateway), initial_sids.clone()).await
+        {
+            match result {
+                Ok(()) => stopped.push(sid),
+                Err(error) => failures.push(format!("{sid}: {error:#}")),
+            }
+        }
+
+        Self::wait_for_project_reservations_to_drain(&gateway, &slug).await?;
+        let initial = initial_sids.iter().cloned().collect::<BTreeSet<_>>();
+        let remaining = gateway
+            .lock()
+            .await
+            .project_session_snapshot(&slug)
+            .into_iter()
+            .filter(|sid| !initial.contains(sid))
+            .collect();
+        for (sid, result) in Self::stop_sessions_shared(Arc::clone(&gateway), remaining).await {
+            match result {
+                Ok(()) => stopped.push(sid),
+                Err(error) => failures.push(format!("{sid}: {error:#}")),
+            }
+        }
+
+        let cleanup_tasks = gateway.lock().await.cleanup_tasks.clone();
+        tokio::time::timeout(Duration::from_secs(30), cleanup_tasks.drain())
+            .await
+            .map_err(|_| anyhow!("timed out draining project `{slug}` cleanup tasks"))?;
+        Self::remove_project_scheduled_rows(&gateway, &slug).await?;
+
+        if !failures.is_empty() {
+            anyhow::bail!(
+                "project `{slug}` session teardown failed: {}",
+                failures.join("; ")
+            );
+        }
+        {
+            let guard = gateway.lock().await;
+            let remaining = guard.project_session_snapshot(&slug);
+            if !remaining.is_empty() || guard.project_has_spawn_reservations(&slug) {
+                anyhow::bail!(
+                    "project `{slug}` retirement did not drain sessions/reservations: {}",
+                    remaining.join(", ")
+                );
+            }
+        }
+
+        let cleanup_path = progress_path.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            ccteam_harness::execution::progress_bridge::cleanup_retired_progress_state(
+                &cleanup_path,
+                false,
+            )
+        })
+        .await
+        .context("retired progress cleanup worker failed")??;
+
+        {
+            let mut guard = gateway.lock().await;
+            guard.remove_project_routes(&slug);
+            guard.retiring_projects.remove(&slug);
+        }
+        Self::persist_latest_routing_shared(&gateway).await?;
+        stopped.sort();
+        stopped.dedup();
+        Ok(ProjectRetireOutcome {
+            slug,
+            sessions_stopped: stopped,
+            progress_removed: removed
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+        })
     }
 
     async fn stop_bulk_snapshot_shared(
@@ -7554,6 +7936,7 @@ impl Gateway {
         // it the web "new project → new session" flow fails "unknown project"
         // immediately after a successful project create.
         self.ensure_project_loaded(&project);
+        self.ensure_project_active(&project)?;
         let cwd = self
             .projects
             .get(&project)
@@ -7592,6 +7975,8 @@ impl Gateway {
         let id = format!("s{}", self.next_session);
         let generation = self.next_live_generation();
         self.new_session_reservations.insert(id.clone(), generation);
+        self.spawn_reservation_projects
+            .insert(id.clone(), project.clone());
         // v0.8.8 F2 — roleless(空 role)session 的 handle 默认会随 role 一起变空,
         // 而空 handle 会让 @handle 路由(session_by_handle / template_by_handle)
         // 误匹配/互撞。空 handle 时回退到 sid(全局唯一,绝不撞),保证 @handle
@@ -7822,6 +8207,17 @@ impl Gateway {
         let pump_fingerprints = plan.fingerprints.clone();
         let meta =
             prepared_meta.unwrap_or_else(|| Self::meta_for_new_session(&plan, &thread, trigger));
+        if let Err(error) = self.ensure_project_active(&plan.project) {
+            self.new_session_reservations.remove(&plan.id);
+            self.delegation_spawn_reservations.remove(&plan.id);
+            self.spawn_reservation_projects.remove(&plan.id);
+            self.principals.forget_if_secret(&plan.id, &plan.secret);
+            let adapter = Arc::clone(&plan.adapter);
+            self.cleanup_tasks.spawn(async move {
+                let _ = adapter.close_thread(&thread).await;
+            });
+            return Err(error);
+        }
         let NewSessionPlan {
             generation,
             id,
@@ -7856,6 +8252,7 @@ impl Gateway {
             .is_some_and(|reserved| *reserved == generation);
         if !reservation_matches || self.sessions.contains_key(&id) {
             self.delegation_spawn_reservations.remove(&id);
+            self.spawn_reservation_projects.remove(&id);
             let orphan_adapter = Arc::clone(&adapter);
             self.cleanup_tasks.spawn(async move {
                 let _ = orphan_adapter.close_thread(&thread).await;
@@ -7864,6 +8261,7 @@ impl Gateway {
         }
         self.new_session_reservations.remove(&id);
         self.delegation_spawn_reservations.remove(&id);
+        self.spawn_reservation_projects.remove(&id);
         let meta_project = project.clone();
         if !capacity_checked {
             let excluded = self.live_capacity_exclusions(&id, parent_sid.as_deref());
@@ -7968,6 +8366,7 @@ impl Gateway {
         if old.role == role {
             return Ok(sid);
         }
+        self.ensure_project_active(&old.project)?;
         let project = old.project.clone();
         let vendor = old.vendor;
         // v0.8.7 W2 (DB.1) — preserve the session's permission posture across a
@@ -10128,6 +10527,7 @@ impl Gateway {
                 ));
             }
             let (project, project_dir) = guard.scheduled_target(&sid)?;
+            guard.ensure_project_active(&project)?;
             let next = guard.next_scheduled.saturating_add(1);
             let (reply_channel, reply_chat_id) = reply
                 .as_ref()
@@ -10345,6 +10745,7 @@ impl Gateway {
             ));
         }
         let (project, project_dir) = self.scheduled_target(sid)?;
+        self.ensure_project_active(&project)?;
         let sid_pending = self
             .scheduled_items
             .values()
@@ -10598,6 +10999,12 @@ impl Gateway {
                 guard.scheduled_notify.notify_one();
                 return None;
             };
+            if guard.project_admission_blocked(&prior.item.project) {
+                guard.scheduled_in_flight.remove(id);
+                guard.scheduled_retry.remove(id);
+                guard.scheduled_notify.notify_one();
+                return None;
+            }
             let retry_ready = guard
                 .scheduled_retry
                 .get(id)
@@ -10930,6 +11337,7 @@ impl Gateway {
                 .filter(|(id, entry)| {
                     entry.item.status == crate::scheduled::ScheduledStatus::Pending
                         && entry.item.send_at <= now
+                        && !guard.project_admission_blocked(&entry.item.project)
                         && !guard.scheduled_in_flight.contains(*id)
                         && retry_ready(id)
                 })
@@ -11260,6 +11668,7 @@ impl Gateway {
             return Ok(None);
         }
         let project = s.project.clone();
+        self.ensure_project_active(&project)?;
         let role = s.role.clone();
         let owner = s.owner.clone();
         let vendor = s.vendor;
@@ -11388,6 +11797,13 @@ impl Gateway {
             ccteam_root: _,
             remote_proxy: _,
         } = plan;
+        if let Err(error) = self.ensure_project_active(&project) {
+            let orphan_adapter = Arc::clone(&adapter);
+            self.cleanup_tasks.spawn(async move {
+                let _ = orphan_adapter.close_thread(&thread).await;
+            });
+            return Err(error);
+        }
         let still_matches = self
             .sessions
             .get(&session_id)
@@ -11583,6 +11999,18 @@ impl Gateway {
         origin: TurnOrigin,
         literal_user_text: bool,
     ) -> Result<SubmitResult> {
+        let project = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.project.clone())
+            .or_else(|| {
+                self.session_catalog
+                    .get(session_id)
+                    .map(|entry| entry.project)
+            });
+        if let Some(project) = project {
+            self.ensure_project_active(&project)?;
+        }
         if !literal_user_text {
             if let Some(directive) = parse_session_directive(&payload) {
                 // Directive path: PROBE-and-resume a dead child before dispatching
@@ -14243,6 +14671,7 @@ impl Gateway {
         client: &str,
     ) -> Result<String> {
         self.ensure_project_loaded(slug);
+        self.ensure_project_active(slug)?;
         // Resolve the project BEFORE the counter bump so a rejected enrollment
         // doesn't burn an `s{n}`.
         let cwd = self
@@ -14928,6 +15357,7 @@ impl Gateway {
     fn forget_principal(&mut self, sid: &str) {
         self.new_session_reservations.remove(sid);
         self.rebuild_reservations.remove(sid);
+        self.spawn_reservation_projects.remove(sid);
         self.delegation_spawn_reservations.remove(sid);
         self.principals.forget(sid);
     }
@@ -14951,6 +15381,7 @@ impl Gateway {
                     self.delegation_spawn_reservations.contains_key(sid) == *delegated;
                 if generation_matches && kind_matches {
                     self.new_session_reservations.remove(sid);
+                    self.spawn_reservation_projects.remove(sid);
                     if *delegated {
                         self.delegation_spawn_reservations.remove(sid);
                     }
@@ -14966,6 +15397,7 @@ impl Gateway {
                     .is_some_and(|reserved| reserved == generation);
                 if matches {
                     self.rebuild_reservations.remove(sid);
+                    self.spawn_reservation_projects.remove(sid);
                 }
                 matches
             }
@@ -17295,6 +17727,7 @@ impl Gateway {
             .get(sid)
             .cloned()
             .ok_or_else(|| anyhow!("current session missing: {sid}"))?;
+        self.ensure_project_active(&session.project)?;
         let project_dir = self
             .projects
             .get(&session.project)
@@ -29276,6 +29709,84 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_stop_joins_failed_pump_blocks_resume_and_keeps_close_retryable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let close = Arc::new(TestStartBarrier::default());
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_close_barrier(Arc::clone(&close))
+                .with_close_failures(1),
+        );
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        if let Some(pump) = gateway.event_pumps.remove(&sid) {
+            pump.abort();
+            let _ = pump.await;
+        }
+        let failed_pump = tokio::spawn(async { panic!("injected event-pump failure") });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !failed_pump.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        gateway.event_pumps.insert(sid.clone(), failed_pump);
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        close.arm();
+        let stop_gateway = Arc::clone(&gateway);
+        let stop_sid = sid.clone();
+        let stop =
+            tokio::spawn(
+                async move { Gateway::stop_session_shared(stop_gateway, &stop_sid).await },
+            );
+        close.wait_until_entered(1).await;
+
+        let resume_gateway = Arc::clone(&gateway);
+        let resume_sid = sid.clone();
+        let mut resume = tokio::spawn(async move {
+            Gateway::resume_stopped_session_shared(
+                resume_gateway,
+                &resume_sid,
+                "user:web-api",
+                Some("alpha"),
+                GatewayDeadline::start(),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut resume)
+                .await
+                .is_err(),
+            "resume must wait for stop's sid claim instead of installing a replacement body"
+        );
+
+        close.release_all();
+        let error = stop.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("close failed"), "{error}");
+        assert!(error.contains("event pump join also failed"), "{error}");
+        assert_eq!(resume.await.unwrap().unwrap(), sid);
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+        assert!(gateway.lock().await.sessions.contains_key(&sid));
+
+        Gateway::stop_session_shared(Arc::clone(&gateway), &sid)
+            .await
+            .unwrap();
+        assert!(gateway.lock().await.sessions.is_empty());
+        assert_eq!(fake.completed_closes(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_mcp_probe_does_not_hold_the_gateway_registry() {
         let tmp = tempfile::TempDir::new().unwrap();
         let barrier = Arc::new(TestStartBarrier::default());
@@ -38493,5 +39004,239 @@ mod tests {
             .scheduled_items_for_sid(&sid)
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_retire_marks_first_joins_pump_stops_and_cleans_state() {
+        struct PumpDrop(Arc<AtomicBool>);
+        impl Drop for PumpDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let close = Arc::new(TestStartBarrier::default());
+        let fake =
+            Arc::new(FakeAdapter::new(AgentVendor::Claude).with_close_barrier(Arc::clone(&close)));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let scheduled = gateway
+            .create_scheduled_message(
+                &sid,
+                "later".into(),
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                "user:web-api".into(),
+                None,
+            )
+            .unwrap();
+        ccteam_core::progress::append_event(
+            &paths.progress_jsonl("alpha"),
+            &serde_json::json!({"event":"fixture"}),
+        )
+        .unwrap();
+
+        if let Some(old) = gateway.event_pumps.remove(&sid) {
+            old.abort();
+            let _ = old.await;
+        }
+        let pump_dropped = Arc::new(AtomicBool::new(false));
+        let pump_probe = Arc::clone(&pump_dropped);
+        gateway.event_pumps.insert(
+            sid.clone(),
+            tokio::spawn(async move {
+                let _drop = PumpDrop(pump_probe);
+                std::future::pending::<()>().await;
+            }),
+        );
+        tokio::task::yield_now().await;
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        close.arm();
+        let retire_gateway = Arc::clone(&gateway);
+        let retire =
+            tokio::spawn(
+                async move { Gateway::retire_project_shared(retire_gateway, "alpha").await },
+            );
+        close.wait_until_entered(1).await;
+
+        assert!(
+            ccteam_harness::execution::progress_bridge::progress_state_is_retired(
+                &paths.progress_jsonl("alpha")
+            )
+            .unwrap(),
+            "durable tombstone must precede vendor stop"
+        );
+        assert!(
+            pump_dropped.load(Ordering::SeqCst),
+            "pump must be joined before close"
+        );
+        let spawn_error = gateway
+            .lock()
+            .await
+            .plan_new_session(
+                ChatKey::new("web", "web-api", "web-api"),
+                "alpha".into(),
+                AgentVendor::Claude,
+                String::new(),
+                String::new(),
+                PermissionMode::Skip,
+                SessionProtocol::default(),
+                SpawnTuning::default(),
+            )
+            .err()
+            .expect("retired project spawn must fail")
+            .to_string();
+        assert!(spawn_error.contains("retired"), "{spawn_error}");
+
+        close.release_all();
+        let outcome = retire.await.unwrap().unwrap();
+        assert_eq!(outcome.sessions_stopped, vec![sid.clone()]);
+        assert!(!outcome.progress_removed.is_empty());
+        let guard = gateway.lock().await;
+        assert!(!guard.sessions.contains_key(&sid));
+        assert!(!guard.projects.contains_key("alpha"));
+        assert!(!guard.scheduled_items.contains_key(&scheduled.id));
+        assert!(guard.event_pumps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_retired_project_and_bot_registration_are_ignored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        ccteam_harness::execution::progress_bridge::mark_progress_retired(
+            &paths.progress_jsonl("alpha"),
+        )
+        .unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        gateway.register_project("alpha", &project_dir);
+        gateway.register_bot_template(
+            &BotRegistration {
+                workflow_slug: "alpha".into(),
+                role: String::new(),
+                vendor: AgentVendor::Claude,
+                persona_id: None,
+                im_platform: "telegram".into(),
+                im_chat_id: "339".into(),
+                chat_handle: None,
+                project_dir: Some(project_dir.clone()),
+                created_at: chrono::Utc::now(),
+            },
+            &project_dir,
+        );
+        assert!(!gateway.projects.contains_key("alpha"));
+        assert!(gateway.templates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_retire_propagates_close_error_and_keeps_session_retryable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_close_failures(1));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        let error = Gateway::retire_project_shared(Arc::clone(&gateway), "alpha")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("close failed"), "{error}");
+        assert!(gateway.lock().await.sessions.contains_key(&sid));
+        assert!(
+            ccteam_harness::execution::progress_bridge::progress_state_is_retired(
+                &paths.progress_jsonl("alpha")
+            )
+            .unwrap()
+        );
+
+        let retry = Gateway::retire_project_shared(Arc::clone(&gateway), "alpha")
+            .await
+            .unwrap();
+        assert_eq!(retry.sessions_stopped, vec![sid]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn project_retire_waits_for_inflight_spawn_and_apply_refuses_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let start = Arc::new(TestStartBarrier::default());
+        let fake =
+            Arc::new(FakeAdapter::new(AgentVendor::Claude).with_start_barrier(Arc::clone(&start)));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
+        gateway.enable_project_creation(paths.clone());
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        start.arm();
+        let spawn_gateway = Arc::clone(&gateway);
+        let spawn = tokio::spawn(async move {
+            Gateway::create_session_api_tuned_shared(
+                spawn_gateway,
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::default(),
+                "web-api".into(),
+                SpawnTuning::default(),
+                GatewayDeadline::start(),
+            )
+            .await
+        });
+        start.wait_until_entered(1).await;
+
+        let retire_gateway = Arc::clone(&gateway);
+        let retire =
+            tokio::spawn(
+                async move { Gateway::retire_project_shared(retire_gateway, "alpha").await },
+            );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if ccteam_harness::execution::progress_bridge::progress_state_is_retired(
+                    &paths.progress_jsonl("alpha"),
+                )
+                .unwrap()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        start.release_all();
+
+        let spawn_error = spawn.await.unwrap().unwrap_err().to_string();
+        assert!(spawn_error.contains("retired"), "{spawn_error}");
+        let outcome = retire.await.unwrap().unwrap();
+        assert!(outcome.sessions_stopped.is_empty());
+        assert!(gateway.lock().await.sessions.is_empty());
+        assert_eq!(
+            fake.completed_closes(),
+            1,
+            "uninstalled thread must be closed"
+        );
     }
 }

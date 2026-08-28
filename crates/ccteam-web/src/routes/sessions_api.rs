@@ -66,7 +66,7 @@ use axum::{
     Extension, Json,
 };
 use ccteam_harness::execution::progress_bridge::{
-    append_turn_verdict_if_changed, latest_turn_verdicts_detailed, TurnVerdict, Verdict,
+    append_turn_verdict_if_changed, latest_turn_verdicts_for_turns_detailed, TurnVerdict, Verdict,
 };
 use ccteam_harness::execution::turns_mirror::{read_all_turns, turns_jsonl_path, TurnRecord};
 use ccteam_harness::{
@@ -546,9 +546,41 @@ pub(crate) async fn handle_session_history(
                 .into_response();
         }
     };
+    let history_dir = resolved.project_dir.clone();
+    let history_sid = resolved.sid.clone();
+    let mut page = match tokio::task::spawn_blocking(move || {
+        collect_session_turns(&history_dir, &history_sid, limit, before)
+    })
+    .await
+    {
+        Ok(Ok(page)) => page,
+        Ok(Err(err)) => {
+            tracing::error!(%sid, %err, "read session history failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "session history unavailable"})),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!(%sid, %err, "session history reader task failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "session history unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    let turn_ids = page
+        .events
+        .iter()
+        .filter_map(|event| event.get("turn_id").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect();
     let progress_path = app.paths.progress_jsonl(&resolved.project);
+    let verdict_sid = resolved.sid.clone();
     let verdict_read = match tokio::task::spawn_blocking(move || {
-        latest_turn_verdicts_detailed(&progress_path)
+        latest_turn_verdicts_for_turns_detailed(&progress_path, &verdict_sid, &turn_ids)
     })
     .await
     {
@@ -579,31 +611,20 @@ pub(crate) async fn handle_session_history(
         }
         None => (std::collections::BTreeMap::new(), "unavailable", None),
     };
-    let history_dir = resolved.project_dir.clone();
-    let history_sid = resolved.sid.clone();
-    let page = match tokio::task::spawn_blocking(move || {
-        collect_session_turns(&history_dir, &history_sid, limit, before, &verdicts)
-    })
-    .await
-    {
-        Ok(Ok(page)) => page,
-        Ok(Err(err)) => {
-            tracing::error!(%sid, %err, "read session history failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "session history unavailable"})),
-            )
-                .into_response();
+    if verdicts_status == "ok" {
+        for event in &mut page.events {
+            let Some(turn_id) = event
+                .get("turn_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if let Some(verdict) = verdicts.get(&(resolved.sid.clone(), turn_id)) {
+                attach_verdict(event, verdict);
+            }
         }
-        Err(err) => {
-            tracing::error!(%sid, %err, "session history reader task failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "session history unavailable"})),
-            )
-                .into_response();
-        }
-    };
+    }
     Json(json!({
         "sid": sid,
         "events": page.events,
@@ -871,7 +892,6 @@ fn collect_session_turns(
     sid: &str,
     limit: usize,
     before: Option<u64>,
-    verdicts: &std::collections::BTreeMap<(String, String), TurnVerdict>,
 ) -> anyhow::Result<SessionHistoryPage> {
     let path = turns_jsonl_path(project_dir, sid);
     let tail = ccteam_core::journal::tail_classify_map(&path, limit, before, |line| {
@@ -885,14 +905,7 @@ fn collect_session_turns(
         }
     })?;
     Ok(SessionHistoryPage {
-        events: tail
-            .events
-            .iter()
-            .map(|turn| {
-                let verdict = verdicts.get(&(sid.to_string(), turn.turn_id.clone()));
-                turn_to_event(turn, verdict)
-            })
-            .collect(),
+        events: tail.events.iter().map(turn_to_event).collect(),
         next_before: if tail.has_more {
             tail.first_offset.map(|offset| offset.to_string())
         } else {
@@ -906,7 +919,7 @@ fn collect_session_turns(
 /// renders. Keeps the user prompt + assistant reply + turn id/ts so a
 /// reopened per-session page can seed its transcript before the live SSE
 /// takes over.
-fn turn_to_event(turn: &TurnRecord, verdict: Option<&TurnVerdict>) -> serde_json::Value {
+fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
     let mut event = json!({
         "turn_id": turn.turn_id,
         "ts": turn.ts,
@@ -928,17 +941,18 @@ fn turn_to_event(turn: &TurnRecord, verdict: Option<&TurnVerdict>) -> serde_json
         event["attachments"] =
             serde_json::to_value(&turn.attachments).unwrap_or_else(|_| json!([]));
     }
-    if let Some(verdict) = verdict {
-        let mut value = json!({
-            "verdict": verdict.verdict,
-            "ts": verdict.ts,
-        });
-        if let Some(feedback) = verdict.feedback.as_deref() {
-            value["feedback"] = json!(feedback);
-        }
-        event["verdict"] = value;
-    }
     event
+}
+
+fn attach_verdict(event: &mut serde_json::Value, verdict: &TurnVerdict) {
+    let mut value = json!({
+        "verdict": verdict.verdict,
+        "ts": verdict.ts,
+    });
+    if let Some(feedback) = verdict.feedback.as_deref() {
+        value["feedback"] = json!(feedback);
+    }
+    event["verdict"] = value;
 }
 
 /// One live session's [`ThreadStatus`], awaited AFTER the caller has dropped
@@ -2598,15 +2612,9 @@ mod tests {
                 .unwrap();
             writeln!(f, "not-json").unwrap();
         }
-        let events = collect_session_turns(
-            project_dir,
-            sid,
-            100,
-            None,
-            &std::collections::BTreeMap::new(),
-        )
-        .unwrap()
-        .events;
+        let events = collect_session_turns(project_dir, sid, 100, None)
+            .unwrap()
+            .events;
         assert_eq!(events.len(), 2, "two parseable turns → two events");
         assert_eq!(events[0]["turn_id"], "t1");
         assert_eq!(events[0]["user"], "review the diff");
@@ -2616,7 +2624,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_history_degrades_verdict_enrichment_when_progress_is_corrupt() {
+    async fn session_history_degrades_verdict_enrichment_when_progress_tail_is_torn() {
         use ccteam_harness::execution::turns_mirror::append_turn;
         use std::io::Write;
 
@@ -2669,7 +2677,7 @@ mod tests {
             },
         )
         .unwrap();
-        writeln!(
+        write!(
             std::fs::OpenOptions::new()
                 .append(true)
                 .open(&progress)
@@ -2692,10 +2700,11 @@ mod tests {
             .unwrap();
         let payload = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
         assert_eq!(payload["verdicts_degraded"], true);
-        assert_eq!(payload["verdict_corrupt_line_count"], 1);
+        assert_eq!(payload["verdicts_status"], "unavailable");
+        assert!(payload["verdict_corrupt_line_count"].is_null());
         assert!(
             payload["events"][0].get("verdict").is_none(),
-            "a corrupt journal makes every verdict unknown instead of serving a stale value"
+            "a torn journal makes every verdict unknown instead of serving a stale value"
         );
     }
 
@@ -2741,14 +2750,7 @@ mod tests {
         let mut before = None;
         let mut pages = Vec::new();
         loop {
-            let page = collect_session_turns(
-                project_dir,
-                sid,
-                50,
-                before,
-                &std::collections::BTreeMap::new(),
-            )
-            .unwrap();
+            let page = collect_session_turns(project_dir, sid, 50, before).unwrap();
             pages.push(
                 page.events
                     .iter()
@@ -2799,15 +2801,9 @@ mod tests {
         append_turn(project_dir, "s1", &mk("t1", "from-s1")).unwrap();
         append_turn(project_dir, "s2", &mk("t2", "from-s2")).unwrap();
 
-        let only_s1 = collect_session_turns(
-            project_dir,
-            "s1",
-            100,
-            None,
-            &std::collections::BTreeMap::new(),
-        )
-        .unwrap()
-        .events;
+        let only_s1 = collect_session_turns(project_dir, "s1", 100, None)
+            .unwrap()
+            .events;
         assert_eq!(
             only_s1.len(),
             1,
@@ -2816,15 +2812,9 @@ mod tests {
         assert_eq!(only_s1[0]["turn_id"], "t1");
         assert_eq!(only_s1[0]["assistant"], "from-s1");
 
-        let only_s2 = collect_session_turns(
-            project_dir,
-            "s2",
-            100,
-            None,
-            &std::collections::BTreeMap::new(),
-        )
-        .unwrap()
-        .events;
+        let only_s2 = collect_session_turns(project_dir, "s2", 100, None)
+            .unwrap()
+            .events;
         assert_eq!(
             only_s2.len(),
             1,
@@ -2855,7 +2845,7 @@ mod tests {
             error_kind: None,
             error: None,
         };
-        let ev = turn_to_event(&turn, None);
+        let ev = turn_to_event(&turn);
         assert_eq!(ev["turn_id"], "t9");
         assert_eq!(ev["role"], "cto");
         assert_eq!(ev["user"], "spawn a reviewer");
@@ -2883,7 +2873,7 @@ mod tests {
             error: Some("provider is overloaded".into()),
         };
 
-        let event = turn_to_event(&turn, None);
+        let event = turn_to_event(&turn);
         assert_eq!(event["outcome"], "failed");
         assert_eq!(event["error_kind"], "server_overloaded");
         assert_eq!(event["error"], "provider is overloaded");
@@ -3457,16 +3447,10 @@ mod tests {
         // not an error. The journal facade returns an empty tail for a missing file.
         // v0.8.8 F1 — keyed by sid (the never-spawned `s99` has no mirror yet).
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(collect_session_turns(
-            tmp.path(),
-            "s99",
-            100,
-            None,
-            &std::collections::BTreeMap::new(),
-        )
-        .unwrap()
-        .events
-        .is_empty());
+        assert!(collect_session_turns(tmp.path(), "s99", 100, None)
+            .unwrap()
+            .events
+            .is_empty());
     }
 
     fn test_paths(root: &std::path::Path) -> ccteam_core::CcteamPaths {

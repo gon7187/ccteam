@@ -161,6 +161,11 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
             ));
         }
     }
+    ccteam_core::preflight_project_upsert(&paths.root, &target_slug).with_context(|| {
+        format!(
+            "project slug `{target_slug}` cannot be initialized because its prior generation is retired"
+        )
+    })?;
 
     // -- 4. Project install pass ------------------------------------
     let project_report = install_project_at(paths, &target, &target_slug, &target_team, &opts)?;
@@ -1810,17 +1815,6 @@ pub fn run_web(opts: WebOptions) -> Result<()> {
     runtime.block_on(ccteam_web::serve(serve_opts))
 }
 
-/// Per-slug unroster trigger file. `ccteam remove` writes here; the
-/// daemon's `poll_unroster_triggers` task picks it up within 250ms
-/// and calls `unroster_project(CancelReason::Removed)`.
-///
-/// Convention mirrors `shutdown_trigger_path()` in main.rs: per-user
-/// namespace under `/tmp` keeps multi-operator hosts safe.
-pub(crate) fn unroster_trigger_path(slug: &str) -> std::path::PathBuf {
-    let user = std::env::var("USER").unwrap_or_else(|_| "ccteam".into());
-    std::path::PathBuf::from("/tmp").join(format!("ccteam-{user}.unroster.{slug}"))
-}
-
 /// Options for `ccteam remove <slug>`.
 #[derive(Debug, Clone, Default)]
 pub struct RemoveOptions {
@@ -1850,6 +1844,76 @@ pub struct RemoveReport {
     /// Set when the refusal gate fired (and `--force` was not passed).
     /// `--dry-run` still reports the refusal so users can rehearse.
     pub refusal: Option<ccteam_core::ActiveSessionRefusal>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonProjectRetire {
+    slug: String,
+    sessions_stopped: Vec<String>,
+    progress_removed: Vec<String>,
+}
+
+/// Retire one project generation through the daemon's same-uid admin bus.
+///
+/// This is deliberately fail-closed: config and project-local state stay put
+/// unless the daemon confirms that the durable tombstone was written and all
+/// live producers were joined before progress cleanup.
+fn request_daemon_project_retire(paths: &CcteamPaths, slug: &str) -> Result<DaemonProjectRetire> {
+    let admin_token = std::fs::read_to_string(paths.web_token_path())
+        .with_context(|| format!("прочитать {}", paths.web_token_path().display()))?;
+    let admin_token = admin_token.trim();
+    if admin_token.is_empty() {
+        bail!(
+            "пустой admin token в {}; запустите daemon, чтобы восстановить локальный control plane",
+            paths.web_token_path().display()
+        );
+    }
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "ccteam/project-retire",
+        "params": {
+            "arguments": {
+                "slug": slug,
+                "_caller_admin_token": admin_token,
+            }
+        }
+    });
+    let socket = ccteam_core::daemon_socket_path(paths);
+    let response = block_on_async(async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(65),
+            crate::mcp_serve::forward_to_socket(&socket, &request),
+        )
+        .await
+    })?
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "daemon не подтвердил retirement проекта `{slug}` за 65 с; config не изменён"
+        )
+    })??;
+
+    if let Some(error) = response.get("error").filter(|value| !value.is_null()) {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string());
+        bail!("daemon отклонил retirement проекта `{slug}`: {message}");
+    }
+    let result = response
+        .get("result")
+        .cloned()
+        .context("daemon вернул retirement-ответ без `result`")?;
+    let outcome: DaemonProjectRetire =
+        serde_json::from_value(result).context("разобрать retirement-ответ daemon")?;
+    if outcome.slug != slug {
+        bail!(
+            "daemon подтвердил retirement чужого проекта `{}` вместо `{slug}`; config не изменён",
+            outcome.slug
+        );
+    }
+    Ok(outcome)
 }
 
 impl std::fmt::Display for RemoveReport {
@@ -3162,25 +3226,14 @@ pub fn run_skill_migrate_project(paths: &CcteamPaths, project: Option<&str>) -> 
 /// Steps (in order):
 /// 1. Refusal gate. Calls [`ccteam_core::refuses_active_session`]; if
 ///    it returns `Some(refusal)` and `opts.force` is false, the command
-///    halts before any mutation. `--dry-run` still walks the rest of
-///    the plan (reporting all steps as "would run") so the user gets a
-///    full preview. Then stop-then-delete: tear down the project's
-///    live chat-mode role sessions (`ccteam-chat-<slug>-*`) before
-///    deregistering — `--dry-run` lists what it would stop.
+///    halts before any mutation.
 /// 2. Resolve project_dir via `~/.ccteam/config.yaml::projects[]` so
 ///    arbitrary-path installs are honoured.
-/// 3. Drop the slug from config.yaml::projects[] (atomic via
-///    `config::save`'s tmp+rename). `--dry-run` prints the plan only.
-/// 4. Unroster the running daemon's in-memory state. **F81 stub: this
-///    skips the daemon-side cancel** — the F82 worktree will replace
-///    `Orchestrator::unroster_project` with cancellation-token wiring;
-///    until then, the daemon picks up the config change on its next
-///    `spawn_new_rostered_projects` tick (eventual consistency).
-/// 5. Remove orchestration state: `~/.ccteam/progress/<slug>.jsonl`
-///    (or flex `~/.ccteam/progress/<slug>/` dir), then any
-///    `~/.ccteam/inbox/<slug>/` and `~/.ccteam/control/<slug>/`
-///    sub-trees that exist.
-/// 6. `--purge`: delete exactly ccteam's project footprint —
+/// 3. Ask the live daemon to durably retire the slug, fence every admission
+///    path, stop and join its sessions/writers, then clean progress state.
+///    Missing/failed acknowledgement is fatal and leaves config untouched.
+/// 4. Stop any legacy mux sessions and remove legacy global state directories.
+/// 5. `--purge`: delete exactly ccteam's project footprint —
 ///    `rm -rf <project>/.ccteam/` and ccteam's hook section inside
 ///    `<project>/.claude/settings.local.json` (surgically; file deleted
 ///    only if it collapses to empty). See [`purge_project_managed_paths`]
@@ -3188,6 +3241,9 @@ pub fn run_skill_migrate_project(paths: &CcteamPaths, project: Option<&str>) -> 
 ///    ANY `.claude/agents/*.md` (all user files — ccteam seeds no
 ///    role), `CLAUDE.md` / `AGENTS.md`, or the user's `settings.json`
 ///    (CLAUDE.md §三 red line).
+/// 6. Drop the config registry row last. A failure before this point leaves a
+///    durable retired generation which daemon startup and spawn paths reject;
+///    retrying the command is safe. The same slug is never reused.
 ///
 /// This is the reusable remove engine: the flat `ccteam remove` and the
 /// grouped `ccteam project rm` both route here (the structured
@@ -3220,29 +3276,6 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
         }
     }
 
-    // 1b. Stop-then-delete (v0.8.6 W3): `rm` first tears down the
-    // project's live chat-mode role sessions, then proceeds with the
-    // deregister/purge below. The refusal gate above already gave the
-    // user the confirm-vs-`--force` choice; once past it, stopping the
-    // sessions is part of the explicit, user-requested removal (the
-    // allowed exception to "never PROACTIVELY kill a long session").
-    // `--dry-run` lists the sessions it would stop and kills nothing.
-    let backend = ccteam_harness::default_process_backend();
-    let chat_stop = stop_project_chat_sessions(backend.as_ref(), slug, opts.dry_run)?;
-    if opts.dry_run {
-        for name in &chat_stop.would_stop {
-            report
-                .steps
-                .push(format!("будет остановлена чат-сессия `{name}`"));
-        }
-    } else {
-        for name in &chat_stop.stopped {
-            report
-                .steps
-                .push(format!("остановлена чат-сессия `{name}`"));
-        }
-    }
-
     // 2. Resolve project_dir via the config registry (so V0.4.2
     // arbitrary-path installs are deleted correctly even when the
     // slug doesn't sit under `paths.projects_root`).
@@ -3255,83 +3288,77 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
         None => paths.project_dir(slug),
     };
 
-    // 3. Config registry drop.
-    if registered.is_some() {
-        if opts.dry_run {
-            report.steps.push(format!(
-                "будет удалена запись config.yaml::projects для `{slug}` (путь: {})",
-                project_dir.display()
-            ));
-        } else {
-            let removed = ccteam_core::remove_project_from_config(&paths.root, slug)?;
-            if removed {
-                report
-                    .steps
-                    .push(format!("удалена запись config.yaml::projects для `{slug}`"));
-            }
-        }
-    } else {
-        report.steps.push(format!(
-            "в config.yaml::projects нет записи для `{slug}` (сирота / установка до V0.4.2)"
-        ));
-    }
-
-    // 4. Daemon unroster. Write a per-slug trigger file; if the daemon
-    // is alive it polls for these every 250ms (same pattern as the F86
-    // shutdown trigger) and calls unroster_project(CancelReason::Removed).
-    let trigger_path = unroster_trigger_path(slug);
-    let daemon_up = ccteam_core::daemon::daemon_reachable(paths);
-    if opts.dry_run {
-        report.steps.push(if daemon_up {
-            "будет записан trigger снятия с roster и ожидание подтверждения демона (≤5 с)"
-                .to_string()
-        } else {
-            "снятие с roster демона будет пропущено (демон не запущен)".to_string()
-        });
-    } else if !daemon_up {
-        report
-            .steps
-            .push("снятие с roster демона: пропущено (демон не запущен)".to_string());
-    } else {
-        match std::fs::write(&trigger_path, slug) {
-            Err(err) => report.steps.push(format!(
-                "снятие с roster демона: не удалось записать trigger ({err}); \
-                 демон заметит удаление из config при следующем сканировании"
-            )),
-            Ok(()) => {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                let mut acknowledged = false;
-                while std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    if !trigger_path.exists() {
-                        acknowledged = true;
-                        break;
-                    }
-                }
-                if acknowledged {
-                    report
-                        .steps
-                        .push("снятие с roster демона: подтверждено демоном".to_string());
-                } else {
-                    let _ = std::fs::remove_file(&trigger_path);
-                    report.steps.push(
-                        "снятие с roster демона: отправлено (демон не подтвердил за 5 с; \
-                         заметит при следующем сканировании)"
-                            .to_string(),
-                    );
-                }
-            }
-        }
-    }
-
-    // 5. Orchestration state cleanup under `~/.ccteam/`.
+    // 3. Dry-run previews the exact destructive surfaces but never contacts
+    // the daemon or creates the stable progress lock.
+    let backend = ccteam_harness::default_process_backend();
     let progress_path = paths.progress_jsonl(slug);
     let progress_dir = paths.progress_dir().join(slug); // flex shard dir
     let global_inbox_slug_dir = paths.inbox_dir().join(slug);
     let global_control_slug_dir = paths.control_dir().join(slug);
 
+    if opts.dry_run {
+        let chat_stop = stop_project_chat_sessions(backend.as_ref(), slug, true)?;
+        for name in &chat_stop.would_stop {
+            report
+                .steps
+                .push(format!("будет остановлена чат-сессия `{name}`"));
+        }
+        report
+            .steps
+            .push(if ccteam_core::daemon::daemon_reachable(paths) {
+                "daemon получит durable retirement, остановит сессии и дождётся всех writer'ов"
+                    .to_string()
+            } else {
+                "для выполнения потребуется запущенный daemon; без ACK config останется нетронутым"
+                    .to_string()
+            });
+        for path in ccteam_harness::execution::progress_bridge::cleanup_progress_state(
+            &progress_path,
+            true,
+        )? {
+            if path == progress_path {
+                report
+                    .steps
+                    .push(format!("будет удалён progress.jsonl {}", path.display()));
+            } else {
+                report.steps.push(format!(
+                    "будет удалено состояние progress {}",
+                    path.display()
+                ));
+            }
+        }
+    } else {
+        let outcome = request_daemon_project_retire(paths, slug).with_context(|| {
+            format!(
+                "project rm `{slug}` требует живой daemon и полного retirement ACK; config не изменён"
+            )
+        })?;
+        report
+            .steps
+            .push("retirement проекта подтверждено демоном".to_string());
+        for sid in outcome.sessions_stopped {
+            report
+                .steps
+                .push(format!("daemon остановил сессию `{sid}`"));
+        }
+        for path in outcome.progress_removed {
+            report
+                .steps
+                .push(format!("daemon удалил состояние progress {path}"));
+        }
+
+        // The gateway owns managed stdio/ACP sessions. Keep the old mux pass
+        // after its ACK solely for terminal-protocol leftovers.
+        let chat_stop = stop_project_chat_sessions(backend.as_ref(), slug, false)?;
+        for name in &chat_stop.stopped {
+            report
+                .steps
+                .push(format!("остановлена legacy чат-сессия `{name}`"));
+        }
+    }
+
+    // 4. Legacy global state is not a producer-owned progress surface.
     for (label, path, is_dir) in [
-        ("progress.jsonl", progress_path.clone(), false),
         ("progress shard dir", progress_dir.clone(), true),
         ("inbox/<slug>/ dir", global_inbox_slug_dir.clone(), true),
         ("control/<slug>/ dir", global_control_slug_dir.clone(), true),
@@ -3361,7 +3388,8 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
         }
     }
 
-    // 6. Optional `--purge`: project-local ccteam-managed paths.
+    // 5. Optional project-local cleanup happens after daemon ACK and before
+    // config deletion, so any partial failure remains visible and retryable.
     if opts.purge {
         purge_project_managed_paths(&project_dir, opts.dry_run, &mut report)?;
         // V0.6.5 F151 — also clean `~/.ccteam/state/im/registry/<slug>/`. The
@@ -3370,6 +3398,24 @@ pub fn run_remove(paths: &CcteamPaths, slug: &str, opts: RemoveOptions) -> Resul
         // entries after the workflow.yaml is gone → daemon can spawn an
         // orphan tmux session.
         purge_imd_registry_for_slug(&paths.root, slug, opts.dry_run, &mut report)?;
+    }
+
+    // 6. Config registry drop is the commit point and therefore always last.
+    if registered.is_some() {
+        if opts.dry_run {
+            report.steps.push(format!(
+                "будет удалена запись config.yaml::projects для `{slug}` (путь: {})",
+                project_dir.display()
+            ));
+        } else if ccteam_core::remove_project_from_config(&paths.root, slug)? {
+            report
+                .steps
+                .push(format!("удалена запись config.yaml::projects для `{slug}`"));
+        }
+    } else {
+        report.steps.push(format!(
+            "в config.yaml::projects нет записи для `{slug}` (сирота / установка до V0.4.2)"
+        ));
     }
 
     Ok(report)
@@ -4765,6 +4811,46 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn run_init_rejects_retired_slug_before_touching_project_files() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let target = tmp.path().join("retired-project");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                slug: Some("retired-project".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        let workflow = target.join(".ccteam").join("workflow.yaml");
+        std::fs::write(&workflow, "USER SENTINEL\n").unwrap();
+        ccteam_harness::execution::progress_bridge::mark_progress_retired(
+            &paths.progress_jsonl("retired-project"),
+        )
+        .unwrap();
+
+        let error = run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target),
+                slug: Some("retired-project".into()),
+                force: true,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("prior generation is retired"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(workflow).unwrap(),
+            "USER SENTINEL\n"
+        );
     }
 
     /// Installing in the ccteam source repo itself is fail-loud

@@ -30,12 +30,18 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
+
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// File name relative to `paths.root` (`~/.ccteam/`).
 pub const CONFIG_FILENAME: &str = "config.yaml";
+const CONFIG_LOCK_FILENAME: &str = "config.lock";
 /// Environment override for [`DaemonConfig::workers`].
 pub const DAEMON_WORKERS_ENV: &str = "CCTEAM_DAEMON_WORKERS";
 
@@ -389,6 +395,11 @@ pub fn load(ccteam_root: &Path) -> Result<CcteamConfig> {
 /// This mirrors `ProjectState::save` so a crash between steps leaves
 /// either the prior `.bak` or the next-version `.tmp` recoverable.
 pub fn save(ccteam_root: &Path, cfg: &CcteamConfig) -> Result<()> {
+    let _lock = ConfigFileLock::acquire(ccteam_root)?;
+    save_unlocked(ccteam_root, cfg)
+}
+
+fn save_unlocked(ccteam_root: &Path, cfg: &CcteamConfig) -> Result<()> {
     std::fs::create_dir_all(ccteam_root)
         .with_context(|| format!("create {}", ccteam_root.display()))?;
     let path = config_path(ccteam_root);
@@ -403,7 +414,110 @@ pub fn save(ccteam_root: &Path, cfg: &CcteamConfig) -> Result<()> {
     std::fs::write(&tmp, yaml.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
+    std::fs::File::open(ccteam_root)
+        .with_context(|| format!("open config directory {}", ccteam_root.display()))?
+        .sync_all()
+        .with_context(|| format!("sync config directory {}", ccteam_root.display()))?;
     Ok(())
+}
+
+#[cfg(unix)]
+struct ConfigFileLock(std::fs::File);
+
+#[cfg(unix)]
+impl ConfigFileLock {
+    fn acquire(ccteam_root: &Path) -> Result<Self> {
+        let state = ccteam_root.join("state");
+        std::fs::create_dir_all(&state)
+            .with_context(|| format!("create config lock directory {}", state.display()))?;
+        let path = state.join(CONFIG_LOCK_FILENAME);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("open config lock {}", path.display()))?;
+        if !file
+            .metadata()
+            .with_context(|| format!("stat config lock {}", path.display()))?
+            .is_file()
+        {
+            return Err(anyhow!(
+                "config lock is not a regular file: {}",
+                path.display()
+            ));
+        }
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("lock config {}", path.display()));
+        }
+        Ok(Self(file))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ConfigFileLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(not(unix))]
+struct ConfigFileLock(std::sync::MutexGuard<'static, ()>);
+
+#[cfg(not(unix))]
+impl ConfigFileLock {
+    fn acquire(_ccteam_root: &Path) -> Result<Self> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        Ok(Self(
+            LOCK.get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        ))
+    }
+}
+
+fn project_progress_path(ccteam_root: &Path, slug: &str) -> PathBuf {
+    ccteam_root
+        .join("state")
+        .join("progress")
+        .join(format!("{slug}.jsonl"))
+}
+
+fn validate_project_progress_generation(
+    ccteam_root: &Path,
+    slug: &str,
+    already_registered: bool,
+) -> Result<()> {
+    let progress_path = project_progress_path(ccteam_root, slug);
+    if already_registered {
+        if ccteam_harness::execution::progress_bridge::progress_state_is_retired(&progress_path)? {
+            return Err(anyhow!(
+                "project slug `{slug}` is permanently retired; create the project under a fresh numeric slug"
+            ));
+        }
+    } else if ccteam_harness::execution::progress_bridge::progress_slug_is_reserved(&progress_path)?
+    {
+        return Err(anyhow!(
+            "project slug `{slug}` is permanently reserved by prior progress state; choose a fresh numeric slug"
+        ));
+    }
+    Ok(())
+}
+
+/// Fail before a project scaffold/refresh touches project-local files when its
+/// durable progress generation has already been retired. Registry writers run
+/// the same check again as their last line of defense.
+pub fn preflight_project_upsert(ccteam_root: &Path, slug: &str) -> Result<()> {
+    let cfg = load(ccteam_root)?;
+    validate_project_progress_generation(
+        ccteam_root,
+        slug,
+        cfg.projects.iter().any(|entry| entry.slug == slug),
+    )
 }
 
 /// Append `entry` to `config.yaml::projects`. Fails loud on slug
@@ -411,6 +525,7 @@ pub fn save(ccteam_root: &Path, cfg: &CcteamConfig) -> Result<()> {
 /// collision earlier so the user gets a clearer error, but this is
 /// the last line of defense.
 pub fn append_project(ccteam_root: &Path, entry: ProjectEntry) -> Result<()> {
+    let _lock = ConfigFileLock::acquire(ccteam_root)?;
     let mut cfg = load(ccteam_root)?;
     if cfg.projects.iter().any(|p| p.slug == entry.slug) {
         return Err(anyhow!(
@@ -419,33 +534,38 @@ pub fn append_project(ccteam_root: &Path, entry: ProjectEntry) -> Result<()> {
             config_path(ccteam_root).display()
         ));
     }
+    validate_project_progress_generation(ccteam_root, &entry.slug, false)?;
     cfg.projects.push(entry);
-    save(ccteam_root, &cfg)
+    save_unlocked(ccteam_root, &cfg)
 }
 
 /// Update or insert `entry`. Used by `ccteam init` re-runs against an
 /// already-registered slug — refresh `path` / `team` / `installed_at`
 /// without erroring on collision.
 pub fn upsert_project(ccteam_root: &Path, entry: ProjectEntry) -> Result<()> {
+    let _lock = ConfigFileLock::acquire(ccteam_root)?;
     let mut cfg = load(ccteam_root)?;
+    let already_registered = cfg.projects.iter().any(|p| p.slug == entry.slug);
+    validate_project_progress_generation(ccteam_root, &entry.slug, already_registered)?;
     if let Some(existing) = cfg.projects.iter_mut().find(|p| p.slug == entry.slug) {
         *existing = entry;
     } else {
         cfg.projects.push(entry);
     }
-    save(ccteam_root, &cfg)
+    save_unlocked(ccteam_root, &cfg)
 }
 
 /// Remove `slug` from the registry. Returns `true` iff the slug was
 /// present.
 pub fn remove_project(ccteam_root: &Path, slug: &str) -> Result<bool> {
+    let _lock = ConfigFileLock::acquire(ccteam_root)?;
     let mut cfg = load(ccteam_root)?;
     let before = cfg.projects.len();
     cfg.projects.retain(|p| p.slug != slug);
     if cfg.projects.len() == before {
         return Ok(false);
     }
-    save(ccteam_root, &cfg)?;
+    save_unlocked(ccteam_root, &cfg)?;
     Ok(true)
 }
 
@@ -465,12 +585,20 @@ pub fn pick_unused_project_slug(ccteam_root: &Path, base: &str) -> Result<String
         .iter()
         .map(|entry| entry.slug.as_str())
         .collect();
-    if !used.contains(base) {
+    if !used.contains(base)
+        && !ccteam_harness::execution::progress_bridge::progress_slug_is_reserved(
+            &project_progress_path(ccteam_root, base),
+        )?
+    {
         return Ok(base.to_string());
     }
     for n in 2u32.. {
         let candidate = format!("{base}{n}");
-        if !used.contains(candidate.as_str()) {
+        if !used.contains(candidate.as_str())
+            && !ccteam_harness::execution::progress_bridge::progress_slug_is_reserved(
+                &project_progress_path(ccteam_root, &candidate),
+            )?
+        {
             return Ok(candidate);
         }
     }
@@ -578,6 +706,42 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_project_appends_do_not_lose_registry_rows() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::sync::Arc::new(tmp.path().to_path_buf());
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|n| {
+                let root = std::sync::Arc::clone(&root);
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    append_project(
+                        &root,
+                        sample_entry(&format!("p{n}"), Path::new(&format!("/x/p{n}"))),
+                    )
+                    .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let loaded = load(&root).unwrap();
+        assert_eq!(loaded.projects.len(), 8);
+        assert_eq!(
+            loaded
+                .projects
+                .iter()
+                .map(|entry| entry.slug.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            8
+        );
+    }
+
+    #[test]
     fn upsert_project_overwrites_existing_entry() {
         let tmp = TempDir::new().unwrap();
         let first = sample_entry("foo", &PathBuf::from("/old/path"));
@@ -619,6 +783,62 @@ mod tests {
             pick_unused_project_slug(tmp.path(), "free").unwrap(),
             "free"
         );
+    }
+
+    #[test]
+    fn retired_project_slug_is_never_reused_or_refreshed() {
+        let tmp = TempDir::new().unwrap();
+        let entry = sample_entry("demo", Path::new("/x/demo"));
+        append_project(tmp.path(), entry.clone()).unwrap();
+        let progress = project_progress_path(tmp.path(), "demo");
+        ccteam_harness::execution::progress_bridge::mark_progress_retired(&progress).unwrap();
+
+        let refresh_error = upsert_project(tmp.path(), entry).unwrap_err().to_string();
+        assert!(
+            refresh_error.contains("permanently retired"),
+            "{refresh_error}"
+        );
+        let preflight_error = preflight_project_upsert(tmp.path(), "demo")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            preflight_error.contains("permanently retired"),
+            "{preflight_error}"
+        );
+
+        assert!(remove_project(tmp.path(), "demo").unwrap());
+        assert_eq!(
+            pick_unused_project_slug(tmp.path(), "demo").unwrap(),
+            "demo2"
+        );
+        let append_error =
+            append_project(tmp.path(), sample_entry("demo", Path::new("/x/recreated")))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            append_error.contains("permanently reserved"),
+            "{append_error}"
+        );
+    }
+
+    #[test]
+    fn any_orphan_progress_lock_reserves_an_unregistered_slug() {
+        let tmp = TempDir::new().unwrap();
+        let progress = project_progress_path(tmp.path(), "demo");
+        ccteam_harness::execution::progress_bridge::append_event(
+            &progress,
+            &serde_json::json!({"event": "orphan"}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            pick_unused_project_slug(tmp.path(), "demo").unwrap(),
+            "demo2"
+        );
+        let error = append_project(tmp.path(), sample_entry("demo", Path::new("/x/demo")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("permanently reserved"), "{error}");
     }
 
     #[test]

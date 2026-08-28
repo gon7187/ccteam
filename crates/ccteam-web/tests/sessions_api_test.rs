@@ -1642,6 +1642,8 @@ async fn session_verdict_is_idempotent_and_history_joins_latest_archive_and_acti
         ),
     )
     .unwrap();
+    ccteam_harness::execution::progress_bridge::load_or_recover_progress_checkpoint(&progress)
+        .unwrap();
 
     let archived_history: Value = client
         .get(format!("{base}/sessions/{sid}"))
@@ -1812,12 +1814,17 @@ async fn session_verdict_and_history_surface_progress_storage_failures() {
         .unwrap();
     assert_eq!(write_failed.status(), 500);
 
-    let read_failed = client
+    let read_degraded = client
         .get(format!("{base}/sessions/{sid}"))
         .send()
         .await
         .unwrap();
-    assert_eq!(read_failed.status(), 500);
+    assert_eq!(read_degraded.status(), 200);
+    let history = read_degraded.json::<Value>().await.unwrap();
+    assert_eq!(history["verdicts_degraded"], true);
+    assert_eq!(history["verdicts_status"], "unavailable");
+    assert!(history["verdict_corrupt_line_count"].is_null());
+    assert!(history["events"][0].get("verdict").is_none());
 }
 
 /// ACL: a tenant may rename its OWN project's session, but a different

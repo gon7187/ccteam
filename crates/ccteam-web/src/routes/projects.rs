@@ -3,7 +3,7 @@
 //! This module owns the **mutating** project resource verbs:
 //!
 //! - `POST   /api/v1/projects`        → create (bootstrap + register) → 201
-//! - `DELETE /api/v1/projects/{slug}` → deregister + stop its sessions → 200
+//! - `DELETE /api/v1/projects/{slug}` → retire + deregister → 200
 //!
 //! The **read** verbs (`GET /api/v1/projects` list, `GET
 //! /api/v1/projects/{slug}` detail) are served by the pre-existing
@@ -15,11 +15,11 @@
 //! SPA already consumes api_v1's richer shapes, and a second GET handler
 //! on the same path would panic at router build time.
 //!
-//! **DELETE semantics (locked W5b decision)**: deregister only —
-//! `config::remove_project(slug)` plus, when a gateway is attached, stop
-//! every live session for that project via the spine. It never
-//! file-purges the working tree; destructive purge stays the CLI op
-//! `ccteam project rm --purge`.
+//! **DELETE semantics**: a live gateway first durably retires the project and
+//! drains its sessions/writers; only that acknowledgement permits removing
+//! the catalog row. Standalone web fails closed. It never file-purges the
+//! working tree; destructive purge stays the CLI op `ccteam project rm
+//! --purge`.
 //!
 //! Auth: merged into [`super::stateful_router`], so the existing
 //! `auth_layer` gate applies.
@@ -518,10 +518,9 @@ pub(crate) async fn handle_import_project(
 
 /// `DELETE /api/v1/projects/{slug}`
 ///
-/// Deregister-only: remove the slug from `config.yaml`, then (when a
-/// gateway is attached) stop every live session belonging to that
-/// project via the spine. 404 when the slug is not registered. Never
-/// file-purges. Returns `{ "removed": true }` on success.
+/// Durably retire the project through the live gateway, then remove its row
+/// from `config.yaml`. A missing gateway or failed retirement leaves config
+/// untouched. 404 when the slug is not registered. Never file-purges.
 #[utoipa::path(
     delete,
     path = "/api/v1/projects/{slug}",
@@ -530,17 +529,19 @@ pub(crate) async fn handle_import_project(
     responses(
         (status = 200, description = "Deregistered; `{removed, sessions_stopped[]}`", body = serde_json::Value),
         (status = 404, description = "Slug not registered"),
-        (status = 500, description = "Deregister failed"),
+        (status = 500, description = "Retirement or deregistration failed"),
+        (status = 503, description = "No live gateway; config left untouched"),
     ),
 )]
 pub(crate) async fn handle_delete_project(
     State(app): State<AppState>,
     Path(slug): Path<String>,
 ) -> Response {
-    // 1. Deregister from config.yaml. `false` = slug wasn't present → 404.
-    match ccteam_core::remove_project_from_config(&app.paths.root, &slug) {
-        Ok(true) => {}
-        Ok(false) => {
+    // Resolve existence before asking the gateway to commit an irreversible
+    // retirement. The catalog mutation itself remains the final step below.
+    match ccteam_core::lookup_project_in_config(&app.paths.root, &slug) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": format!("project not registered: {slug}")})),
@@ -548,48 +549,78 @@ pub(crate) async fn handle_delete_project(
                 .into_response();
         }
         Err(err) => {
-            tracing::error!(%slug, %err, "remove_project_from_config failed");
+            tracing::error!(%slug, %err, "lookup_project_in_config failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("deregister failed: {err}")})),
+                Json(serde_json::json!({
+                    "error": format!("project lookup failed: {err}"),
+                    "removed": false,
+                    "retired": false,
+                })),
             )
                 .into_response();
         }
     }
 
-    // 2. Stop every live session for this project via the spine, if a
-    //    gateway is attached. Snapshot the sids under one short lock, then
-    //    let the shared lifecycle spine stop them without holding the global
-    //    registry across vendor teardown.
-    //    No gateway (standalone internal-web path) ⇒ skip; deregister
-    //    alone is the meaningful effect there.
-    let mut stopped: Vec<String> = Vec::new();
-    if let Some(gw) = app.gateway.as_ref() {
-        let sids: Vec<String> = {
-            let guard = gw.lock().await;
-            guard
-                .session_views()
-                .into_iter()
-                .filter(|v| v.project == slug)
-                .map(|v| v.sid)
-                .collect()
-        };
-        for (sid, result) in Gateway::stop_sessions_shared(Arc::clone(gw), sids).await {
-            match result {
-                Ok(()) => stopped.push(sid),
-                Err(err) => {
-                    // Best-effort: a session that vanished mid-teardown
-                    // shouldn't fail the deregister (already removed from
-                    // config). Log + continue.
-                    tracing::warn!(%slug, %sid, %err, "stop_session during project delete failed");
-                }
-            }
+    let Some(gateway) = app.gateway.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "no live gateway: project retirement unavailable on standalone web",
+                "removed": false,
+                "retired": false,
+            })),
+        )
+            .into_response();
+    };
+
+    // The daemon owns every process and progress writer. Its acknowledgement
+    // is the sole proof that removing the catalog row can no longer orphan or
+    // resurrect project state.
+    let outcome = match Gateway::retire_project_shared(Arc::clone(gateway), &slug).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::error!(%slug, %err, "project retirement failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("project retirement failed: {err}"),
+                    "removed": false,
+                    "retired": false,
+                })),
+            )
+                .into_response();
         }
-    }
+    };
+
+    // Config deletion is deliberately last. If it fails, report the durable
+    // retirement truthfully so retry/reconciliation does not assume the old
+    // generation can still run.
+    let removed = match ccteam_core::remove_project_from_config(&app.paths.root, &slug) {
+        Ok(removed) => removed,
+        Err(err) => {
+            tracing::error!(%slug, %err, "remove_project_from_config failed after retirement");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("project retired but deregistration failed: {err}"),
+                    "removed": false,
+                    "retired": true,
+                    "slug": &outcome.slug,
+                    "sessions_stopped": &outcome.sessions_stopped,
+                    "progress_removed": &outcome.progress_removed,
+                })),
+            )
+                .into_response();
+        }
+    };
 
     Json(serde_json::json!({
-        "removed": true,
-        "sessions_stopped": stopped,
+        "removed": removed,
+        "retired": true,
+        "slug": outcome.slug,
+        "sessions_stopped": outcome.sessions_stopped,
+        "progress_removed": outcome.progress_removed,
     }))
     .into_response()
 }

@@ -2,11 +2,12 @@
 //!
 //! Confirms the CLI surface end-to-end:
 //!
-//! 1. `ccteam internal web --help` advertises the three flags (bind /
-//!    no-auth / token-file) so a typo doesn't silently drop one.
-//! 2. `ccteam internal web --bind 127.0.0.1:0 --no-auth` spawns, prints
-//!    the bound address on stdout, serves `GET /health` 200 + JSON, and
-//!    can be terminated by `child.kill()`.
+//! 1. `ccteam internal web --help` advertises the four flags (bind /
+//!    DSH companion bind / no-auth / token-file) so a typo doesn't silently
+//!    drop one.
+//! 2. `ccteam internal web --bind 127.0.0.1:0 --dsh-web-bind off --no-auth`
+//!    spawns, prints the bound address on stdout, serves `GET /health` 200 +
+//!    JSON, and can be terminated by `child.kill()`.
 //!
 //! The lib-level `serve` round-trip (in-process axum + reqwest) is
 //! covered in `crates/ccteam-web/src/lib.rs` tests; this file
@@ -30,7 +31,7 @@ fn ccteam_internal_web_help_advertises_flags() {
         "ccteam internal web --help should exit 0"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for flag in ["--bind", "--no-auth", "--token-file"] {
+    for flag in ["--bind", "--dsh-web-bind", "--no-auth", "--token-file"] {
         assert!(
             stdout.contains(flag),
             "ccteam internal web --help should mention {flag}; got: {stdout}",
@@ -41,8 +42,20 @@ fn ccteam_internal_web_help_advertises_flags() {
 #[test]
 fn ccteam_web_serves_health_then_exits_when_killed() {
     let bin = env!("CARGO_BIN_EXE_ccteam");
+    let temp = tempfile::tempdir().unwrap();
     let mut child = Command::new(bin)
-        .args(["internal", "web", "--bind", "127.0.0.1:0", "--no-auth"])
+        .args([
+            "internal",
+            "web",
+            "--bind",
+            "127.0.0.1:0",
+            "--dsh-web-bind",
+            "off",
+            "--no-auth",
+        ])
+        .env("HOME", temp.path().join("home"))
+        .env("CCTEAM_HOME", temp.path().join("ccteam-home"))
+        .env("CCTEAM_PROJECTS_ROOT", temp.path().join("projects"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -133,25 +146,33 @@ fn stdlib_http_get(url: &str, deadline: Duration) -> Result<String, String> {
     loop {
         match TcpStream::connect(host) {
             Ok(mut stream) => {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .map_err(|e| e.to_string())?;
-                let req =
-                    format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n",);
-                stream
-                    .write_all(req.as_bytes())
-                    .map_err(|e| e.to_string())?;
-                let mut buf = String::new();
-                stream.read_to_string(&mut buf).map_err(|e| e.to_string())?;
-                let body = buf
-                    .split_once("\r\n\r\n")
-                    .map(|(_, b)| b.to_string())
-                    .unwrap_or(buf);
-                return Ok(body);
+                let attempt = (|| -> Result<String, String> {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .map_err(|e| e.to_string())?;
+                    let req = format!(
+                        "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n",
+                    );
+                    stream
+                        .write_all(req.as_bytes())
+                        .map_err(|e| e.to_string())?;
+                    let mut buf = String::new();
+                    stream.read_to_string(&mut buf).map_err(|e| e.to_string())?;
+                    Ok(buf
+                        .split_once("\r\n\r\n")
+                        .map(|(_, body)| body.to_string())
+                        .unwrap_or(buf))
+                })();
+                match attempt {
+                    Ok(body) => return Ok(body),
+                    Err(_) if start.elapsed() < deadline => {
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(err) => return Err(format!("request {host}{path}: {err}")),
+                }
             }
             Err(_) if start.elapsed() < deadline => {
                 thread::sleep(Duration::from_millis(100));
-                continue;
             }
             Err(err) => return Err(format!("connect {host}: {err}")),
         }

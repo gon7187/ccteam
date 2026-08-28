@@ -2,6 +2,7 @@ mod support {
     pub mod perf_fixture;
 }
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -231,17 +232,24 @@ async fn perf_gate() {
         assert_ok(&client, &format!("{base}/api/v1/status")).await;
     }
     let projection_before = projection.metrics();
-    let journal_before = ccteam_core::journal::metrics();
+    let core_journal_before = ccteam_core::journal::metrics();
+    let harness_journal_before = ccteam_harness::execution::journal::metrics();
     let status_samples = measure_gets(&client, &format!("{base}/api/v1/status"), 25).await;
     let projection_after = projection.metrics();
-    let journal_after = ccteam_core::journal::metrics();
+    let core_journal_after = ccteam_core::journal::metrics();
+    let harness_journal_after = ccteam_harness::execution::journal::metrics();
     let status_p95 = percentile(&status_samples, 95);
     let projection_bytes = projection_after
         .bytes_ingested
         .saturating_sub(projection_before.bytes_ingested);
-    let journal_bytes = journal_after
+    let journal_bytes = core_journal_after
         .bytes_read
-        .saturating_sub(journal_before.bytes_read);
+        .saturating_sub(core_journal_before.bytes_read)
+        .saturating_add(
+            harness_journal_after
+                .bytes_read
+                .saturating_sub(harness_journal_before.bytes_read),
+        );
     let read_per_call = journal_bytes / status_samples.len() as u64;
     println!(
         "perf-gate status: target p95<100ms/ingest≈0/read<10MiB measured={:.2}ms/{}B/{:.3}MiB hydration={:.2}s",
@@ -311,12 +319,72 @@ async fn perf_gate() {
     assert_release(tail_time < Duration::from_millis(50), "journal tail");
 
     let history_url = format!("{base}/api/v1/sessions/{}", fixture.history_sid);
-    let history_journal_before = ccteam_core::journal::metrics();
-    assert_ok(&client, &history_url).await;
+    let degraded_history: serde_json::Value = client
+        .get(&history_url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(degraded_history["events"].as_array().unwrap().len(), 100);
+    assert_eq!(degraded_history["verdicts_status"], "degraded_corrupt");
+    assert!(degraded_history["verdict_corrupt_line_count"]
+        .as_u64()
+        .is_some_and(|count| count > 0));
+    assert!(degraded_history["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event.get("verdict").is_none()));
+
+    reset_temp_progress_for_clean_history(root.path(), &fixture.progress_path);
+    for turn in HISTORY_TURNS - 100..HISTORY_TURNS {
+        ccteam_harness::execution::progress_bridge::append_turn_verdict_if_changed(
+            &fixture.progress_path,
+            &ccteam_harness::execution::progress_bridge::TurnVerdict {
+                sid: fixture.history_sid.clone(),
+                turn_id: format!("history-{turn:05}"),
+                ts: chrono::Utc::now(),
+                verdict: ccteam_harness::execution::progress_bridge::Verdict::Accept,
+                feedback: None,
+            },
+        )
+        .unwrap();
+    }
+    let enriched_history: serde_json::Value = client
+        .get(&history_url)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(enriched_history["events"].as_array().unwrap().len(), 100);
+    assert_eq!(enriched_history["verdicts_status"], "ok");
+    assert_eq!(enriched_history["verdict_corrupt_line_count"], 0);
+    assert!(enriched_history["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event["verdict"]["verdict"] == "accept"));
+    let history_core_journal_before = ccteam_core::journal::metrics();
+    let history_harness_journal_before = ccteam_harness::execution::journal::metrics();
     let history_samples = measure_gets(&client, &history_url, 20).await;
-    let history_journal_bytes = ccteam_core::journal::metrics()
+    let history_core_journal_after = ccteam_core::journal::metrics();
+    let history_harness_journal_after = ccteam_harness::execution::journal::metrics();
+    let history_journal_bytes = history_core_journal_after
         .bytes_read
-        .saturating_sub(history_journal_before.bytes_read);
+        .saturating_sub(history_core_journal_before.bytes_read)
+        .saturating_add(
+            history_harness_journal_after
+                .bytes_read
+                .saturating_sub(history_harness_journal_before.bytes_read),
+        );
     let history_p95 = percentile(&history_samples, 95);
     println!(
         "perf-gate 10k-history: target p95<100ms/read<10MiB measured={:.2}ms/{:.3}MiB source_turns={}",
@@ -341,6 +409,31 @@ async fn perf_gate() {
     assert_release(lock.hold.p99_us < 5_000, "gateway lock hold p99");
 
     server.abort();
+}
+
+fn reset_temp_progress_for_clean_history(temp_root: &Path, active: &Path) {
+    assert!(active.starts_with(temp_root));
+    let file_name = active.file_name().unwrap().to_string_lossy();
+    let stem = file_name.strip_suffix(".jsonl").unwrap();
+    let sibling = |suffix: &str| active.with_file_name(format!("{stem}{suffix}"));
+    for path in [
+        sibling(".1.jsonl"),
+        sibling(".checkpoint.json"),
+        sibling(".verdicts.json"),
+        sibling(".verdicts.corrupt.json"),
+        sibling(".terminals.jsonl"),
+        sibling(".turn-verdicts.jsonl"),
+        sibling(".terminal-keys"),
+        sibling(".verdict-keys"),
+    ] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&path).unwrap(),
+            Ok(_) => std::fs::remove_file(&path).unwrap(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("stat {}: {error}", path.display()),
+        }
+    }
+    std::fs::write(active, []).unwrap();
 }
 
 async fn measure_gets(client: &reqwest::Client, url: &str, count: usize) -> Vec<Duration> {

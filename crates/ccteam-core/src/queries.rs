@@ -172,6 +172,26 @@ pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
         crate::config::CcteamConfig::default()
     });
     for entry in &cfg.projects {
+        match ccteam_harness::execution::progress_bridge::progress_state_is_retired(
+            &paths.progress_jsonl(&entry.slug),
+        ) {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::warn!(
+                    slug = %entry.slug,
+                    "registered project is retired; skipping until project removal finishes"
+                );
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    slug = %entry.slug,
+                    error = %err,
+                    "registered project's progress generation is unreadable; skipping fail-closed"
+                );
+                continue;
+            }
+        }
         let state_path = entry.path.join(".ccteam").join("state.json");
         if !state_path.exists() {
             tracing::warn!(
@@ -212,6 +232,20 @@ pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
             };
             if seen_slugs.contains(&slug) {
                 continue;
+            }
+            match ccteam_harness::execution::progress_bridge::progress_state_is_retired(
+                &paths.progress_jsonl(&slug),
+            ) {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        slug,
+                        error = %err,
+                        "legacy project progress generation is unreadable; skipping fail-closed"
+                    );
+                    continue;
+                }
             }
             let state_path = paths.project_state(&slug);
             if !state_path.exists() {

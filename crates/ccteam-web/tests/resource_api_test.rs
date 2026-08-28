@@ -12,10 +12,13 @@
 //! Auth is disabled (loopback default) so these focus on route logic.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use ccteam_core::{
     bootstrap_project, disable_tool_surface_bootstrap_for_tests, write_role, CcteamPaths,
 };
+use ccteam_harness::ClaudeBgAdapter;
+use ccteam_im::gateway::Gateway;
 use ccteam_web::{router_with_state, AppState};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -30,6 +33,23 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
 fn fixture_project(paths: &CcteamPaths, slug: &str) {
     disable_tool_surface_bootstrap_for_tests();
     bootstrap_project(paths, slug, "demo request", "dev").unwrap();
+}
+
+fn fixture_registered_project(paths: &CcteamPaths, slug: &str) {
+    fixture_project(paths, slug);
+    ccteam_core::upsert_project_in_config(
+        &paths.root,
+        ccteam_core::ProjectEntry {
+            slug: slug.to_string(),
+            path: paths.projects_root.join(slug),
+            host: ccteam_core::LOCAL_HOST.to_string(),
+            remote_slug: None,
+            remote_path: None,
+            team: "dev".to_string(),
+            installed_at: chrono::Utc::now(),
+        },
+    )
+    .unwrap();
 }
 
 async fn spawn(state: AppState) -> SocketAddr {
@@ -556,47 +576,93 @@ async fn import_remote_project_is_idempotent_and_surfaces_binding() {
 }
 
 #[tokio::test]
-async fn delete_project_deregisters_without_gateway() {
+async fn delete_project_without_gateway_is_503_and_preserves_config() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     let root = paths.root.clone();
-    let target = tmp.path().join("torm");
+    fixture_registered_project(&paths, "torm");
+    let target = paths.project_dir("torm");
     let addr = spawn(AppState::new(paths)).await;
-    let client = reqwest::Client::new();
 
-    // Create then delete.
-    client
-        .post(format!("http://{addr}/api/v1/projects"))
-        .json(&serde_json::json!({ "slug": "torm", "path": target.display().to_string() }))
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/v1/projects/torm"))
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 503);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["removed"], false);
+    assert_eq!(v["retired"], false);
 
-    let resp = client
+    // No daemon acknowledgement means no registry mutation at all.
+    assert!(ccteam_core::lookup_project_in_config(&root, "torm")
+        .unwrap()
+        .is_some());
+    assert!(
+        target.exists(),
+        "DELETE must NOT file-purge the working tree"
+    );
+    assert!(target.join(".ccteam/state.json").exists());
+}
+
+#[tokio::test]
+async fn delete_project_retire_failure_preserves_config() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let root = paths.root.clone();
+    fixture_registered_project(&paths, "torm");
+    let gateway = Gateway::new(
+        Arc::new(ClaudeBgAdapter::new()),
+        "torm",
+        paths.project_dir("torm"),
+    );
+    // Deliberately omit `enable_project_creation`: retirement cannot commit
+    // its durable marker, so the route must fail before touching config.yaml.
+    let addr = spawn(AppState::new(paths).with_gateway_owned(gateway)).await;
+
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/v1/projects/torm"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["removed"], false);
+    assert_eq!(v["retired"], false);
+    assert!(ccteam_core::lookup_project_in_config(&root, "torm")
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn delete_project_retires_then_deregisters_with_truthful_ack() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let root = paths.root.clone();
+    fixture_registered_project(&paths, "torm");
+    let mut gateway = Gateway::new(
+        Arc::new(ClaudeBgAdapter::new()),
+        "torm",
+        paths.project_dir("torm"),
+    );
+    gateway.enable_project_creation(paths.clone());
+    let addr = spawn(AppState::new(paths).with_gateway_owned(gateway)).await;
+
+    let resp = reqwest::Client::new()
         .delete(format!("http://{addr}/api/v1/projects/torm"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let v: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(v.get("removed").unwrap(), true);
-    // sessions_stopped is empty (no gateway attached).
-    assert!(v
-        .get("sessions_stopped")
-        .unwrap()
-        .as_array()
-        .unwrap()
-        .is_empty());
-
-    // Deregistered from config.yaml; working tree NOT purged.
+    assert_eq!(v["removed"], true);
+    assert_eq!(v["retired"], true);
+    assert_eq!(v["slug"], "torm");
+    assert_eq!(v["sessions_stopped"], serde_json::json!([]));
+    assert!(v["progress_removed"].is_array());
     assert!(ccteam_core::lookup_project_in_config(&root, "torm")
         .unwrap()
         .is_none());
-    assert!(
-        target.exists(),
-        "DELETE must NOT file-purge the working tree"
-    );
-    assert!(target.join(".ccteam/state.json").exists());
 }
 
 #[tokio::test]

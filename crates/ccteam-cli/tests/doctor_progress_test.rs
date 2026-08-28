@@ -121,38 +121,38 @@ fn doctor_reports_and_repairs_progress_damage_idempotently() {
 
     let first = doctor_command(temp.path(), false).output().unwrap();
     let stdout = String::from_utf8_lossy(&first.stdout);
-    assert!(stdout.contains("progress\n"), "{stdout}");
-    assert!(stdout.contains("SIZE WARNING"), "{stdout}");
+    assert!(stdout.contains("прогресс\n"), "{stdout}");
+    assert!(stdout.contains("ПРЕДУПРЕЖДЕНИЕ О РАЗМЕРЕ"), "{stdout}");
     assert!(
-        stdout.contains("active corrupt=1 first_offset="),
+        stdout.contains("active повреждено=1 first_offset="),
         "{stdout}"
     );
     assert!(
-        stdout.contains("archive=") && stdout.contains("corrupt=1"),
+        stdout.contains("archive=") && stdout.contains("повреждено=1"),
         "{stdout}"
     );
     assert!(
-        stdout.contains("TOP KINDS BY BYTES: flood_kind="),
+        stdout.contains("ТОП ТИПОВ ПО БАЙТАМ: flood_kind="),
         "{stdout}"
     );
-    assert!(stdout.contains("checkpoint=INCONSISTENT"), "{stdout}");
+    assert!(stdout.contains("checkpoint=НЕСОГЛАСОВАН"), "{stdout}");
     assert!(
-        stdout.contains("archive status=ORPHAN/uncovered"),
+        stdout.contains("статус archive=СИРОТА/не покрыт"),
         "{stdout}"
     );
 
     let repaired = doctor_command(temp.path(), true).output().unwrap();
     let repaired_stdout = String::from_utf8_lossy(&repaired.stdout);
     assert!(
-        repaired_stdout.contains("demo.jsonl: kept 2, dropped 1"),
+        repaired_stdout.contains("demo.jsonl: сохранено 2, отброшено 1"),
         "{repaired_stdout}"
     );
     assert!(
-        repaired_stdout.contains("demo.1.jsonl: kept 1, dropped 1"),
+        repaired_stdout.contains("demo.1.jsonl: сохранено 1, отброшено 1"),
         "{repaired_stdout}"
     );
     assert!(
-        repaired_stdout.contains("a torn line usually costs 2 records"),
+        repaired_stdout.contains("оборванная строка обычно теряет 2 записи"),
         "{repaired_stdout}"
     );
     assert_eq!(backup_count(progress), 2);
@@ -167,7 +167,7 @@ fn doctor_reports_and_repairs_progress_damage_idempotently() {
     let second = doctor_command(temp.path(), true).output().unwrap();
     let second_stdout = String::from_utf8_lossy(&second.stdout);
     assert!(
-        second_stdout.contains("no corrupt progress lines found; no journals changed"),
+        second_stdout.contains("повреждённых строк progress не найдено; журналы не менялись"),
         "{second_stdout}"
     );
     assert_eq!(backup_count(progress), 2);
@@ -176,7 +176,7 @@ fn doctor_reports_and_repairs_progress_damage_idempotently() {
     let parse_error = doctor_command(temp.path(), false).output().unwrap();
     let parse_error_stdout = String::from_utf8_lossy(&parse_error.stdout);
     assert!(
-        parse_error_stdout.contains("checkpoint=PARSE ERROR"),
+        parse_error_stdout.contains("checkpoint=ОШИБКА РАЗБОРА"),
         "{parse_error_stdout}"
     );
 
@@ -190,7 +190,7 @@ fn doctor_reports_and_repairs_progress_damage_idempotently() {
     let repaired_with_bad_checkpoint_stdout =
         String::from_utf8_lossy(&repaired_with_bad_checkpoint.stdout);
     assert!(
-        repaired_with_bad_checkpoint_stdout.contains("demo.jsonl: kept 2, dropped 1"),
+        repaired_with_bad_checkpoint_stdout.contains("demo.jsonl: сохранено 2, отброшено 1"),
         "{repaired_with_bad_checkpoint_stdout}"
     );
     assert_eq!(backup_count(progress), 3);

@@ -172,9 +172,8 @@ fn skill_search_filters_catalog_and_role_add_refuses_skills() {
         .output()
         .unwrap();
     assert!(!role_add.status.success());
-    assert!(
-        String::from_utf8_lossy(&role_add.stderr).contains("use: ccteam skill add helper-skill")
-    );
+    assert!(String::from_utf8_lossy(&role_add.stderr)
+        .contains("используйте: ccteam skill add helper-skill"));
 
     let wrong_type = sandbox
         .hub_cmd(&hub)
@@ -182,9 +181,8 @@ fn skill_search_filters_catalog_and_role_add_refuses_skills() {
         .output()
         .unwrap();
     assert!(!wrong_type.status.success());
-    assert!(
-        String::from_utf8_lossy(&wrong_type.stderr).contains("use: ccteam role add helper-agent")
-    );
+    assert!(String::from_utf8_lossy(&wrong_type.stderr)
+        .contains("используйте: ccteam role add helper-agent"));
 }
 
 #[test]
@@ -218,7 +216,7 @@ fn skill_add_and_update_touch_only_the_library() {
         .unwrap();
     assert_success(&update_all, "skill update --all");
     assert_eq!(std::fs::read_to_string(&installed).unwrap(), SKILL_BODY);
-    assert!(String::from_utf8_lossy(&update_all.stdout).contains("1 updated"));
+    assert!(String::from_utf8_lossy(&update_all.stdout).contains("обновлено 1"));
     assert!(std::fs::read_dir(&sandbox.repo).unwrap().next().is_none());
 }
 
@@ -355,7 +353,7 @@ fn skill_source_plain_path_is_copied_once_and_self_managed() {
         .output()
         .unwrap();
     assert_success(&update, "skill source update path");
-    assert!(String::from_utf8_lossy(&update.stdout).contains("self-managed"));
+    assert!(String::from_utf8_lossy(&update.stdout).contains("управляется самостоятельно"));
 }
 
 #[cfg(unix)]
