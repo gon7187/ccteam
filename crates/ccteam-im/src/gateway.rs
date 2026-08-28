@@ -2192,6 +2192,15 @@ struct NewSessionPlan {
     remote: Option<ccteam_harness::RemoteExecTarget>,
     ccteam_root: Option<PathBuf>,
     remote_proxy: Option<Arc<dyn crate::remote_host::RemoteHostProxy>>,
+    /// Immutable attribution captured on the blocking pool before vendor
+    /// startup. `None` only during the short in-memory planning phase.
+    fingerprints: Option<SpawnFingerprintSnapshot>,
+}
+
+#[derive(Clone)]
+struct SpawnFingerprintSnapshot {
+    role_sha: Option<String>,
+    skills_sha: Option<BTreeMap<String, String>>,
 }
 
 /// v0.9 T2 — sync-computed inputs needed to resume a dead child in place.
@@ -4737,6 +4746,12 @@ impl Gateway {
         let Some(plan) = plan else {
             return Ok(sid);
         };
+        // Fingerprinting is filesystem work and defines this process
+        // generation's attribution. Finish it before tearing down the current
+        // thread so a failed blocking task leaves `/role` as a no-op.
+        let fingerprints =
+            Self::capture_spawn_fingerprints(plan.spawn.cwd.clone(), plan.spawn.role.clone())
+                .await?;
         let _ = plan.old_adapter.close_thread(&plan.old_thread).await;
         let (principals, cleanup_tasks) = {
             let guard = gateway.lock().await;
@@ -4843,11 +4858,15 @@ impl Gateway {
             meta.model = plan.spawn.model_id.clone();
             meta.effort = plan.spawn.effort.clone();
             meta.mode = plan.spawn.mode.clone();
-            meta.role_sha =
-                ccteam_harness::execution::experience::role_fingerprint(&cwd, &plan.spawn.role);
-            meta.skills_sha = ccteam_harness::execution::experience::skills_fingerprint(&cwd);
+            meta.role_sha = fingerprints.role_sha.clone();
+            meta.skills_sha = fingerprints.skills_sha.clone();
             meta.last_active = chrono::Utc::now().to_rfc3339();
-            let _ = catalog.write(&cwd, meta);
+            if let Err(error) = catalog.write(&cwd, meta) {
+                tracing::warn!(%sid, %error, "failed to persist role-switch metadata");
+                // Keep the live pump on the same immutable generation even
+                // when the durable metadata write itself degraded.
+                catalog.insert(&cwd, meta);
+            }
         }
         {
             let mut guard = gateway.lock().await;
@@ -4859,7 +4878,7 @@ impl Gateway {
                 // The pump snapshots role/skill fingerprints from the durable
                 // catalog at spawn. Start it only after `/role` published the
                 // new fingerprint generation above.
-                guard.spawn_event_pump(&sid);
+                guard.spawn_event_pump_with_fingerprints(&sid, Some(fingerprints.clone()));
             }
         }
         Self::persist_latest_routing_shared(&gateway).await?;
@@ -5716,13 +5735,13 @@ impl Gateway {
                 let mut g = crate::latency::gateway_lock(&gateway, "im.turn.spawn_plan").await;
                 g.plan_ensure_current_session(&chat)?
             };
-            if let EnsureSessionOutcome::Spawn(plan) = outcome {
+            if let EnsureSessionOutcome::Spawn(mut plan) = outcome {
                 // The slow part — deliberately NO gateway lock held here.
                 let (principals, cleanup_tasks) = {
                     let guard = gateway.lock().await;
                     (guard.principals(), guard.cleanup_tasks.clone())
                 };
-                let thread = match Self::spawn_for_new_session_plan(&plan).await {
+                let thread = match Self::spawn_for_new_session_plan(&mut plan).await {
                     Ok(thread) => thread,
                     Err(err) => {
                         crate::latency::gateway_lock(&gateway, "im.turn.spawn_rollback")
@@ -6967,8 +6986,8 @@ impl Gateway {
     async fn ensure_current_session(&mut self, chat: &ChatKey) -> Result<()> {
         match self.plan_ensure_current_session(chat)? {
             EnsureSessionOutcome::AlreadyHasSession => Ok(()),
-            EnsureSessionOutcome::Spawn(plan) => {
-                let thread = match Self::spawn_for_new_session_plan(&plan).await {
+            EnsureSessionOutcome::Spawn(mut plan) => {
+                let thread = match Self::spawn_for_new_session_plan(&mut plan).await {
                     Ok(thread) => thread,
                     Err(err) => {
                         self.forget_principal(&plan.id);
@@ -7220,7 +7239,7 @@ impl Gateway {
             tuning,
         )?;
         plan.remote = host_target.remote;
-        let thread = match Self::spawn_for_new_session_plan(&plan).await {
+        let thread = match Self::spawn_for_new_session_plan(&mut plan).await {
             Ok(thread) => thread,
             Err(err) => {
                 self.forget_principal(&plan.id);
@@ -7369,6 +7388,7 @@ impl Gateway {
             remote: None,
             ccteam_root: self.project_paths.as_ref().map(|paths| paths.root.clone()),
             remote_proxy: self.remote_host_proxy.clone(),
+            fingerprints: None,
         })
     }
 
@@ -7376,8 +7396,10 @@ impl Gateway {
     /// [`NewSessionPlan`]. Self-less (no `&self`/`&mut self`) so a caller can
     /// run it with NO gateway lock held at all — mirrors [`Self::spawn_for_plan`].
     async fn spawn_for_new_session_plan(
-        plan: &NewSessionPlan,
+        plan: &mut NewSessionPlan,
     ) -> Result<ThreadHandle, HarnessError> {
+        plan.fingerprints =
+            Some(Self::capture_spawn_fingerprints(plan.cwd.clone(), plan.role.clone()).await?);
         let remote = if plan.remote.is_some() || plan.host == ccteam_core::LOCAL_HOST {
             plan.remote.clone()
         } else {
@@ -7437,6 +7459,20 @@ impl Gateway {
             .await
     }
 
+    async fn capture_spawn_fingerprints(
+        cwd: PathBuf,
+        role: String,
+    ) -> Result<SpawnFingerprintSnapshot, HarnessError> {
+        tokio::task::spawn_blocking(move || SpawnFingerprintSnapshot {
+            role_sha: ccteam_harness::execution::experience::role_fingerprint(&cwd, &role),
+            skills_sha: ccteam_harness::execution::experience::skills_fingerprint(&cwd),
+        })
+        .await
+        .map_err(|error| {
+            HarnessError::SpawnFailed(format!("spawn fingerprint task failed: {error}"))
+        })
+    }
+
     /// Build the durable metadata for a fresh session without borrowing the
     /// gateway. Shared entry points run this filesystem-backed fingerprinting
     /// step before the short live-map apply lock.
@@ -7446,10 +7482,10 @@ impl Gateway {
         trigger: Option<&str>,
     ) -> SessionMeta {
         let now = chrono::Utc::now().to_rfc3339();
-        let (role_sha, skills_sha) = (
-            ccteam_harness::execution::experience::role_fingerprint(&plan.cwd, &plan.role),
-            ccteam_harness::execution::experience::skills_fingerprint(&plan.cwd),
-        );
+        let fingerprints = plan
+            .fingerprints
+            .as_ref()
+            .expect("vendor start requires a fingerprint snapshot");
         let trigger = trigger.map(str::to_string).unwrap_or_else(|| {
             let channel = plan.reply_to.channel.as_str();
             if channel == "web" || channel == "user" {
@@ -7488,8 +7524,8 @@ impl Gateway {
             turn_count: 0,
             cost_usd: None,
             tokens_total: None,
-            role_sha,
-            skills_sha,
+            role_sha: fingerprints.role_sha.clone(),
+            skills_sha: fingerprints.skills_sha.clone(),
             trigger: Some(trigger),
             parent_sid: plan.parent_sid.clone(),
             spawned_by_role: plan.spawned_by_role.clone(),
@@ -7517,6 +7553,7 @@ impl Gateway {
         capacity_checked: bool,
         prepared_meta: Option<SessionMeta>,
     ) -> Result<StartOutcome> {
+        let pump_fingerprints = plan.fingerprints.clone();
         let meta =
             prepared_meta.unwrap_or_else(|| Self::meta_for_new_session(&plan, &thread, trigger));
         let NewSessionPlan {
@@ -7545,6 +7582,7 @@ impl Gateway {
             remote: _,
             ccteam_root: _,
             remote_proxy: _,
+            fingerprints: _,
         } = plan;
         let reservation_matches = self
             .new_session_reservations
@@ -7622,7 +7660,7 @@ impl Gateway {
                 }
             }
         }
-        self.spawn_event_pump(&id);
+        self.spawn_event_pump_with_fingerprints(&id, pump_fingerprints);
         // Pending-turn drain is async (re-enters submit_resolved); the
         // async caller of apply_new_session must invoke
         // `drain_and_dispatch_pending_turns` after this returns.
@@ -7962,6 +8000,14 @@ impl Gateway {
     }
 
     fn spawn_event_pump(&mut self, session_id: &str) {
+        self.spawn_event_pump_with_fingerprints(session_id, None);
+    }
+
+    fn spawn_event_pump_with_fingerprints(
+        &mut self,
+        session_id: &str,
+        fingerprints: Option<SpawnFingerprintSnapshot>,
+    ) {
         if self.event_pumps.contains_key(session_id) {
             return;
         }
@@ -7988,11 +8034,14 @@ impl Gateway {
         let progress_projection = self.progress_projection.clone();
         // v0.9 T5 — spawn-time fingerprints for experience.jsonl (do NOT re-read
         // meta.json per turn). Missing meta → None digests.
-        let (pump_role_sha, pump_skills_sha) = self
-            .session_catalog
-            .get(&session.id)
-            .map(|entry| entry.meta)
-            .map(|m| (m.role_sha, m.skills_sha))
+        let (pump_role_sha, pump_skills_sha) = fingerprints
+            .map(|snapshot| (snapshot.role_sha, snapshot.skills_sha))
+            .or_else(|| {
+                self.session_catalog
+                    .get(&session.id)
+                    .map(|entry| entry.meta)
+                    .map(|meta| (meta.role_sha, meta.skills_sha))
+            })
             .unwrap_or((None, None));
         let session_catalog = Arc::clone(&self.session_catalog);
         let session_id = session.id.clone();
@@ -8622,60 +8671,6 @@ impl Gateway {
                                 };
                             terminal_completion_metadata = Some(terminal_metadata.clone());
 
-                            let experience_lock = project_dir.as_ref().and_then(|dir| {
-                                match ccteam_harness::execution::experience::lock_experience(dir) {
-                                    Ok(lock) => Some(lock),
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            session = %session_id,
-                                            error = %err,
-                                            "ccteam-im: failed to lock derived terminal projection"
-                                        );
-                                        None
-                                    }
-                                }
-                            });
-                            // Terminal protocol's Stop hook owns its canonical
-                            // progress row. A paneless progress path is independent
-                            // of the registered project directory: losing the
-                            // directory degrades turns/Experience only, never the
-                            // progress SoT. When a directory exists, the derived
-                            // lock remains held across canonical and projection
-                            // writes.
-                            let mut canonical_progress_ready = session.protocol.is_terminal();
-                            if !session.protocol.is_terminal() {
-                                if let Some(ppath) = progress_path.as_ref() {
-                                    let event = ccteam_core::progress::build_chat_turn_completed_event_with_metadata(
-                                        &session.role,
-                                        &session_id,
-                                        &terminal.turn_id,
-                                        &terminal.usage,
-                                        terminal.model.as_deref(),
-                                        Some(vendor_str(session.vendor)),
-                                        &terminal_metadata,
-                                    );
-                                    match ccteam_core::progress::append_chat_turn_completed_if_absent(
-                                        ppath, &event,
-                                    ) {
-                                        Ok(admission)
-                                            if !admission.appended && !terminal_closes_active =>
-                                        {
-                                            tracing::debug!(
-                                                session = %session_id,
-                                                turn_id = %terminal.turn_id,
-                                                "pump: ignored durable duplicate terminal boundary"
-                                            );
-                                            continue;
-                                        }
-                                        Ok(_) => canonical_progress_ready = true,
-                                        Err(err) => tracing::warn!(
-                                            session = %session_id,
-                                            error = %err,
-                                            "stream-json pump: failed to mirror canonical chat_turn_completed"
-                                        ),
-                                    }
-                                }
-                            }
                             let model_owned = terminal
                                 .model
                                 .as_deref()
@@ -8718,70 +8713,157 @@ impl Gateway {
                                     },
                                 },
                             );
+                            let progress_event = (!session.protocol.is_terminal()).then(|| {
+                                ccteam_core::progress::build_chat_turn_completed_event_with_metadata(
+                                    &session.role,
+                                    &session_id,
+                                    &terminal.turn_id,
+                                    &terminal.usage,
+                                    terminal.model.as_deref(),
+                                    Some(vendor_str(session.vendor)),
+                                    &terminal_metadata,
+                                )
+                            });
                             // The message was mirrored provisionally when it
                             // arrived so delegation ordering remained durable.
                             // At the vendor boundary append one terminal row
                             // under the adapter's canonical id. History hides
                             // provisional rows and exposes this exact row to the
                             // verdict API, Experience and progress joins.
-                            let mut canonical_turn_ready = false;
-                            if let Some(dir) = project_dir.as_ref() {
-                                if is_completed {
-                                    let final_text = turn_last_answer
+                            let terminal_turn_record = is_completed.then(|| {
+                                ccteam_harness::execution::turns_mirror::TurnRecord {
+                                    turn_id: terminal.turn_id.clone(),
+                                    ts: chrono::Utc::now(),
+                                    vendor: vendor_str(session.vendor).to_string(),
+                                    role: session.role.clone(),
+                                    user: String::new(),
+                                    assistant: turn_last_answer
                                         .as_ref()
                                         .map(|(_, text)| text.clone())
-                                        .unwrap_or_default();
-                                    let record =
-                                        ccteam_harness::execution::turns_mirror::TurnRecord {
-                                            turn_id: terminal.turn_id.clone(),
-                                            ts: chrono::Utc::now(),
-                                            vendor: vendor_str(session.vendor).to_string(),
-                                            role: session.role.clone(),
-                                            user: String::new(),
-                                            assistant: final_text,
-                                            usage: serde_json::to_value(terminal.usage)
-                                                .unwrap_or(serde_json::Value::Null),
-                                            tool_calls: Vec::new(),
-                                            attachments: Vec::new(),
-                                            outcome: Some("completed".to_string()),
-                                            error_kind: None,
-                                            error: None,
-                                        };
-                                    match ccteam_harness::execution::turns_mirror::append_turn(
-                                        dir,
-                                        &session_id,
-                                        &record,
-                                    ) {
-                                        Ok(_) => {
-                                            canonical_turn_ready = true;
-                                            turn_covered.push(terminal.turn_id.clone());
+                                        .unwrap_or_default(),
+                                    usage: serde_json::to_value(terminal.usage)
+                                        .unwrap_or(serde_json::Value::Null),
+                                    tool_calls: Vec::new(),
+                                    attachments: Vec::new(),
+                                    outcome: Some("completed".to_string()),
+                                    error_kind: None,
+                                    error: None,
+                                }
+                            });
+                            let projection_dir = project_dir.clone();
+                            let projection_progress = progress_path.clone();
+                            let projection_sid = session_id.clone();
+                            let projection_turn_id = terminal.turn_id.clone();
+                            let terminal_protocol = session.protocol.is_terminal();
+                            let projection = tokio::task::spawn_blocking(move || {
+                                // One blocking transaction owns the flock and all
+                                // canonical/derived filesystem writes. Tokio workers
+                                // only await its result; a slow filesystem cannot
+                                // starve unrelated status or session requests.
+                                let experience_lock = projection_dir.as_ref().and_then(|dir| {
+                                    match ccteam_harness::execution::experience::lock_experience(dir)
+                                    {
+                                        Ok(lock) => Some(lock),
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                session = %projection_sid,
+                                                error = %err,
+                                                "ccteam-im: failed to lock derived terminal projection"
+                                            );
+                                            None
                                         }
+                                    }
+                                });
+                                // Terminal protocol's Stop hook owns its canonical
+                                // progress row. A paneless progress path is independent
+                                // of the registered project directory: losing the
+                                // directory degrades turns/Experience only, never the
+                                // progress SoT. When a directory exists, the derived
+                                // lock remains held across canonical and projection
+                                // writes.
+                                let mut canonical_progress_ready = terminal_protocol;
+                                if let (Some(path), Some(event)) =
+                                    (projection_progress.as_ref(), progress_event.as_ref())
+                                {
+                                    match ccteam_core::progress::append_chat_turn_completed_if_absent(
+                                        path, event,
+                                    ) {
+                                        Ok(admission)
+                                            if !admission.appended && !terminal_closes_active =>
+                                        {
+                                            return (true, false);
+                                        }
+                                        Ok(_) => canonical_progress_ready = true,
                                         Err(err) => tracing::warn!(
-                                            session = %session_id,
+                                            session = %projection_sid,
                                             error = %err,
-                                            "ccteam-im: failed to mirror canonical terminal turn"
+                                            "stream-json pump: failed to mirror canonical chat_turn_completed"
                                         ),
                                     }
                                 }
-                                if let Some(experience_lock) = experience_lock.as_ref().filter(|_| {
-                                    canonical_progress_ready || canonical_turn_ready
-                                }) {
-                                    if let Err(err) = ccteam_harness::execution::experience::append_experience_locked(
-                                        dir, experience_lock, &record,
-                                    ) {
+                                let mut canonical_turn_ready = false;
+                                if let Some(dir) = projection_dir.as_ref() {
+                                    if let Some(turn_record) = terminal_turn_record.as_ref() {
+                                        match ccteam_harness::execution::turns_mirror::append_turn(
+                                            dir,
+                                            &projection_sid,
+                                            turn_record,
+                                        ) {
+                                            Ok(_) => canonical_turn_ready = true,
+                                            Err(err) => tracing::warn!(
+                                                session = %projection_sid,
+                                                error = %err,
+                                                "ccteam-im: failed to mirror canonical terminal turn"
+                                            ),
+                                        }
+                                    }
+                                    if let Some(experience_lock) = experience_lock
+                                        .as_ref()
+                                        .filter(|_| canonical_progress_ready || canonical_turn_ready)
+                                    {
+                                        if let Err(err) = ccteam_harness::execution::experience::append_experience_locked(
+                                            dir,
+                                            experience_lock,
+                                            &record,
+                                        ) {
+                                            tracing::warn!(
+                                                session = %projection_sid,
+                                                error = %err,
+                                                "ccteam-im: failed to append experience.jsonl"
+                                            );
+                                        }
+                                    } else if experience_lock.is_some() {
                                         tracing::warn!(
-                                            session = %session_id,
-                                            error = %err,
-                                            "ccteam-im: failed to append experience.jsonl"
+                                            session = %projection_sid,
+                                            turn_id = %projection_turn_id,
+                                            "ccteam-im: skipped derived experience without a canonical terminal write"
                                         );
                                     }
-                                } else if experience_lock.is_some() {
+                                }
+                                (false, canonical_turn_ready)
+                            })
+                            .await;
+                            let (ignored_duplicate, canonical_turn_ready) = match projection {
+                                Ok(outcome) => outcome,
+                                Err(err) => {
                                     tracing::warn!(
                                         session = %session_id,
-                                        turn_id = %terminal.turn_id,
-                                        "ccteam-im: skipped derived experience without a canonical terminal write"
+                                        error = %err,
+                                        "ccteam-im: terminal persistence task failed"
                                     );
+                                    (false, false)
                                 }
+                            };
+                            if ignored_duplicate {
+                                tracing::debug!(
+                                    session = %session_id,
+                                    turn_id = %terminal.turn_id,
+                                    "pump: ignored durable duplicate terminal boundary"
+                                );
+                                continue;
+                            }
+                            if canonical_turn_ready {
+                                turn_covered.push(terminal.turn_id.clone());
                             }
 
                             if is_completed {
@@ -14234,7 +14316,7 @@ impl Gateway {
             proxy.as_ref(),
         )
         .await?;
-        let plan = {
+        let mut plan = {
             let mut guard = deadline.lock(&gateway).await?;
             let handle = role.clone();
             let mut plan = guard.plan_new_session(
@@ -14258,7 +14340,7 @@ impl Gateway {
             let guard = gateway.lock().await;
             (guard.principals(), guard.cleanup_tasks.clone())
         };
-        let thread = match Self::spawn_for_new_session_plan(&plan).await {
+        let thread = match Self::spawn_for_new_session_plan(&mut plan).await {
             Ok(thread) => thread,
             Err(error) => {
                 gateway.lock().await.forget_principal(&plan.id);
@@ -14836,7 +14918,7 @@ impl Gateway {
         plan.delegation_depth = child_depth;
         plan.title = title.clone();
         let child_sid = plan.id.clone();
-        let thread = match Self::spawn_for_new_session_plan(&plan).await {
+        let thread = match Self::spawn_for_new_session_plan(&mut plan).await {
             Ok(thread) => thread,
             Err(err) => {
                 self.forget_principal(&plan.id);
@@ -14903,7 +14985,7 @@ impl Gateway {
         )
         .await?;
         let host = host_target.host.clone();
-        let plan = {
+        let mut plan = {
             let mut guard = deadline.lock(&gateway).await?;
             let (parent_sid, spawned_by_role, child_depth) = if let Some(p) = &parent {
                 let cfg = guard.delegation_config();
@@ -15027,7 +15109,7 @@ impl Gateway {
             let guard = gateway.lock().await;
             (guard.principals(), guard.cleanup_tasks.clone())
         };
-        let thread = match Self::spawn_for_new_session_plan(&plan).await {
+        let thread = match Self::spawn_for_new_session_plan(&mut plan).await {
             Ok(thread) => thread,
             Err(error) => {
                 gateway.lock().await.forget_principal(&plan.id);
@@ -27118,6 +27200,225 @@ mod tests {
         .expect("terminal experience row after role switch");
         assert_eq!(record.role, "helper");
         assert_eq!(record.role_sha, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_new_session_keeps_the_pre_start_fingerprint_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_role(&project_dir, "reviewer");
+        let skill = project_dir.join(".claude/skills/build/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "version one").unwrap();
+        let expected_role =
+            ccteam_harness::execution::experience::role_fingerprint(&project_dir, "reviewer");
+        let expected_skills =
+            ccteam_harness::execution::experience::skills_fingerprint(&project_dir);
+
+        let start = Arc::new(TestStartBarrier::default());
+        start.arm();
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_start_barrier(Arc::clone(&start))
+                .with_turn_boundary(),
+        );
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let create_gateway = Arc::clone(&gateway);
+        let create = tokio::spawn(async move {
+            Gateway::create_session_api_tuned_shared(
+                create_gateway,
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning::default(),
+                GatewayDeadline::start(),
+            )
+            .await
+        });
+
+        start.wait_until_entered(1).await;
+        seed_role_with_model(&project_dir, "reviewer", Some("mutated-after-start"));
+        std::fs::write(&skill, "version two").unwrap();
+        start.release_all();
+        let sid = create.await.unwrap().unwrap().sid;
+
+        let meta = gateway
+            .lock()
+            .await
+            .session_catalog
+            .get(&sid)
+            .expect("new session metadata")
+            .meta;
+        assert_eq!(meta.role_sha, expected_role);
+        assert_eq!(meta.skills_sha, expected_skills);
+
+        gateway
+            .lock()
+            .await
+            .submit_to_sid(&sid, "work".into())
+            .await
+            .unwrap();
+        let record = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(turn) =
+                    ccteam_harness::execution::experience::read_all_experience(&project_dir)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find_map(|record| match record {
+                            ccteam_harness::execution::experience::ExperienceRecord::Turn(turn) => {
+                                Some(turn)
+                            }
+                            _ => None,
+                        })
+                {
+                    break turn;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shared spawn terminal projection");
+        assert_eq!(record.role_sha, expected_role);
+        assert_eq!(record.skills_sha, expected_skills);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_role_switch_keeps_the_pre_start_fingerprint_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        for role in ["reviewer", "helper"] {
+            seed_role(&project_dir, role);
+        }
+        let skill = project_dir.join(".claude/skills/build/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "version one").unwrap();
+        let expected_role =
+            ccteam_harness::execution::experience::role_fingerprint(&project_dir, "helper");
+        let expected_skills =
+            ccteam_harness::execution::experience::skills_fingerprint(&project_dir);
+
+        let start = Arc::new(TestStartBarrier::default());
+        let fake =
+            Arc::new(FakeAdapter::new(AgentVendor::Claude).with_start_barrier(Arc::clone(&start)));
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths);
+        gateway
+            .handle_text("telegram", "chat-a", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        start.arm();
+        let role_gateway = Arc::clone(&gateway);
+        let switch = tokio::spawn(async move {
+            Gateway::handle_message_shared(
+                role_gateway,
+                "telegram",
+                "chat-a",
+                "alice",
+                "role-snapshot",
+                "/role helper",
+                &[],
+                None,
+            )
+            .await
+        });
+
+        start.wait_until_entered(1).await;
+        seed_role_with_model(&project_dir, "helper", Some("mutated-after-start"));
+        std::fs::write(&skill, "version two").unwrap();
+        start.release_all();
+        switch.await.unwrap().unwrap();
+
+        let meta = gateway
+            .lock()
+            .await
+            .session_catalog
+            .get("s1")
+            .expect("switched session metadata")
+            .meta;
+        assert_eq!(meta.role_sha, expected_role);
+        assert_eq!(meta.skills_sha, expected_skills);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_experience_projection_does_not_starve_gateway_observation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        for _ in 0..4 {
+            gateway
+                .create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap();
+        }
+        let identities = gateway
+            .sessions
+            .values()
+            .map(|session| session.thread.identity.clone())
+            .collect::<Vec<_>>();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        let lock_dir = project_dir.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let locker = std::thread::spawn(move || {
+            let _lock = ccteam_harness::execution::experience::lock_experience(&lock_dir)
+                .expect("hold experience projection lock");
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("experience projection lock held");
+
+        let observed_gateway = Arc::clone(&gateway);
+        let observation_started = std::time::Instant::now();
+        let observation = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let count = observed_gateway.lock().await.sessions.len();
+            (observation_started.elapsed(), count)
+        });
+        tokio::task::yield_now().await;
+        {
+            let mut events = fake.events.lock().await;
+            for (index, identity) in identities.into_iter().enumerate() {
+                events.push_back((
+                    identity,
+                    ThreadEvent::TurnCompleted {
+                        turn_id: format!("blocked-{index}"),
+                        usage: ccteam_harness::UnifiedTokenUsage::default(),
+                        model: None,
+                    },
+                ));
+            }
+        }
+        fake.events_notify.notify_waiters();
+
+        let (elapsed, count) = observation.await.unwrap();
+        assert_eq!(count, 4);
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "blocking projection locks starved the Tokio runtime for {elapsed:?}"
+        );
+        tokio::task::spawn_blocking(move || locker.join().unwrap())
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

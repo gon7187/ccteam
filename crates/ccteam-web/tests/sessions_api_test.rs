@@ -502,7 +502,10 @@ async fn session_interrupt_wire_does_not_claim_an_already_idle_turn_was_interrup
     let project_dir = paths.projects_root.join("demo");
     std::fs::create_dir_all(&project_dir).unwrap();
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter {
+            vendor,
+            start_failure: None,
+        }) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
     let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;

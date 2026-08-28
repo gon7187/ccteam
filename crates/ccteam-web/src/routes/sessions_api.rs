@@ -66,7 +66,7 @@ use axum::{
     Extension, Json,
 };
 use ccteam_harness::execution::progress_bridge::{
-    append_turn_verdict_if_changed, latest_turn_verdicts, TurnVerdict, Verdict,
+    append_turn_verdict_if_changed, latest_turn_verdicts_detailed, TurnVerdict, Verdict,
 };
 use ccteam_harness::execution::turns_mirror::{read_all_turns, turns_jsonl_path, TurnRecord};
 use ccteam_harness::{
@@ -546,9 +546,14 @@ pub(crate) async fn handle_session_history(
                 .into_response();
         }
     };
-    let verdicts = match latest_turn_verdicts(&app.paths.progress_jsonl(&resolved.project)) {
-        Ok(verdicts) => verdicts,
-        Err(err) => {
+    let progress_path = app.paths.progress_jsonl(&resolved.project);
+    let verdict_read = match tokio::task::spawn_blocking(move || {
+        latest_turn_verdicts_detailed(&progress_path)
+    })
+    .await
+    {
+        Ok(Ok(read)) => read,
+        Ok(Err(err)) => {
             tracing::error!(%sid, project = %resolved.project, %err, "read turn verdicts failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -556,17 +561,57 @@ pub(crate) async fn handle_session_history(
             )
                 .into_response();
         }
-    };
-    let page = match collect_session_turns(
-        &resolved.project_dir,
-        &resolved.sid,
-        limit,
-        before,
-        &verdicts,
-    ) {
-        Ok(page) => page,
         Err(err) => {
+            tracing::error!(%sid, project = %resolved.project, %err, "turn verdict reader task failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "session verdict history unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    if verdict_read.corrupt_line_count > 0 {
+        tracing::error!(
+            %sid,
+            project = %resolved.project,
+            corrupt_line_count = verdict_read.corrupt_line_count,
+            "session history: corrupt canonical progress"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "session verdict history degraded",
+                "degraded": true,
+                "source": "progress",
+                "corrupt_line_count": verdict_read.corrupt_line_count,
+            })),
+        )
+            .into_response();
+    }
+    let history_dir = resolved.project_dir.clone();
+    let history_sid = resolved.sid.clone();
+    let page = match tokio::task::spawn_blocking(move || {
+        collect_session_turns(
+            &history_dir,
+            &history_sid,
+            limit,
+            before,
+            &verdict_read.verdicts,
+        )
+    })
+    .await
+    {
+        Ok(Ok(page)) => page,
+        Ok(Err(err)) => {
             tracing::error!(%sid, %err, "read session history failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "session history unavailable"})),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!(%sid, %err, "session history reader task failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "session history unavailable"})),
@@ -2577,6 +2622,80 @@ mod tests {
         assert_eq!(events[0]["assistant"], "LGTM");
         assert_eq!(events[1]["turn_id"], "t2");
         assert_eq!(events[1]["assistant"], "all green");
+    }
+
+    #[tokio::test]
+    async fn session_history_fails_closed_when_the_verdict_journal_is_corrupt() {
+        use ccteam_harness::execution::turns_mirror::append_turn;
+        use std::io::Write;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = test_app_with_gateway(tmp.path());
+        let sid = app
+            .gateway
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .create_session_api(
+                "demo".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let project_dir = app.paths.projects_root.join("demo");
+        append_turn(
+            &project_dir,
+            &sid,
+            &TurnRecord {
+                turn_id: "turn-1".into(),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: "question".into(),
+                assistant: "answer".into(),
+                usage: serde_json::Value::Null,
+                tool_calls: Vec::new(),
+                attachments: Vec::new(),
+                outcome: Some("completed".into()),
+                error_kind: None,
+                error: None,
+            },
+        )
+        .unwrap();
+        let progress = app.paths.progress_jsonl("demo");
+        append_turn_verdict_if_changed(
+            &progress,
+            &TurnVerdict {
+                sid: sid.clone(),
+                turn_id: "turn-1".into(),
+                ts: chrono::Utc::now(),
+                verdict: Verdict::Accept,
+                feedback: None,
+            },
+        )
+        .unwrap();
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&progress)
+                .unwrap(),
+            "corrupt-latest-verdict"
+        )
+        .unwrap();
+
+        let response = handle_session_history(
+            State(app),
+            Extension(crate::auth::Identity::admin()),
+            Path(sid),
+            Query(SessionHistoryQuery::default()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
