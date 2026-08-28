@@ -249,6 +249,10 @@ pending = None
 for raw in sys.stdin:
     command = json.loads(raw)
     kind = command.get("type")
+    control_log = os.environ.get("CCTEAM_PI_FAKE_CONTROL_LOG")
+    if control_log:
+        with open(control_log, "a", encoding="utf-8") as log:
+            log.write(str(kind) + "\n")
     if kind == "get_state":
         response(
             command,

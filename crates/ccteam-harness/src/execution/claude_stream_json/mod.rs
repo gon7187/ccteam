@@ -54,9 +54,9 @@ use crate::execution::session_status::{read_status_file, write_status_file};
 use crate::execution::transcript_tail::anthropic_project_dir;
 use crate::{
     AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, DetachOutcome, Directive,
-    DirectiveOutcome, ExecutionMode, HarnessAdapter, HarnessError, RecoveredTurn, SpawnCtx,
-    ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
-    UnobservedTurnCtx,
+    DirectiveOutcome, ExecutionMode, HarnessAdapter, HarnessError, InterruptOutcome, RecoveredTurn,
+    SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting,
+    TurnSubmission, UnobservedTurnCtx,
 };
 
 use bridge::{ApprovalDecision, CanUseToolResolver, SlashClass};
@@ -2037,13 +2037,16 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
     /// left fully live: no `close_thread`, no map removal, no pump abort — only
     /// the current turn stops, so a following `/model` etc. still works on the
     /// same context.
-    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
         let Some(live) = self.lookup(&h.identity) else {
             return Err(HarnessError::SubmitFailed(format!(
                 "interrupt: no live stream-json session for {} (nothing to interrupt)",
                 h.identity
             )));
         };
+        if !live.active_turn.load(Ordering::Acquire) {
+            return Ok(InterruptOutcome::AlreadyIdle);
+        }
         let body = live
             .transport
             .request_control("interrupt", json!({}), init_timeout())
@@ -2055,7 +2058,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 body.error.unwrap_or_else(|| body.subtype.clone())
             )));
         }
-        Ok(())
+        Ok(InterruptOutcome::Interrupted)
     }
 
     /// Claude's title surface is its transcript's `custom-title` entry (the

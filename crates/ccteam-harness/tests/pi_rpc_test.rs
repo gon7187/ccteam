@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ContextSource, Directive, DirectiveOutcome, HarnessAdapter,
-    PermissionMode, PiRoleDocument, PiRpcAdapter, SpawnCtx, ThreadEvent, ThreadHandle,
-    ThreadItemDetails, TurnDisposition, TurnInput, TurnRouting,
+    InterruptOutcome, PermissionMode, PiRoleDocument, PiRpcAdapter, SpawnCtx, ThreadEvent,
+    ThreadHandle, ThreadItemDetails, TurnDisposition, TurnInput, TurnRouting,
 };
 use futures::StreamExt;
 use serial_test::serial;
@@ -32,6 +32,7 @@ struct PiTestEnv {
     project: tempfile::TempDir,
     ccteam_home: PathBuf,
     log: PathBuf,
+    control_log: PathBuf,
     sessions: PathBuf,
     previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _mcp: tokio::task::JoinHandle<()>,
@@ -51,6 +52,7 @@ impl PiTestEnv {
         let project = tempfile::tempdir().unwrap();
         let ccteam_home = home.path().join("ccteam-home");
         let log = home.path().join("fake-pi-log.jsonl");
+        let control_log = home.path().join("fake-pi-control.log");
         let sessions = home.path().join("fake-pi-sessions");
         std::fs::create_dir_all(&ccteam_home).unwrap();
         std::fs::create_dir_all(&sessions).unwrap();
@@ -63,6 +65,7 @@ impl PiTestEnv {
             ("CCTEAM_HOME", ccteam_home.as_os_str()),
             ("CCTEAM_PI_BIN", fake.as_os_str()),
             ("CCTEAM_PI_FAKE_LOG", log.as_os_str()),
+            ("CCTEAM_PI_FAKE_CONTROL_LOG", control_log.as_os_str()),
             ("CCTEAM_PI_FAKE_SESSION_DIR", sessions.as_os_str()),
         ];
         let mut previous = Vec::new();
@@ -77,6 +80,7 @@ impl PiTestEnv {
             project,
             ccteam_home,
             log,
+            control_log,
             sessions,
             previous,
             _mcp: mcp,
@@ -488,6 +492,15 @@ async fn settled_terminal_routing_usage_context_and_directives() {
     }
 
     let mut abort_events = adapter.events(&handle);
+    let idle = adapter.interrupt_turn(&handle).await.unwrap();
+    assert_eq!(idle, InterruptOutcome::AlreadyIdle);
+    assert!(
+        std::fs::read_to_string(&env.control_log)
+            .unwrap_or_default()
+            .lines()
+            .all(|line| line != "abort"),
+        "an idle Pi session must not receive an abort request"
+    );
     let mut aborting = adapter
         .submit_turn_routed(
             &handle,
@@ -497,7 +510,17 @@ async fn settled_terminal_routing_usage_context_and_directives() {
         .await
         .unwrap();
     aborting.release_completion();
-    adapter.interrupt_turn(&handle).await.unwrap();
+    let interrupted = adapter.interrupt_turn(&handle).await.unwrap();
+    assert_eq!(interrupted, InterruptOutcome::Interrupted);
+    assert_eq!(
+        std::fs::read_to_string(&env.control_log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == "abort")
+            .count(),
+        1,
+        "the proven active turn receives exactly one abort"
+    );
     loop {
         let event = tokio::time::timeout(Duration::from_secs(3), abort_events.next())
             .await

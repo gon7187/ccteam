@@ -47,9 +47,9 @@ use crate::execution::session_status::write_status_file;
 use crate::{
     AgentSpecBrief, AgentVendor, ApprovalIR, ApprovalKind, ApprovalScope, ChoiceOption,
     ChoicePrompt, ContextSource, ContextUsage, DetachOutcome, Directive, DirectiveOutcome,
-    ExecutionMode, HarnessAdapter, HarnessError, SessionTitleTarget, SpawnCtx, ThreadErrorEvent,
-    ThreadEvent, ThreadHandle, ThreadStatus, TitleSync, TurnDisposition, TurnId, TurnInput,
-    TurnRouting, TurnSubmission,
+    ExecutionMode, HarnessAdapter, HarnessError, InterruptOutcome, SessionTitleTarget, SpawnCtx,
+    ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadStatus, TitleSync, TurnDisposition, TurnId,
+    TurnInput, TurnRouting, TurnSubmission,
 };
 
 pub const PI_RPC_ADAPTER_NAME: &str = "pi-rpc";
@@ -1572,10 +1572,20 @@ impl HarnessAdapter for PiRpcAdapter {
             .unwrap_or(true)
     }
 
-    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
         let live = self.lookup(&h.identity).ok_or_else(|| {
             HarnessError::ThreadDied(format!("Pi session {} is not live", h.identity))
         })?;
+        let active = live
+            .translate
+            .lock()
+            .unwrap()
+            .translator
+            .active_turn_id()
+            .is_some();
+        if !active {
+            return Ok(InterruptOutcome::AlreadyIdle);
+        }
         let response = live
             .transport
             .read()
@@ -1584,7 +1594,7 @@ impl HarnessAdapter for PiRpcAdapter {
             .await
             .map_err(HarnessError::SubmitFailed)?;
         if response.success {
-            Ok(())
+            Ok(InterruptOutcome::Interrupted)
         } else {
             Err(HarnessError::SubmitFailed(
                 response

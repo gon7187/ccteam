@@ -939,6 +939,7 @@ where
     // cancellation before detaching bodies so no accepted inbound submit can
     // outlive daemon shutdown and commit a late reply.
     let _ = inbound_consumer.await;
+    Gateway::drain_cleanup_tasks_shared(&gateway).await;
     gateway_event_consumer.abort();
     scheduled_scheduler.abort();
     body_watcher.abort();
@@ -1763,45 +1764,6 @@ fn spawn_inbound_consumer(
             )
             .await;
 
-            let restore_incomplete = !*restore_complete.borrow();
-            if can_bypass
-                && clean_payload.split_whitespace().next() == Some("/sessions")
-                && restore_incomplete
-            {
-                // Startup restore deliberately runs outside the gateway lock
-                // so the daemon and web face remain available while vendor
-                // children resume. A listing must not expose a partial prefix
-                // of that batch (s1 applied while s2 is still spawning), so
-                // park ONLY this request on the explicit completion signal.
-                // Its own task keeps the inbound consumer free to serve every
-                // unrelated message during restore.
-                let gateway = Arc::clone(&gateway);
-                let channel = Arc::clone(&channel);
-                let msg = msg.clone();
-                let cid = cid.clone();
-                let mut restore_complete = restore_complete.clone();
-                tasks.spawn(async move {
-                    if let Some(mut prior_observation) = prior_observation {
-                        let _ = prior_observation.wait_for(|ready| *ready).await;
-                    }
-                    if restore_complete.changed().await.is_err() {
-                        tracing::warn!(
-                            "ccteam-im: restore task ended before session-list readiness was signalled"
-                        );
-                    }
-                    let replies = Gateway::handle_observability_shared(
-                        gateway,
-                        &msg.channel,
-                        &msg.reply_target,
-                        &msg.sender,
-                        &clean_payload,
-                    )
-                    .await;
-                    deliver_gateway_replies(&cid, route_t0, &msg, channel.as_ref(), replies).await;
-                });
-                continue;
-            }
-
             // Every state-changing inbound message enters the same per-chat
             // lane. Only read-only observability commands bypass it, keeping
             // `/sessions` and `/status` responsive without letting `/new`,
@@ -1854,6 +1816,7 @@ fn spawn_inbound_consumer(
             let channel = Arc::clone(&channel);
             let msg = msg.clone();
             let cid = cid.clone();
+            let mut restore_complete = restore_complete.clone();
             tasks.spawn(async move {
                 let mut completion = InboundLaneCompletion::new(completion);
                 let still_observability = Gateway::inbound_can_bypass_after_prior_routing(
@@ -1866,7 +1829,18 @@ fn spawn_inbound_consumer(
                     msg.selection.is_some(),
                 )
                 .await;
+                let restore_ready = wait_for_restore_after_reclassification(
+                    still_observability,
+                    &clean_payload,
+                    &mut restore_complete,
+                )
+                .await;
                 let replies = if still_observability {
+                    if !restore_ready {
+                        tracing::warn!(
+                            "ccteam-im: restore task ended before session-list readiness was signalled"
+                        );
+                    }
                     let _ = ready_tx.send(true);
                     completion.release();
                     Gateway::handle_observability_shared(
@@ -1900,6 +1874,27 @@ fn spawn_inbound_consumer(
         while tasks.join_next().await.is_some() {}
         tracing::debug!("imd: inbound consumer exited (all senders closed)");
     })
+}
+
+/// A lexical `/sessions` is parked on startup recovery only after the prior
+/// same-chat routing mutation has confirmed it is still an observability
+/// command. If `/use` made those bytes a pending editor answer, return
+/// immediately; unrelated restore work must not stall the ordered chat lane.
+async fn wait_for_restore_after_reclassification(
+    still_observability: bool,
+    payload: &str,
+    restore_complete: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    if !still_observability
+        || payload.split_whitespace().next() != Some("/sessions")
+        || *restore_complete.borrow()
+    {
+        return true;
+    }
+    restore_complete
+        .wait_for(|complete| *complete)
+        .await
+        .is_ok()
 }
 
 /// Send the outcome of one `handle_message`/`handle_message_shared` call to
@@ -3443,6 +3438,33 @@ pub fn _link_check(_c: &Credentials) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn restore_wait_is_skipped_after_sessions_text_becomes_pending_input() {
+        let (_complete, mut restore) = tokio::sync::watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            wait_for_restore_after_reclassification(false, "/sessions", &mut restore),
+        )
+        .await
+        .expect("reclassified pending input must not wait for startup restore");
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn restore_wait_holds_a_real_sessions_listing_until_the_batch_is_complete() {
+        let (complete, mut restore) = tokio::sync::watch::channel(false);
+        let wait = tokio::spawn(async move {
+            wait_for_restore_after_reclassification(true, "/sessions", &mut restore).await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "partial restored fleet must stay hidden"
+        );
+        complete.send(true).unwrap();
+        assert!(wait.await.unwrap());
+    }
 
     /// v0.8.20 F2 — one channel per tenant bot, keyed `"<platform>@<tenant_id>"`
     /// (the unique routing key); a tenant with no IM creds yields no channel.

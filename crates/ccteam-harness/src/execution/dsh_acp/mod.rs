@@ -33,8 +33,8 @@ use crate::execution::session_meta::read_session_meta;
 use crate::execution::session_status::read_status_file;
 use crate::{
     AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, EventAttachment, ExecutionMode,
-    HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent, ThreadHandle,
-    ThreadStatus, ToolSurfaceRebuild, TurnId, TurnInput, TurnRouting, TurnSubmission,
+    HarnessAdapter, HarnessError, InterruptOutcome, PermissionMode, SpawnCtx, ThreadEvent,
+    ThreadHandle, ThreadStatus, ToolSurfaceRebuild, TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
 use handshake::{CcteamSessionMeta, DshAgentOptions};
@@ -671,15 +671,15 @@ impl HarnessAdapter for DshAcpAdapter {
         Ok(self.thread_status_inner(&live))
     }
 
-    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
         let Some(live) = self.get_live(&h.identity) else {
-            return Ok(());
+            return Ok(InterruptOutcome::AlreadyIdle);
         };
         live.transport
             .notify("session/cancel", json!({ "sessionId": live.session_id }))
             .await
             .map_err(|e| HarnessError::SubmitFailed(format!("session/cancel: {e}")))?;
-        Ok(())
+        Ok(InterruptOutcome::Requested)
     }
 
     fn thread_is_live(&self, h: &ThreadHandle) -> bool {

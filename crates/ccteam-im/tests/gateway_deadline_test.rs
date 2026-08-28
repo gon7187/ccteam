@@ -6,8 +6,9 @@ use std::{collections::VecDeque, sync::Mutex};
 use async_trait::async_trait;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, EventAttachment, ExecutionMode,
-    HarnessAdapter, HarnessError, PermissionMode, SessionProtocol, SpawnCtx, ThreadEvent,
-    ThreadHandle, ThreadStatus, ToolSurfaceRebuild, TurnInput, TurnRouting, TurnSubmission,
+    HarnessAdapter, HarnessError, InterruptOutcome, PermissionMode, SessionProtocol, SpawnCtx,
+    ThreadEvent, ThreadHandle, ThreadStatus, ToolSurfaceRebuild, TurnInput, TurnRouting,
+    TurnSubmission,
 };
 use ccteam_im::gateway::{Gateway, GatewayDeadline, GatewayRequestError, SpawnTuning};
 use futures::stream::BoxStream;
@@ -16,8 +17,10 @@ use futures::stream::BoxStream;
 struct DeadlineAdapter {
     submissions: AtomicUsize,
     interrupts: AtomicUsize,
+    interrupt_already_idle: AtomicBool,
     stall_submit: AtomicBool,
     emit_started_before_stall: AtomicBool,
+    emit_prior_completed_before_stall: AtomicBool,
     events: Arc<Mutex<VecDeque<ThreadEvent>>>,
     events_notify: Arc<tokio::sync::Notify>,
 }
@@ -59,6 +62,21 @@ impl HarnessAdapter for DeadlineAdapter {
                 .unwrap()
                 .push_back(ThreadEvent::TurnStarted {
                     turn_id: format!("turn-{sequence}"),
+                });
+            self.events_notify.notify_waiters();
+        }
+        if self
+            .emit_prior_completed_before_stall
+            .load(Ordering::SeqCst)
+            && sequence > 1
+        {
+            self.events
+                .lock()
+                .unwrap()
+                .push_back(ThreadEvent::TurnCompleted {
+                    turn_id: format!("turn-{}", sequence - 1),
+                    usage: Default::default(),
+                    model: None,
                 });
             self.events_notify.notify_waiters();
         }
@@ -110,9 +128,16 @@ impl HarnessAdapter for DeadlineAdapter {
         Ok(())
     }
 
-    async fn interrupt_turn(&self, _handle: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt_turn(
+        &self,
+        _handle: &ThreadHandle,
+    ) -> Result<InterruptOutcome, HarnessError> {
         self.interrupts.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        Ok(if self.interrupt_already_idle.load(Ordering::SeqCst) {
+            InterruptOutcome::AlreadyIdle
+        } else {
+            InterruptOutcome::Interrupted
+        })
     }
 
     async fn handle_directive(
@@ -128,6 +153,79 @@ impl HarnessAdapter for DeadlineAdapter {
     async fn thread_status(&self, _handle: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
         Ok(ThreadStatus::default())
     }
+}
+
+#[tokio::test]
+async fn a_late_terminal_event_from_the_prior_turn_cannot_reconcile_a_new_timeout() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).expect("create project");
+    std::env::set_var("CCTEAM_IM_GATEWAY_SUBMIT_TIMEOUT_MS", "40");
+
+    let adapter = Arc::new(DeadlineAdapter::default());
+    let gateway = Arc::new(tokio::sync::Mutex::new(Gateway::new(
+        Arc::clone(&adapter) as Arc<dyn HarnessAdapter + Send + Sync>,
+        "alpha",
+        &project,
+    )));
+    let created = Gateway::create_session_api_tuned_shared(
+        Arc::clone(&gateway),
+        "alpha".to_string(),
+        String::new(),
+        AgentVendor::Claude,
+        PermissionMode::Skip,
+        SessionProtocol::StreamJson,
+        "web-api".to_string(),
+        SpawnTuning::default(),
+        GatewayDeadline::start(),
+    )
+    .await
+    .expect("seed live session");
+    let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+    gateway.lock().await.set_event_sink(events);
+
+    Gateway::submit_to_sid_shared(
+        Arc::clone(&gateway),
+        &created.sid,
+        "first".to_string(),
+        GatewayDeadline::start(),
+    )
+    .await
+    .expect("first turn acknowledged");
+
+    adapter
+        .emit_prior_completed_before_stall
+        .store(true, Ordering::SeqCst);
+    adapter.stall_submit.store(true, Ordering::SeqCst);
+    Gateway::submit_to_sid_shared(
+        Arc::clone(&gateway),
+        &created.sid,
+        "second".to_string(),
+        GatewayDeadline::start(),
+    )
+    .await
+    .expect_err("second acknowledgement times out");
+    adapter.stall_submit.store(false, Ordering::SeqCst);
+    adapter.interrupt_already_idle.store(true, Ordering::SeqCst);
+    Gateway::submit_to_sid_shared(
+        Arc::clone(&gateway),
+        &created.sid,
+        "/interrupt".to_string(),
+        GatewayDeadline::start(),
+    )
+    .await
+    .expect("already-idle interrupt remains an available recovery command");
+
+    let retry = Gateway::submit_to_sid_shared(
+        Arc::clone(&gateway),
+        &created.sid,
+        "unsafe retry".to_string(),
+        GatewayDeadline::start(),
+    )
+    .await
+    .expect_err("the prior terminal boundary cannot authorize a retry");
+    assert_code(&retry, "vendor_submit_timeout");
+    assert_eq!(adapter.submissions.load(Ordering::SeqCst), 2);
 }
 
 fn assert_code(error: &anyhow::Error, expected: &str) {
@@ -252,6 +350,15 @@ async fn queue_and_vendor_deadlines_are_split_and_leave_gateway_healthy() {
     assert_eq!(interrupted, format!("directive:{}", created.sid));
     assert_eq!(adapter.interrupts.load(Ordering::SeqCst), 1);
     assert_eq!(adapter.submissions.load(Ordering::SeqCst), 2);
+    Gateway::submit_to_sid_shared(
+        Arc::clone(&gateway),
+        &created.sid,
+        "follow-up-after-confirmed-interrupt".to_string(),
+        GatewayDeadline::start(),
+    )
+    .await
+    .expect("a confirmed concrete interrupt reconciles the timed-out dispatch");
+    assert_eq!(adapter.submissions.load(Ordering::SeqCst), 3);
 
     let status = tokio::time::timeout(
         Duration::from_secs(1),

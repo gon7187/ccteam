@@ -11,7 +11,8 @@ use ccteam_harness::execution::codex_app_server::{
 use ccteam_harness::execution::codex_jsonrpc::Notification;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ChoiceSelection, Directive, DirectiveOutcome, ExecutionMode,
-    HarnessAdapter, HarnessError, SessionTitleTarget, SpawnCtx, ThreadEvent, TitleSync, TurnInput,
+    HarnessAdapter, HarnessError, InterruptOutcome, SessionTitleTarget, SpawnCtx, ThreadEvent,
+    TitleSync, TurnInput,
 };
 use serde_json::{json, Value};
 use serial_test::serial;
@@ -1868,10 +1869,11 @@ async fn interrupt_turn_method_uses_active_turn_and_noops_when_idle() {
     let (adapter, h, seen, peer, notif, sock) = d2_start_with_notif("interrupt-method").await;
 
     // No active turn → Ok, no RPC frame.
-    adapter
+    let idle = adapter
         .interrupt_turn(&h)
         .await
         .expect("idle interrupt is a no-op success");
+    assert_eq!(idle, InterruptOutcome::AlreadyIdle);
     assert!(find_frame(&seen.lock().unwrap(), "turn/interrupt").is_none());
     assert!(
         find_frame(&seen.lock().unwrap(), "thread/archive").is_none(),
@@ -1898,7 +1900,10 @@ async fn interrupt_turn_method_uses_active_turn_and_noops_when_idle() {
     .await;
 
     seen.lock().unwrap().clear();
-    adapter.interrupt_turn(&h).await.unwrap();
+    assert_eq!(
+        adapter.interrupt_turn(&h).await.unwrap(),
+        InterruptOutcome::Interrupted
+    );
     let frames = seen.lock().unwrap().clone();
     assert_eq!(
         find_frame(&frames, "turn/interrupt").unwrap()["params"],

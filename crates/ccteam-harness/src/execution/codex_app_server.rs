@@ -63,9 +63,9 @@ use crate::execution::progress_bridge::{
 };
 use crate::execution::session_meta::read_session_meta;
 use crate::{
-    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
-    SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId,
-    TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage,
+    AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, InterruptOutcome,
+    PermissionMode, SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
+    ThreadItemDetails, TurnId, TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage,
 };
 use crate::{
     ChoiceOption, ChoicePrompt, ChoiceSelection, ContextSource, ContextUsage, Directive,
@@ -2309,14 +2309,14 @@ impl HarnessAdapter for CodexAppServerAdapter {
     /// leaves the thread alive: no `thread/archive`, no unsubscribe. No active
     /// turn → a clean no-op (nothing to interrupt), never an error — so a
     /// gateway `/interrupt` on an idle codex session is harmless.
-    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
         let active = self
             .tracker_snapshot(&h.identity)
             .await
             .and_then(|t| t.active_turn);
         let Some(turn_id) = active else {
             // No in-flight turn — nothing to stop. Idempotent success.
-            return Ok(());
+            return Ok(InterruptOutcome::AlreadyIdle);
         };
         let client = self.client().await?;
         client
@@ -2326,7 +2326,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
             )
             .await
             .map_err(|e| HarnessError::SubmitFailed(format!("turn/interrupt: {e:#}")))?;
-        Ok(())
+        Ok(InterruptOutcome::Interrupted)
     }
 
     /// Codex's title surface is the `thread/name/set` RPC (`thread.rs:660`) —

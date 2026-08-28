@@ -1005,6 +1005,18 @@ pub struct ThreadStatus {
     pub goal: Option<GoalStatus>,
 }
 
+/// What an adapter can prove after an explicit interrupt request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptOutcome {
+    /// The vendor acknowledged interruption of a concrete active turn.
+    Interrupted,
+    /// The adapter proved that no turn was active when asked.
+    AlreadyIdle,
+    /// The cancellation signal was sent, but the transport provides no
+    /// acknowledgement that a concrete turn stopped.
+    Requested,
+}
+
 /// Account-level usage / rate-limits (Claude `get_usage` control_request; Codex
 /// equivalent), vendor-agnostic. Surfaced in the IM `/status` operator
 /// dashboard. This is the ACCOUNT's state (5-hour + weekly windows + extra
@@ -1488,7 +1500,7 @@ pub trait HarnessAdapter: Send + Sync {
     /// WARN-only. The default impl is an honest [`HarnessError::NotImplemented`]
     /// so an adapter without an interrupt mechanism degrades cleanly (the
     /// gateway surfaces the reason) instead of silently doing nothing.
-    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
         let _ = h;
         Err(HarnessError::NotImplemented {
             reason: format!(
