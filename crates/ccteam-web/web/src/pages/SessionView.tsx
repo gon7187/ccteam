@@ -42,6 +42,7 @@ import {
   resolveApproval as apiResolveApproval,
   submitTurn,
   type OutboundAttachmentRef,
+  type SessionHistory,
   type SessionHistoryEvent,
   type SessionView as SessionSummary,
   type ScheduledItem,
@@ -290,6 +291,37 @@ export default function SessionView({
     nextBefore: null as string | null,
     loadingEarlier: false,
   });
+  const historyVerdictStatusRequestRef = useRef(0);
+  const [historyVerdictQuality, setHistoryVerdictQuality] = useState<{
+    status: SessionHistory["verdicts_status"] | "pending";
+    corruptLineCount: number | null;
+  }>({ status: "pending", corruptLineCount: null });
+  const recordHistoryVerdictStatus = useCallback(
+    (history: SessionHistory | undefined, request: number) => {
+      if (request !== historyVerdictStatusRequestRef.current) return;
+      setHistoryVerdictQuality({
+        status: history ? (history.verdicts_status ?? "ok") : "unavailable",
+        corruptLineCount: history?.verdict_corrupt_line_count ?? null,
+      });
+    },
+    [],
+  );
+  const historyVerdictWarning =
+    historyVerdictQuality.status === "degraded_corrupt"
+      ? tr(
+          lang,
+          `消息历史可用,但评价已隐藏:规范进度日志中有 ${historyVerdictQuality.corruptLineCount ?? "?"} 行损坏。`,
+          `Message history is available, but feedback is hidden: canonical progress has ${historyVerdictQuality.corruptLineCount ?? "?"} corrupt rows.`,
+          `История сообщений доступна, но оценки скрыты: повреждено строк progress — ${historyVerdictQuality.corruptLineCount ?? "?"}.`,
+        )
+      : historyVerdictQuality.status === "unavailable"
+        ? tr(
+            lang,
+            "消息历史可用,但评价暂时不可用。",
+            "Message history is available, but feedback is temporarily unavailable.",
+            "История сообщений доступна, но оценки временно недоступны.",
+          )
+        : null;
   const historyWindowReady = historyPage.windowKey === historyWindowKey;
   useEffect(() => {
     eventsRef.current = events;
@@ -316,6 +348,7 @@ export default function SessionView({
       });
     });
     const request = ++historyWindowRequestRef.current;
+    const qualityRequest = ++historyVerdictStatusRequestRef.current;
     const verdictVersions = new Map(verdictMutationVersionRef.current);
     getHistory(sid)
       .then((h) => {
@@ -324,6 +357,7 @@ export default function SessionView({
           || request !== historyWindowRequestRef.current
           || mountWindowKey !== historyWindowKeyRef.current
         ) return;
+        recordHistoryVerdictStatus(h, qualityRequest);
         setRows((current) => {
           const seeded = reseedTranscriptRows(
             h.events,
@@ -343,12 +377,13 @@ export default function SessionView({
         });
       })
       .catch(() => {
+        recordHistoryVerdictStatus(undefined, qualityRequest);
         /* best-effort — keep the localStorage rows (or empty) on error */
       });
     return () => {
       cancelled = true;
     };
-  }, [sid, preserveNewerVerdicts]);
+  }, [sid, preserveNewerVerdicts, recordHistoryVerdictStatus]);
 
   // The first successful open races the mount seed above, so epoch 1 needs no
   // second fetch. Every later open follows a real disconnect: the server's
@@ -379,6 +414,7 @@ export default function SessionView({
       });
     });
     const request = ++historyWindowRequestRef.current;
+    const qualityRequest = ++historyVerdictStatusRequestRef.current;
     const verdictVersions = new Map(verdictMutationVersionRef.current);
     getHistory(sid)
       .then((h) => {
@@ -387,6 +423,7 @@ export default function SessionView({
           || request !== historyWindowRequestRef.current
           || historyWindowKey !== historyWindowKeyRef.current
         ) return;
+        recordHistoryVerdictStatus(h, qualityRequest);
         const foldBarrier = eventsRef.current.length;
         setRows((current) => {
           const seeded = reseedTranscriptRows(
@@ -406,12 +443,19 @@ export default function SessionView({
         });
       })
       .catch(() => {
+        recordHistoryVerdictStatus(undefined, qualityRequest);
         /* best-effort — keep the current transcript on reseed failure */
       });
     return () => {
       cancelled = true;
     };
-  }, [sid, connectionEpoch, historyWindowKey, preserveNewerVerdicts]);
+  }, [
+    sid,
+    connectionEpoch,
+    historyWindowKey,
+    preserveNewerVerdicts,
+    recordHistoryVerdictStatus,
+  ]);
 
   const loadEarlier = useCallback(() => {
     if (
@@ -423,6 +467,7 @@ export default function SessionView({
     ) return;
     const before = historyPage.nextBefore;
     const request = ++historyPaginationRequestRef.current;
+    const qualityRequest = ++historyVerdictStatusRequestRef.current;
     const requestWindowKey = historyWindowKey;
     const verdictVersions = new Map(verdictMutationVersionRef.current);
     setHistoryPage((current) => ({ ...current, loadingEarlier: true }));
@@ -432,6 +477,7 @@ export default function SessionView({
           request !== historyPaginationRequestRef.current
           || requestWindowKey !== historyWindowKeyRef.current
         ) return;
+        recordHistoryVerdictStatus(history, qualityRequest);
         const earlier = historyToRows(history.events);
         if (earlier.length > 0) {
           setRows((current) => [
@@ -447,6 +493,7 @@ export default function SessionView({
         });
       })
       .catch(() => {
+        recordHistoryVerdictStatus(undefined, qualityRequest);
         /* The cursor remains retryable; finally releases the affordance. */
       })
       .finally(() => {
@@ -458,7 +505,14 @@ export default function SessionView({
           current.loadingEarlier ? { ...current, loadingEarlier: false } : current,
         );
       });
-  }, [sid, historyPage, historyWindowKey, historyWindowReady, preserveNewerVerdicts]);
+  }, [
+    sid,
+    historyPage,
+    historyWindowKey,
+    historyWindowReady,
+    preserveNewerVerdicts,
+    recordHistoryVerdictStatus,
+  ]);
 
   // ---- live SSE → append into this sid's transcript ------------------------
   useEffect(() => {
@@ -500,10 +554,12 @@ export default function SessionView({
     refreshedAnswerRef.current = latestAnswer;
     let cancelled = false;
     const request = ++historyMetadataRequestRef.current;
+    const qualityRequest = ++historyVerdictStatusRequestRef.current;
     const verdictVersions = new Map(verdictMutationVersionRef.current);
     getHistory(sid)
       .then((history) => {
         if (cancelled || request !== historyMetadataRequestRef.current) return;
+        recordHistoryVerdictStatus(history, qualityRequest);
         historyMetadataEventsRef.current = history.events;
         setRows((current) =>
           preserveNewerVerdicts(
@@ -514,12 +570,13 @@ export default function SessionView({
         );
       })
       .catch(() => {
+        recordHistoryVerdictStatus(undefined, qualityRequest);
         /* best-effort — the next reconnect/history open can supply turn ids */
       });
     return () => {
       cancelled = true;
     };
-  }, [sid, latestAnswer, preserveNewerVerdicts]);
+  }, [sid, latestAnswer, preserveNewerVerdicts, recordHistoryVerdictStatus]);
   useEffect(() => {
     let cancelled = false;
     getSessionStatus(sid)
@@ -947,6 +1004,15 @@ export default function SessionView({
               data-testid="chat-scroll"
             >
               <div className="chat-inner">
+                {historyVerdictWarning ? (
+                  <div
+                    className="msg system fade-in"
+                    data-testid="history-verdict-warning"
+                    role="status"
+                  >
+                    <div className="bubble">{historyVerdictWarning}</div>
+                  </div>
+                ) : null}
                 {historyWindowReady && historyPage.hasMore ? (
                   <button
                     type="button"
@@ -1044,7 +1110,8 @@ export default function SessionView({
                           project={session?.project}
                           attachments={row.attachments}
                         />
-                        {row.outcome === "completed" ? (
+                        {historyVerdictQuality.status === "ok" &&
+                        row.outcome === "completed" ? (
                           <TurnVerdictControls
                             lang={lang}
                             row={row}

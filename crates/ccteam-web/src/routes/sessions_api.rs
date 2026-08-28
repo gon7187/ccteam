@@ -487,8 +487,8 @@ pub(crate) async fn handle_create_session(
 /// mirror `<project_dir>/.ccteam/chat/<sid>/turns.jsonl`. Returns the newest
 /// 100 turns by default and supports backwards cursor
 /// pagination. `{sid, events: []}` (200) when no turn has been mirrored yet
-/// yet. Transcript or verdict journal read failures are 500. 503 with no
-/// gateway.
+/// yet. Verdict enrichment degrades explicitly without hiding the transcript;
+/// transcript read failures are 500. 503 with no gateway.
 ///
 /// Lock discipline: `session_resolve` is sync (no `.await`) and only clones
 /// scalar fields, so we run it under the gateway guard, then **drop the
@@ -503,9 +503,9 @@ pub(crate) async fn handle_create_session(
         ("before" = Option<String>, Query, description = "Opaque byte cursor returned as `next_before`")
     ),
     responses(
-        (status = 200, description = "History `{sid, events:[...], next_before, has_more}`", body = serde_json::Value),
+        (status = 200, description = "History `{sid, events:[...], next_before, has_more, verdicts_status, verdicts_degraded, verdict_corrupt_line_count}`", body = serde_json::Value),
         (status = 404, description = "Unknown session"),
-        (status = 500, description = "Transcript or verdict journal read failed"),
+        (status = 500, description = "Transcript read failed"),
         (status = 503, description = "No live gateway (standalone web)"),
     ),
 )]
@@ -552,52 +552,37 @@ pub(crate) async fn handle_session_history(
     })
     .await
     {
-        Ok(Ok(read)) => read,
+        Ok(Ok(read)) => Some(read),
         Ok(Err(err)) => {
             tracing::error!(%sid, project = %resolved.project, %err, "read turn verdicts failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "session verdict history unavailable"})),
-            )
-                .into_response();
+            None
         }
         Err(err) => {
             tracing::error!(%sid, project = %resolved.project, %err, "turn verdict reader task failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "session verdict history unavailable"})),
-            )
-                .into_response();
+            None
         }
     };
-    if verdict_read.corrupt_line_count > 0 {
-        tracing::error!(
-            %sid,
-            project = %resolved.project,
-            corrupt_line_count = verdict_read.corrupt_line_count,
-            "session history: corrupt canonical progress"
-        );
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": "session verdict history degraded",
-                "degraded": true,
-                "source": "progress",
-                "corrupt_line_count": verdict_read.corrupt_line_count,
-            })),
-        )
-            .into_response();
-    }
+    let (verdicts, verdicts_status, verdict_corrupt_line_count) = match verdict_read {
+        Some(read) if read.corrupt_line_count == 0 => (read.verdicts, "ok", Some(0)),
+        Some(read) => {
+            tracing::warn!(
+                %sid,
+                project = %resolved.project,
+                corrupt_line_count = read.corrupt_line_count,
+                "session history: verdict enrichment disabled by corrupt canonical progress"
+            );
+            (
+                std::collections::BTreeMap::new(),
+                "degraded_corrupt",
+                Some(read.corrupt_line_count),
+            )
+        }
+        None => (std::collections::BTreeMap::new(), "unavailable", None),
+    };
     let history_dir = resolved.project_dir.clone();
     let history_sid = resolved.sid.clone();
     let page = match tokio::task::spawn_blocking(move || {
-        collect_session_turns(
-            &history_dir,
-            &history_sid,
-            limit,
-            before,
-            &verdict_read.verdicts,
-        )
+        collect_session_turns(&history_dir, &history_sid, limit, before, &verdicts)
     })
     .await
     {
@@ -624,6 +609,9 @@ pub(crate) async fn handle_session_history(
         "events": page.events,
         "next_before": page.next_before,
         "has_more": page.has_more,
+        "verdicts_status": verdicts_status,
+        "verdicts_degraded": verdicts_status != "ok",
+        "verdict_corrupt_line_count": verdict_corrupt_line_count,
     }))
     .into_response()
 }
@@ -2628,7 +2616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_history_fails_closed_when_the_verdict_journal_is_corrupt() {
+    async fn session_history_degrades_verdict_enrichment_when_progress_is_corrupt() {
         use ccteam_harness::execution::turns_mirror::append_turn;
         use std::io::Write;
 
@@ -2698,7 +2686,17 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(payload["verdicts_degraded"], true);
+        assert_eq!(payload["verdict_corrupt_line_count"], 1);
+        assert!(
+            payload["events"][0].get("verdict").is_none(),
+            "a corrupt journal makes every verdict unknown instead of serving a stale value"
+        );
     }
 
     #[test]

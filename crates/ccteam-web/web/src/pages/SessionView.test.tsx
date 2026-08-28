@@ -397,6 +397,78 @@ describe("SessionView human verdict flow", () => {
     ],
   });
 
+  it("shows when corrupt progress makes every historical verdict unknown", async () => {
+    const history = vi.fn().mockResolvedValue({
+      ...reviewedHistory(),
+      verdicts_status: "degraded_corrupt",
+      verdicts_degraded: true,
+      verdict_corrupt_line_count: 2,
+    });
+
+    try {
+      const { renderView } = await mountVerdictView({ history });
+      renderView();
+      await flushPromises();
+
+      const warning = findByTestId(renderView(), "history-verdict-warning");
+      expect(warning).not.toBeNull();
+      const warningText = collectElementText(warning).join(" ");
+      expect(warningText).toContain(
+        "Message history is available, but feedback is hidden",
+      );
+      expect(warningText).toContain("2 corrupt rows");
+      expect(findVerdictControls(renderView())).toBeNull();
+    } finally {
+      unmountVerdictView();
+    }
+  });
+
+  it("keeps degraded verdicts hidden when an older history request resolves last", async () => {
+    let resolveInitial: (value: unknown) => void = () => {};
+    const initialHistory = new Promise((resolve) => {
+      resolveInitial = resolve;
+    });
+    const history = vi
+      .fn()
+      .mockReturnValueOnce(initialHistory)
+      .mockResolvedValueOnce({
+        ...reviewedHistory(),
+        verdicts_status: "degraded_corrupt",
+        verdicts_degraded: true,
+        verdict_corrupt_line_count: 1,
+      });
+    const stream = {
+      events: [] as SessionEvent[],
+      connected: true,
+      connectionEpoch: 1,
+      lastError: null,
+      gatewayUnavailable: false,
+    };
+
+    try {
+      const { renderView } = await mountVerdictView({ history, stream });
+      renderView();
+
+      stream.events = [{ id: "live-answer", kind: "answer", content: "done" }];
+      renderView();
+      await flushPromises();
+      expect(history).toHaveBeenCalledTimes(2);
+
+      let tree = renderView();
+      expect(findByTestId(tree, "history-verdict-warning")).not.toBeNull();
+      expect(findVerdictControls(tree)).toBeNull();
+
+      resolveInitial({ ...reviewedHistory("accept"), verdicts_status: "ok" });
+      await flushPromises();
+      tree = renderView();
+
+      expect(findByTestId(tree, "history-verdict-warning")).not.toBeNull();
+      expect(findVerdictControls(tree)).toBeNull();
+    } finally {
+      unmountVerdictView();
+    }
+  });
+
   it("optimistically accepts a completed assistant row and commits the PUT result", async () => {
     let resolvePut: (value: unknown) => void = () => {};
     const pendingPut = new Promise((resolve) => {

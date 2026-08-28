@@ -183,6 +183,41 @@ async fn perf_gate() {
         .hydrate_now(&[SLUG.to_string()])
         .unwrap();
     let hydration_time = hydration_started.elapsed();
+    let repaired_progress_bytes = std::fs::metadata(&fixture.progress_path).unwrap().len();
+    assert_eq!(
+        repaired_progress_bytes,
+        fixture.stats.progress_bytes + 1,
+        "hydration must preserve the torn tail and add exactly one delimiter"
+    );
+    {
+        use std::io::{Read as _, Seek as _};
+        let mut progress = std::fs::File::open(&fixture.progress_path).unwrap();
+        progress.seek(std::io::SeekFrom::End(-1)).unwrap();
+        let mut last = [0_u8; 1];
+        progress.read_exact(&mut last).unwrap();
+        assert_eq!(last, [b'\n']);
+    }
+    std::env::set_var("CCTEAM_PROGRESS_ROTATE_BYTES", (128 * MIB).to_string());
+    ccteam_harness::execution::progress_bridge::append_event(
+        &fixture.progress_path,
+        &serde_json::json!({"event": "perf_rotation_barrier"}),
+    )
+    .unwrap();
+    assert!(
+        ccteam_harness::execution::progress_bridge::progress_archive_path(&fixture.progress_path)
+            .exists(),
+        "perf history must exercise a real retained archive"
+    );
+    for seq in 0..200_u64 {
+        ccteam_harness::execution::progress_bridge::append_event(
+            &fixture.progress_path,
+            &serde_json::json!({"event": "perf_tail_fixture", "seq": seq}),
+        )
+        .unwrap();
+    }
+    app.progress_projection
+        .hydrate_now(&[SLUG.to_string()])
+        .unwrap();
     let projection = Arc::clone(&app.progress_projection);
     let app = app.with_gateway_owned(gateway);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -276,18 +311,24 @@ async fn perf_gate() {
     assert_release(tail_time < Duration::from_millis(50), "journal tail");
 
     let history_url = format!("{base}/api/v1/sessions/{}", fixture.history_sid);
+    let history_journal_before = ccteam_core::journal::metrics();
     assert_ok(&client, &history_url).await;
     let history_samples = measure_gets(&client, &history_url, 20).await;
+    let history_journal_bytes = ccteam_core::journal::metrics()
+        .bytes_read
+        .saturating_sub(history_journal_before.bytes_read);
     let history_p95 = percentile(&history_samples, 95);
     println!(
-        "perf-gate 10k-history: target p95<100ms measured={:.2}ms source_turns={}",
+        "perf-gate 10k-history: target p95<100ms/read<10MiB measured={:.2}ms/{:.3}MiB source_turns={}",
         history_p95.as_secs_f64() * 1000.0,
+        history_journal_bytes as f64 / MIB as f64,
         HISTORY_TURNS
     );
     assert_release(
         history_p95 < Duration::from_millis(100),
         "session-history p95",
     );
+    assert!(history_journal_bytes < 10 * MIB);
 
     let lock = gateway_lock_metrics();
     println!(

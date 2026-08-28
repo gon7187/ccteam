@@ -32,7 +32,7 @@ static PERSIST_OBSERVER: OnceLock<Box<PersistObserver>> = OnceLock::new();
 /// Default active progress journal size before single-level rotation.
 pub const DEFAULT_PROGRESS_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
 const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
-const VERDICT_INDEX_SCHEMA_VERSION: u32 = 2;
+const VERDICT_INDEX_SCHEMA_VERSION: u32 = 3;
 
 pub const CHAT_SESSION_RESET: &str = "chat_session_reset";
 pub const CHAT_SESSION_STARTED: &str = "chat_session_started";
@@ -407,6 +407,10 @@ pub struct ArchiveCoverage {
     /// SHA-256 of the complete immutable archive generation (v3+ identity).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_file_sha256: Option<String>,
+    /// Stable identity of the immutable retained generation. This lets hot
+    /// readers trust an already-covered archive without hashing it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_identity: Option<PendingActiveFileIdentity>,
 }
 
 /// Cumulative lifetime aggregates for data no longer present in the active
@@ -485,10 +489,29 @@ enum PendingProgressIndexWrite {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingActiveFileIdentity {
     device: u64,
     inode: u64,
+}
+
+/// Active-journal bytes already folded into the compact verdict projection.
+/// The file identity prevents a same-size rotation/replacement from being
+/// mistaken for an unchanged append-only generation.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct ActiveVerdictCoverage {
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    checkpoint_rotation_sequence: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    offset: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    corrupt_line_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_identity: Option<PendingActiveFileIdentity>,
+}
+
+const fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Small durable projection used by verdict GET/PUT. `progress.jsonl` remains
@@ -503,6 +526,12 @@ struct ProgressVerdictIndex {
     terminal_turns: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending: Option<PendingProgressIndexWrite>,
+    #[serde(default, skip_serializing_if = "active_verdict_coverage_is_empty")]
+    active: ActiveVerdictCoverage,
+}
+
+fn active_verdict_coverage_is_empty(coverage: &ActiveVerdictCoverage) -> bool {
+    coverage == &ActiveVerdictCoverage::default()
 }
 
 impl Default for ProgressVerdictIndex {
@@ -512,6 +541,7 @@ impl Default for ProgressVerdictIndex {
             verdicts: BTreeMap::new(),
             terminal_turns: BTreeMap::new(),
             pending: None,
+            active: ActiveVerdictCoverage::default(),
         }
     }
 }
@@ -836,22 +866,8 @@ pub fn append_chat_turn_completed_if_absent(
     let lock_file = open_progress_lock(path)?;
     let lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
-    settle_pending_progress_write_locked(path)?;
-    if read_verdict_index_locked(path)?.is_none() {
-        if path.exists()
-            || progress_archive_path(path).exists()
-            || progress_checkpoint_path(path).exists()
-        {
-            let checkpoint = recover_progress_checkpoint_locked(path)?;
-            ensure_verdict_index_locked(path, checkpoint.as_ref())?;
-        } else {
-            write_verdict_index(path, &ProgressVerdictIndex::default())?;
-        }
-    }
-
-    let mut index = read_verdict_index_locked(path)?.ok_or_else(|| {
-        anyhow::anyhow!("progress verdict index disappeared for {}", path.display())
-    })?;
+    let checkpoint = recover_progress_checkpoint_locked(path)?;
+    let mut index = reconcile_verdict_index_locked(path, checkpoint.as_ref())?;
     if let Some(first) = index
         .terminal_turns
         .get(&sid)
@@ -871,9 +887,8 @@ pub fn append_chat_turn_completed_if_absent(
     if current_size > 0 && current_size.saturating_add(byte_count) > progress_rotate_bytes() {
         rotate_progress_locked(path)?;
         rotated = true;
-        index = read_verdict_index_locked(path)?.ok_or_else(|| {
-            anyhow::anyhow!("progress verdict index disappeared for {}", path.display())
-        })?;
+        let checkpoint = recover_progress_checkpoint_locked(path)?;
+        index = reconcile_verdict_index_locked(path, checkpoint.as_ref())?;
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -885,12 +900,13 @@ pub fn append_chat_turn_completed_if_absent(
         .metadata()
         .with_context(|| format!("stat {}", path.display()))?;
     let active_offset = active_metadata.len();
+    let active_file_identity = pending_active_file_identity(&active_metadata);
     index.pending = Some(PendingProgressIndexWrite::TerminalTurn {
         event: event.clone(),
         active_offset,
         line_len: byte_count,
         line_sha256: hex_digest(Sha256::digest(&line).as_slice()),
-        active_file_identity: pending_active_file_identity(&active_metadata),
+        active_file_identity: active_file_identity.clone(),
     });
     write_verdict_index(path, &index)?;
 
@@ -910,6 +926,8 @@ pub fn append_chat_turn_completed_if_absent(
         .or_default()
         .insert(turn_id, event.clone());
     index.pending = None;
+    index.active.offset = size;
+    index.active.file_identity = active_file_identity;
     write_verdict_index(path, &index)?;
     if size > progress_rotate_bytes() {
         rotate_progress_locked(path)?;
@@ -971,16 +989,13 @@ pub fn latest_turn_verdicts_detailed(path: &Path) -> Result<TurnVerdictRead> {
     let _lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
     let checkpoint = recover_progress_checkpoint_locked(path)?;
-    if read_verdict_index_locked(path)?.is_none() {
-        ensure_verdict_index_locked(path, checkpoint.as_ref())?;
-    }
-    let active = super::fs_atomic::read_jsonl_detailed::<Value>(path)?;
+    let index = reconcile_verdict_index_locked(path, checkpoint.as_ref())?;
     Ok(TurnVerdictRead {
-        verdicts: latest_turn_verdicts_locked(path)?,
+        verdicts: verdicts_from_index(&index),
         corrupt_line_count: checkpoint
             .map(|checkpoint| checkpoint.corrupt_line_count)
             .unwrap_or(0)
-            .saturating_add(active.corrupt_line_count),
+            .saturating_add(index.active.corrupt_line_count),
     })
 }
 
@@ -1016,20 +1031,10 @@ pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Res
     let lock_file = open_progress_lock(path)?;
     let lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
-    settle_pending_progress_write_locked(path)?;
-    if read_verdict_index_locked(path)?.is_none() {
-        if path.exists()
-            || progress_archive_path(path).exists()
-            || progress_checkpoint_path(path).exists()
-        {
-            let checkpoint = recover_progress_checkpoint_locked(path)?;
-            ensure_verdict_index_locked(path, checkpoint.as_ref())?;
-        } else {
-            write_verdict_index(path, &ProgressVerdictIndex::default())?;
-        }
-    }
+    let checkpoint = recover_progress_checkpoint_locked(path)?;
+    let mut index = reconcile_verdict_index_locked(path, checkpoint.as_ref())?;
     let key = (verdict.sid.clone(), verdict.turn_id.clone());
-    if latest_turn_verdicts_locked(path)?
+    if verdicts_from_index(&index)
         .get(&key)
         .is_some_and(|latest| verdict_content_eq(latest, verdict))
     {
@@ -1041,10 +1046,9 @@ pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Res
     let current_size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
     if current_size > 0 && current_size.saturating_add(byte_count) > progress_rotate_bytes() {
         rotate_progress_locked(path)?;
+        let checkpoint = recover_progress_checkpoint_locked(path)?;
+        index = reconcile_verdict_index_locked(path, checkpoint.as_ref())?;
     }
-    let mut index = read_verdict_index_locked(path)?.ok_or_else(|| {
-        anyhow::anyhow!("progress verdict index disappeared for {}", path.display())
-    })?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1055,12 +1059,13 @@ pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Res
         .metadata()
         .with_context(|| format!("stat {}", path.display()))?;
     let active_offset = active_metadata.len();
+    let active_file_identity = pending_active_file_identity(&active_metadata);
     index.pending = Some(PendingProgressIndexWrite::Verdict {
         verdict: verdict.clone(),
         active_offset,
         line_len: byte_count,
         line_sha256: hex_digest(Sha256::digest(&line).as_slice()),
-        active_file_identity: pending_active_file_identity(&active_metadata),
+        active_file_identity: active_file_identity.clone(),
     });
     write_verdict_index(path, &index)?;
 
@@ -1080,6 +1085,8 @@ pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Res
         .or_default()
         .insert(verdict.turn_id.clone(), verdict.clone());
     index.pending = None;
+    index.active.offset = size;
+    index.active.file_identity = active_file_identity;
     write_verdict_index(path, &index)?;
     let rotated = if size > progress_rotate_bytes() {
         rotate_progress_locked(path)?;
@@ -1095,20 +1102,14 @@ pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Res
     Ok(true)
 }
 
-fn latest_turn_verdicts_locked(path: &Path) -> Result<BTreeMap<(String, String), TurnVerdict>> {
+fn verdicts_from_index(index: &ProgressVerdictIndex) -> BTreeMap<(String, String), TurnVerdict> {
     let mut latest = BTreeMap::new();
-    let Some(index) = read_verdict_index_locked(path)? else {
-        anyhow::bail!(
-            "progress verdict index missing for {}; run progress recovery before serving verdict reads",
-            path.display()
-        );
-    };
-    for (sid, turns) in index.verdicts {
+    for (sid, turns) in &index.verdicts {
         for (turn_id, verdict) in turns {
-            latest.insert((sid.clone(), turn_id), verdict);
+            latest.insert((sid.clone(), turn_id.clone()), verdict.clone());
         }
     }
-    Ok(latest)
+    latest
 }
 
 fn read_verdict_index_locked(path: &Path) -> Result<Option<ProgressVerdictIndex>> {
@@ -1118,6 +1119,21 @@ fn read_verdict_index_locked(path: &Path) -> Result<Option<ProgressVerdictIndex>
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("read {}", index_path.display())),
     };
+    #[derive(Deserialize)]
+    struct VersionEnvelope {
+        schema_version: u32,
+    }
+    let version = match serde_json::from_slice::<VersionEnvelope>(&bytes) {
+        Ok(envelope) => envelope.schema_version,
+        Err(_) => return Ok(None),
+    };
+    if version > VERDICT_INDEX_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported progress verdict index schema {} in {}",
+            version,
+            index_path.display()
+        );
+    }
     let mut index = match serde_json::from_slice::<ProgressVerdictIndex>(&bytes) {
         Ok(index) => index,
         // This file is only a compact projection. A torn or otherwise invalid
@@ -1125,19 +1141,10 @@ fn read_verdict_index_locked(path: &Path) -> Result<Option<ProgressVerdictIndex>
         // startup) down; callers holding the journal lock rebuild it below.
         Err(_) => return Ok(None),
     };
-    if index.schema_version < VERDICT_INDEX_SCHEMA_VERSION {
-        return Ok(None);
-    }
-    if index.schema_version > VERDICT_INDEX_SCHEMA_VERSION {
-        anyhow::bail!(
-            "unsupported progress verdict index schema {} in {}",
-            index.schema_version,
-            index_path.display()
-        );
-    }
+    let legacy = index.schema_version < VERDICT_INDEX_SCHEMA_VERSION;
 
     let Some(pending) = index.pending.take() else {
-        return Ok(Some(index));
+        return Ok((!legacy).then_some(index));
     };
     match pending {
         PendingProgressIndexWrite::Verdict {
@@ -1205,7 +1212,7 @@ fn read_verdict_index_locked(path: &Path) -> Result<Option<ProgressVerdictIndex>
         }
     }
     write_verdict_index(path, &index)?;
-    Ok(Some(index))
+    Ok((!legacy).then_some(index))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1338,24 +1345,21 @@ fn pending_active_file_identity(
     None
 }
 
-fn trim_ascii_line(mut raw: &[u8]) -> &[u8] {
-    while raw.last().is_some_and(u8::is_ascii_whitespace) {
-        raw = &raw[..raw.len() - 1];
-    }
-    while raw.first().is_some_and(u8::is_ascii_whitespace) {
-        raw = &raw[1..];
-    }
-    raw
-}
-
 fn write_verdict_index(path: &Path, index: &ProgressVerdictIndex) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(index).context("serialize progress verdict index")?;
     atomic_write_durable(&progress_verdict_index_path(path), &bytes)
 }
 
 fn ensure_verdict_index_locked(path: &Path, checkpoint: Option<&ProgressCheckpoint>) -> Result<()> {
-    if read_verdict_index_locked(path)?.is_some() {
-        return Ok(());
+    reconcile_verdict_index_locked(path, checkpoint).map(drop)
+}
+
+fn reconcile_verdict_index_locked(
+    path: &Path,
+    checkpoint: Option<&ProgressCheckpoint>,
+) -> Result<ProgressVerdictIndex> {
+    if let Some(index) = read_verdict_index_locked(path)? {
+        return refresh_verdict_index_locked(path, index, checkpoint);
     }
 
     let index_path = progress_verdict_index_path(path);
@@ -1366,7 +1370,7 @@ fn ensure_verdict_index_locked(path: &Path, checkpoint: Option<&ProgressCheckpoi
             return Err(error).with_context(|| format!("read {}", index_path.display()));
         }
     };
-    finish_valid_unterminated_progress_tail_locked(path)?;
+    finish_unterminated_progress_tail_locked(path)?;
     if let Some(invalid_index) = invalid_index {
         atomic_write_durable(
             &progress_sibling_path(path, ".verdicts.corrupt.json"),
@@ -1374,31 +1378,127 @@ fn ensure_verdict_index_locked(path: &Path, checkpoint: Option<&ProgressCheckpoi
         )?;
     }
 
+    let index = verdict_index_from_checkpoint(checkpoint);
+    rebuild_active_verdict_index_locked(path, index)
+}
+
+fn verdict_index_from_checkpoint(checkpoint: Option<&ProgressCheckpoint>) -> ProgressVerdictIndex {
     let mut index = ProgressVerdictIndex::default();
     if let Some(checkpoint) = checkpoint {
         index.verdicts = checkpoint.turn_verdicts.clone();
         index.terminal_turns = checkpoint.terminal_turns.clone();
+        index.active.checkpoint_rotation_sequence = checkpoint.rotation_sequence;
     }
+    index
+}
+
+fn fold_verdict_index_event(index: &mut ProgressVerdictIndex, event: Value) {
+    if let Some(verdict) = parse_turn_verdict_event(&event) {
+        index
+            .verdicts
+            .entry(verdict.sid.clone())
+            .or_default()
+            .insert(verdict.turn_id.clone(), verdict);
+    }
+    if let Some((sid, turn_id)) = terminal_turn_identity(&event) {
+        index
+            .terminal_turns
+            .entry(sid.to_string())
+            .or_default()
+            .entry(turn_id.to_string())
+            .or_insert(event);
+    }
+}
+
+fn active_progress_state(path: &Path) -> Result<(u64, Option<PendingActiveFileIdentity>)> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok((metadata.len(), pending_active_file_identity(&metadata))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((0, None)),
+        Err(error) => Err(error).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
+fn archive_progress_state(path: &Path) -> Result<Option<(u64, Option<PendingActiveFileIdentity>)>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some((
+            metadata.len(),
+            pending_active_file_identity(&metadata),
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
+fn rebuild_active_verdict_index_locked(
+    path: &Path,
+    mut index: ProgressVerdictIndex,
+) -> Result<ProgressVerdictIndex> {
     // Recovery folds the retained archive into the checkpoint first. Only the
     // active journal remains to backfill, once, outside GET/PUT request paths.
-    journal::scan_stream(path, |event| {
-        if let Some(verdict) = parse_turn_verdict_event(&event) {
-            index
-                .verdicts
-                .entry(verdict.sid.clone())
-                .or_default()
-                .insert(verdict.turn_id.clone(), verdict);
-        }
-        if let Some((sid, turn_id)) = terminal_turn_identity(&event) {
-            index
-                .terminal_turns
-                .entry(sid.to_string())
-                .or_default()
-                .entry(turn_id.to_string())
-                .or_insert(event);
-        }
+    let before = active_progress_state(path)?;
+    let summary = journal::scan_stream(path, |event| {
+        fold_verdict_index_event(&mut index, event);
     })?;
-    write_verdict_index(path, &index)
+    let after = active_progress_state(path)?;
+    if before != after || summary.next_offset != after.0 {
+        anyhow::bail!(
+            "active progress journal changed while rebuilding verdict index for {}",
+            path.display()
+        );
+    }
+    index.active = ActiveVerdictCoverage {
+        checkpoint_rotation_sequence: index.active.checkpoint_rotation_sequence,
+        offset: summary.next_offset,
+        corrupt_line_count: u64::try_from(summary.corrupt_count).unwrap_or(u64::MAX),
+        file_identity: after.1,
+    };
+    write_verdict_index(path, &index)?;
+    Ok(index)
+}
+
+fn refresh_verdict_index_locked(
+    path: &Path,
+    mut index: ProgressVerdictIndex,
+    checkpoint: Option<&ProgressCheckpoint>,
+) -> Result<ProgressVerdictIndex> {
+    // Pending exact-write recovery ran inside `read_verdict_index_locked`.
+    // Only after that fence is settled may a leftover raw tail be delimited.
+    finish_unterminated_progress_tail_locked(path)?;
+    let before = active_progress_state(path)?;
+    let checkpoint_rotation_sequence = checkpoint
+        .map(|checkpoint| checkpoint.rotation_sequence)
+        .unwrap_or(0);
+    if index.active.checkpoint_rotation_sequence != checkpoint_rotation_sequence
+        || index.active.file_identity != before.1
+        || index.active.offset > before.0
+    {
+        return rebuild_active_verdict_index_locked(
+            path,
+            verdict_index_from_checkpoint(checkpoint),
+        );
+    }
+    if index.active.offset == before.0 {
+        return Ok(index);
+    }
+
+    let delta = journal::scan_stream_from(path, index.active.offset, |event| {
+        fold_verdict_index_event(&mut index, event);
+    })?;
+    let after = active_progress_state(path)?;
+    if before != after || delta.next_offset != after.0 {
+        anyhow::bail!(
+            "active progress journal changed while refreshing verdict index for {}",
+            path.display()
+        );
+    }
+    index.active.offset = delta.next_offset;
+    index.active.corrupt_line_count = index
+        .active
+        .corrupt_line_count
+        .saturating_add(u64::try_from(delta.corrupt_count).unwrap_or(u64::MAX));
+    index.active.file_identity = after.1;
+    write_verdict_index(path, &index)?;
+    Ok(index)
 }
 
 fn verdict_content_eq(left: &TurnVerdict, right: &TurnVerdict) -> bool {
@@ -1589,22 +1689,35 @@ fn rotate_progress_locked(active_path: &Path) -> Result<()> {
     // Crash consistency is marker based: rename first, then fold the now
     // immutable archive and atomically publish the checkpoint. A crash between
     // these operations leaves a marker mismatch that startup hydration repairs.
-    recover_progress_checkpoint_locked(active_path)?;
+    let checkpoint = recover_progress_checkpoint_locked(active_path)?;
     File::create(active_path).with_context(|| format!("create {}", active_path.display()))?;
+    // Publish an empty-generation cursor tied to the newly incremented
+    // checkpoint sequence. A crash before this write is repaired by the same
+    // sequence mismatch on startup/read.
+    reconcile_verdict_index_locked(active_path, checkpoint.as_ref())?;
     Ok(())
 }
 
 fn settle_pending_progress_write_locked(path: &Path) -> Result<()> {
-    if read_verdict_index_locked(path)?.is_some() {
-        return Ok(());
+    // Resolve an exact pending verdict/terminal fence before touching the raw
+    // tail. Ordinary telemetry appends deliberately do not refresh the full
+    // compact index here: the next startup/read/special writer streams only
+    // the uncovered delta, avoiding a sidecar rewrite on every progress row.
+    let index = read_verdict_index_locked(path)?;
+    finish_unterminated_progress_tail_locked(path)?;
+    if index.is_none() {
+        let checkpoint = recover_progress_checkpoint_locked(path)?;
+        reconcile_verdict_index_locked(path, checkpoint.as_ref())?;
     }
-    let checkpoint = recover_progress_checkpoint_locked(path)?;
-    ensure_verdict_index_locked(path, checkpoint.as_ref())
+    Ok(())
 }
 
-const MAX_UNTERMINATED_PROGRESS_TAIL_BYTES: usize = 16 * 1024 * 1024;
-
-fn finish_valid_unterminated_progress_tail_locked(path: &Path) -> Result<()> {
+/// Durably delimit an unterminated active-journal tail while holding the
+/// stable progress lock. Existing bytes are never truncated or rewritten: a
+/// valid JSON value becomes a complete row, while a torn/invalid fragment
+/// becomes an explicit corrupt row that scanners count and skip. Either way,
+/// the next append cannot concatenate onto ambiguous bytes and wedge startup.
+fn finish_unterminated_progress_tail_locked(path: &Path) -> Result<()> {
     let mut file = match OpenOptions::new().read(true).write(true).open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1627,31 +1740,6 @@ fn finish_valid_unterminated_progress_tail_locked(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let bounded_len = len.min((MAX_UNTERMINATED_PROGRESS_TAIL_BYTES + 1) as u64);
-    let bounded_len = usize::try_from(bounded_len).context("progress tail length overflow")?;
-    file.seek(SeekFrom::End(-(bounded_len as i64)))
-        .with_context(|| format!("seek tail of {}", path.display()))?;
-    let mut tail_window = vec![0_u8; bounded_len];
-    file.read_exact(&mut tail_window)
-        .with_context(|| format!("read unterminated tail of {}", path.display()))?;
-    let tail = match tail_window.iter().rposition(|byte| *byte == b'\n') {
-        Some(newline) => &tail_window[newline + 1..],
-        None if len <= MAX_UNTERMINATED_PROGRESS_TAIL_BYTES as u64 => &tail_window[..],
-        None => anyhow::bail!(
-            "ambiguous unterminated canonical progress tail in {} exceeds {} bytes",
-            path.display(),
-            MAX_UNTERMINATED_PROGRESS_TAIL_BYTES
-        ),
-    };
-    if tail.len() > MAX_UNTERMINATED_PROGRESS_TAIL_BYTES
-        || serde_json::from_slice::<Value>(trim_ascii_line(tail)).is_err()
-    {
-        anyhow::bail!(
-            "ambiguous unterminated canonical progress tail in {}",
-            path.display()
-        );
-    }
-
     file.seek(SeekFrom::End(0))
         .with_context(|| format!("seek to append boundary of {}", path.display()))?;
     file.write_all(b"\n")
@@ -1663,8 +1751,15 @@ fn finish_valid_unterminated_progress_tail_locked(path: &Path) -> Result<()> {
 
 fn recover_progress_checkpoint_locked(active_path: &Path) -> Result<Option<ProgressCheckpoint>> {
     let archive_path = progress_archive_path(active_path);
-    let archive = archive_coverage_for_path(&archive_path)?;
     let mut checkpoint = read_progress_checkpoint(active_path)?;
+    let archive_state = archive_progress_state(&archive_path)?;
+    if checkpoint.as_ref().is_some_and(|checkpoint| {
+        checkpoint.schema_version == CHECKPOINT_SCHEMA_VERSION
+            && checkpoint_covers_archive_state(checkpoint, archive_state.as_ref())
+    }) {
+        return Ok(checkpoint);
+    }
+    let archive = archive_coverage_for_path(&archive_path)?;
 
     if checkpoint
         .as_ref()
@@ -1723,9 +1818,23 @@ fn recover_progress_checkpoint_locked(active_path: &Path) -> Result<Option<Progr
     };
     if checkpoint
         .as_ref()
-        .is_some_and(|checkpoint| checkpoint_covers_archive(checkpoint, Some(&archive)))
+        .and_then(|checkpoint| checkpoint.coverage.as_ref())
+        == Some(&archive)
     {
         return Ok(checkpoint);
+    }
+    if checkpoint.as_ref().is_some_and(|checkpoint| {
+        checkpoint.schema_version == CHECKPOINT_SCHEMA_VERSION
+            && checkpoint
+                .coverage
+                .as_ref()
+                .is_some_and(|coverage| coverage.file_identity.is_none())
+            && checkpoint_covers_archive(checkpoint, Some(&archive))
+    }) {
+        let mut enriched = checkpoint.take().expect("checked above");
+        enriched.coverage = Some(archive);
+        write_progress_checkpoint(active_path, &enriched)?;
+        return Ok(Some(enriched));
     }
 
     let mut next = checkpoint.take().unwrap_or_default();
@@ -1764,6 +1873,22 @@ fn coverage_matches_legacy(
         (Some(checkpoint), Some(archive)) => {
             checkpoint.byte_size == archive.byte_size
                 && checkpoint.first_line_sha256 == archive.first_line_sha256
+        }
+        _ => false,
+    }
+}
+
+fn checkpoint_covers_archive_state(
+    checkpoint: &ProgressCheckpoint,
+    archive: Option<&(u64, Option<PendingActiveFileIdentity>)>,
+) -> bool {
+    match (checkpoint.coverage.as_ref(), archive) {
+        (None, None) => true,
+        (Some(coverage), Some((byte_size, file_identity))) => {
+            coverage.byte_size == *byte_size
+                && coverage.full_file_sha256.is_some()
+                && coverage.file_identity.is_some()
+                && coverage.file_identity.as_ref() == file_identity.as_ref()
         }
         _ => false,
     }
@@ -1808,10 +1933,11 @@ fn archive_coverage_for_path(path: &Path) -> Result<Option<ArchiveCoverage>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
     };
-    let byte_size = file
+    let metadata = file
         .metadata()
-        .with_context(|| format!("stat {}", path.display()))?
-        .len();
+        .with_context(|| format!("stat {}", path.display()))?;
+    let byte_size = metadata.len();
+    let file_identity = pending_active_file_identity(&metadata);
     let mut full_hasher = Sha256::new();
     let mut first_hasher = Sha256::new();
     let mut first_line_open = true;
@@ -1836,10 +1962,20 @@ fn archive_coverage_for_path(path: &Path) -> Result<Option<ArchiveCoverage>> {
             first_line_open = take == chunk.len() && chunk.last() != Some(&b'\n');
         }
     }
+    let final_metadata = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?;
+    if final_metadata.len() != byte_size
+        || pending_active_file_identity(&final_metadata) != file_identity
+    {
+        anyhow::bail!("archive changed while hashing {}", path.display());
+    }
+    journal::record_raw_read(byte_size);
     Ok(Some(ArchiveCoverage {
         byte_size,
         first_line_sha256: found_bytes.then(|| hex_digest(first_hasher.finalize().as_slice())),
         full_file_sha256: Some(hex_digest(full_hasher.finalize().as_slice())),
+        file_identity,
     }))
 }
 
@@ -3301,7 +3437,7 @@ mod tests {
 
         assert_eq!(read_rows(&path).len(), 2);
         assert_eq!(
-            latest_turn_verdicts_locked(&path).unwrap()[&("s1".into(), "turn-1".into())],
+            latest_turn_verdicts(&path).unwrap()[&("s1".into(), "turn-1".into())],
             revised
         );
     }
@@ -3325,23 +3461,215 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_verdict_index_preserves_an_ambiguous_unterminated_active_tail() {
+    fn corrupt_verdict_index_delimits_an_ambiguous_unterminated_active_tail() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("progress.jsonl");
         let active = b"{\"event\":\"session_started\"}\n{\"event\":\"chat_turn_completed\"";
         std::fs::write(&path, active).unwrap();
         write_truncated_current_verdict_index(&path);
         let corrupt_index = std::fs::read(progress_verdict_index_path(&path)).unwrap();
+        let ordinary = json!({"event": "ordinary_fact"});
 
-        let error = append_event(&path, &json!({"event": "ordinary_fact"}))
-            .unwrap_err()
-            .to_string();
+        append_event(&path, &ordinary).unwrap();
 
-        assert!(error.contains("ambiguous unterminated canonical progress tail"));
-        assert_eq!(std::fs::read(&path).unwrap(), active);
+        let mut expected = active.to_vec();
+        expected.push(b'\n');
+        expected.extend_from_slice(&serde_json::to_vec(&ordinary).unwrap());
+        expected.push(b'\n');
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        assert_eq!(
+            std::fs::read(progress_sibling_path(&path, ".verdicts.corrupt.json")).unwrap(),
+            corrupt_index
+        );
+    }
+
+    #[test]
+    fn missing_verdict_index_delimits_an_ambiguous_unterminated_active_tail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let active = b"{\"event\":\"session_started\"}\n{corrupt-trailing-line";
+        std::fs::write(&path, active).unwrap();
+
+        load_or_recover_progress_checkpoint(&path).unwrap();
+
+        let mut expected = active.to_vec();
+        expected.push(b'\n');
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        assert!(read_verdict_index_locked(&path).unwrap().is_some());
+        assert_eq!(
+            latest_turn_verdicts_detailed(&path)
+                .unwrap()
+                .corrupt_line_count,
+            1
+        );
+    }
+
+    #[test]
+    fn verdict_quality_projection_catches_up_only_the_new_active_delta() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        std::fs::write(&path, b"{\"event\":\"session_started\"}\ncorrupt-initial\n").unwrap();
+        load_or_recover_progress_checkpoint(&path).unwrap();
+        let initial = read_verdict_index_locked(&path).unwrap().unwrap();
+        assert_eq!(
+            initial.active.offset,
+            std::fs::metadata(&path).unwrap().len()
+        );
+        assert_eq!(initial.active.corrupt_line_count, 1);
+
+        let verdict = sample_verdict(
+            Verdict::Accept,
+            Some("delta"),
+            "2026-08-28T02:00:00Z".parse().unwrap(),
+        );
+        let mut verdict_event = serde_json::to_value(&verdict).unwrap();
+        verdict_event
+            .as_object_mut()
+            .unwrap()
+            .insert("event".into(), Value::String(TURN_VERDICT.into()));
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&verdict_event).unwrap()).unwrap();
+        writeln!(file, "corrupt-delta").unwrap();
+        drop(file);
+
+        let read = latest_turn_verdicts_detailed(&path).unwrap();
+        assert_eq!(read.corrupt_line_count, 2);
+        assert_eq!(read.verdicts[&("s1".into(), "turn-1".into())], verdict);
+        let caught_up = read_verdict_index_locked(&path).unwrap().unwrap();
+        assert_eq!(
+            caught_up.active.offset,
+            std::fs::metadata(&path).unwrap().len()
+        );
+        assert_eq!(caught_up.active.corrupt_line_count, 2);
+
+        let index_bytes = std::fs::read(progress_verdict_index_path(&path)).unwrap();
+        assert_eq!(latest_turn_verdicts_detailed(&path).unwrap(), read);
         assert_eq!(
             std::fs::read(progress_verdict_index_path(&path)).unwrap(),
-            corrupt_index
+            index_bytes,
+            "an unchanged journal must not rewrite or rescan the compact projection"
+        );
+    }
+
+    #[test]
+    fn ordinary_append_leaves_a_valid_verdict_projection_for_lazy_catch_up() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        std::fs::write(&path, b"{\"event\":\"session_started\",\"sid\":\"s1\"}\n").unwrap();
+        load_or_recover_progress_checkpoint(&path).unwrap();
+        let index_path = progress_verdict_index_path(&path);
+        let index_before = std::fs::read(&index_path).unwrap();
+        let covered_before = read_verdict_index_locked(&path).unwrap().unwrap();
+
+        append_event(
+            &path,
+            &json!({"event": "ordinary_fact", "sid": "s1", "value": 1}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&index_path).unwrap(),
+            index_before,
+            "ordinary telemetry must not rewrite the compact verdict projection"
+        );
+        assert!(covered_before.active.offset < std::fs::metadata(&path).unwrap().len());
+
+        latest_turn_verdicts_detailed(&path).unwrap();
+        let caught_up = read_verdict_index_locked(&path).unwrap().unwrap();
+        assert_eq!(
+            caught_up.active.offset,
+            std::fs::metadata(&path).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn legacy_v2_verdict_index_rebuilds_into_cursor_schema() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let verdict = sample_verdict(
+            Verdict::Accept,
+            Some("canonical"),
+            "2026-08-28T03:00:00Z".parse().unwrap(),
+        );
+        let mut event = serde_json::to_value(&verdict).unwrap();
+        event
+            .as_object_mut()
+            .unwrap()
+            .insert("event".into(), Value::String(TURN_VERDICT.into()));
+        std::fs::write(&path, format!("{event}\n")).unwrap();
+        let legacy = serde_json::to_vec(&json!({
+            "schema_version": 2,
+            "verdicts": {},
+            "terminal_turns": {},
+        }))
+        .unwrap();
+        std::fs::write(progress_verdict_index_path(&path), &legacy).unwrap();
+
+        let read = latest_turn_verdicts_detailed(&path).unwrap();
+
+        assert_eq!(read.verdicts[&("s1".into(), "turn-1".into())], verdict);
+        let rebuilt = read_verdict_index_locked(&path).unwrap().unwrap();
+        assert_eq!(rebuilt.schema_version, VERDICT_INDEX_SCHEMA_VERSION);
+        assert_eq!(
+            rebuilt.active.offset,
+            std::fs::metadata(&path).unwrap().len()
+        );
+        assert_eq!(
+            std::fs::read(progress_sibling_path(&path, ".verdicts.corrupt.json")).unwrap(),
+            legacy
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_v2_pending_tail_is_settled_before_cursor_schema_rebuild() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let existing = json!({"event": "session_started", "sid": "s1"});
+        let mut existing_line = serde_json::to_vec(&existing).unwrap();
+        existing_line.push(b'\n');
+        let pending_event = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T00:00:00Z",
+        });
+        let mut pending_line = serde_json::to_vec(&pending_event).unwrap();
+        pending_line.push(b'\n');
+        let active_offset = existing_line.len() as u64;
+        let mut active = existing_line;
+        active.extend_from_slice(&pending_line[..pending_line.len() / 2]);
+        std::fs::write(&path, active).unwrap();
+        let mut legacy = ProgressVerdictIndex {
+            pending: Some(PendingProgressIndexWrite::TerminalTurn {
+                event: pending_event,
+                active_offset,
+                line_len: pending_line.len() as u64,
+                line_sha256: hex_digest(Sha256::digest(&pending_line).as_slice()),
+                active_file_identity: pending_active_file_identity(
+                    &std::fs::metadata(&path).unwrap(),
+                ),
+            }),
+            ..ProgressVerdictIndex::default()
+        };
+        legacy.schema_version = 2;
+        write_verdict_index(&path, &legacy).unwrap();
+        let replay = json!({
+            "event": CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "turn_id": "turn-1",
+            "ts": "2026-08-28T01:00:00Z",
+        });
+
+        let admitted = append_chat_turn_completed_if_absent(&path, &replay).unwrap();
+
+        assert!(admitted.appended);
+        assert_eq!(read_rows(&path), vec![existing, replay]);
+        assert_eq!(
+            latest_turn_verdicts_detailed(&path)
+                .unwrap()
+                .corrupt_line_count,
+            0
         );
     }
 
@@ -3360,6 +3688,7 @@ mod tests {
                 progress_verdict_index_path(&path),
                 serde_json::to_vec(&json!({
                     "schema_version": VERDICT_INDEX_SCHEMA_VERSION + 1,
+                    "pending": {"kind": "future_kind", "opaque": true},
                 }))
                 .unwrap(),
             )

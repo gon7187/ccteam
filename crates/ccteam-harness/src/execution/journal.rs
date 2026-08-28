@@ -45,6 +45,10 @@ fn record_metrics(bytes_read: u64, records_parsed: u64, invalid_lines: usize) {
     INVALID_LINES.fetch_add(invalid_lines as u64, Ordering::Relaxed);
 }
 
+pub(super) fn record_raw_read(bytes_read: u64) {
+    record_metrics(bytes_read, 0, 0);
+}
+
 /// A corruption-tolerant tail, ordered oldest first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tail<T = Value> {
@@ -293,6 +297,75 @@ where
         summary.corrupt_count,
     );
 
+    Ok(summary)
+}
+
+/// Stream complete rows after a durable byte cursor without collecting them.
+/// Like [`read_delta`], an unterminated final row is left for the next pass and
+/// does not advance `next_offset`.
+pub fn scan_stream_from<F>(path: &Path, from_offset: u64, mut reduce: F) -> Result<ScanSummary>
+where
+    F: FnMut(Value),
+{
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ScanSummary {
+                next_offset: from_offset,
+                ..ScanSummary::default()
+            });
+        }
+        Err(err) => return Err(err).with_context(|| format!("open {}", path.display())),
+    };
+    let len = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    if from_offset > len {
+        bail!(
+            "journal offset {from_offset} is beyond {} byte length {len}",
+            path.display()
+        );
+    }
+    file.seek(SeekFrom::Start(from_offset))
+        .with_context(|| format!("seek {} to {from_offset}", path.display()))?;
+
+    let mut reader = BufReader::new(file);
+    let mut summary = ScanSummary {
+        next_offset: from_offset,
+        ..ScanSummary::default()
+    };
+    let mut raw = Vec::new();
+    let mut bytes_read = 0u64;
+    let mut valid_count = 0u64;
+    loop {
+        raw.clear();
+        let read = reader
+            .read_until(b'\n', &mut raw)
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if raw.last() != Some(&b'\n') {
+            break;
+        }
+        summary.next_offset = summary
+            .next_offset
+            .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        let line = trim_ascii(&raw);
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<Value>(line) {
+            Ok(value) => {
+                valid_count = valid_count.saturating_add(1);
+                reduce(value);
+            }
+            Err(_) => summary.corrupt_count += 1,
+        }
+    }
+    record_metrics(bytes_read, valid_count, summary.corrupt_count);
     Ok(summary)
 }
 
@@ -586,6 +659,50 @@ mod tests {
         assert_eq!(resumed.events.len(), 1);
         assert_eq!(resumed.events[0]["n"], 2);
         assert_eq!(resumed.next_offset, std::fs::metadata(path).unwrap().len());
+    }
+
+    #[test]
+    fn streaming_delta_reduces_without_collecting_and_stops_at_partial_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.jsonl");
+        let first = b"{\"n\":1}\n";
+        let corrupt = b"not-json\n";
+        let second = b"{\"n\":2}\n";
+        let partial = b"{\"n\":3";
+        let mut bytes = first.to_vec();
+        bytes.extend_from_slice(corrupt);
+        bytes.extend_from_slice(second);
+        bytes.extend_from_slice(partial);
+        std::fs::write(&path, bytes).unwrap();
+        let mut seen = Vec::new();
+
+        let delta = scan_stream_from(&path, first.len() as u64, |event| {
+            seen.push(event["n"].clone())
+        })
+        .unwrap();
+
+        assert_eq!(seen, vec![Value::from(2)]);
+        assert_eq!(delta.corrupt_count, 1);
+        assert_eq!(
+            delta.next_offset,
+            (first.len() + corrupt.len() + second.len()) as u64
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"}\n").unwrap();
+        let mut resumed = Vec::new();
+        let completed = scan_stream_from(&path, delta.next_offset, |event| {
+            resumed.push(event["n"].clone())
+        })
+        .unwrap();
+        assert_eq!(resumed, vec![Value::from(3)]);
+        assert_eq!(completed.corrupt_count, 0);
+        assert_eq!(
+            completed.next_offset,
+            std::fs::metadata(path).unwrap().len()
+        );
     }
 
     #[test]

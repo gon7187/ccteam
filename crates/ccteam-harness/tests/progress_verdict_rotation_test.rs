@@ -1,8 +1,8 @@
 use ccteam_harness::execution::progress_bridge::{
     append_event, append_turn_verdict_if_changed, latest_turn_verdicts,
     load_or_recover_progress_checkpoint, progress_archive_coverage, progress_archive_path,
-    progress_checkpoint_path, progress_verdict_index_path, read_progress_checkpoint, TurnVerdict,
-    Verdict,
+    progress_checkpoint_path, progress_corrupt_line_count, progress_verdict_index_path,
+    read_progress_checkpoint, TurnVerdict, Verdict,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -57,6 +57,57 @@ fn latest_verdict_survives_three_archive_replacements_and_stays_idempotent() {
         !append_turn_verdict_if_changed(&active, &duplicate).unwrap(),
         "an identical PUT remains idempotent after repeated rotation"
     );
+}
+
+#[test]
+fn corrupt_row_moves_from_active_cursor_to_checkpoint_exactly_once_on_rotation() {
+    std::env::set_var("CCTEAM_PROGRESS_ROTATE_BYTES", "1024");
+    let temp = tempfile::tempdir().unwrap();
+    let active = temp.path().join("corrupt-rotation.jsonl");
+    std::fs::write(&active, b"corrupt-active-row\n").unwrap();
+
+    append_event(
+        &active,
+        &json!({
+            "event": "force_rotation",
+            "padding": "x".repeat(1200),
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(
+        read_progress_checkpoint(&active)
+            .unwrap()
+            .unwrap()
+            .corrupt_line_count,
+        1
+    );
+    assert_eq!(progress_corrupt_line_count(&active).unwrap(), 1);
+    assert_eq!(progress_corrupt_line_count(&active).unwrap(), 1);
+}
+
+#[test]
+fn same_bytes_in_a_new_archive_generation_are_folded_again() {
+    std::env::set_var("CCTEAM_PROGRESS_ROTATE_BYTES", "1024");
+    let temp = tempfile::tempdir().unwrap();
+    let active = temp.path().join("same-bytes.jsonl");
+    append_event(
+        &active,
+        &json!({"event": "generation", "padding": "x".repeat(1200)}),
+    )
+    .unwrap();
+    let first = read_progress_checkpoint(&active).unwrap().unwrap();
+    let archive = progress_archive_path(&active);
+    let replacement = temp.path().join("replacement.jsonl");
+    std::fs::write(&replacement, std::fs::read(&archive).unwrap()).unwrap();
+    std::fs::rename(&replacement, &archive).unwrap();
+
+    let recovered = load_or_recover_progress_checkpoint(&active)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(recovered.rotation_sequence, first.rotation_sequence + 1);
+    assert_eq!(recovered.event_count, first.event_count * 2);
 }
 
 #[test]

@@ -117,6 +117,9 @@ export interface SessionHistory {
   events: SessionHistoryEvent[];
   next_before: string | null;
   has_more: boolean;
+  verdicts_status: "ok" | "degraded_corrupt" | "unavailable";
+  verdicts_degraded: boolean;
+  verdict_corrupt_line_count: number | null;
 }
 
 export interface ReadRequestOptions {
