@@ -369,10 +369,11 @@ where
 }
 
 async fn hydrate_progress_before_serving(state: &AppState) -> Result<()> {
-    let hydration_paths = std::sync::Arc::clone(&state.paths);
+    let hydration_state = state.clone();
     let hydration_projection = std::sync::Arc::clone(&state.progress_projection);
     tokio::task::spawn_blocking(move || {
-        let slugs = ccteam_core::collect_projects(&hydration_paths)?
+        let slugs = hydration_state
+            .collect_projects_blocking()?
             .into_iter()
             .map(|project| project.state.slug)
             .collect::<Vec<_>>();

@@ -1514,12 +1514,11 @@ pub(crate) async fn handle_create_scheduled(
     let visible_projects = if identity.is_admin {
         None
     } else {
+        // Off-worker catalog walk (per-project progress locks).
         Some(
-            ccteam_core::collect_projects(&app.paths)
-                .unwrap_or_default()
+            app.visible_project_slugs(&identity)
+                .await
                 .into_iter()
-                .filter(|project| identity.can_see_owner(project.state.owner.as_deref()))
-                .map(|project| project.state.slug)
                 .collect::<std::collections::HashSet<_>>(),
         )
     };

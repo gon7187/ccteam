@@ -140,21 +140,6 @@ pub(crate) struct AgentsGraphQuery {
 /// global) so one slow vendor never costs the others their model.
 const LIVE_STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_millis(750);
 
-/// Project slugs `identity` may see (mirrors `api_v1::build_projects`'s
-/// per-tenant filter). Best-effort: a `collect_projects` failure degrades to
-/// "no projects visible" rather than 500ing the whole graph.
-fn visible_project_slugs(app: &AppState, identity: &Identity) -> Vec<String> {
-    ccteam_core::collect_projects(&app.paths)
-        .map(|summaries| {
-            summaries
-                .into_iter()
-                .filter(|s| identity.can_see_owner(s.state.owner.as_deref()))
-                .map(|s| s.state.slug)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Sort hosts with `"local"` pinned first, everything else alphabetical.
 fn sort_hosts(hosts: HashSet<String>) -> Vec<String> {
     let mut out: Vec<String> = hosts.into_iter().collect();
@@ -277,7 +262,7 @@ pub(crate) async fn handle_agents_graph(
     };
     let slugs: Vec<String> = match &q.slug {
         Some(slug) => vec![slug.clone()],
-        None => visible_project_slugs(&app, &identity),
+        None => app.visible_project_slugs(&identity).await,
     };
     let (live_by_sid, armed_watches, live_handles) = {
         let guard = gw.lock().await;
@@ -364,9 +349,17 @@ struct EventAcl {
 }
 
 impl EventAcl {
-    fn resolve(app: &AppState, identity: &Identity) -> Self {
+    /// Async because the visible-project set comes from the catalog walk, which
+    /// takes per-project progress locks: an SSE reconnect storm resolving this
+    /// inline would park one tokio worker per reconnect (see
+    /// `AppState::collect_projects_blocking`).
+    async fn resolve(app: &AppState, identity: &Identity) -> Self {
         Self {
-            visible: visible_project_slugs(app, identity).into_iter().collect(),
+            visible: app
+                .visible_project_slugs(identity)
+                .await
+                .into_iter()
+                .collect(),
             allow_unattributed: identity.is_admin,
         }
     }
@@ -425,7 +418,7 @@ pub(crate) async fn handle_agents_events(
 ) -> Response {
     let last_id = parse_last_event_id(&headers, &query);
     let rx = app.gateway.as_ref().map(|_| app.global_ring.subscribe());
-    let visible = EventAcl::resolve(&app, &identity);
+    let visible = EventAcl::resolve(&app, &identity).await;
     let stream = match rx {
         Some(rx) => {
             let catchup: Vec<Event> = match last_id {

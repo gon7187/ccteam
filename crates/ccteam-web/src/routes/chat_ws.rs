@@ -402,12 +402,9 @@ fn parse_sessions_reply(content: &str) -> Option<Vec<SessionItem>> {
 /// connected chat the full project list of the box, leaking other users'
 /// project names.
 async fn session_items(app: &AppState, identity: &Identity) -> Vec<SessionItem> {
-    // `collect_projects` takes a blocking per-project flock; running it inline
-    // would stall this socket's tokio worker (and every task sharing it).
-    let paths = app.paths.clone();
-    let Ok(Ok(projects)) =
-        tokio::task::spawn_blocking(move || ccteam_core::collect_projects(&paths)).await
-    else {
+    // The accessor keeps the blocking per-project flock off this socket's
+    // tokio worker (and every task sharing it).
+    let Ok(projects) = app.collect_projects().await else {
         return Vec::new();
     };
     let mut items = Vec::new();

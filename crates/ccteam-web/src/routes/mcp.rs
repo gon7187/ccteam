@@ -550,7 +550,7 @@ async fn handle_enroll_post(
         }
         None => {
             log_tier_call(&format!("enroll:{}", credential.id), &req);
-            if let Some(refusal) = refuse_projectless_call(app, credential, &binding, &req) {
+            if let Some(refusal) = refuse_projectless_call(app, credential, &binding, &req).await {
                 return refusal;
             }
             dispatch_json_rpc(app, req, ccteam_im::mcp::McpCaller::Ambient).await
@@ -715,7 +715,7 @@ async fn bind_named_project(
     if !may_bind_project(app, credential, &slug) {
         return Err(Box::new(mcp_tool_error(
             req,
-            unaddressable_project(app, credential, tool, &slug),
+            unaddressable_project(app, credential, tool, &slug).await,
         )));
     }
     // The registry is the arbiter of "one session, one workspace": a binding
@@ -797,7 +797,7 @@ fn may_bind_project(app: &AppState, credential: &EnrollCredential, slug: &str) -
 /// here and invisible to its owner are deliberately the same text, so a caller
 /// cannot probe for the existence of somebody else's workspace. Both halves
 /// depend only on the OWNER, never on the probed slug's fate.
-fn unaddressable_project(
+async fn unaddressable_project(
     app: &AppState,
     credential: &EnrollCredential,
     tool: &str,
@@ -807,7 +807,7 @@ fn unaddressable_project(
         "{tool}: project `{slug}` is not registered here, or not this credential owner's — \
          one answer for both on purpose."
     );
-    match addressable_projects(app, &credential.owner) {
+    match addressable_projects(app, &credential.owner).await {
         projects if projects.is_empty() => message.push_str(
             " No project is registered for this credential's owner yet; create one in the web \
              console first.",
@@ -899,7 +899,7 @@ fn no_such_mcp_session(req: &Value) -> Response {
 /// Everything else is withheld, because acting needs a workspace and ccteam will
 /// not pick one — an inferred project is how a hand-started agent's children
 /// ended up in a scratch repo nobody had named.
-fn refuse_projectless_call(
+async fn refuse_projectless_call(
     app: &AppState,
     credential: &EnrollCredential,
     binding: &NativeBinding,
@@ -922,7 +922,7 @@ fn refuse_projectless_call(
         "{tool}: this MCP session has no project — {cause}. ccteam never infers one from your \
          working directory, your address or the most recent project."
     );
-    let projects = addressable_projects(app, &credential.owner);
+    let projects = addressable_projects(app, &credential.owner).await;
     if projects.is_empty() {
         message.push_str(
             " No project is registered for this credential's owner yet; create one in the web \
@@ -970,14 +970,10 @@ fn mcp_tool_error(req: &Value, message: String) -> Response {
 
 /// Projects this credential's owner could be handed a scoped snippet for.
 /// Ownership-filtered so the hint cannot enumerate another tenant's workspaces.
-fn addressable_projects(app: &AppState, owner: &str) -> Vec<String> {
-    let identity = identity_for_owner(owner);
-    ccteam_core::collect_projects(&app.paths)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| identity.can_see_owner(p.state.owner.as_deref()))
-        .map(|p| p.state.slug)
-        .collect()
+/// Async: the catalog walk takes per-project progress locks and must stay off
+/// the async workers (see `AppState::collect_projects_blocking`).
+async fn addressable_projects(app: &AppState, owner: &str) -> Vec<String> {
+    app.visible_project_slugs(&identity_for_owner(owner)).await
 }
 
 /// The web identity an enrollment credential speaks for.
