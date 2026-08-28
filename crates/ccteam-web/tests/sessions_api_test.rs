@@ -19,8 +19,8 @@ use std::time::Duration;
 use ccteam_core::CcteamPaths;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
-    HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, ThreadStatus,
-    TurnId, TurnInput, TurnSubmission, UnifiedTokenUsage,
+    HarnessCapability, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItem,
+    ThreadItemDetails, ThreadStatus, TurnId, TurnInput, TurnSubmission, UnifiedTokenUsage,
 };
 use ccteam_web::{router_with_state, AppState};
 use futures::stream::{self, BoxStream};
@@ -40,6 +40,23 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
 
 struct FakeAdapter {
     vendor: AgentVendor,
+    start_failure: Option<HarnessCapability>,
+}
+
+impl FakeAdapter {
+    fn new(vendor: AgentVendor) -> Self {
+        Self {
+            vendor,
+            start_failure: None,
+        }
+    }
+
+    fn failing(vendor: AgentVendor, capability: HarnessCapability) -> Self {
+        Self {
+            vendor,
+            start_failure: Some(capability),
+        }
+    }
 }
 
 /// A real-shaped paneless turn script whose terminal boundary is released by
@@ -220,6 +237,12 @@ impl HarnessAdapter for FakeAdapter {
         _spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        if let Some(capability) = self.start_failure {
+            return Err(HarnessError::CapabilityUnavailable {
+                capability,
+                detail: "fake vendor capability rejection".to_string(),
+            });
+        }
         Ok(ThreadHandle {
             vendor: self.vendor,
             mode: ExecutionMode::Chat,
@@ -360,6 +383,45 @@ async fn create_session_rejects_removed_host_parameter() {
         body["error"],
         ccteam_im::remote_host::HOST_SPAWN_PARAM_REMOVED
     );
+}
+
+#[tokio::test]
+async fn create_session_exposes_typed_capability_failures() {
+    for (capability, error_code) in [
+        (HarnessCapability::Vendor, "vendor_unavailable"),
+        (HarnessCapability::Model, "model_unavailable"),
+        (HarnessCapability::Effort, "effort_unavailable"),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let paths = fake_paths(tmp.path());
+        let project_dir = paths.projects_root.join("demo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let factory = Arc::new(move |vendor, _protocol| {
+            Arc::new(FakeAdapter::failing(vendor, capability))
+                as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
+        let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
+            .json(&serde_json::json!({
+                "role": "",
+                "vendor": "claude",
+                "model": "opus",
+                "effort": "max"
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 422);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error_code"], error_code);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("fake vendor capability rejection"));
+    }
 }
 
 #[tokio::test]
@@ -610,7 +672,7 @@ async fn session_events_fresh_connect_reseeds_a_pending_approval() {
     let project_dir = paths.projects_root.join("demo");
     std::fs::create_dir_all(&project_dir).unwrap();
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
     let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
@@ -664,7 +726,7 @@ async fn session_events_reconnect_with_last_event_id_replays_the_gap() {
     let project_dir = paths.projects_root.join("demo");
     std::fs::create_dir_all(&project_dir).unwrap();
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
     let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
@@ -740,7 +802,7 @@ async fn history_and_resume_roundtrip_over_http() {
     seed_role_with_model(&project_dir, "cto", None);
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -890,7 +952,7 @@ async fn import_external_claude_session_over_http() {
     std::env::set_var("CCTEAM_HOME", home.path().join(".ccteam"));
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -995,7 +1057,7 @@ async fn rename_session_over_http_happy_path_and_validation() {
     seed_role_with_model(&project_dir, "cto", None);
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1125,7 +1187,7 @@ async fn session_history_defaults_to_newest_100_and_pages_backwards() {
     std::fs::create_dir_all(&project_dir).unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1478,7 +1540,7 @@ async fn session_verdict_is_idempotent_and_history_joins_latest_archive_and_acti
     std::fs::create_dir_all(&project_dir).unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1657,7 +1719,7 @@ async fn session_verdict_and_history_surface_progress_storage_failures() {
     let progress = paths.progress_jsonl("demo");
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1741,7 +1803,7 @@ async fn rename_session_denies_cross_tenant_project() {
     st.save(&state_path).unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1898,7 +1960,7 @@ async fn upload_then_turn_weaves_attachment_lines_into_turn_text() {
     seed_project_state(&project_dir, "demo");
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -1991,7 +2053,7 @@ async fn skill_list_and_attach_names_skill_file_in_turn() {
     .unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -2104,7 +2166,7 @@ async fn global_skill_list_and_nested_attach_use_library_path_only() {
     .unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -2176,7 +2238,7 @@ async fn global_skill_attach_rejects_invalid_missing_and_unknown_scope() {
     seed_project_state(&project_dir, "demo");
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -2270,7 +2332,7 @@ async fn tenant_can_list_and_attach_global_skills_in_own_session() {
     project_state.save(&state_path).unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -2333,7 +2395,7 @@ async fn global_skill_attach_rejects_remote_host_project() {
     .unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
@@ -2399,7 +2461,7 @@ async fn turn_attachments_reject_foreign_paths_and_unknown_skills() {
     std::fs::write(&outside, "nope").unwrap();
 
     let factory = Arc::new(|vendor, _protocol| {
-        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+        Arc::new(FakeAdapter::new(vendor)) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());

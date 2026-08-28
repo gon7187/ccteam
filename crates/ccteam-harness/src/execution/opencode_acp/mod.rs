@@ -604,7 +604,9 @@ impl HarnessAdapter for OpencodeAcpAdapter {
                     }),
                 )
                 .await
-                .map_err(|e| crate::execution::acp::spawn_pick_refused(axis.what, axis.value, e))?;
+                .map_err(|e| {
+                    crate::execution::acp::spawn_pick_request_failed(axis.what, axis.value, e)
+                })?;
             if let Ok(mut st) = live.state.lock() {
                 if axis.what == "model" {
                     st.model = Some(axis.value.to_string());

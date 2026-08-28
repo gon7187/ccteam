@@ -2173,16 +2173,7 @@ async fn run_session_spawn_at(
         deadline,
     )
     .await
-    .map_err(|error| {
-        if error
-            .downcast_ref::<crate::gateway::GatewayRequestError>()
-            .is_some()
-        {
-            mcp_gateway_error("session_spawn", &error)
-        } else {
-            spawn_create_error(error, &project, &caller, paths)
-        }
-    })?;
+    .map_err(|error| session_spawn_create_error(error, &project, &caller, paths))?;
     let sid = created.sid;
     let resolved = gateway.lock().await.session_resolve(&sid);
     // Read the child meta once for the vendor resume key + the delegation
@@ -2373,13 +2364,60 @@ fn spawn_create_error(
     )
 }
 
+fn session_spawn_create_error(
+    err: anyhow::Error,
+    project: &str,
+    caller: &McpCaller,
+    paths: Option<&CcteamPaths>,
+) -> String {
+    if mcp_error_code(&err).is_some() {
+        mcp_gateway_error("session_spawn", &err)
+    } else {
+        spawn_create_error(err, project, caller, paths)
+    }
+}
+
+fn mcp_error_code(err: &anyhow::Error) -> Option<&'static str> {
+    err.downcast_ref::<crate::gateway::GatewayRequestError>()
+        .map(crate::gateway::GatewayRequestError::error_code)
+        .or_else(|| {
+            err.downcast_ref::<ccteam_harness::HarnessError>()
+                .and_then(ccteam_harness::HarnessError::capability_error_code)
+        })
+}
+
 fn mcp_gateway_error(tool: &str, err: &anyhow::Error) -> String {
-    let code = err
-        .downcast_ref::<crate::gateway::GatewayRequestError>()
-        .map(crate::gateway::GatewayRequestError::error_code);
-    match code {
+    match mcp_error_code(err) {
         Some(code) => format!("{tool} failed: {err} (error_code={code})"),
         None => format!("{tool} failed: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod mcp_gateway_error_tests {
+    use super::*;
+    use ccteam_harness::{HarnessCapability, HarnessError};
+
+    #[test]
+    fn session_spawn_formats_capability_code_and_leaves_generic_harness_errors_uncoded() {
+        let capability = anyhow::Error::new(HarnessError::CapabilityUnavailable {
+            capability: HarnessCapability::Model,
+            detail: "vendor refused opus".to_string(),
+        });
+        assert_eq!(
+            session_spawn_create_error(capability, "demo", &McpCaller::Ambient, None),
+            "session_spawn failed: model unavailable: vendor refused opus (error_code=model_unavailable)"
+        );
+
+        let generic = anyhow::Error::new(HarnessError::SpawnFailed(
+            "authentication required".to_string(),
+        ));
+        let rendered = session_spawn_create_error(generic, "demo", &McpCaller::Ambient, None);
+        assert_eq!(
+            rendered,
+            "session_spawn: spawn failed: authentication required"
+        );
+        assert!(!rendered.contains("error_code="));
     }
 }
 

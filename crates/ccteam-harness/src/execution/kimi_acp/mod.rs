@@ -650,7 +650,7 @@ impl HarnessAdapter for KimiAcpAdapter {
                     }),
                 )
                 .await
-                .map_err(|e| crate::execution::acp::spawn_pick_refused("model", model, e))?;
+                .map_err(|e| crate::execution::acp::spawn_pick_request_failed("model", model, e))?;
             if let Ok(mut st) = live.state.lock() {
                 st.model = Some(model.to_string());
             }
@@ -676,7 +676,9 @@ impl HarnessAdapter for KimiAcpAdapter {
                     }),
                 )
                 .await
-                .map_err(|e| crate::execution::acp::spawn_pick_refused("effort", effort, e))?;
+                .map_err(|e| {
+                    crate::execution::acp::spawn_pick_request_failed("effort", effort, e)
+                })?;
             if let Ok(mut st) = live.state.lock() {
                 st.effort = Some(effort.to_string());
             }

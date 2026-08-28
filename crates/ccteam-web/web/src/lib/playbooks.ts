@@ -68,6 +68,35 @@ export interface CommanderSpawnPosture {
   effort?: string;
 }
 
+interface CommanderClaudePosture {
+  vendor: "claude";
+  model: "opus";
+  effort?: string;
+}
+
+function commanderClaudePosture(catalog: VendorCatalog): CommanderClaudePosture {
+  const claude = catalog.claude;
+  const opus = claude?.models.find((model) => model.id === "opus");
+  let efforts: string[];
+  if (opus?.efforts !== undefined) {
+    efforts = opus.efforts;
+  } else if (opus && claude?.efforts.length) {
+    efforts = claude.efforts;
+  } else if (!claude || claude.models.length === 0) {
+    // No live evidence exists yet. Use the same CLI-verified cold ladder as
+    // the composer; once the catalog says anything about Opus, never guess.
+    efforts = effortRowsFor("claude", null, "opus").slice(1);
+  } else {
+    efforts = [];
+  }
+  const effort = efforts.at(-1);
+  return {
+    vendor: "claude",
+    model: "opus",
+    ...(effort ? { effort } : {}),
+  };
+}
+
 /** Pick the best Codex posture ccteam can substantiate for this host.
  *
  * Host installation is a hard prerequisite: an absent/failed host probe must
@@ -97,69 +126,32 @@ export function bestCommanderCodexPosture(
 
 /** True only for an unavailable Commander bootstrap capability.
  *
- * The retry seam is deliberately narrower than "create failed": auth, ACL,
- * network, timeout, quota, and generic server failures retain their original
- * error. A missing executable additionally requires host-probe evidence that
- * Claude is absent, so an unrelated ENOENT cannot silently switch vendors. */
+ * The retry seam is an allowlist, not a failure denylist: a typed transport
+ * failure must carry one of the explicit capability codes below. Generic
+ * server/network/auth failures and untyped prose therefore cannot become a
+ * retry merely because their message also mentions a model. */
 export function isCommanderBootstrapCapabilityError(
   error: unknown,
   posture: { vendor?: string; model?: string; effort?: string },
-  installedVendors: readonly VendorId[] | null,
 ): boolean {
-  if (posture.vendor !== "claude" || posture.model !== "opus" || posture.effort !== "max") {
+  if (posture.vendor !== "claude" || posture.model !== "opus") {
     return false;
   }
 
   const shape = error && typeof error === "object" ? (error as Record<string, unknown>) : null;
-  const message =
-    error instanceof Error
-      ? error.message
-      : typeof shape?.message === "string"
-        ? shape.message
-        : String(error);
   const status = typeof shape?.status === "number" ? shape.status : null;
-  const code = typeof shape?.code === "string" ? shape.code : "";
+  const rawCode = [shape?.errorCode, shape?.error_code, shape?.code]
+    .find((value): value is string => typeof value === "string");
+  const code = rawCode?.trim().toUpperCase().replace(/[.-]/g, "_") ?? "";
   const vendor = typeof shape?.vendor === "string" ? shape.vendor : "";
-  if (
-    status === 429
-    || status === 408
-    || status === 401
-    || status === 403
-    || status === 404
-    || (status !== null && status >= 500)
-    || /(?:^|\b)(?:UNAUTHENTICATED|FORBIDDEN|NOT_FOUND)(?:\b|$)/i.test(message)
-    || /\bHTTP\s+(?:401|403|404|429)\b/i.test(message)
-    || /\bHTTP\s+5\d\d\b/i.test(message)
-    || /\b(?:authentication|authorization|unauthorized|not authenticated|access denied|permission denied|credentials?|api key|subscription|rate.?limit|too many requests|overload(?:ed|ing)?|quota|budget|timed?\s*out|timeout)\b/i.test(message)
-    || /^(?:RATE.?LIMIT(?:ED)?|TOO.?MANY(?:_REQUESTS)?|OVERLOAD(?:ED)?|UNAUTHENTICATED|FORBIDDEN|QUOTA|BUDGET|ETIMEDOUT|ECONN\w*|INTERNAL(?:_SERVER_ERROR)?|NETWORK(?:_ERROR)?|SERVICE_UNAVAILABLE)$/i.test(code)
-    || /\b(?:ACL|guards?|guardrails?|delegation[ _-]?depth|depth[ _-]?limit|maximum[ _-]?depth|delegation[ _-]?cycle|cycles?|cyclic|child(?:ren)?[ _-]?limit)\b/i.test(message)
-    || /\b(?:network|failed to fetch|fetch failed|connection[ _-]?(?:failed|refused|reset)|ECONN\w*|internal(?: server| state)? error|service unavailable)\b/i.test(message)
-    || /\bproject\b[^\n]{0,80}\bnot visible\b/i.test(message)
-    || /^network:/i.test(message.trim())
-  ) {
-    return false;
-  }
-
-  const unavailable = "(?:invalid|unknown|unsupported|unavailable|not available|not found|does not support|is not supported)";
-  const axis = "(?:model|reasoning[ _-]?effort|effort)";
-  const capabilityPattern = new RegExp(
-    `(?:${unavailable})[^\\n]{0,100}\\b${axis}\\b|\\b${axis}\\b[^\\n]{0,100}(?:${unavailable})`,
-    "i",
-  );
-  if (capabilityPattern.test(message)) return true;
-
-  const typedVendorUnavailable =
-    vendor.toLowerCase() === "claude"
-    && /^(?:VENDOR_UNAVAILABLE|VENDOR_NOT_AVAILABLE|VENDOR_NOT_INSTALLED)$/i.test(code);
-  const textVendorUnavailable =
-    /\b(?:claude\s+vendor|vendor\s+claude)\b[^\n]{0,80}\b(?:unavailable|not available|not installed|missing|unsupported)\b/i.test(
-      message,
-    );
-  if (typedVendorUnavailable || textVendorUnavailable) return true;
-
-  const claudeAbsent = installedVendors !== null && !installedVendors.includes("claude");
-  return claudeAbsent
-    && /(?:not installed|command not found|executable[^\n]*not found|binary[^\n]*not found|\bENOENT\b|no such file or directory)/i.test(message);
+  const capabilityCodes = new Set([
+    "VENDOR_UNAVAILABLE",
+    "MODEL_UNAVAILABLE",
+    "EFFORT_UNAVAILABLE",
+  ]);
+  const capabilityStatus = status === null || status === 400 || status === 422;
+  const vendorMatches = !vendor || vendor.toLowerCase() === "claude";
+  return capabilityStatus && vendorMatches && capabilityCodes.has(code);
 }
 
 interface HomeTurnLaunchInput {
@@ -256,7 +248,7 @@ export function completeHomeLaunch(
 /** Create the lazy session and submit its first user turn.
  *
  * Commander gets one tightly-classified bootstrap fallback: when its exact
- * Claude/Opus/max posture is rejected as unavailable, retry once through an
+ * Claude/Opus posture is rejected as unavailable, retry once through an
  * installed Codex posture derived from the live catalog. The first user turn
  * is sent only after one of those creates succeeds, so it reaches exactly the
  * session returned to the caller. */
@@ -269,32 +261,36 @@ export async function createAndSubmitHomeTurn(
   // Codex posture, but an unrelated installed vendor must never become the
   // Commander merely because it is first in the host menu.
   let initialOptions = input.options;
+  let directFallback = false;
   if (input.commander) {
     const claudeConfirmedAbsent =
       input.installedVendors !== null && !input.installedVendors.includes("claude");
     const codex = claudeConfirmedAbsent
       ? bestCommanderCodexPosture(input.installedVendors, input.catalog)
       : null;
-    initialOptions = codex
-      ? {
-          ...input.options,
-          vendor: codex.vendor,
-          protocol: "stream-json",
-          model: codex.model,
-          effort: codex.effort,
-        }
-      : {
-          ...input.options,
-          vendor: "claude",
-          protocol: "stream-json",
-          model: "opus",
-          effort: "max",
-        };
+    if (codex) {
+      initialOptions = {
+        ...input.options,
+        vendor: codex.vendor,
+        protocol: "stream-json",
+        model: codex.model,
+        effort: codex.effort,
+      };
+    } else {
+      const claude = commanderClaudePosture(input.catalog);
+      initialOptions = {
+        ...input.options,
+        ...claude,
+        protocol: "stream-json",
+      };
+      if (!claude.effort) delete initialOptions.effort;
+    }
+    directFallback = codex !== null;
   }
 
   let created: { sid: string };
   let actualOptions = initialOptions;
-  let fallbackUsed = false;
+  let fallbackUsed = directFallback;
   try {
     created = await deps.createSession(input.slug, initialOptions);
   } catch (primaryError) {
@@ -302,7 +298,6 @@ export async function createAndSubmitHomeTurn(
       && isCommanderBootstrapCapabilityError(
         primaryError,
         initialOptions,
-        input.installedVendors,
       )
       ? bestCommanderCodexPosture(input.installedVendors, input.catalog)
       : null;

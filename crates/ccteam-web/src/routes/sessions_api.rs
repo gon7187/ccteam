@@ -455,6 +455,17 @@ pub(crate) async fn handle_create_session(
                 tracing::info!(%slug, %role, "create_session_api: unknown role -> 422");
                 return create_error(StatusCode::UNPROCESSABLE_ENTITY, missing.to_string(), mode);
             }
+            if let Some(error_code) = err
+                .downcast_ref::<ccteam_harness::HarnessError>()
+                .and_then(ccteam_harness::HarnessError::capability_error_code)
+            {
+                tracing::info!(%slug, %role, %error_code, "create_session_api: unsupported capability -> 422");
+                return create_capability_error(
+                    format_create_session_error(&err),
+                    error_code,
+                    mode,
+                );
+            }
             tracing::warn!(%slug, %role, %err, "create_session_api failed");
             create_gateway_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2367,6 +2378,17 @@ fn create_error(status: StatusCode, msg: String, mode: InputMode) -> Response {
     match mode {
         InputMode::Form => (status, msg).into_response(),
         InputMode::Json => (status, Json(json!({"ok": false, "error": msg}))).into_response(),
+    }
+}
+
+fn create_capability_error(msg: String, error_code: &'static str, mode: InputMode) -> Response {
+    match mode {
+        InputMode::Form => (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response(),
+        InputMode::Json => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"ok": false, "error": msg, "error_code": error_code})),
+        )
+            .into_response(),
     }
 }
 

@@ -1576,6 +1576,38 @@ pub trait HarnessAdapter: Send + Sync {
 // HarnessError — F107 adds NotImplemented{reason:String} (dynamic)
 // =====================================================================
 
+/// Capability axis that a vendor explicitly rejected while starting a
+/// session. This is deliberately tiny: callers may branch on these stable
+/// facts, while every transport/auth/quota/internal failure remains generic
+/// and fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessCapability {
+    Vendor,
+    Model,
+    Effort,
+}
+
+impl HarnessCapability {
+    /// Stable wire code used by the HTTP API.
+    pub const fn error_code(self) -> &'static str {
+        match self {
+            Self::Vendor => "vendor_unavailable",
+            Self::Model => "model_unavailable",
+            Self::Effort => "effort_unavailable",
+        }
+    }
+}
+
+impl std::fmt::Display for HarnessCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Vendor => "vendor",
+            Self::Model => "model",
+            Self::Effort => "effort",
+        })
+    }
+}
+
 /// Error type returned by every fallible [`HarnessAdapter`] surface.
 ///
 /// V0.6.0 F107 drops the old `&'static str` constraint on
@@ -1584,6 +1616,14 @@ pub trait HarnessAdapter: Send + Sync {
 /// dynamic message naming which wave will fill the gap.
 #[derive(Debug, Error)]
 pub enum HarnessError {
+    /// The vendor explicitly cannot satisfy one requested spawn capability.
+    /// This is the only spawn failure safe for callers to use as a fallback
+    /// signal; generic [`Self::SpawnFailed`] remains deliberately untyped.
+    #[error("{capability} unavailable: {detail}")]
+    CapabilityUnavailable {
+        capability: HarnessCapability,
+        detail: String,
+    },
     /// JSON parse / shape mismatch on the harness state channel.
     #[error("snapshot ingest failed: {0}")]
     IngestFailed(String),
@@ -1613,6 +1653,17 @@ pub enum HarnessError {
     /// Unrecoverable IO error (filesystem reservation, etc.).
     #[error("io error: {0}")]
     Io(String),
+}
+
+impl HarnessError {
+    /// Stable code only for an explicitly classified spawn capability.
+    /// Every other harness failure intentionally has no fallback signal.
+    pub const fn capability_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::CapabilityUnavailable { capability, .. } => Some(capability.error_code()),
+            _ => None,
+        }
+    }
 }
 
 impl From<std::io::Error> for HarnessError {

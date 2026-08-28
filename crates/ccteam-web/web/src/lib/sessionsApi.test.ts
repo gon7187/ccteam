@@ -390,6 +390,27 @@ describe("sessionsApi", () => {
     );
   });
 
+  it("createSession preserves status and error_code on a typed API error", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValueOnce(
+      jsonResponse(422, {
+        ok: false,
+        error: "requested model is unavailable",
+        error_code: "model_unavailable",
+      }),
+    );
+    const failure = await createSession("dex-ui", { role: "cto" }).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).constructor.name).toBe("ApiError");
+    expect(failure).toMatchObject({
+      status: 422,
+      errorCode: "model_unavailable",
+    });
+    expect((failure as Error).message).toContain("requested model is unavailable");
+  });
+
   it("caps non-JSON error bodies and prefixes the HTTP status", async () => {
     const html = `<html>${"x".repeat(1000)}</html>`;
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(textResponse(500, html));

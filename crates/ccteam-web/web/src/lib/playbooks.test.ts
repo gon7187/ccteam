@@ -108,6 +108,9 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
           "认证、ACL、超时、配额",
           "fail closed",
           "委派深度",
+          "如果 Opus 可用",
+          "当前会话是有意启动的 Codex fallback",
+          "不要再创建 Opus",
         ],
       ],
       [
@@ -119,6 +122,9 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
           "аутентификации, ACL, тайм-ауте, квоте",
           "fail closed",
           "глубины делегирования",
+          "Если Opus доступен",
+          "текущая сессия намеренно запущена как Codex fallback",
+          "не создавай Opus повторно",
         ],
       ],
       [
@@ -130,6 +136,9 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
           "authentication, ACL, timeout, quota",
           "fail closed",
           "delegation-depth",
+          "If Opus is available",
+          "this session is the deliberate Codex fallback",
+          "do not spawn Opus again",
         ],
       ],
     ] as const) {
@@ -141,6 +150,13 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
       ["en", "if Claude or Opus is unavailable, Codex takes command"],
     ] as const) {
       expect(I18N[lang].tplCommanderP).not.toContain(broadFallback);
+    }
+    for (const [lang, unconditionalRespawn] of [
+      ["zh", "如果当前会话不是 Opus，请创建独立的 Opus 指挥官"],
+      ["ru", "Если текущая сессия не Opus, создай отдельного Opus-командира"],
+      ["en", "If the current session is not Opus, create a separate Opus commander"],
+    ] as const) {
+      expect(I18N[lang].tplCommanderP).not.toContain(unconditionalRespawn);
     }
   });
 
@@ -167,22 +183,23 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
     ).toEqual({ vendor: "codex", model: "gpt-no-effort" });
   });
 
-  it("recognizes only capability failures as Commander fallback candidates", () => {
+  it("requires a typed capability code for a Commander runtime fallback", () => {
     const posture = { vendor: "claude", model: "opus", effort: "max" } as const;
     expect(
       isCommanderBootstrapCapabilityError(
-        new Error("会话启动失败: invalid reasoning effort `max`"),
+        Object.assign(new Error("会话启动失败: invalid reasoning effort `max`"), {
+          status: 422,
+          errorCode: "EFFORT_UNAVAILABLE",
+        }),
         posture,
-        ["claude", "codex"],
       ),
     ).toBe(true);
     expect(
       isCommanderBootstrapCapabilityError(
         new Error("spawn failed: No such file or directory"),
         posture,
-        ["codex"],
       ),
-    ).toBe(true);
+    ).toBe(false);
 
     for (const message of [
       "UNAUTHENTICATED",
@@ -205,7 +222,6 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
         isCommanderBootstrapCapabilityError(
           new Error(message),
           posture,
-          ["codex"],
         ),
         message,
       ).toBe(false);
@@ -216,7 +232,6 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
       isCommanderBootstrapCapabilityError(
         new Error("invalid model"),
         { vendor: "codex", model: "gpt-5.6-codex", effort: "xhigh" },
-        ["codex"],
       ),
     ).toBe(false);
   });
@@ -232,7 +247,7 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
       }),
     ]) {
       expect(
-        isCommanderBootstrapCapabilityError(error, posture, ["claude", "codex"]),
+        isCommanderBootstrapCapabilityError(error, posture),
         error.message,
       ).toBe(false);
     }
@@ -241,17 +256,41 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
   it("fails closed for typed timeout, network, and internal failures", () => {
     const posture = { vendor: "claude", model: "opus", effort: "max" } as const;
     for (const details of [
-      { status: 408, code: "ETIMEDOUT" },
-      { code: "ETIMEDOUT" },
-      { code: "ECONNRESET" },
-      { code: "INTERNAL" },
+      { status: 408, errorCode: "TIMEOUT" },
+      { status: 422, errorCode: "ETIMEDOUT" },
+      { status: 422, errorCode: "ECONNRESET" },
+      { status: 500, errorCode: "INTERNAL_ERROR" },
+      { status: 422, errorCode: "BUDGET_EXCEEDED" },
+      { status: 403, errorCode: "ACL_DENIED" },
     ]) {
       const error = Object.assign(new Error("model opus is unavailable"), details);
       expect(
-        isCommanderBootstrapCapabilityError(error, posture, ["claude", "codex"]),
+        isCommanderBootstrapCapabilityError(error, posture),
         JSON.stringify(details),
       ).toBe(false);
     }
+  });
+
+  it("allows only an explicit typed capability code from an API failure", () => {
+    const posture = { vendor: "claude", model: "opus", effort: "high" } as const;
+    expect(
+      isCommanderBootstrapCapabilityError(
+        Object.assign(new Error("spawn rejected"), {
+          status: 422,
+          errorCode: "MODEL_UNAVAILABLE",
+        }),
+        posture,
+      ),
+    ).toBe(true);
+    expect(
+      isCommanderBootstrapCapabilityError(
+        Object.assign(new Error("model opus is unavailable"), {
+          status: 500,
+          errorCode: "MODEL_UNAVAILABLE",
+        }),
+        posture,
+      ),
+    ).toBe(false);
   });
 
   it("allows one fallback for an explicit Claude vendor-unavailable signal", () => {
@@ -260,9 +299,8 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
       isCommanderBootstrapCapabilityError(
         new Error("Claude vendor is unavailable on this host"),
         posture,
-        ["claude", "codex"],
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       isCommanderBootstrapCapabilityError(
         Object.assign(new Error("vendor unavailable"), {
@@ -270,7 +308,6 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
           vendor: "claude",
         }),
         posture,
-        ["claude", "codex"],
       ),
     ).toBe(true);
   });

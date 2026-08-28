@@ -386,8 +386,9 @@ pub(crate) fn render_routing_notes(found: Option<&RoutingFile>) -> String {
 
 /// The `session_spawn` discovery error for a vendor that is not installed on
 /// the project's bound host. Lists the installed vendors on THAT host (from
-/// the same snapshot) + freshness, and keeps model ids advisory (a fresh
-/// install can retry). Never a local fallback; never blocks on auth.
+/// the same snapshot) + freshness. Model ids have no static whitelist; the
+/// vendor handshake may still reject an unavailable model or effort. Never a
+/// local fallback; never blocks on auth.
 pub(crate) fn spawn_unavailable_message(
     vendor: &str,
     host: &str,
@@ -404,8 +405,10 @@ pub(crate) fn spawn_unavailable_message(
          (installed there: {installed}; observed {freshness}). Spawn one of the installed \
          vendors, or install `{vendor}` on that host and retry — the admin can one-click \
          install npm-packaged vendors (claude/codex/grok/opencode/dsh) from the Ops & Hosts \
-         web page; kimi/pi install manually. Model ids stay advisory (ccteam does not \
-         validate them), so a genuinely fresh install can just retry."
+         web page; kimi/pi install manually. Model ids have no static whitelist; the \
+         vendor handshake may still return model_unavailable or effort_unavailable. \
+         A genuinely fresh install can just retry. \
+         (error_code=vendor_unavailable)"
     )
 }
 
@@ -1138,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_unavailable_lists_installed_set_and_stays_advisory() {
+    fn spawn_unavailable_lists_installed_set_and_explains_handshake_validation() {
         let msg = spawn_unavailable_message(
             "grok",
             "local",
@@ -1148,7 +1151,9 @@ mod tests {
         assert!(msg.contains("vendor `grok` is not installed on host `local`"));
         assert!(msg.contains("installed there: claude, codex"));
         assert!(msg.contains("observed just now"));
-        assert!(msg.contains("advisory"));
+        assert!(msg.contains("no static whitelist"));
+        assert!(msg.contains("model_unavailable or effort_unavailable"));
+        assert!(msg.contains("error_code=vendor_unavailable"));
         // Never a local fallback; the admin one-click install is the pointer.
         assert!(msg.contains("one-click install"));
     }

@@ -242,7 +242,12 @@ describe("HomeView (landing page)", () => {
   it("retries a failed Commander bootstrap once through the best installed Codex posture", async () => {
     const createSession = vi
       .fn()
-      .mockRejectedValueOnce(new Error("会话启动失败: invalid reasoning effort `max`"))
+      .mockRejectedValueOnce(
+        Object.assign(new Error("会话启动失败: invalid reasoning effort `max`"), {
+          status: 422,
+          errorCode: "EFFORT_UNAVAILABLE",
+        }),
+      )
       .mockResolvedValueOnce({ sid: "s42" });
     const submit = vi.fn().mockResolvedValue(undefined);
     const prompt = "Commander prompt with the user's concrete task";
@@ -341,7 +346,7 @@ describe("HomeView (landing page)", () => {
       vendor: "codex",
       model: "gpt-5.6-codex",
       effort: "xhigh",
-      fallback: false,
+      fallback: true,
     });
 
     expect(createSession).toHaveBeenCalledOnce();
@@ -354,6 +359,93 @@ describe("HomeView (landing page)", () => {
       effort: "xhigh",
     });
     expect(submit).toHaveBeenCalledWith("s43", "task", []);
+  });
+
+  it("launches Commander at the highest Opus effort advertised by the live catalog", async () => {
+    const createSession = vi.fn().mockResolvedValue({ sid: "s44" });
+    const submit = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      createAndSubmitHomeTurn(
+        {
+          slug: "ccteam",
+          options: {
+            role: "",
+            vendor: "claude",
+            permission_mode: "skip",
+            protocol: "stream-json",
+            model: "opus",
+            effort: "max",
+          },
+          text: "task",
+          attachments: [],
+          commander: true,
+          installedVendors: ["claude", "codex"],
+          catalog: {
+            claude: {
+              models: [{ id: "opus", efforts: ["low", "high"] }],
+              efforts: ["low", "medium", "high", "max"],
+            },
+          },
+        },
+        { createSession, submitTurn: submit },
+      ),
+    ).resolves.toEqual({
+      sid: "s44",
+      vendor: "claude",
+      model: "opus",
+      effort: "high",
+      fallback: false,
+    });
+
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(createSession).toHaveBeenCalledWith("ccteam", {
+      role: "",
+      vendor: "claude",
+      permission_mode: "skip",
+      protocol: "stream-json",
+      model: "opus",
+      effort: "high",
+    });
+    expect(submit).toHaveBeenCalledWith("s44", "task", []);
+  });
+
+  it("does not apply a cold Opus effort when the live catalog observed only other models", async () => {
+    const createSession = vi.fn().mockResolvedValue({ sid: "s45" });
+    const submit = vi.fn().mockResolvedValue(undefined);
+
+    await createAndSubmitHomeTurn(
+      {
+        slug: "ccteam",
+        options: {
+          role: "",
+          vendor: "claude",
+          permission_mode: "skip",
+          protocol: "stream-json",
+          model: "opus",
+          effort: "max",
+        },
+        text: "task",
+        attachments: [],
+        commander: true,
+        installedVendors: ["claude", "codex"],
+        catalog: {
+          claude: {
+            models: [{ id: "sonnet", efforts: ["low", "high", "max"] }],
+            efforts: ["low", "medium", "high", "max"],
+          },
+        },
+      },
+      { createSession, submitTurn: submit },
+    );
+
+    expect(createSession).toHaveBeenCalledWith("ccteam", {
+      role: "",
+      vendor: "claude",
+      permission_mode: "skip",
+      protocol: "stream-json",
+      model: "opus",
+    });
   });
 
   it("retains the unavailable Commander error instead of launching an unrelated Grok lead", async () => {
@@ -442,7 +534,12 @@ describe("HomeView (landing page)", () => {
   it("does not retry the fallback create itself and preserves both sanitized causes", async () => {
     const createSession = vi
       .fn()
-      .mockRejectedValueOnce(new Error("invalid model `opus`\nBearer primary-secret"))
+      .mockRejectedValueOnce(
+        Object.assign(new Error("invalid model `opus`\nBearer primary-secret"), {
+          status: 422,
+          errorCode: "MODEL_UNAVAILABLE",
+        }),
+      )
       .mockRejectedValueOnce(new Error("codex start failed\u0000 token=fallback-secret"));
     const submit = vi.fn();
     const failure = await createAndSubmitHomeTurn(
@@ -479,9 +576,12 @@ describe("HomeView (landing page)", () => {
     const createSession = vi
       .fn()
       .mockRejectedValueOnce(
-        new Error(
-          "invalid model `opus`\naccess_token=access-secret password=hunter2 secret=shared-secret\n"
-          + '{"access_token":"json-access","password":"json-pass","secret":"json-secret","cookie":"json-cookie","set-cookie":"json-set-cookie"}',
+        Object.assign(
+          new Error(
+            "invalid model `opus`\naccess_token=access-secret password=hunter2 secret=shared-secret\n"
+            + '{"access_token":"json-access","password":"json-pass","secret":"json-secret","cookie":"json-cookie","set-cookie":"json-set-cookie"}',
+          ),
+          { status: 422, errorCode: "MODEL_UNAVAILABLE" },
         ),
       )
       .mockRejectedValueOnce(

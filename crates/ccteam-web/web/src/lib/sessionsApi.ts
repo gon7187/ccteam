@@ -18,6 +18,7 @@
 //   other non-2xx → throw server `{error}` / text body, else `HTTP <status>`
 
 import { backgroundHeaders } from "./backgroundRequest";
+import { ApiError, httpError } from "./httpError";
 
 /** One live gateway session (the `SessionView` the backend serializes —
  *  `crates/ccteam-im/src/gateway.rs::SessionView`). `sid` is the gateway
@@ -247,9 +248,16 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
       `network: ${e instanceof Error ? e.message : "connection failed"}`,
     );
   }
-  if (res.status === 401) throw new Error("UNAUTHENTICATED");
-  if (res.status === 404) throw new Error("NOT_FOUND");
-  if (!res.ok) throw new Error(await errorMessage(res));
+  if (!res.ok) {
+    const error = await httpError(res);
+    if (res.status === 401) {
+      throw new ApiError(res.status, "UNAUTHENTICATED", error.errorCode);
+    }
+    if (res.status === 404) {
+      throw new ApiError(res.status, "NOT_FOUND", error.errorCode);
+    }
+    throw error;
+  }
   return (await res.json()) as T;
 }
 
