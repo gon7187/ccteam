@@ -188,3 +188,76 @@ fn covered_archive_and_cold_active_verdict_lookup_stay_below_read_budget() {
         after_put.bytes_read - before_put.bytes_read
     );
 }
+
+#[test]
+fn corrupt_derived_verdict_index_rebuilds_from_progress_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let active = temp.path().join("corrupt-index.jsonl");
+    let verdict = TurnVerdict {
+        sid: "s1".into(),
+        turn_id: "t1".into(),
+        ts: chrono::Utc::now(),
+        verdict: Verdict::Revise,
+        feedback: Some("keep the journal fact".into()),
+    };
+    assert!(append_turn_verdict_if_changed(&active, &verdict).unwrap());
+
+    std::fs::write(progress_verdict_index_path(&active), b"{truncated").unwrap();
+
+    assert_eq!(
+        latest_turn_verdicts(&active)
+            .unwrap()
+            .get(&(verdict.sid.clone(), verdict.turn_id.clone())),
+        Some(&verdict),
+        "a direct GET must rebuild the derived index from progress.jsonl"
+    );
+
+    std::fs::write(progress_verdict_index_path(&active), b"{truncated-again").unwrap();
+    load_or_recover_progress_checkpoint(&active).unwrap();
+    assert_eq!(
+        latest_turn_verdicts(&active)
+            .unwrap()
+            .get(&(verdict.sid.clone(), verdict.turn_id.clone())),
+        Some(&verdict),
+        "startup hydration must rebuild the same derived index"
+    );
+
+    std::fs::write(
+        progress_verdict_index_path(&active),
+        serde_json::to_vec(&json!({"schema_version": 999, "verdicts": {}})).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        latest_turn_verdicts(&active).is_err(),
+        "an older binary must not overwrite a valid future index schema"
+    );
+}
+
+#[test]
+fn generic_append_routes_canonical_verdicts_through_the_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let active = temp.path().join("generic-verdict.jsonl");
+    let verdict = TurnVerdict {
+        sid: "s1".into(),
+        turn_id: "t1".into(),
+        ts: chrono::Utc::now(),
+        verdict: Verdict::Accept,
+        feedback: None,
+    };
+    let mut event = serde_json::to_value(&verdict).unwrap();
+    event["event"] = json!("turn_verdict");
+
+    append_event(&active, &event).unwrap();
+
+    assert_eq!(
+        latest_turn_verdicts(&active)
+            .unwrap()
+            .get(&(verdict.sid.clone(), verdict.turn_id.clone())),
+        Some(&verdict),
+        "the public generic writer must not bypass the canonical verdict projection"
+    );
+    assert!(
+        append_event(&active, &json!({"event": "turn_verdict", "sid": "s1"})).is_err(),
+        "a malformed canonical verdict must fail closed"
+    );
+}

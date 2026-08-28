@@ -730,6 +730,12 @@ pub fn progress_cost_contribution(event: &Value) -> Option<ProgressCostContribut
 }
 
 pub fn append_event(path: &Path, event: &Value) -> Result<()> {
+    if event_kind_name(event) == Some(TURN_VERDICT) {
+        let verdict =
+            parse_turn_verdict_event(event).context("malformed canonical turn_verdict event")?;
+        append_turn_verdict_if_changed(path, &verdict)?;
+        return Ok(());
+    }
     append_event_at(path, event, Instant::now(), None)
 }
 
@@ -759,7 +765,7 @@ pub fn latest_turn_verdicts(path: &Path) -> Result<BTreeMap<(String, String), Tu
     let lock_file = open_progress_lock(path)?;
     let _lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
-    if !progress_verdict_index_path(path).exists() {
+    if read_verdict_index_locked(path)?.is_none() {
         let checkpoint = recover_progress_checkpoint_locked(path)?;
         ensure_verdict_index_locked(path, checkpoint.as_ref())?;
     }
@@ -791,7 +797,7 @@ pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Res
     let lock_file = open_progress_lock(path)?;
     let lock = ProgressFileLock::lock(&lock_file)
         .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
-    if !progress_verdict_index_path(path).exists() {
+    if read_verdict_index_locked(path)?.is_none() {
         if path.exists()
             || progress_archive_path(path).exists()
             || progress_checkpoint_path(path).exists()
@@ -839,6 +845,8 @@ pub fn append_turn_verdict_if_changed(path: &Path, verdict: &TurnVerdict) -> Res
         .metadata()
         .with_context(|| format!("stat {}", path.display()))?
         .len();
+    file.sync_data()
+        .with_context(|| format!("sync verdict event to {}", path.display()))?;
     drop(file);
 
     index
@@ -885,8 +893,13 @@ fn read_verdict_index_locked(path: &Path) -> Result<Option<ProgressVerdictIndex>
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("read {}", index_path.display())),
     };
-    let mut index = serde_json::from_slice::<ProgressVerdictIndex>(&bytes)
-        .with_context(|| format!("parse {}", index_path.display()))?;
+    let mut index = match serde_json::from_slice::<ProgressVerdictIndex>(&bytes) {
+        Ok(index) => index,
+        // This file is only a compact projection. A torn or otherwise invalid
+        // copy must never take the authoritative progress journal (or web
+        // startup) down; callers holding the journal lock rebuild it below.
+        Err(_) => return Ok(None),
+    };
     if index.schema_version != VERDICT_INDEX_SCHEMA_VERSION {
         anyhow::bail!(
             "unsupported progress verdict index schema {} in {}",
