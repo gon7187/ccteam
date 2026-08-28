@@ -124,6 +124,26 @@ pub fn run_init(paths: &CcteamPaths, opts: InitOptions) -> Result<String> {
             )
         }
     })?;
+    // A derived slug follows the catalog rule "directory name + numeric
+    // suffix on collision" (AGENTS.md §三): when the basename is reserved by
+    // a retired or surviving progress generation and no catalog row owns it,
+    // the next free slug is picked instead of refusing. An explicit `--slug`
+    // is the operator's word and is never rewritten.
+    let target_slug = if slug_was_explicit
+        || ccteam_core::lookup_project_in_config(&paths.root, &target_slug)?.is_some()
+    {
+        target_slug
+    } else {
+        let picked = ccteam_core::pick_unused_project_slug(&paths.root, &target_slug)?;
+        if picked != target_slug {
+            tracing::info!(
+                base = %target_slug,
+                slug = %picked,
+                "ccteam init: derived slug is reserved; using the next free numeric slug"
+            );
+        }
+        picked
+    };
     let target_team = opts.team.clone().unwrap_or_else(|| "dev".to_string());
 
     // -- 3a. Refuse install in the ccteam repo itself ----------------
@@ -5037,6 +5057,49 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn run_init_without_explicit_slug_steps_past_a_retired_directory_name() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let target = tmp.path().join("retired-dir");
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+        ccteam_core::remove_project_from_config(&paths.root, "retired-dir").unwrap();
+        ccteam_harness::execution::progress_bridge::mark_progress_retired(
+            &paths.progress_jsonl("retired-dir"),
+        )
+        .unwrap();
+
+        run_init(
+            &paths,
+            InitOptions {
+                install_in: Some(target.clone()),
+                force: true,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+
+        let cfg = ccteam_core::load_ccteam_config(&paths.root).unwrap();
+        let slugs = cfg
+            .projects
+            .iter()
+            .map(|entry| entry.slug.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(slugs, vec!["retired-dir2"], "{slugs:?}");
+        let state: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(target.join(".ccteam").join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state["slug"], "retired-dir2");
     }
 
     #[test]
