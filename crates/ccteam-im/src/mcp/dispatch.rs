@@ -3822,23 +3822,27 @@ async fn run_session_stop(
             .to_string(),
         McpCaller::Admin | McpCaller::User { .. } => String::new(),
     };
-    let mut gw = gateway.lock().await;
-    if !caller_sid.is_empty() && !gw.ancestor_chain(&sid).contains(&caller_sid) {
-        return Err(format!(
-            "session_stop: permission denied — session {sid} is not a descendant of the caller {caller_sid} (an agent may only stop the sessions it delegated)"
-        ));
-    }
-    // Capture the delegation event fields + drop the child's own watch BEFORE
-    // the stop removes it from the live map.
-    let stopped_meta = gw.session_vendor_host_slug(&sid);
-    if !caller_sid.is_empty() {
-        gw.disarm_delegation_watch(&sid);
-    }
-    gw.stop_session(&sid)
+    let stopped_meta = {
+        let mut gw = gateway.lock().await;
+        if !caller_sid.is_empty() && !gw.ancestor_chain(&sid).contains(&caller_sid) {
+            return Err(format!(
+                "session_stop: permission denied — session {sid} is not a descendant of the caller {caller_sid} (an agent may only stop the sessions it delegated)"
+            ));
+        }
+        // Capture the delegation event fields + drop the child's own watch
+        // BEFORE the shared stop removes it from the live map.
+        let stopped_meta = gw.session_vendor_host_slug(&sid);
+        if !caller_sid.is_empty() {
+            gw.disarm_delegation_watch(&sid);
+        }
+        stopped_meta
+    };
+    Gateway::stop_session_shared(std::sync::Arc::clone(gateway), &sid)
         .await
         .map_err(|e| format!("session_stop failed: {e}"))?;
     if !caller_sid.is_empty() {
         if let Some((vendor, host, slug)) = stopped_meta {
+            let gw = gateway.lock().await;
             gw.emit_delegation_progress(
                 &slug,
                 ccteam_harness::execution::progress_bridge::DELEGATION_STOPPED,
@@ -3852,7 +3856,6 @@ async fn run_session_stop(
             );
         }
     }
-    drop(gw);
     Ok(serde_json::to_string_pretty(&serde_json::json!({
         "ok": true,
         "sid": sid,
@@ -4474,6 +4477,7 @@ mod session_tool_tests {
         >,
         notify: std::sync::Arc<tokio::sync::Notify>,
         spawn_barrier: Option<std::sync::Arc<StubSpawnBarrier>>,
+        close_barrier: Option<std::sync::Arc<StubSpawnBarrier>>,
     }
 
     #[async_trait::async_trait]
@@ -4650,6 +4654,20 @@ mod session_tool_tests {
             &self,
             _h: &ccteam_harness::ThreadHandle,
         ) -> std::result::Result<(), ccteam_harness::HarnessError> {
+            if let Some(barrier) = self.close_barrier.as_ref() {
+                if barrier.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                    barrier
+                        .entered
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    barrier.entered_notify.notify_waiters();
+                    barrier
+                        .release
+                        .acquire()
+                        .await
+                        .expect("test barrier stays open")
+                        .forget();
+                }
+            }
             Ok(())
         }
         async fn handle_directive(
@@ -7101,6 +7119,52 @@ mod session_tool_tests {
         .await
         .unwrap();
         assert_eq!(parse(&ok)["stopped"], json!(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_stop_vendor_close_does_not_hold_the_gateway_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let close = std::sync::Arc::new(StubSpawnBarrier::default());
+        let factory: crate::daemon::AdapterFactory = {
+            let close = std::sync::Arc::clone(&close);
+            std::sync::Arc::new(move |_, _| {
+                std::sync::Arc::new(StubAdapter {
+                    close_barrier: Some(std::sync::Arc::clone(&close)),
+                    ..Default::default()
+                })
+                    as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+            })
+        };
+        let mut gateway = Gateway::new_with_factory(factory, "alpha", tmp.path());
+        mark_stub_vendors_installed(&mut gateway);
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                ccteam_harness::AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let gateway = std::sync::Arc::new(tokio::sync::Mutex::new(gateway));
+        close.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let stop_gateway = std::sync::Arc::clone(&gateway);
+        let stop_sid = sid.clone();
+        let stop = tokio::spawn(async move {
+            run_session_stop(&json!({"sid": stop_sid}), &stop_gateway, McpCaller::Admin).await
+        });
+        close.wait_for(1).await;
+
+        let guard = tokio::time::timeout(std::time::Duration::from_millis(250), gateway.lock())
+            .await
+            .expect("MCP stop must release the gateway before vendor close");
+        assert!(guard.session_views().is_empty());
+        drop(guard);
+
+        close.release.add_permits(1);
+        assert_eq!(parse(&stop.await.unwrap().unwrap())["stopped"], json!(true));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]

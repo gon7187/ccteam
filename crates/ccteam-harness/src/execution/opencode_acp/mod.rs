@@ -306,7 +306,10 @@ impl OpencodeAcpAdapter {
         routing: TurnRouting,
     ) -> Result<TurnSubmission, HarnessError> {
         let live = self.get_live(&h.identity).ok_or_else(|| {
-            HarnessError::ThreadDied(format!("opencode session {} not live", h.identity))
+            HarnessError::ThreadUnavailableBeforeDispatch(format!(
+                "opencode session {} not live",
+                h.identity
+            ))
         })?;
         let text = match input {
             TurnInput::UserText(t) => t,

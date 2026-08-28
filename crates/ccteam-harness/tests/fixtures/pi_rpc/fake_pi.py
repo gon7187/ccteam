@@ -378,6 +378,8 @@ for raw in sys.stdin:
         if message == "context-null":
             state["context_null"] = True
         save()
+        if message == "accept-then-exit":
+            os._exit(0)
         response(command)
         emit({"type": "agent_start"})
         if message == "bridge-tools":

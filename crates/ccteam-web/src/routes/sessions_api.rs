@@ -3,7 +3,7 @@
 //! These are the network face of the live IM gateway's session lifecycle
 //! (the W5b spine: [`Gateway::session_views`] /
 //! [`Gateway::create_session_api`] / [`Gateway::submit_to_sid`] /
-//! [`Gateway::stop_session`]). The web server runs in the same daemon
+//! [`Gateway::stop_session_shared`]). The web server runs in the same daemon
 //! process that owns the in-memory `s{n}` session map, so when a gateway
 //! is attached ([`AppState::gateway`] = `Some`) these endpoints drive it
 //! directly under its `Mutex`.
@@ -17,7 +17,7 @@
 //! - `PUT    /api/v1/sessions/{sid}/turns/{turn_id}/verdict` → human verdict
 //! - `GET    /api/v1/sessions/{sid}/events`           → SSE (filtered by `sid`)
 //! - `POST   /api/v1/sessions/{sid}/stop`             → stop → 200 `{stopped:true}`
-//! - `POST   /api/v1/sessions/{sid}/interrupt`        → interrupt running turn → 200 `{interrupted:true}`
+//! - `POST   /api/v1/sessions/{sid}/interrupt`        → interrupt running turn → 200 `{outcome,interrupted}`
 //!
 //! **No-gateway contract (locked W5b)**: the standalone "internal web"
 //! path runs without a daemon gateway ([`AppState::gateway`] = `None`).
@@ -70,10 +70,10 @@ use ccteam_harness::execution::progress_bridge::{
 };
 use ccteam_harness::execution::turns_mirror::{read_all_turns, turns_jsonl_path, TurnRecord};
 use ccteam_harness::{
-    AgentVendor, ChoicePrompt, HarnessAdapter, PermissionMode, SessionProtocol, ThreadHandle,
-    ThreadStatus,
+    AgentVendor, ChoicePrompt, HarnessAdapter, InterruptOutcome, PermissionMode, SessionProtocol,
+    ThreadHandle, ThreadStatus,
 };
-use ccteam_im::gateway::{GatewayEvent, SessionView};
+use ccteam_im::gateway::{Gateway, GatewayEvent, SessionView};
 use ccteam_im::transport::MessageOption;
 use futures::stream::StreamExt;
 use serde::Deserialize;
@@ -783,13 +783,7 @@ pub(crate) async fn handle_patch_session(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    let result = {
-        let guard = gw.lock().await;
-        // Held across the vendor push, like `interrupt_session`'s adapter call:
-        // the push is one file append / one RPC, and serializing renames keeps
-        // meta.json's read-modify-write atomic against a concurrent rename.
-        guard.rename_session(&sid, &body.title).await
-    };
+    let result = Gateway::rename_session_shared(Arc::clone(gw), &sid, &body.title).await;
     match result {
         Ok(renamed) => Json(rename_payload(&renamed)).into_response(),
         Err(err) => {
@@ -1893,10 +1887,7 @@ pub(crate) async fn handle_session_stop(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    let result = {
-        let mut guard = gw.lock().await;
-        guard.stop_session(&sid).await
-    };
+    let result = Gateway::stop_session_shared(Arc::clone(gw), &sid).await;
     match result {
         Ok(()) => Json(json!({"stopped": true})).into_response(),
         Err(err) => {
@@ -1911,18 +1902,20 @@ pub(crate) async fn handle_session_stop(
 /// Interrupts the session's CURRENTLY-RUNNING turn WITHOUT destroying it — the
 /// non-destructive twin of `/stop`. The session stays live + idle (its context
 /// survives), so the client can immediately `/model` switch or send a
-/// follow-up. The spine's [`Gateway::interrupt_session`] reaches the adapter
+/// follow-up. The spine's [`Gateway::interrupt_session_shared`] reaches the adapter
 /// OUT-OF-BAND (stream-json `interrupt` control_request / TUI ESC / codex
 /// `turn/interrupt`), so the interrupt is NOT queued behind the running turn.
-/// 200 `{interrupted:true}`. 404 for an unknown sid. 503 with no gateway. Same
-/// auth + project ACL (`gate_sid`) as the stop route.
+/// The 200 body distinguishes `interrupted`, `already_idle`, and `requested`;
+/// `interrupted` is true only when the adapter confirmed the turn stopped.
+/// 404 for an unknown sid. 503 with no gateway. Same auth + project ACL
+/// (`gate_sid`) as the stop route.
 #[utoipa::path(
     post,
     path = "/api/v1/sessions/{sid}/interrupt",
     tag = "sessions",
     params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
     responses(
-        (status = 200, description = "Interrupted the running turn (session kept). `{interrupted:true}`", body = serde_json::Value),
+        (status = 200, description = "Interrupt outcome (session kept). `{outcome,interrupted}`", body = serde_json::Value),
         (status = 404, description = "Unknown session"),
         (status = 503, description = "No live gateway (standalone web)"),
     ),
@@ -1938,17 +1931,23 @@ pub(crate) async fn handle_session_interrupt(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    let result = {
-        let mut guard = gw.lock().await;
-        guard.interrupt_session(&sid).await
-    };
+    let result = Gateway::interrupt_session_shared(Arc::clone(gw), &sid).await;
     match result {
-        Ok(()) => Json(json!({"interrupted": true})).into_response(),
+        Ok(outcome) => Json(interrupt_payload(outcome)).into_response(),
         Err(err) => {
             tracing::warn!(%sid, %err, "interrupt_session failed");
             unknown_session(&sid)
         }
     }
+}
+
+fn interrupt_payload(outcome: InterruptOutcome) -> serde_json::Value {
+    let (outcome, interrupted) = match outcome {
+        InterruptOutcome::Interrupted => ("interrupted", true),
+        InterruptOutcome::AlreadyIdle => ("already_idle", false),
+        InterruptOutcome::Requested => ("requested", false),
+    };
+    json!({"outcome": outcome, "interrupted": interrupted})
 }
 
 // ── v0.8.21 history / resume / external-import ───────────────────────────────
@@ -2475,6 +2474,22 @@ mod tests {
     fn parse_vendor_rejects_unknown() {
         assert!(parse_vendor("gemini").is_err());
         assert!(parse_vendor("").is_err());
+    }
+
+    #[test]
+    fn interrupt_payload_reports_the_exact_adapter_outcome() {
+        assert_eq!(
+            interrupt_payload(ccteam_harness::InterruptOutcome::Interrupted),
+            json!({"outcome": "interrupted", "interrupted": true})
+        );
+        assert_eq!(
+            interrupt_payload(ccteam_harness::InterruptOutcome::AlreadyIdle),
+            json!({"outcome": "already_idle", "interrupted": false})
+        );
+        assert_eq!(
+            interrupt_payload(ccteam_harness::InterruptOutcome::Requested),
+            json!({"outcome": "requested", "interrupted": false})
+        );
     }
 
     #[test]

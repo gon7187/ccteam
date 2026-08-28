@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ContextSource, Directive, DirectiveOutcome, HarnessAdapter,
-    InterruptOutcome, PermissionMode, PiRoleDocument, PiRpcAdapter, SpawnCtx, ThreadEvent,
-    ThreadHandle, ThreadItemDetails, TurnDisposition, TurnInput, TurnRouting,
+    HarnessError, InterruptOutcome, PermissionMode, PiRoleDocument, PiRpcAdapter, SpawnCtx,
+    ThreadEvent, ThreadHandle, ThreadItemDetails, TurnDisposition, TurnInput, TurnRouting,
 };
 use futures::StreamExt;
 use serial_test::serial;
@@ -196,6 +196,55 @@ async fn pi_adapter_is_a_user_reachable_vendor() {
         serde_json::from_str::<AgentVendor>("\"claude\"").unwrap(),
         AgentVendor::Claude
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn pi_distinguishes_proven_pre_dispatch_absence_from_post_request_disconnect() {
+    let env = PiTestEnv::new().await;
+    let adapter = PiRpcAdapter::new(role_reader());
+    let spec = AgentSpecBrief {
+        role: String::new(),
+    };
+
+    let absent = ThreadHandle {
+        vendor: AgentVendor::Pi,
+        mode: ccteam_harness::ExecutionMode::Chat,
+        identity: "missing-pi-session".to_string(),
+        started_at: chrono::Utc::now(),
+        raw_extras: serde_json::json!({}),
+    };
+    let absent_error = adapter
+        .submit_turn_routed(
+            &absent,
+            TurnInput::UserText("never written".into()),
+            TurnRouting::Inject,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        absent_error,
+        HarnessError::ThreadUnavailableBeforeDispatch(_)
+    ));
+
+    let handle = adapter
+        .start_thread(&spec, &env.ctx("s-disconnect"))
+        .await
+        .unwrap();
+    let error = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("accept-then-exit".into()),
+            TurnRouting::Inject,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, HarnessError::ThreadDied(_)));
+    let native: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(env.sessions.join("ccteam-s-disconnect.jsonl")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(native["history"], serde_json::json!(["accept-then-exit"]));
 }
 
 #[tokio::test]

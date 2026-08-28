@@ -24,6 +24,8 @@
 //! Auth: merged into [`super::stateful_router`], so the existing
 //! `auth_layer` gate applies.
 
+use std::sync::Arc;
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -31,6 +33,7 @@ use axum::{
     Extension, Json,
 };
 use ccteam_core::ProjectEntry;
+use ccteam_im::gateway::Gateway;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -555,22 +558,24 @@ pub(crate) async fn handle_delete_project(
     }
 
     // 2. Stop every live session for this project via the spine, if a
-    //    gateway is attached. Snapshot the sids under one lock (session_
-    //    views is sync), then stop them (each stop_session is async, held
-    //    under the same lock — the gateway access pattern from the spine).
+    //    gateway is attached. Snapshot the sids under one short lock, then
+    //    let the shared lifecycle spine stop them without holding the global
+    //    registry across vendor teardown.
     //    No gateway (standalone internal-web path) ⇒ skip; deregister
     //    alone is the meaningful effect there.
     let mut stopped: Vec<String> = Vec::new();
     if let Some(gw) = app.gateway.as_ref() {
-        let mut guard = gw.lock().await;
-        let sids: Vec<String> = guard
-            .session_views()
-            .into_iter()
-            .filter(|v| v.project == slug)
-            .map(|v| v.sid)
-            .collect();
-        for sid in sids {
-            match guard.stop_session(&sid).await {
+        let sids: Vec<String> = {
+            let guard = gw.lock().await;
+            guard
+                .session_views()
+                .into_iter()
+                .filter(|v| v.project == slug)
+                .map(|v| v.sid)
+                .collect()
+        };
+        for (sid, result) in Gateway::stop_sessions_shared(Arc::clone(gw), sids).await {
+            match result {
                 Ok(()) => stopped.push(sid),
                 Err(err) => {
                     // Best-effort: a session that vanished mid-teardown

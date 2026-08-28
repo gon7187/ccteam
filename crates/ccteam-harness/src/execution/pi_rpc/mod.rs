@@ -1181,7 +1181,10 @@ impl HarnessAdapter for PiRpcAdapter {
             }
         };
         let live = self.lookup(&h.identity).ok_or_else(|| {
-            HarnessError::ThreadDied(format!("Pi session {} is not live", h.identity))
+            HarnessError::ThreadUnavailableBeforeDispatch(format!(
+                "Pi session {} is not live",
+                h.identity
+            ))
         })?;
         Self::wait_not_settling(&live).await;
         let (turn_id, disposition, permit, command) = {

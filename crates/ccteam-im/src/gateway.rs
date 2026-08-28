@@ -509,9 +509,10 @@ impl Drop for UnlockedTurnRollbackGuard {
         let phase = self.phase;
         let should_rollback = match phase {
             UnlockedTurnPhase::PreDispatch => true,
-            UnlockedTurnPhase::Dispatched(epoch) => {
-                plan.session.submit_reconciled_epoch.load(Ordering::SeqCst) < epoch
-            }
+            // Dropping the submit future cannot prove whether the vendor
+            // accepted the bytes. Keep the epoch ambiguous until a canonical
+            // event, acknowledgement, or confirmed interrupt reconciles it.
+            UnlockedTurnPhase::Dispatched(_) => false,
         };
         if !should_rollback {
             return;
@@ -535,6 +536,18 @@ impl CleanupTaskTracker {
             handles.retain(|handle| !handle.is_finished());
             handles.push(handle);
         }
+    }
+
+    fn spawn_result<T: Send + 'static>(
+        &self,
+        task: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> tokio::sync::oneshot::Receiver<T> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.spawn(async move {
+            let result = task.await;
+            let _ = tx.send(result);
+        });
+        rx
     }
 
     async fn drain(&self) {
@@ -792,18 +805,14 @@ fn delegation_notify_error_is_retryable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<HarnessError>().is_some_and(|error| {
         matches!(
             error,
-            HarnessError::SpawnFailed(_)
-                | HarnessError::SubmitFailed(_)
-                | HarnessError::ThreadDied(_)
+            HarnessError::SpawnFailed(_) | HarnessError::ThreadUnavailableBeforeDispatch(_)
         )
     }) || error
         .downcast_ref::<GatewayRequestError>()
         .is_some_and(|error| {
             matches!(
                 error,
-                GatewayRequestError::QueueDeadline
-                    | GatewayRequestError::SessionResumeFailed(_)
-                    | GatewayRequestError::VendorChannelClosed { .. }
+                GatewayRequestError::QueueDeadline | GatewayRequestError::SessionResumeFailed(_)
             )
         })
 }
@@ -2944,7 +2953,7 @@ impl Gateway {
             .is_some_and(|generation| *generation == plan.generation);
         if !reservation_matches || self.sessions.contains_key(&sid) {
             let adapter = Arc::clone(&plan.adapter);
-            tokio::spawn(async move {
+            self.cleanup_tasks.spawn(async move {
                 let _ = adapter.close_thread(&thread).await;
             });
             return Err(GatewayRequestError::SessionGenerationConflict(sid).into());
@@ -3753,6 +3762,8 @@ impl Gateway {
     /// body, also used by the body watcher after a body exits. A typed
     /// detached refusal is an info (the watcher keeps it); anything else warns.
     async fn restore_one_shared(gateway: &Arc<tokio::sync::Mutex<Self>>, sid: &str) {
+        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+        let _claim = claims.lock_for_sid(sid).await;
         let plan_and_reply = {
             let mut g = gateway.lock().await;
             if g.sessions.contains_key(sid) {
@@ -3829,7 +3840,13 @@ impl Gateway {
             }
             Err(err) => {
                 let sid_owned = plan.sid.clone();
-                gateway.lock().await.forget_principal(&sid_owned);
+                gateway.lock().await.forget_spawn_reservation_if_matches(
+                    &sid_owned,
+                    &SpawnReservationProof::Rebuild {
+                        generation: plan.generation,
+                        secret: plan.secret.clone(),
+                    },
+                );
                 tracing::warn!(
                     session = %sid_owned,
                     error = %err,
@@ -4747,7 +4764,7 @@ impl Gateway {
                 principal_rollback.disarm();
                 let thread = uninstalled.take_for_install();
                 let adapter = Arc::clone(&plan.spawn.adapter);
-                tokio::spawn(async move {
+                guard.cleanup_tasks.spawn(async move {
                     let _ = adapter.close_thread(&thread).await;
                 });
                 return Err(GatewayRequestError::SessionGenerationConflict(sid).into());
@@ -4819,80 +4836,129 @@ impl Gateway {
         Ok(sid)
     }
 
-    async fn stop_live_session_shared(
+    /// Stop one live or detached session without holding the gateway registry
+    /// across vendor/process teardown. Frontends must apply their own ACL
+    /// before entering this sid-only lifecycle core.
+    ///
+    /// Once the session has been claimed, teardown is owned by the gateway's
+    /// cleanup tracker. Dropping the HTTP/IM request future therefore cannot
+    /// strand a half-stopped session or cancel `close_thread`.
+    pub async fn stop_session_shared(
         gateway: Arc<tokio::sync::Mutex<Self>>,
-        chat: &ChatKey,
         sid: &str,
-    ) -> Result<String> {
+    ) -> Result<()> {
+        enum StopPlan {
+            Live(Box<GatewaySession>),
+            Detached(DetachedBody),
+        }
+
         let claims = Arc::clone(&gateway.lock().await.spawn_claims);
-        let _turn_claim = claims.lock_for_turn(sid).await;
-        let removed = {
+        let turn_claim = claims.lock_for_turn(sid).await;
+        let (plan, cleanup_tasks) = {
             let mut guard = gateway.lock().await;
-            let Some(session) = guard.sessions.get(sid) else {
-                return Ok(format!("Сессия {sid} недоступна этому чату"));
+            let plan = if guard.sessions.contains_key(sid) {
+                guard.principals.forget(sid);
+                if let Some(pump) = guard.event_pumps.remove(sid) {
+                    pump.abort();
+                }
+                let removed = guard.sessions.remove(sid).expect("checked live session");
+                guard
+                    .current_session
+                    .write()
+                    .unwrap()
+                    .retain(|_, current| current != sid);
+                StopPlan::Live(Box::new(removed))
+            } else if let Some(detached) = guard.detached.get(sid).cloned() {
+                StopPlan::Detached(detached)
+            } else {
+                return Err(anyhow!("unknown session: {sid}"));
             };
-            if !guard.chat_can_access(chat, session) {
-                return Ok(format!("Сессия {sid} недоступна этому чату"));
-            }
-            guard.principals.forget(sid);
-            if let Some(pump) = guard.event_pumps.remove(sid) {
-                pump.abort();
-            }
-            let removed = guard.sessions.remove(sid).expect("checked live session");
-            guard
-                .current_session
-                .write()
-                .unwrap()
-                .retain(|_, current| current != sid);
-            removed
+            (plan, guard.cleanup_tasks.clone())
         };
-        Self::persist_latest_routing_shared(&gateway).await?;
-        let _ = removed.adapter.close_thread(&removed.thread).await;
-        Ok(format!("Сессия {sid} остановлена"))
+        let completion_gateway = Arc::clone(&gateway);
+        let sid = sid.to_string();
+        let completion = cleanup_tasks.spawn_result(async move {
+            let _turn_claim = turn_claim;
+            match plan {
+                StopPlan::Live(removed) => {
+                    let persist = Self::persist_latest_routing_shared(&completion_gateway).await;
+                    if let Err(error) = removed.adapter.close_thread(&removed.thread).await {
+                        tracing::warn!(%sid, %error, "ccteam-im: stopped session close reported an error");
+                    }
+                    persist
+                }
+                StopPlan::Detached(detached) => {
+                    let body = detached.body.clone();
+                    let terminate_sid = sid.clone();
+                    let termination = tokio::task::spawn_blocking(move || {
+                        session_body::terminate(
+                            &body,
+                            &terminate_sid,
+                            std::time::Duration::from_secs(5),
+                        )
+                    })
+                    .await
+                    .context("join body terminate")
+                    .and_then(|result| result);
+                    classify_detached_termination(termination)?;
+
+                    let mut guard = completion_gateway.lock().await;
+                    let matches = guard
+                        .detached
+                        .get(&sid)
+                        .is_some_and(|current| current.body == detached.body);
+                    if !matches {
+                        return Err(GatewayRequestError::SessionGenerationConflict(sid).into());
+                    }
+                    guard.detached.remove(&sid);
+                    guard.principals.forget(&sid);
+                    guard.finish_stopped_detached_body(&sid, detached)
+                }
+            }
+        });
+        completion
+            .await
+            .map_err(|_| anyhow!("stop completion task ended before reporting"))?
     }
 
-    async fn stop_detached_session_shared(
+    async fn stop_session_for_chat_shared(
         gateway: Arc<tokio::sync::Mutex<Self>>,
         chat: &ChatKey,
         sid: &str,
     ) -> Result<String> {
-        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
-        let _turn_claim = claims.lock_for_turn(sid).await;
-        let detached = {
+        let (accessible, was_detached) = {
             let guard = gateway.lock().await;
-            let detached = guard
-                .detached
-                .get(sid)
-                .cloned()
-                .ok_or_else(|| anyhow!("Сессия {sid} недоступна этому чату"))?;
-            if !guard.chat_can_access_sid(chat, sid) {
-                return Err(anyhow!("Сессия {sid} недоступна этому чату"));
-            }
-            detached
+            (
+                guard.chat_can_access_sid(chat, sid),
+                guard.is_session_detached(sid),
+            )
         };
-        let body = detached.body.clone();
-        let sid_owned = sid.to_string();
-        let termination = tokio::task::spawn_blocking(move || {
-            session_body::terminate(&body, &sid_owned, std::time::Duration::from_secs(5))
-        })
-        .await
-        .context("join body terminate")
-        .and_then(|result| result);
-        classify_detached_termination(termination)?;
-        let mut guard = gateway.lock().await;
-        let matches = guard
-            .detached
-            .get(sid)
-            .is_some_and(|current| current.body == detached.body);
-        if !matches {
-            return Err(GatewayRequestError::SessionGenerationConflict(sid.to_string()).into());
+        if !accessible {
+            return Ok(format!("Сессия {sid} недоступна этому чату"));
         }
-        guard.detached.remove(sid);
-        guard.principals.forget(sid);
-        guard.finish_stopped_detached_body(sid, detached)?;
-        Ok(format!(
-            "Сессия {sid} остановлена (её процесс до перезапуска завершён)"
-        ))
+        Self::stop_session_shared(gateway, sid).await?;
+        Ok(if was_detached {
+            format!("Сессия {sid} остановлена (её процесс до перезапуска завершён)")
+        } else {
+            format!("Сессия {sid} остановлена")
+        })
+    }
+
+    /// Stop a fixed sid snapshot without serializing vendor teardown behind
+    /// the global gateway mutex. Each result stays paired with its sid so a
+    /// bulk caller can report partial failure truthfully.
+    pub async fn stop_sessions_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sids: Vec<String>,
+    ) -> Vec<(String, Result<()>)> {
+        join_all(sids.into_iter().map(|sid| {
+            let gateway = Arc::clone(&gateway);
+            async move {
+                let result = Self::stop_session_shared(gateway, &sid).await;
+                (sid, result)
+            }
+        }))
+        .await
     }
 
     async fn stop_bulk_snapshot_shared(
@@ -4909,15 +4975,12 @@ impl Gateway {
         let dropped: Vec<String> = snapshot.difference(&visible).cloned().collect();
         let mut stopped = Vec::new();
         let mut failures = Vec::new();
-        for sid in &visible {
-            let detached = gateway.lock().await.is_session_detached(sid);
-            let result = if detached {
-                Self::stop_detached_session_shared(Arc::clone(&gateway), chat, sid).await
-            } else {
-                Self::stop_live_session_shared(Arc::clone(&gateway), chat, sid).await
-            };
+        for (sid, result) in
+            Self::stop_sessions_shared(Arc::clone(&gateway), visible.iter().cloned().collect())
+                .await
+        {
             match result {
-                Ok(_) => stopped.push(sid.clone()),
+                Ok(()) => stopped.push(sid),
                 Err(error) => failures.push(format!("{sid} ({error})")),
             }
         }
@@ -4982,9 +5045,12 @@ impl Gateway {
         }
     }
 
-    async fn interrupt_session_shared(
+    /// Interrupt one live turn without holding the gateway registry across
+    /// the adapter call. Frontends must apply their own ACL first. The exact
+    /// adapter outcome is preserved so callers never report a requested or
+    /// already-idle turn as confirmed interrupted.
+    pub async fn interrupt_session_shared(
         gateway: Arc<tokio::sync::Mutex<Self>>,
-        chat: &ChatKey,
         sid: &str,
     ) -> Result<InterruptOutcome> {
         let claims = Arc::clone(&gateway.lock().await.spawn_claims);
@@ -4995,10 +5061,7 @@ impl Gateway {
                 .sessions
                 .get(sid)
                 .cloned()
-                .ok_or_else(|| anyhow!("Сессия {sid} недоступна этому чату"))?;
-            if !guard.chat_can_access(chat, &session) {
-                return Err(anyhow!("Сессия {sid} недоступна этому чату"));
-            }
+                .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
             session
         };
         let outcome = session
@@ -5404,8 +5467,7 @@ impl Gateway {
                     "Сессия {sid} недоступна этому чату"
                 ))]);
             }
-            let renamed =
-                Self::rename_session_shared(Arc::clone(&gateway), &chat, &sid, title).await?;
+            let renamed = Self::rename_session_shared(Arc::clone(&gateway), &sid, title).await?;
             if let Some(ready) = ready.take() {
                 let _ = ready.send(true);
             }
@@ -5427,7 +5489,13 @@ impl Gateway {
                         anyhow!("Для /interrupt нужна активная сессия (или /interrupt <sid>)")
                     })?,
             };
-            let outcome = Self::interrupt_session_shared(Arc::clone(&gateway), &chat, &sid).await?;
+            let accessible = gateway.lock().await.chat_can_access_sid(&chat, &sid);
+            if !accessible {
+                return Ok(vec![RichReply::plain(format!(
+                    "Сессия {sid} недоступна этому чату"
+                ))]);
+            }
+            let outcome = Self::interrupt_session_shared(Arc::clone(&gateway), &sid).await?;
             if let Some(ready) = ready.take() {
                 let _ = ready.send(true);
             }
@@ -5477,12 +5545,8 @@ impl Gateway {
                 return Ok(plain_replies(replies));
             }
             if !bulk {
-                let detached = gateway.lock().await.is_session_detached(target);
-                let reply = if detached {
-                    Self::stop_detached_session_shared(Arc::clone(&gateway), &chat, target).await?
-                } else {
-                    Self::stop_live_session_shared(Arc::clone(&gateway), &chat, target).await?
-                };
+                let reply =
+                    Self::stop_session_for_chat_shared(Arc::clone(&gateway), &chat, target).await?;
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(true);
                 }
@@ -5521,7 +5585,7 @@ impl Gateway {
                     GatewayDeadline::start(),
                 )
                 .await?;
-                let receipt = match Self::stop_live_session_shared(
+                let receipt = match Self::stop_session_for_chat_shared(
                     Arc::clone(&gateway),
                     &chat,
                     &old_sid,
@@ -6098,9 +6162,14 @@ impl Gateway {
                         "Сессия {sid} недоступна этому чату"
                     ))));
                 }
-                self.interrupt_session(&sid).await?;
+                let outcome = self.interrupt_session(&sid).await?;
+                let detail = match outcome {
+                    InterruptOutcome::Interrupted => "прерван",
+                    InterruptOutcome::AlreadyIdle => "уже был остановлен",
+                    InterruptOutcome::Requested => "получил запрос на прерывание",
+                };
                 Ok(Some(RichReply::plain(format!(
-                    "Текущий turn сессии {sid} прерван (сессия сохранена; можно продолжить /model и др.)"
+                    "Текущий turn сессии {sid} {detail} (сессия сохранена; можно продолжить /model и др.)"
                 ))))
             }
             "/cd" => {
@@ -7448,7 +7517,7 @@ impl Gateway {
         if !reservation_matches || self.sessions.contains_key(&id) {
             self.delegation_spawn_reservations.remove(&id);
             let orphan_adapter = Arc::clone(&adapter);
-            tokio::spawn(async move {
+            self.cleanup_tasks.spawn(async move {
                 let _ = orphan_adapter.close_thread(&thread).await;
             });
             return Err(GatewayRequestError::SessionGenerationConflict(id).into());
@@ -10120,7 +10189,7 @@ impl Gateway {
             // do NOT insert a zombie; close the fresh thread gracefully.
             let orphan_adapter = Arc::clone(&adapter);
             let orphan_thread = thread.clone();
-            tokio::spawn(async move {
+            self.cleanup_tasks.spawn(async move {
                 let _ = orphan_adapter.close_thread(&orphan_thread).await;
             });
             tracing::warn!(
@@ -10153,8 +10222,9 @@ impl Gateway {
         }
         self.spawn_event_pump(&session_id);
         // Note: do NOT drain pending turns here — apply_resume is often
-        // called from inside submit_resolved (ThreadDied retry). Draining
-        // would recurse. Fresh-start path drains after spawn_event_pump.
+        // called from inside submit_resolved after a proven pre-dispatch
+        // absence. Draining would recurse. Fresh-start path drains after the
+        // event pump is installed.
         tracing::info!(
             session_id = %session_id,
             project = %project,
@@ -10242,10 +10312,10 @@ impl Gateway {
     /// This PRE-CHECK guards the DIRECTIVE path (`/compact`, `/clear`, …): a
     /// directive can have side effects, so it must NOT be blindly retried on a
     /// failure — probe-then-dispatch is the safe shape. The TURN path takes the
-    /// opposite, race-free shape (submit → on [`HarnessError::ThreadDied`]
-    /// resume + retry once): a turn is idempotent on a dead-before-delivery
-    /// signal, so reacting to the failure closes the probe→send TOCTOU window a
-    /// pre-check inherently leaves open.
+    /// opposite, race-free shape (submit → retry only on
+    /// [`HarnessError::ThreadUnavailableBeforeDispatch`]): the typed lookup
+    /// miss proves no write/request was attempted. A generic `ThreadDied`
+    /// remains ambiguous and is never retried.
     async fn ensure_session_live(&mut self, session_id: &str, chat: &ChatKey) -> Result<()> {
         // Deepest rung: a session absent from the live map entirely (evicted /
         // restart-rebuild-failed / stopped) is cold-resumed from meta.json, so a
@@ -10462,11 +10532,10 @@ impl Gateway {
         // it is gone from the agent's failed tool call.
         self.prime_tool_surface(session_id).await;
         // Submit with reactive resume-and-retry: a turn is idempotent on a
-        // `ThreadDied` (the child exited before the line was delivered), so on
-        // that signal resume-by-sid and retry EXACTLY once — closing the
-        // probe→send race a pre-check can't. Any other error (a real rejection /
-        // timeout) is surfaced as-is, never retried. Each attempt re-borrows the
-        // session so the retry sees the resumed thread/adapter.
+        // `ThreadUnavailableBeforeDispatch` (the adapter proved no write was
+        // attempted), so on that signal resume-by-sid and retry EXACTLY once.
+        // `ThreadDied` is deliberately not retried: a write/request may have
+        // reached the remote before the transport died.
         let submit_wait = gateway_submit_timeout_duration();
         let mut attempt: u8 = 0;
         let submitted = loop {
@@ -10493,7 +10562,7 @@ impl Gateway {
                     ));
                 }
                 Ok(Ok(submitted)) => break Ok(submitted),
-                Ok(Err(HarnessError::ThreadDied(_))) if attempt == 1 => {
+                Ok(Err(HarnessError::ThreadUnavailableBeforeDispatch(_))) if attempt == 1 => {
                     if let Err(error) = self.resume_dead_session(session_id).await {
                         break Err(error);
                     }
@@ -13158,8 +13227,15 @@ impl Gateway {
             }
             guard.plan_session_rebuild(&slug, cwd, &meta, &caller)?
         };
+        let reservation = SpawnReservationProof::Rebuild {
+            generation: plan.generation,
+            secret: plan.secret.clone(),
+        };
         if let Err(error) = deadline.ensure_vendor_phase_can_start() {
-            gateway.lock().await.forget_principal(&plan.sid);
+            gateway
+                .lock()
+                .await
+                .forget_spawn_reservation_if_matches(&plan.sid, &reservation);
             return Err(error);
         }
         let (principals, cleanup_tasks) = {
@@ -13169,7 +13245,10 @@ impl Gateway {
         let thread = match Self::spawn_for_plan(&plan).await {
             Ok(thread) => thread,
             Err(error) => {
-                gateway.lock().await.forget_principal(&plan.sid);
+                gateway
+                    .lock()
+                    .await
+                    .forget_spawn_reservation_if_matches(&plan.sid, &reservation);
                 return Err(GatewayRequestError::SessionResumeFailed(error.to_string()).into());
             }
         };
@@ -13177,10 +13256,7 @@ impl Gateway {
             &gateway,
             principals,
             plan.sid.clone(),
-            Some(SpawnReservationProof::Rebuild {
-                generation: plan.generation,
-                secret: plan.secret.clone(),
-            }),
+            Some(reservation),
             cleanup_tasks,
             Arc::clone(&plan.adapter),
             thread,
@@ -15718,7 +15794,7 @@ impl Gateway {
                     }
                     .into());
                 }
-                Ok(Err(HarnessError::ThreadDied(_detail))) if attempt == 1 => {
+                Ok(Err(HarnessError::ThreadUnavailableBeforeDispatch(_detail))) if attempt == 1 => {
                     rollback.rollback().await;
                     Self::resume_dead_session_shared_with_deadline(
                         Arc::clone(&gateway),
@@ -15728,16 +15804,15 @@ impl Gateway {
                     .await?;
                     continue;
                 }
-                Ok(Err(HarnessError::ThreadDied(detail))) => {
+                Ok(Err(HarnessError::ThreadUnavailableBeforeDispatch(detail))) => {
                     rollback.rollback().await;
-                    return Err(GatewayRequestError::VendorChannelClosed {
-                        sid: sid.to_string(),
-                        detail,
-                    }
-                    .into());
+                    return Err(HarnessError::ThreadUnavailableBeforeDispatch(detail).into());
                 }
                 Ok(Err(error)) => {
-                    rollback.rollback().await;
+                    // Every error except the typed pre-dispatch absence remains
+                    // ambiguous: an adapter error after hand-off is not proof
+                    // that the vendor did not accept the turn.
+                    rollback.disarm();
                     return Err(error.into());
                 }
                 Ok(Ok(submitted)) => submitted,
@@ -15807,7 +15882,7 @@ impl Gateway {
             session.adapter.handle_directive(&session.thread, directive),
         )
         .await;
-        if outcome.is_ok() {
+        if matches!(outcome, Ok(Ok(_))) {
             session
                 .submit_reconciled_epoch
                 .fetch_max(dispatch_epoch, Ordering::SeqCst);
@@ -16714,7 +16789,7 @@ impl Gateway {
     /// applies `chat_can_access` first) and the web `POST
     /// /sessions/{sid}/interrupt` route (which applies the project ACL via
     /// `gate_sid` first). Unknown sid → `Err` so the web edge can 404.
-    pub async fn interrupt_session(&mut self, sid: &str) -> Result<()> {
+    pub async fn interrupt_session(&mut self, sid: &str) -> Result<InterruptOutcome> {
         let session = self
             .sessions
             .get(sid)
@@ -16729,7 +16804,7 @@ impl Gateway {
         if outcome == InterruptOutcome::Interrupted {
             Self::reconcile_confirmed_interrupt(&session);
         }
-        Ok(())
+        Ok(outcome)
     }
 
     /// Rename a session's user-facing title — the ACL-less core every frontend
@@ -16871,9 +16946,11 @@ impl Gateway {
         self.apply_rename_session_plan(plan, vendor_sync)
     }
 
-    async fn rename_session_shared(
+    /// Rename a live or stopped session without holding the gateway registry
+    /// across metadata I/O or the best-effort vendor title push. Frontends
+    /// must apply their own ACL before entering this sid-only lifecycle core.
+    pub async fn rename_session_shared(
         gateway: Arc<tokio::sync::Mutex<Self>>,
-        chat: &ChatKey,
         sid: &str,
         raw_title: &str,
     ) -> Result<SessionRename> {
@@ -16881,9 +16958,6 @@ impl Gateway {
         let _turn_claim = claims.lock_for_turn(sid).await;
         let plan = {
             let guard = gateway.lock().await;
-            if !guard.chat_can_access_sid(chat, sid) {
-                return Err(anyhow!("Сессия {sid} недоступна этому чату"));
-            }
             guard.plan_rename_session(sid, raw_title)?
         };
         let (plan, vendor_sync) = Self::execute_rename_session_plan(plan).await?;
@@ -20883,6 +20957,7 @@ mod tests {
         /// gateway lock across the slow spawn.
         start_delay: std::time::Duration,
         start_barrier: Option<Arc<TestStartBarrier>>,
+        start_failures_remaining: Arc<AtomicUsize>,
         close_barrier: Option<Arc<TestStartBarrier>>,
         submit_barrier: Option<Arc<TestStartBarrier>>,
         tool_face_barrier: Option<Arc<TestStartBarrier>>,
@@ -20952,8 +21027,11 @@ mod tests {
         /// resume both close).
         closes: AtomicUsize,
         closes_notify: tokio::sync::Notify,
+        close_completions: AtomicUsize,
         close_failures_remaining: Arc<AtomicUsize>,
         submit_failures_remaining: Arc<AtomicUsize>,
+        predispatch_unavailable_remaining: Arc<AtomicUsize>,
+        post_dispatch_thread_deaths_remaining: Arc<AtomicUsize>,
     }
 
     impl Default for FakeAdapter {
@@ -20991,6 +21069,7 @@ mod tests {
                 resume_delay: std::time::Duration::ZERO,
                 start_delay: std::time::Duration::ZERO,
                 start_barrier: None,
+                start_failures_remaining: Arc::new(AtomicUsize::new(0)),
                 close_barrier: None,
                 submit_barrier: None,
                 tool_face_barrier: None,
@@ -21017,8 +21096,11 @@ mod tests {
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
                 closes_notify: tokio::sync::Notify::new(),
+                close_completions: AtomicUsize::new(0),
                 close_failures_remaining: Arc::new(AtomicUsize::new(0)),
                 submit_failures_remaining: Arc::new(AtomicUsize::new(0)),
+                predispatch_unavailable_remaining: Arc::new(AtomicUsize::new(0)),
+                post_dispatch_thread_deaths_remaining: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -21142,6 +21224,10 @@ mod tests {
             .await
             .expect("expected vendor close");
         }
+
+        fn completed_closes(&self) -> usize {
+            self.close_completions.load(Ordering::SeqCst)
+        }
     }
 
     #[async_trait::async_trait]
@@ -21174,6 +21260,17 @@ mod tests {
             }
             if !self.start_delay.is_zero() {
                 tokio::time::sleep(self.start_delay).await;
+            }
+            if self
+                .start_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(HarnessError::SpawnFailed(
+                    "scripted start failure".to_string(),
+                ));
             }
             self.spawn_modes.lock().await.push(ctx.permission_mode);
             self.spawn_secrets.lock().await.push(ctx.secret.clone());
@@ -21208,15 +21305,25 @@ mod tests {
                     "transient test failure".to_string(),
                 ));
             }
-            // Model a stream-json child that has exited: a dead session's submit
-            // returns the recoverable ThreadDied WITHOUT delivering (so the
-            // gateway resumes + retries, and no double-submit is recorded). A
-            // resume revives `live` (start_thread sets it true).
+            // Model a stream-json child that is absent before dispatch. The
+            // typed lookup miss permits one safe resume+retry; a resume revives
+            // `live` (start_thread sets it true).
             if !self.live.load(Ordering::SeqCst) {
-                return Err(HarnessError::ThreadDied(format!(
+                return Err(HarnessError::ThreadUnavailableBeforeDispatch(format!(
                     "fake child exited: {}",
                     h.identity
                 )));
+            }
+            if self
+                .predispatch_unavailable_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(HarnessError::ThreadUnavailableBeforeDispatch(
+                    "proven test lookup miss".to_string(),
+                ));
             }
             if let Some(barrier) = self.submit_barrier.as_ref() {
                 if barrier.armed.load(Ordering::SeqCst) {
@@ -21238,6 +21345,17 @@ mod tests {
                 .lock()
                 .await
                 .push((h.identity.clone(), text.clone()));
+            if self
+                .post_dispatch_thread_deaths_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(HarnessError::ThreadDied(
+                    "transport died after accepting the test turn".to_string(),
+                ));
+            }
             let turn_id = format!("turn-{}", h.identity);
             if self.emit_turn_started {
                 self.events.lock().await.push_back((
@@ -21475,6 +21593,7 @@ mod tests {
                     Err(current) => remaining = current,
                 }
             }
+            self.close_completions.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -22926,8 +23045,11 @@ mod tests {
     async fn concurrent_replacement_discards_stale_resume_without_touching_newer_entry() {
         let tmp = tempfile::TempDir::new().unwrap();
         let barrier = Arc::new(TestStartBarrier::default());
+        let close = Arc::new(TestStartBarrier::default());
         let fake = Arc::new(
-            FakeAdapter::new(AgentVendor::Claude).with_start_barrier(Arc::clone(&barrier)),
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_start_barrier(Arc::clone(&barrier))
+                .with_close_barrier(Arc::clone(&close)),
         );
         let mut gw = Gateway::new(fake.clone(), "alpha", tmp.path());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
@@ -22950,6 +23072,7 @@ mod tests {
         // the phase-2 window with no gateway lock.
         fake.live.store(false, Ordering::SeqCst);
         barrier.arm();
+        close.arm();
         let gateway = Arc::new(tokio::sync::Mutex::new(gw));
 
         let gw_a = Arc::clone(&gateway);
@@ -22988,11 +23111,19 @@ mod tests {
         assert_eq!(current.thread.identity, "newer-live-thread");
         drop(guard);
         fake.wait_for_closes(1).await;
+        let drain_gateway = Arc::clone(&gateway);
+        let mut drain = tokio::spawn(async move {
+            Gateway::drain_cleanup_tasks_shared(&drain_gateway).await;
+        });
         assert!(
-            fake.closes.load(Ordering::SeqCst) >= 1,
-            "the discarded vendor result must be closed, got {} closes",
-            fake.closes.load(Ordering::SeqCst)
+            tokio::time::timeout(Duration::from_millis(100), &mut drain)
+                .await
+                .is_err(),
+            "shutdown drain must own the discarded vendor close"
         );
+        close.release_all();
+        drain.await.unwrap();
+        assert_eq!(fake.completed_closes(), 1);
     }
 
     /// A cold resume on one sid must not freeze a different live sid or the
@@ -23522,11 +23653,10 @@ mod tests {
 
     /// Dead-child recovery on the TURN path (reactive): when a session's child
     /// has exited out from under the held handle, `submit_turn` returns the
-    /// recoverable `HarnessError::ThreadDied`, and the gateway transparently
-    /// resumes-by-session-id (re-`start_thread`, SAME sid) and RETRIES once —
-    /// the turn lands instead of failing "stream-json writer closed". The turn
-    /// was never delivered on a ThreadDied, so the single retry can't
-    /// double-submit. Killed twice to prove it's repeatable, not a one-shot, and
+    /// proven-pre-dispatch `HarnessError::ThreadUnavailableBeforeDispatch`, and
+    /// the gateway transparently resumes-by-session-id (re-`start_thread`, SAME
+    /// sid) and RETRIES once. The adapter proved no write was attempted, so the
+    /// retry cannot double-submit. Killed twice to prove it's repeatable, and
     /// that a LIVE session never re-spawns (3 starts for 3 deaths — no spurious
     /// resume on the healthy first turn).
     ///
@@ -24316,7 +24446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_im_submit_failure_rolls_back_working_state_and_reaction() {
+    async fn shared_im_submit_failure_stays_ambiguous_and_blocks_blind_retry() {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
@@ -24345,26 +24475,78 @@ mod tests {
 
         let guard = gateway.lock().await;
         let session = guard.sessions.values().next().expect("the session");
-        assert!(session.turn_started_at.lock().unwrap().is_none());
-        assert!(session.pending_reaction.lock().unwrap().is_none());
-        assert!(
-            !session.tool_face_primed.load(Ordering::SeqCst),
-            "a rejected turn must retry first-activation diagnostics next time"
+        assert!(session.turn_started_at.lock().unwrap().is_some());
+        assert_eq!(
+            session.pending_reaction.lock().unwrap().as_deref(),
+            Some("tg-failed")
         );
+        assert!(
+            session.submit_outcome_unknown.load(Ordering::SeqCst),
+            "a post-dispatch error cannot prove that the vendor rejected the bytes before accepting them"
+        );
+        assert!(session.submit_ambiguity.lock().unwrap().is_some());
         drop(guard);
+
+        let retry_error = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-7",
+            "alice",
+            "tg-retry",
+            "do a thing again",
+            &[],
+            None,
+        )
+        .await
+        .expect_err("an ambiguous first submit must block a blind retry");
+        assert!(retry_error.to_string().contains("outcome is unknown"));
+
         let reactions = std::iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|event| match event.kind {
                 GatewayEventKind::Reaction { message_id, on } => Some((message_id, on)),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            reactions,
-            vec![
-                ("tg-failed".to_string(), true),
-                ("tg-failed".to_string(), false)
-            ]
-        );
+        assert_eq!(reactions, vec![("tg-failed".to_string(), true)]);
+    }
+
+    #[tokio::test]
+    async fn post_dispatch_thread_death_is_ambiguous_and_never_auto_retried() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Pi));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(events);
+        gateway
+            .handle_text("telegram", "chat-7", "alice", "/new pi")
+            .await
+            .unwrap();
+        fake.post_dispatch_thread_deaths_remaining
+            .store(1, Ordering::SeqCst);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        let error = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-7",
+            "alice",
+            "pi-ambiguous",
+            "accepted remotely",
+            &[],
+            None,
+        )
+        .await
+        .expect_err("post-request disconnect must stay ambiguous");
+        assert!(matches!(
+            error.downcast_ref::<HarnessError>(),
+            Some(HarnessError::ThreadDied(_))
+        ));
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.submissions.lock().await.len(), 1);
+        let guard = gateway.lock().await;
+        let session = &guard.sessions["s1"];
+        assert!(session.submit_outcome_unknown.load(Ordering::SeqCst));
+        assert!(session.submit_ambiguity.lock().unwrap().is_some());
     }
 
     /// v0.8.19 — a WEB-driven turn emits NO 👀 reaction (web has its own UI; the
@@ -26595,24 +26777,43 @@ mod tests {
         let gateway = Arc::new(tokio::sync::Mutex::new(gw));
         close.arm();
         let stop_gateway = Arc::clone(&gateway);
-        let stop = tokio::spawn(async move {
-            Gateway::handle_message_shared(
-                stop_gateway,
-                "telegram",
-                "chat-a",
-                "alice",
-                "stop-1",
-                "/stop s1",
-                &[],
-                None,
-            )
-            .await
-        });
+        let stop =
+            tokio::spawn(async move { Gateway::stop_session_shared(stop_gateway, "s1").await });
         close.wait_until_entered(1).await;
         assert_other_chat_observability_is_prompt(&gateway).await;
         close.release_all();
         stop.await.unwrap().unwrap();
         assert!(gateway.lock().await.sessions.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_shared_stop_finishes_close_through_cleanup_tracker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let close = Arc::new(TestStartBarrier::default());
+        let fake =
+            Arc::new(FakeAdapter::new(AgentVendor::Claude).with_close_barrier(Arc::clone(&close)));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("telegram", "chat-a", "alice", "/new claude")
+            .await
+            .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        close.arm();
+        let stop_gateway = Arc::clone(&gateway);
+        let stop =
+            tokio::spawn(async move { Gateway::stop_session_shared(stop_gateway, "s1").await });
+        close.wait_until_entered(1).await;
+        stop.abort();
+        let _ = stop.await;
+        close.release_all();
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+
+        assert!(gateway.lock().await.sessions.is_empty());
+        assert_eq!(
+            fake.completed_closes(),
+            1,
+            "accepted stop must finish the vendor close after caller cancellation"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -26667,23 +26868,13 @@ mod tests {
         barrier.arm();
         let task_gateway = Arc::clone(&gateway);
         let task = tokio::spawn(async move {
-            Gateway::handle_message_shared(
-                task_gateway,
-                "telegram",
-                "chat-a",
-                "alice",
-                "rename-1",
-                "/rename exact title",
-                &[],
-                None,
-            )
-            .await
+            Gateway::rename_session_shared(task_gateway, "s1", "exact title").await
         });
         barrier.wait_until_entered(1).await;
         assert_other_chat_observability_is_prompt(&gateway).await;
         barrier.release_all();
-        let replies = task.await.unwrap().unwrap();
-        assert!(replies[0].plain.contains("exact title"));
+        let renamed = task.await.unwrap().unwrap();
+        assert_eq!(renamed.title, "exact title");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -26701,23 +26892,14 @@ mod tests {
         let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
         barrier.arm();
         let task_gateway = Arc::clone(&gateway);
-        let task = tokio::spawn(async move {
-            Gateway::handle_message_shared(
-                task_gateway,
-                "telegram",
-                "chat-a",
-                "alice",
-                "interrupt-1",
-                "/interrupt",
-                &[],
-                None,
-            )
-            .await
-        });
+        let task =
+            tokio::spawn(
+                async move { Gateway::interrupt_session_shared(task_gateway, "s1").await },
+            );
         barrier.wait_until_entered(1).await;
         assert_other_chat_observability_is_prompt(&gateway).await;
         barrier.release_all();
-        task.await.unwrap().unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), InterruptOutcome::Interrupted);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -27129,6 +27311,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_restore_spawn_failure_cannot_erase_a_newer_reservation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let start = Arc::new(TestStartBarrier::default());
+        let fake =
+            Arc::new(FakeAdapter::new(AgentVendor::Claude).with_start_barrier(Arc::clone(&start)));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway.stop_session(&sid).await.unwrap();
+        fake.start_failures_remaining.store(1, Ordering::SeqCst);
+        start.arm();
+        let principals = gateway.principals();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let stale_gateway = Arc::clone(&gateway);
+        let stale_sid = sid.clone();
+        let stale = tokio::spawn(async move {
+            Gateway::restore_one_shared(&stale_gateway, &stale_sid).await;
+        });
+        start.wait_until_entered(1).await;
+
+        let (new_generation, new_secret) = {
+            let mut guard = gateway.lock().await;
+            let (slug, cwd, meta) = guard.find_meta_for_sid(&sid).unwrap();
+            let newer = guard
+                .plan_session_rebuild(&slug, cwd, &meta, &web_api_chat())
+                .unwrap();
+            (newer.generation, newer.secret)
+        };
+        start.release_all();
+        stale.await.unwrap();
+
+        let guard = gateway.lock().await;
+        assert_eq!(guard.rebuild_reservations.get(&sid), Some(&new_generation));
+        assert!(principals.verify(&sid, &new_secret).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_tool_face_prime_rolls_back_pre_dispatch_turn_state() {
         let tmp = tempfile::TempDir::new().unwrap();
         let tool_face_barrier = Arc::new(TestStartBarrier::default());
@@ -27195,7 +27422,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_unacknowledged_submit_rolls_back_provisional_turn_state() {
+    async fn cancelled_post_dispatch_submit_stays_ambiguous_and_blocks_retry() {
         let tmp = tempfile::TempDir::new().unwrap();
         let submit_barrier = Arc::new(TestStartBarrier::default());
         let fake = Arc::new(
@@ -27237,23 +27464,32 @@ mod tests {
         submit.abort();
         let _ = submit.await;
         submit_barrier.release_all();
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                let rolled_back = {
-                    let guard = gateway.lock().await;
-                    let session = &guard.sessions["s1"];
-                    session.turn_started_at.lock().unwrap().is_none()
-                        && session.pending_reaction.lock().unwrap().is_none()
-                        && !session.tool_face_primed.load(Ordering::SeqCst)
-                };
-                if rolled_back {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+        {
+            let guard = gateway.lock().await;
+            let session = &guard.sessions["s1"];
+            assert!(session.turn_started_at.lock().unwrap().is_some());
+            assert_eq!(
+                session.pending_reaction.lock().unwrap().as_deref(),
+                Some("msg-abort")
+            );
+            assert!(session.tool_face_primed.load(Ordering::SeqCst));
+            assert!(session.submit_outcome_unknown.load(Ordering::SeqCst));
+            assert!(session.submit_ambiguity.lock().unwrap().is_some());
+        }
+        let retry = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-a",
+            "alice",
+            "msg-retry",
+            "do not duplicate",
+            &[],
+            None,
+        )
         .await
-        .expect("cancelled pre-dispatch submit rolls provisional state back");
+        .expect_err("cancellation after dispatch must block a blind retry");
+        assert!(retry.to_string().contains("outcome is unknown"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -33439,7 +33675,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delegation_submit_failure_retries_without_daemon_restart() {
+    async fn delegation_ambiguous_submit_failure_is_not_blind_retried() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().to_path_buf();
         let remaining = Arc::new(AtomicUsize::new(1));
@@ -33512,65 +33748,52 @@ mod tests {
         .expect("the first parent submit fails");
         assert!(
             ccteam_harness::read_delegation_watch(&project_dir, &child_sid).is_some(),
-            "a transient parent-submit failure must keep the watch armed"
+            "an ambiguous parent-submit failure must keep the watch armed"
         );
         delivery.await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if ccteam_notification_turns(&project_dir, &parent_sid).len() == 1 {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the in-process notifier retries a transient submit failure");
         assert_eq!(
             ccteam_notification_turns(&project_dir, &parent_sid).len(),
-            1,
-            "retry must produce exactly one parent notification"
+            0,
+            "a generic submit failure carries no zero-dispatch proof"
         );
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while ccteam_harness::read_delegation_watch(&project_dir, &child_sid).is_some() {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the successful retry spends the durable watch");
         assert!(
-            ccteam_harness::read_delegation_watch(&project_dir, &child_sid).is_none(),
-            "the successful retry spends the durable watch"
+            ccteam_harness::read_delegation_watch(&project_dir, &child_sid).is_some(),
+            "startup reconciliation keeps ownership of the unresolved watch"
         );
         let progress = ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha"))
             .unwrap_or_default();
-        for event in [
-            ccteam_harness::execution::progress_bridge::DELEGATION_COMPLETED,
-            ccteam_harness::execution::progress_bridge::DELEGATION_NOTIFIED,
-        ] {
-            assert_eq!(
-                progress
-                    .iter()
-                    .filter(|record| {
-                        record.get("event").and_then(serde_json::Value::as_str) == Some(event)
-                            && record.get("child_sid").and_then(serde_json::Value::as_str)
-                                == Some(child_sid.as_str())
-                    })
-                    .count(),
-                1,
-                "retry must write exactly one {event}: {progress:#?}"
-            );
-        }
+        let count = |event| {
+            progress
+                .iter()
+                .filter(|record| {
+                    record.get("event").and_then(serde_json::Value::as_str) == Some(event)
+                        && record.get("child_sid").and_then(serde_json::Value::as_str)
+                            == Some(child_sid.as_str())
+                })
+                .count()
+        };
+        assert_eq!(
+            count(ccteam_harness::execution::progress_bridge::DELEGATION_COMPLETED),
+            1
+        );
+        assert_eq!(
+            count(ccteam_harness::execution::progress_bridge::DELEGATION_NOTIFIED),
+            0
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delegation_delivery_serializes_rearm_until_old_notification_finishes() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().to_path_buf();
-        let remaining = Arc::new(AtomicUsize::new(1));
+        // The shared submit path consumes one proven pre-dispatch miss with
+        // its own safe resume+retry. A second miss reaches the notifier, whose
+        // retry delay keeps the child claim held for this serialization proof.
+        let remaining = Arc::new(AtomicUsize::new(2));
         let factory_remaining = Arc::clone(&remaining);
         let factory: crate::daemon::AdapterFactory = Arc::new(move |vendor, _protocol| {
             Arc::new(FakeAdapter {
-                submit_failures_remaining: Arc::clone(&factory_remaining),
+                predispatch_unavailable_remaining: Arc::clone(&factory_remaining),
                 ..FakeAdapter::new(vendor).with_turn_boundary()
             }) as Arc<dyn HarnessAdapter + Send + Sync>
         });

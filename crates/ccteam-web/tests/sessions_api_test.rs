@@ -19,8 +19,9 @@ use std::time::Duration;
 use ccteam_core::CcteamPaths;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter,
-    HarnessCapability, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItem,
-    ThreadItemDetails, ThreadStatus, TurnId, TurnInput, TurnSubmission, UnifiedTokenUsage,
+    HarnessCapability, HarnessError, InterruptOutcome, SpawnCtx, ThreadEvent, ThreadHandle,
+    ThreadItem, ThreadItemDetails, ThreadStatus, TurnId, TurnInput, TurnSubmission,
+    UnifiedTokenUsage,
 };
 use ccteam_web::{router_with_state, AppState};
 use futures::stream::{self, BoxStream};
@@ -301,6 +302,10 @@ impl HarnessAdapter for FakeAdapter {
         Ok(())
     }
 
+    async fn interrupt_turn(&self, _h: &ThreadHandle) -> Result<InterruptOutcome, HarnessError> {
+        Ok(InterruptOutcome::AlreadyIdle)
+    }
+
     async fn handle_directive(
         &self,
         _h: &ThreadHandle,
@@ -488,6 +493,42 @@ async fn session_interrupt_no_gateway_is_503() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 503);
+}
+
+#[tokio::test]
+async fn session_interrupt_wire_does_not_claim_an_already_idle_turn_was_interrupted() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let response = client
+        .post(format!("http://{addr}/api/v1/sessions/{sid}/interrupt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        serde_json::json!({"outcome": "already_idle", "interrupted": false})
+    );
 }
 
 /// v0.8.22 P1 — `PATCH /sessions/{sid}` (rename) follows the same no-gateway

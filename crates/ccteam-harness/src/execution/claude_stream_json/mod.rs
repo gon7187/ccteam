@@ -1672,10 +1672,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             });
         }
         let Some(live) = self.lookup(&h.identity) else {
-            // Registry miss = the session was idle-released / closed: nothing was
-            // sent, so this is a recoverable ThreadDied (caller resumes + retries
-            // once), not a hard SubmitFailed.
-            return Err(HarnessError::ThreadDied(format!(
+            // Registry miss happens before any transport write, so it is the
+            // one typed outcome the caller may safely resume and retry once.
+            return Err(HarnessError::ThreadUnavailableBeforeDispatch(format!(
                 "stream-json session not live: {} (needs resume)",
                 h.identity
             )));
@@ -1703,9 +1702,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             .await
         {
             live.active_turn.store(was_active, Ordering::Release);
-            // Writer closed = the child exited mid-handoff (the probe→send
-            // race): the line was NOT delivered, so it's a recoverable
-            // ThreadDied the gateway resumes + retries once.
+            // A failed async write cannot prove whether zero, some, or all
+            // bytes reached the child. Keep it ambiguous; the gateway must not
+            // blind-retry this `ThreadDied`.
             return Err(HarnessError::ThreadDied(format!(
                 "stream-json send: {error:#}"
             )));
