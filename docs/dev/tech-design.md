@@ -176,7 +176,7 @@ per-adapter best-fit,不强行统一:
 
 | 资源 | 端点 | 说明 |
 |---|---|---|
-| **project** | `GET /projects`(每项带 `host`+`host_online`)、`GET /projects/{slug}`(`api_v1.rs`,只读)· `POST /projects`(可带 `host`= 卫星 id,经 `project_init` op 远程建,§2.7)、`POST /projects/import`(接入卫星已注册项目)、`DELETE /projects/{slug}`(`routes/projects.rs`) | `DELETE` = **注销 + 停 session(deregister),不 file-purge、不触卫星**;破坏性 purge 留 CLI `project rm --purge`(§4) |
+| **project** | `GET /projects`(每项带 `host`+`host_online`)、`GET /projects/{slug}`(`api_v1.rs`,只读)· `POST /projects`(可带 `host`= 卫星 id,经 `project_init` op 远程建,§2.7)、`POST /projects/import`(接入卫星已注册项目)、`DELETE /projects/{slug}`(`routes/projects.rs`) | `DELETE` = **daemon 主导的原子退役 + 注销**(§4.3):无 live gateway → 503、config 不动;标记已落但退役未完成 → 500 且 `retired:true`(行保留待重试);不 file-purge、不触卫星;破坏性 purge 留 CLI `project rm --purge` |
 | **role** | `GET /projects/{slug}/roles`、`GET/PUT /projects/{slug}/roles/{role}`(`routes/roles.rs`) | 读 `.claude/agents` 库;core `ccteam_core::roles::{list_roles,read_role}` 解析 frontmatter |
 | **routing(分工宪章)** | `GET/PUT /projects/{slug}/routing`(`routes/routing.rs`,v0.9.11) | 项目级 `routing.md` 读写面:GET 三态 `source: project\|global\|none`(+content/sha256/updated_at/fallback_path,global 只作只读回显);PUT 原子写**项目**文件(>256 KiB → 413;绝不写全局,全局写入口留 CLI/文件系统);语义与 MCP `status` 透传同源(§6.5 routing notes,web 只是编辑器,不解释不注入);URL 形状落 `project_acl_layer` |
 | **session** | `GET/POST /projects/{slug}/sessions`、`GET /sessions/{sid}`、`POST /sessions/{sid}/turn`、`POST /sessions/{sid}/resolve`(HITL token-resolve)、`GET /sessions/{sid}/events`(SSE)、`POST /sessions/{sid}/stop`(`routes/sessions_api.rs`) | session = 独立一等实体(role 是属性),resume-by-session-id;`{sid}` = gateway `s{n}`(持久);POST 空 role = roleless;`/resolve {token,selection}` 走 `Gateway::resolve_web_selection`(= IM 点击同路,**非** turn) |
@@ -410,6 +410,16 @@ gateway 的原则:失败必须可见,不能静默挂住。
 
 ---
 
+### 4.3 项目退役(atomic project retirement,v0.10.4)
+
+`ccteam project rm <slug>`(`ccteam-cli/src/commands.rs::run_remove`)与 `DELETE /api/v1/projects/{slug}`(`ccteam-web/src/routes/projects.rs`)都不自己删东西,而是让 daemon 走同一条脊柱 `Gateway::retire_project_shared`(`ccteam-im/src/gateway.rs`;CLI 经本机 `mcp.sock` JSON-RPC `ccteam/project-retire`,仅 socket-admin 提升可达,`mcp/dispatch.rs`):
+
+1. **durable 标记先行**:在稳定 progress lock inode(`state/progress/<slug>.lock`)持 flock 写 `RETIRED` 标记(`progress_bridge::mark_progress_retired`)。此后任何 writer(哪怕已排队等锁)拿到锁即见标记而失败(`require_active_progress_lock_locked`);daemon 中途死亡,下次启动 `enable_project_creation` 拒绝该 stale 行。未注册 / 非法 slug 在此之前即拒(`ProjectRetireError{marker_committed:false}`),**绝不为手误 slug 铸标记**。
+2. **内存围栏**:`retiring_projects`/`retired_projects`/`retirement_unknown` 三集合,`ensure_project_active` 与 `project_admission_blocked` **只查内存**(spawn/rebuild/resume/dispatch/scheduled/bot 模板/submit 全部 fail-closed);盘上标记只在 load-time(`enable_project_creation`/`register_project`/`ensure_project_loaded` 首载)与本脊柱内读。不可读标记 → `retirement_unknown`(阻断但保留在 roster),`refresh_unknown_retirement_shared` 单飞 per-slug、`spawn_blocking` 内用有界 `progress_state_is_retired_shared_try`(`LOCK_SH|LOCK_NB` + deadline)自愈,submit/resume 路径各重试一次。
+3. **停会话并 join**:`stop_session_shared` 先 abort+join 事件泵再 `close_thread`;close 失败则**完整重装**(sessions + principal + pump + chat 焦点)保持可重试,绝不留无泵僵尸。等 spawn 预留 drain、**项目级** cleanup tracker drain(`CleanupTaskTracker::drain_project`,不再等全局),移除 scheduled 行;委派 watch 双向处理(父在本项目 → 子 watch 解除;子在本项目 → 在同一 per-child `delegation-watch` claim 下解除并给活父投一条普通 user turn「委派已取消」,绝不与完成通知双投)。
+4. **清 progress 状态**:`cleanup_retired_progress_state` 删 journal/archive/checkpoint/index/receipts,**tombstone inode 永留**;`config::pick_unused_project_slug`/`append_project`/`upsert_project`/`init` 派生 slug 按 `progress_slug_reservation`(Retired 或仍有 state = 保留,裸旧 lock = 空闲)自动数字递增,显式 `--slug` 撞退役 slug = 拒绝。
+5. **调用方最后删 config 行**(`config.rs` 写入经 `state/config.lock` flock 串行 + 目录 fsync)。任何在标记之后的失败以 `ProjectRetireError{marker_committed:true}` 上报:web 500 + `retired:true` + `stage`,CLI 文案「已不可逆、重跑 `project rm`」,RPC `error.data.marker_committed`;CLI 在 ACK 之后的清理步骤一律 report-and-continue,未完成清理 exit 2(dry-run 永不 exit 2)。已注销 slug 的 `--purge` 只清由 `state.json` slug 证明归属的目录,绝不猜 `projects_root/<slug>`。
+
 ## 5. 数据与文件协议
 
 完整字段、JSON schema、文件命名规则、事件类型清单**以代码为准**(见 §10「协议 → 代码位置」指针表)。本节只保留架构约束:
@@ -625,6 +635,7 @@ MCP 工具共 **8**(v0.9-T1 cull 15→8:删 advise 2 / admin_change_persona+add_
 | role 库读取 | `crates/ccteam-core/src/roles.rs`(`list_roles` / `read_role` / `RoleSummary` / `RoleDetail`,frontmatter 解析) | `cargo test -p ccteam-core roles` |
 | 默认 cto role 模板 | `crates/ccteam-core/src/templates/cto_role.md`(导出 `ccteam_core::CTO_ROLE_MD`)+ `commands.rs::DEFAULT_AGENT_SCAFFOLDS` | — |
 | progress.jsonl 事件 schema | `crates/ccteam-harness/src/execution/progress_bridge.rs` + `enriched_event.rs`(`EventKind`) | schema 单一权威 |
+| **项目退役(v0.10.4,§4.3)** | 脊柱 `ccteam-im/src/gateway.rs`(`retire_project_shared`/`retire_project_after_marker`/`ensure_project_active`/`refresh_unknown_retirement_shared`/`stop_session_shared`)+ RPC `ccteam-im/src/mcp/dispatch.rs`(`execute_project_retire`)+ 存储围栏 `ccteam-harness/src/execution/progress_bridge.rs`(`mark_progress_retired`/`progress_state_is_retired{,_shared,_shared_try}`/`progress_slug_reservation`/`cleanup_retired_progress_state`)+ 注册表 `ccteam-core/src/config.rs`(`ConfigFileLock`/`preflight_project_upsert`/`pick_unused_project_slug`)+ 调用方 `ccteam-cli/src/commands.rs::run_remove`、`ccteam-web/src/routes/projects.rs::handle_delete_project` | `cargo test -p ccteam-im --lib retire`;`-p ccteam-cli --test remove_test`;`-p ccteam-web --test resource_api_test delete_project`;`-p ccteam-harness --lib progress_bridge::` |
 | chat turns.jsonl(按 sid)| `crates/ccteam-harness/src/execution/turns_mirror.rs`(`append_turn`/`read_all_turns`,目录键 = sid)+ live writer = `ccteam-im/src/gateway.rs`(`spawn_event_pump` ANSWER 分支按 `session.id` append) | `cargo test -p ccteam-im event_pump_writes_turns` |
 | CLI 命令 / flag(分组) | `crates/ccteam-cli/src/main.rs`(clap `Command` / `Project` / `Session` / `Internal`)+ `commands.rs` | `ccteam --help` |
 | `config` setup hub | `crates/ccteam-cli/src/commands.rs`(`run_config_menu` + `config <key> <value>`/`get`/`show`/`mcp`;包 `ccteam_im::onboarding::telegram_setup`) | `ccteam config show`;`cargo test -p ccteam-cli config` |

@@ -139,7 +139,7 @@ When running ccteam behind HTTPS, proxy the DSH companion listener as well as th
 
 In the new-session dialog, choose **+ New project...**, enter a slug and directory path, and ccteam registers that directory as a project. If the same slug already exists, ccteam appends a number such as `demo2` or `demo3`.
 
-Managing one afterwards happens where the project lives: hover its workspace header in the sidebar and open the **⋯** menu — start a session in it, copy its path, or **remove it from ccteam**. Removal asks you to type the slug, then deregisters the project and stops its live sessions; the directory on disk and your code are untouched, and you can add it back any time. (Same semantics as `ccteam project rm` and `DELETE /api/v1/projects/{slug}`.)
+Managing one afterwards happens where the project lives: hover its workspace header in the sidebar and open the **⋯** menu — start a session in it, copy its path, or **remove it from ccteam**. Removal asks you to type the slug, then the daemon retires the project atomically: it writes a durable tombstone first, stops and joins every session of that project, clears its progress state, and only then drops the catalog row. The directory on disk and your code are untouched. A retired slug is never reused — re-adding the same directory gets the next numeric slug (`demo2`). (Same semantics as `ccteam project rm` and `DELETE /api/v1/projects/{slug}`; both need a live daemon.)
 
 ### Start, Switch, and Drive Sessions
 
@@ -406,9 +406,11 @@ ccteam project ls                  # List known projects.
 ccteam project show demo           # Full project status and recent events.
 ccteam project new demo            # Create under <projects_root>/demo/ and init (collision appends demo2, demo3, …).
 ccteam project stop demo           # Stop all project sessions; resumable by id.
-ccteam project rm demo             # Deregister project and clear ccteam state.
-ccteam project rm demo --dry-run   # Preview what would stop/delete.
-ccteam project rm demo --purge     # Deregister and remove ccteam-owned project traces.
+ccteam project rm demo             # Retire via the daemon (tombstone → stop+join sessions → clear state → drop config row).
+ccteam project rm demo --dry-run   # Preview only; never contacts the daemon for a retire, never exits 2.
+ccteam project rm demo --purge     # Also remove ccteam-owned traces under the project (.ccteam/, hook section).
+# Exit codes: 0 done · 1 refused/nothing committed · 2 retirement committed but cleanup unfinished (re-run to finish).
+# A retired slug is permanently reserved: `ccteam init --slug demo` refuses, `ccteam init` in the same directory picks `demo2`.
 ```
 
 `rm --purge` removes only ccteam-owned traces: project `.ccteam/` and ccteam hook entries in `settings.local.json`. It **always keeps** your work roles, `CLAUDE.md` / `AGENTS.md`, `.env`, product code, and `.claude/settings.json`.

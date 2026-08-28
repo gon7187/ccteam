@@ -304,6 +304,12 @@
 - **规格**:completion notification = 固定 metadata 行(sid·title·时长·idle)+ final turn 尾部限幅(纯路由裁剪非模型总结);usage 缺失显式 `usage_source:unsupported`/`tokens_total:null`。
 - **DoD**:通知形态落地;kimi session 外显 usage unavailable;不改「turn 边界一次通知」语义。
 
+### STATUS-DUP-1 `ccteam status` 项目行重复(4g/dashigor 各出现两次;v0.10.4 收口真机实锤,0.10.3 已有)
+- **状态**:待排 · **冲突域**:`crates/ccteam-cli(status_view)` + `crates/ccteam-core(queries::collect_projects)` · **建议入口**:dev 会话(小改)
+- **背景**:本机 `ccteam status` 对同一 slug 打印两条项目行(含其会话行),web `GET /projects` 未见重复;疑 `collect_projects` 注册表行 + legacy 目录扫描(`seen_slugs`)去重键与 status 渲染的合并键不一致,或同 slug 多 host 条目。与 v0.10.4 退役改动无关(0.10.3 二进制同样复现)。
+- **规格**:先定位重复来源(注册表 vs legacy 扫描 vs host 维度),在**一层**去重;加 `status_view_test` 回归(同 slug 两来源 → 一行)。
+- **DoD**:`ccteam status` 每 slug 一行;测试无修则红。
+
 ### STATE-CULL-1 ProjectState 活字段迁家退役(STATUS-SLIM-1 裁决遗留;候选无授权)
 - **状态**:待排 · **冲突域**:`crates/ccteam-core(state) + crates/ccteam-im(watchdog) + crates/ccteam-cli(attach) + crates/ccteam-web(PTY/workflow)` · **建议入口**:版本波(拆卡时钉;`tmux_session` 项 gated on terminal 协议退役)
 - **背景**:STATUS-SLIM-1 已把 `team`/`current_phase`/`tmux_session` 清出 MCP wire;三字段在 `ProjectState`(state.json)仍有活消费者,深退役 = 三条迁家(codex 偏差申报 B 案字面):① `team` 消费方(init refresh/migration/web API/watchdog)统一改读 catalog 后删字段;② watchdog 告警文案去 `current_phase` 依赖后删;③ project 级 terminal/PTY 路由(`core::tmux`、CLI attach/peek、PTY websocket、workflow session detail)改 per-session meta 或随 terminal 协议整体退役后删。
