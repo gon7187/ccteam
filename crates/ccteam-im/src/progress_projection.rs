@@ -489,7 +489,21 @@ impl ProgressProjection {
         }
         let _ingest = match projection.ingest.try_lock() {
             Ok(guard) => guard,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // Another ingest pass (hydration or an observer catch-up) is
+                // in flight. A slightly stale snapshot is acceptable; an
+                // EMPTY one is not: when nothing has been folded yet for a
+                // journal that has bytes on disk, wait for that pass instead
+                // of answering "no events" to the first reader.
+                if offset == 0 && size > 0 {
+                    projection
+                        .ingest
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                } else {
+                    return Ok(());
+                }
+            }
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
         };
         self.catch_up_locked(slug, &projection, false)
@@ -1047,6 +1061,44 @@ mod tests {
         assert_eq!(snapshot.cost.cost_24h_by_vendor["claude"], 15.0);
         assert_eq!(snapshot.sessions["s1"].tokens_total, Some(1_000_000));
         assert_eq!(snapshot.tokens_24h, 1_000_000);
+    }
+
+    /// A query that races the first ingest of a journal must wait for it
+    /// rather than answer with an empty projection (the web project detail
+    /// used to read `events: []` / `total_cost_usd: 0` right after startup).
+    #[test]
+    fn first_query_waits_for_an_in_flight_ingest_instead_of_answering_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        write_lines(
+            &paths.progress_jsonl("busy"),
+            &[agent_done("s1", "claude", 0.42, fixed_now())],
+        );
+        let projection = projection(paths);
+        let slot = projection.slug("busy");
+        let in_flight = slot.ingest.lock().unwrap();
+
+        let reader = Arc::clone(&projection);
+        let query = std::thread::spawn(move || reader.project_snapshot("busy"));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !query.is_finished(),
+            "the first reader must wait for the in-flight ingest"
+        );
+        drop(in_flight);
+
+        let snapshot = query.join().unwrap();
+        assert_eq!(snapshot.workflow_events.len(), 1);
+        assert!((snapshot.cost.cost_total_usd - 0.42).abs() < 1e-9);
+
+        // Once folded, a busy ingest no longer blocks readers: a stale
+        // snapshot is served instead of waiting.
+        let in_flight = slot.ingest.lock().unwrap();
+        let reader = Arc::clone(&projection);
+        let query = std::thread::spawn(move || reader.project_snapshot("busy"));
+        let snapshot = query.join().unwrap();
+        drop(in_flight);
+        assert_eq!(snapshot.workflow_events.len(), 1);
     }
 
     #[test]
