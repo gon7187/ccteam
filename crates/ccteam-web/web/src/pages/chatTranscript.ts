@@ -326,42 +326,102 @@ export function historyToRows(events: SessionHistoryEvent[]): TranscriptRow[] {
   return rows;
 }
 
-function assistantSignature(row: TranscriptRow): string {
+function transcriptSignature(
+  content: string,
+  attachments?: OutboundAttachmentRef[],
+): string {
   return JSON.stringify([
-    row.content,
-    (row.attachments ?? []).map((attachment) => attachment.id),
+    content,
+    (attachments ?? []).map((attachment) => attachment.id),
   ]);
 }
 
-/** Overlay authoritative turn identities and persisted verdicts onto live
- * assistant rows without replacing transient activity/system rows. Live SSE
- * answers intentionally have no canonical turn id; a history refresh after
- * completion supplies it. Matching runs newest-first so repeated identical
- * answers bind to the correct latest turn. */
+function assistantSignature(row: TranscriptRow): string {
+  return transcriptSignature(row.content, row.attachments);
+}
+
+type AuthoritativeTerminalRow = TranscriptRow & { turnId: string };
+
+interface AuthoritativeTurn {
+  row: AuthoritativeTerminalRow;
+  signatures: Set<string>;
+}
+
+function applyAuthoritativeTurn(
+  row: TranscriptRow,
+  source: AuthoritativeTerminalRow,
+): TranscriptRow {
+  if (source.kind === "error") {
+    return {
+      id: row.id,
+      kind: "error",
+      content: source.content,
+      ts: row.ts ?? source.ts,
+      turnId: source.turnId,
+      outcome: "failed",
+      ...(source.errorKind ? { errorKind: source.errorKind } : {}),
+    };
+  }
+
+  const verdict = source.verdict ?? row.verdict;
+  const ts = row.ts ?? source.ts;
+  const outcome = source.outcome ?? row.outcome;
+  return {
+    ...row,
+    turnId: source.turnId,
+    ts,
+    ...(outcome ? { outcome } : {}),
+    ...(verdict ? { verdict } : {}),
+  };
+}
+
+/** Overlay authoritative terminal turn state onto live assistant rows without
+ * replacing transient activity/system rows. Live SSE answers intentionally
+ * have no canonical turn id; a history refresh supplies it and can also
+ * replace a provisional answer with the canonical failed/error row. Matching
+ * runs newest-first so repeated identical answers bind to the latest turn. */
 export function mergeAuthoritativeTurnMetadata(
   rows: TranscriptRow[],
   events: SessionHistoryEvent[],
 ): TranscriptRow[] {
-  const authoritative = historyToRows(events).filter(
-    (row): row is TranscriptRow & { turnId: string } =>
-      row.kind === "assistant" && typeof row.turnId === "string",
-  );
+  const authoritative: AuthoritativeTurn[] = [];
+  for (const event of events) {
+    const terminal = historyToRows([event]).find(
+      (row): row is AuthoritativeTerminalRow =>
+        (row.kind === "assistant" || row.kind === "error")
+        && typeof row.turnId === "string",
+    );
+    if (!terminal) continue;
+    const signatures = new Set([assistantSignature(terminal)]);
+    if (terminal.kind === "error") {
+      // A live SSE answer carries the provider's partial assistant content,
+      // while authoritative failed history renders the readable error. Either
+      // exact representation may be the provisional row we need to replace.
+      signatures.add(transcriptSignature(event.assistant, event.attachments));
+    }
+    authoritative.push({ row: terminal, signatures });
+  }
   if (authoritative.length === 0) return rows;
 
-  const byTurnId = new Map(authoritative.map((row) => [row.turnId, row]));
+  const byTurnId = new Map(authoritative.map((turn) => [turn.row.turnId, turn.row]));
   const claimed = new Set<string>();
   let changed = false;
   const next = rows.map((row) => {
-    if (row.kind !== "assistant" || !row.turnId) return row;
+    if ((row.kind !== "assistant" && row.kind !== "error") || !row.turnId) return row;
     claimed.add(row.turnId);
     const source = byTurnId.get(row.turnId);
     if (!source) return row;
-    const verdict = source.verdict ?? row.verdict;
-    const ts = row.ts ?? source.ts;
-    const outcome = source.outcome ?? row.outcome;
-    if (verdict === row.verdict && ts === row.ts && outcome === row.outcome) return row;
+    const merged = applyAuthoritativeTurn(row, source);
+    if (
+      merged.kind === row.kind
+      && merged.content === row.content
+      && merged.ts === row.ts
+      && merged.outcome === row.outcome
+      && merged.errorKind === row.errorKind
+      && merged.verdict === row.verdict
+    ) return row;
     changed = true;
-    return { ...row, ts, ...(outcome ? { outcome } : {}), ...(verdict ? { verdict } : {}) };
+    return merged;
   });
 
   let authoritativeCursor = authoritative.length - 1;
@@ -370,18 +430,16 @@ export function mergeAuthoritativeTurnMetadata(
     if (!row || row.kind !== "assistant" || row.turnId) continue;
     const signature = assistantSignature(row);
     for (let candidateIndex = authoritativeCursor; candidateIndex >= 0; candidateIndex -= 1) {
-      const source = authoritative[candidateIndex];
-      if (!source || claimed.has(source.turnId) || assistantSignature(source) !== signature) {
+      const candidate = authoritative[candidateIndex];
+      if (
+        !candidate
+        || claimed.has(candidate.row.turnId)
+        || !candidate.signatures.has(signature)
+      ) {
         continue;
       }
-      next[index] = {
-        ...row,
-        turnId: source.turnId,
-        ts: row.ts ?? source.ts,
-        ...(source.outcome ? { outcome: source.outcome } : {}),
-        ...(source.verdict ? { verdict: source.verdict } : {}),
-      };
-      claimed.add(source.turnId);
+      next[index] = applyAuthoritativeTurn(row, candidate.row);
+      claimed.add(candidate.row.turnId);
       authoritativeCursor = candidateIndex - 1;
       changed = true;
       break;

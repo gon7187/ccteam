@@ -221,6 +221,60 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
     ).toBe(false);
   });
 
+  it("fails closed for HTTP 429 and overloaded errors with capability wording", () => {
+    const posture = { vendor: "claude", model: "opus", effort: "max" } as const;
+    for (const error of [
+      new Error("HTTP 429: model opus is unavailable"),
+      new Error("provider overloaded: model opus is unavailable"),
+      Object.assign(new Error("model opus is unavailable"), {
+        status: 429,
+        code: "RATE_LIMITED",
+      }),
+    ]) {
+      expect(
+        isCommanderBootstrapCapabilityError(error, posture, ["claude", "codex"]),
+        error.message,
+      ).toBe(false);
+    }
+  });
+
+  it("fails closed for typed timeout, network, and internal failures", () => {
+    const posture = { vendor: "claude", model: "opus", effort: "max" } as const;
+    for (const details of [
+      { status: 408, code: "ETIMEDOUT" },
+      { code: "ETIMEDOUT" },
+      { code: "ECONNRESET" },
+      { code: "INTERNAL" },
+    ]) {
+      const error = Object.assign(new Error("model opus is unavailable"), details);
+      expect(
+        isCommanderBootstrapCapabilityError(error, posture, ["claude", "codex"]),
+        JSON.stringify(details),
+      ).toBe(false);
+    }
+  });
+
+  it("allows one fallback for an explicit Claude vendor-unavailable signal", () => {
+    const posture = { vendor: "claude", model: "opus", effort: "max" } as const;
+    expect(
+      isCommanderBootstrapCapabilityError(
+        new Error("Claude vendor is unavailable on this host"),
+        posture,
+        ["claude", "codex"],
+      ),
+    ).toBe(true);
+    expect(
+      isCommanderBootstrapCapabilityError(
+        Object.assign(new Error("vendor unavailable"), {
+          code: "VENDOR_UNAVAILABLE",
+          vendor: "claude",
+        }),
+        posture,
+        ["claude", "codex"],
+      ),
+    ).toBe(true);
+  });
+
   it("playbookFromState extracts only a string playbook id from router state", () => {
     expect(playbookFromState({ playbook: "advisor" })).toBe("advisor");
     expect(playbookFromState(null)).toBeNull();

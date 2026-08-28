@@ -401,7 +401,9 @@ describe("HomeView (landing page)", () => {
       "network: connection failed",
       "network failure: model opus is unavailable",
       "HTTP 403: project is not visible",
+      "HTTP 429: model opus is unavailable",
       "HTTP 500: model opus is unavailable",
+      "provider overloaded: model opus is unavailable",
       "request timed out while creating the session",
       "quota exceeded: model opus is unavailable",
       "budget guard rejected spawn: model opus is unavailable",
@@ -471,6 +473,70 @@ describe("HomeView (landing page)", () => {
     expect(message).not.toContain("\n");
     expect(createSession).toHaveBeenCalledTimes(2);
     expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("redacts auth headers, cookies, and named credentials from both launch causes", async () => {
+    const createSession = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error(
+          "invalid model `opus`\naccess_token=access-secret password=hunter2 secret=shared-secret\n"
+          + '{"access_token":"json-access","password":"json-pass","secret":"json-secret","cookie":"json-cookie","set-cookie":"json-set-cookie"}',
+        ),
+      )
+      .mockRejectedValueOnce(
+        new Error(
+          "codex start failed\nAuthorization: Basic YmFzaWMtc2VjcmV0\nCookie: sid=cookie-secret; theme=dark\nSet-Cookie: refresh=set-cookie-secret; HttpOnly",
+        ),
+      );
+    const failure = await createAndSubmitHomeTurn(
+      {
+        slug: "ccteam",
+        options: {
+          role: "",
+          vendor: "claude",
+          protocol: "stream-json",
+          model: "opus",
+          effort: "max",
+        },
+        text: "task",
+        attachments: [],
+        commander: true,
+        installedVendors: ["claude", "codex"],
+        catalog: {},
+      },
+      { createSession, submitTurn: vi.fn() },
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    const message = (failure as Error).message;
+    expect(message).toContain("primary: invalid model `opus`");
+    expect(message).toContain("fallback: codex start failed");
+    for (const label of [
+      "access_token=[redacted]",
+      "password=[redacted]",
+      "secret=[redacted]",
+      "Authorization: [redacted]",
+      "Cookie: [redacted]",
+      "Set-Cookie: [redacted]",
+    ]) {
+      expect(message).toContain(label);
+    }
+    for (const secret of [
+      "access-secret",
+      "hunter2",
+      "shared-secret",
+      "json-access",
+      "json-pass",
+      "json-secret",
+      "json-cookie",
+      "json-set-cookie",
+      "YmFzaWMtc2VjcmV0",
+      "cookie-secret",
+      "set-cookie-secret",
+    ]) {
+      expect(message).not.toContain(secret);
+    }
   });
 
   it("surfaces the actual successful posture before navigating", () => {

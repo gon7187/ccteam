@@ -581,16 +581,176 @@ describe("SessionView human verdict flow", () => {
     }
   });
 
-  it("keeps the live answer metadata when older mount and reconnect history resolve last", async () => {
-    let resolveInitial: (value: unknown) => void = () => {};
-    let resolveReconnect: (value: unknown) => void = () => {};
-    const initialHistory = new Promise((resolve) => {
-      resolveInitial = resolve;
+  it("replaces a live answer with an authoritative failure and shows no verdict controls", async () => {
+    const stream = {
+      events: [] as SessionEvent[],
+      connected: true,
+      connectionEpoch: 1,
+      lastError: null,
+      gatewayUnavailable: false,
+    };
+    const history = vi
+      .fn()
+      .mockResolvedValueOnce({ sid: "s9", events: [] })
+      .mockResolvedValueOnce({
+        sid: "s9",
+        events: [
+          {
+            turn_id: "t-failed",
+            ts: "2026-08-28T00:00:00Z",
+            role: "reviewer",
+            user: "review this",
+            assistant: "partial answer",
+            outcome: "failed",
+            error_kind: "server_overloaded",
+            error: "provider is overloaded",
+          },
+        ],
+      });
+
+    try {
+      const { renderView } = await mountVerdictView({ history, stream });
+      renderView();
+      await flushPromises();
+
+      stream.events = [
+        { id: "live-failed", kind: "answer", content: "partial answer" },
+      ];
+      renderView();
+      await flushPromises();
+      const tree = renderView();
+
+      expect(collectElementText(tree)).toContain("provider is overloaded");
+      expect(collectElementText(tree)).not.toContain("partial answer");
+      expect(findVerdictControls(tree)).toBeNull();
+    } finally {
+      unmountVerdictView();
+    }
+  });
+
+  it.each(["reseed-first", "overlay-first"] as const)(
+    "keeps the full reconnect window and metadata overlay when %s resolves",
+    async (order) => {
+      let resolveReconnect: (value: unknown) => void = () => {};
+      let resolveOverlay: (value: unknown) => void = () => {};
+      const reconnectHistory = new Promise((resolve) => {
+        resolveReconnect = resolve;
+      });
+      const overlayHistory = new Promise((resolve) => {
+        resolveOverlay = resolve;
+      });
+      const initialHistory = {
+        sid: "s9",
+        events: [
+          {
+            turn_id: "t-seed",
+            ts: "2026-08-28T00:00:00Z",
+            role: "reviewer",
+            user: "seed task",
+            assistant: "seed answer",
+            outcome: "completed",
+          },
+        ],
+        next_before: "cursor-old",
+        has_more: true,
+      };
+      const fullWindow = {
+        sid: "s9",
+        events: [
+          {
+            turn_id: "t-missed",
+            ts: "2026-08-28T00:30:00Z",
+            role: "reviewer",
+            user: "missed task",
+            assistant: "missed answer",
+          },
+        ],
+        next_before: "cursor-new",
+        has_more: true,
+      };
+      const metadataOverlay = {
+        sid: "s9",
+        events: [
+          {
+            turn_id: "t-live",
+            ts: "2026-08-28T01:00:00Z",
+            role: "reviewer",
+            user: "review this",
+            assistant: "fresh live answer",
+            outcome: "completed",
+            verdict: {
+              verdict: "accept" as const,
+              feedback: null,
+              ts: "2026-08-28T01:01:00Z",
+            },
+          },
+        ],
+        next_before: "metadata-cursor-must-not-win",
+        has_more: true,
+      };
+      const history = vi
+        .fn()
+        .mockResolvedValueOnce(initialHistory)
+        .mockReturnValueOnce(reconnectHistory)
+        .mockReturnValueOnce(overlayHistory)
+        .mockResolvedValueOnce({ sid: "s9", events: [], has_more: false });
+      const stream = {
+        events: [] as SessionEvent[],
+        connected: true,
+        connectionEpoch: 1,
+        lastError: null,
+        gatewayUnavailable: false,
+      };
+
+      try {
+        const { renderView } = await mountVerdictView({ history, stream });
+        renderView();
+        await flushPromises();
+
+        stream.connectionEpoch = 2;
+        renderView();
+        stream.events = [
+          { id: "live-answer", kind: "answer", content: "fresh live answer" },
+        ];
+        renderView();
+        expect(history).toHaveBeenCalledTimes(3);
+
+        if (order === "reseed-first") {
+          resolveReconnect(fullWindow);
+          await flushPromises();
+          resolveOverlay(metadataOverlay);
+        } else {
+          resolveOverlay(metadataOverlay);
+          await flushPromises();
+          resolveReconnect(fullWindow);
+        }
+        await flushPromises();
+        const tree = renderView();
+
+        expect(collectElementText(tree)).toContain("missed task");
+        const row = findVerdictControls(tree)?.props.row as {
+          content?: string;
+          turnId?: string;
+          verdict?: { verdict: string };
+        };
+        expect(row.content).toBe("fresh live answer");
+        expect(row.turnId).toBe("t-live");
+        expect(row.verdict?.verdict).toBe("accept");
+
+        (findByTestId(tree, "load-earlier")?.props.onClick as () => void)();
+        expect(history).toHaveBeenNthCalledWith(4, "s9", { before: "cursor-new" });
+      } finally {
+        unmountVerdictView();
+      }
+    },
+  );
+
+  it("discards a metadata overlay that started before a reconnect window", async () => {
+    let resolveStaleOverlay: (value: unknown) => void = () => {};
+    const staleOverlay = new Promise((resolve) => {
+      resolveStaleOverlay = resolve;
     });
-    const reconnectHistory = new Promise((resolve) => {
-      resolveReconnect = resolve;
-    });
-    const freshHistory = {
+    const currentWindow = {
       sid: "s9",
       events: [
         {
@@ -598,7 +758,7 @@ describe("SessionView human verdict flow", () => {
           ts: "2026-08-28T01:00:00Z",
           role: "reviewer",
           user: "review this",
-          assistant: "fresh live answer",
+          assistant: "same answer",
           outcome: "completed",
           verdict: {
             verdict: "accept" as const,
@@ -608,29 +768,11 @@ describe("SessionView human verdict flow", () => {
         },
       ],
     };
-    const staleHistory = {
-      sid: "s9",
-      events: [
-        {
-          turn_id: "t-stale",
-          ts: "2026-08-28T00:00:00Z",
-          role: "reviewer",
-          user: "old task",
-          assistant: "stale answer",
-          outcome: "completed",
-          verdict: {
-            verdict: "revise" as const,
-            feedback: "old feedback",
-            ts: "2026-08-28T00:01:00Z",
-          },
-        },
-      ],
-    };
     const history = vi
       .fn()
-      .mockReturnValueOnce(initialHistory)
-      .mockReturnValueOnce(reconnectHistory)
-      .mockResolvedValueOnce(freshHistory);
+      .mockResolvedValueOnce({ sid: "s9", events: [] })
+      .mockReturnValueOnce(staleOverlay)
+      .mockResolvedValueOnce(currentWindow);
     const stream = {
       events: [] as SessionEvent[],
       connected: true,
@@ -642,53 +784,37 @@ describe("SessionView human verdict flow", () => {
     try {
       const { renderView } = await mountVerdictView({ history, stream });
       renderView();
-      expect(history).toHaveBeenCalledTimes(1);
+      await flushPromises();
 
-      stream.connectionEpoch = 2;
+      stream.events = [{ id: "live-answer", kind: "answer", content: "same answer" }];
       renderView();
       expect(history).toHaveBeenCalledTimes(2);
 
-      stream.events = [
-        { id: "final-progress", kind: "progress", content: "done", done: true },
-      ];
-      renderView();
-      stream.events = [
-        ...stream.events,
-        {
-          id: "live-answer",
-          kind: "answer",
-          content: "fresh live answer",
-          done: false,
-        },
-      ];
+      stream.connectionEpoch = 2;
       renderView();
       await flushPromises();
-
-      let tree = renderView();
-      let row = findVerdictControls(tree)?.props.row as {
-        content?: string;
-        turnId?: string;
-        verdict?: { verdict: string };
-      };
       expect(history).toHaveBeenCalledTimes(3);
-      expect(row.content).toBe("fresh live answer");
-      expect(row.turnId).toBe("t-live");
-      expect(row.verdict?.verdict).toBe("accept");
 
-      resolveInitial(staleHistory);
-      resolveReconnect(staleHistory);
+      resolveStaleOverlay({
+        sid: "s9",
+        events: [
+          {
+            ...currentWindow.events[0],
+            verdict: {
+              verdict: "revise",
+              feedback: "stale",
+              ts: "2026-08-28T00:59:00Z",
+            },
+          },
+        ],
+      });
       await flushPromises();
-      tree = renderView();
-      row = findVerdictControls(tree)?.props.row as {
-        content?: string;
-        turnId?: string;
-        verdict?: { verdict: string };
-      };
+      const tree = renderView();
 
-      expect(collectElementText(tree)).not.toContain("stale answer");
-      expect(row.content).toBe("fresh live answer");
-      expect(row.turnId).toBe("t-live");
-      expect(row.verdict?.verdict).toBe("accept");
+      expect(
+        (findVerdictControls(tree)?.props.row as { verdict?: { verdict: string } }).verdict
+          ?.verdict,
+      ).toBe("accept");
     } finally {
       unmountVerdictView();
     }
@@ -745,6 +871,97 @@ describe("SessionView human verdict flow", () => {
 });
 
 describe("SessionView reconnect history reseed", () => {
+  it("hides the old cursor immediately and rejects its stale handler during reseed", async () => {
+    const harness = createHookHarness();
+    let stream = {
+      events: [],
+      connected: true,
+      connectionEpoch: 1,
+      lastError: null,
+      gatewayUnavailable: false,
+    };
+    let resolveReseed: (value: unknown) => void = () => {};
+    const reseed = new Promise((resolve) => {
+      resolveReseed = resolve;
+    });
+    const history = vi
+      .fn()
+      .mockResolvedValueOnce({
+        sid: "s9",
+        events: [
+          { turn_id: "t2", ts: "now", role: "cto", user: "new", assistant: "answer" },
+        ],
+        next_before: "cursor-old",
+        has_more: true,
+      })
+      .mockReturnValueOnce(reseed)
+      .mockResolvedValueOnce({ sid: "s9", events: [], has_more: false });
+
+    vi.resetModules();
+    vi.doMock("react", async () => ({
+      ...(await vi.importActual<typeof import("react")>("react")),
+      ...harness.hooks,
+    }));
+    vi.doMock("../hooks/useSessionEvents", async () => ({
+      ...(await vi.importActual<typeof import("../hooks/useSessionEvents")>(
+        "../hooks/useSessionEvents",
+      )),
+      useSessionEvents: () => stream,
+    }));
+    vi.doMock("../lib/sessionsApi", async () => ({
+      ...(await vi.importActual<typeof import("../lib/sessionsApi")>("../lib/sessionsApi")),
+      getHistory: history,
+      getSessionStatus: vi.fn().mockResolvedValue({
+        sid: "s9",
+        model: null,
+        context: null,
+        status_line: null,
+      }),
+    }));
+
+    try {
+      const View = (await import("./SessionView")).default;
+      const renderView = () => harness.render(() => View({ sid: "s9", session: SESSION }));
+
+      renderView();
+      await flushPromises();
+      let tree = renderView();
+      const staleLoad = findByTestId(tree, "load-earlier")?.props.onClick as () => void;
+      expect(staleLoad).toBeTypeOf("function");
+
+      stream = { ...stream, connectionEpoch: 2 };
+      tree = renderView();
+      expect(history).toHaveBeenCalledTimes(2);
+      expect(findByTestId(tree, "load-earlier")).toBeNull();
+      staleLoad();
+      expect(history).toHaveBeenCalledTimes(2);
+
+      resolveReseed({
+        sid: "s9",
+        events: [
+          {
+            turn_id: "t3",
+            ts: "newest",
+            role: "cto",
+            user: "reseeded",
+            assistant: "answer",
+          },
+        ],
+        next_before: "cursor-new",
+        has_more: true,
+      });
+      await flushPromises();
+      tree = renderView();
+      (findByTestId(tree, "load-earlier")?.props.onClick as () => void)();
+      expect(history).toHaveBeenNthCalledWith(3, "s9", { before: "cursor-new" });
+    } finally {
+      vi.doUnmock("react");
+      vi.doUnmock("../hooks/useSessionEvents");
+      vi.doUnmock("../lib/sessionsApi");
+      vi.resetModules();
+    }
+  });
+
   it("refetches authoritative history and restores an answer never delivered by SSE", async () => {
     const harness = createHookHarness();
     let stream = {

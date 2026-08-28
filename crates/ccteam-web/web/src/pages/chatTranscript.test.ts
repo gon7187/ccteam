@@ -410,6 +410,50 @@ describe("chatTranscript historyToRows", () => {
     ]);
   });
 
+  it("replaces a live assistant row with the authoritative failed turn", () => {
+    const live: TranscriptRow[] = [
+      {
+        id: "live-failed",
+        kind: "assistant",
+        content: "partial answer",
+        verdict: {
+          verdict: "accept",
+          feedback: null,
+          ts: "2026-08-28T00:01:00Z",
+        },
+      },
+    ];
+    const events: SessionHistoryEvent[] = [
+      {
+        turn_id: "t-failed",
+        ts: "2026-08-28T00:00:00Z",
+        role: "reviewer",
+        user: "review this",
+        assistant: "partial answer",
+        outcome: "failed",
+        error_kind: "server_overloaded",
+        error: "provider is overloaded",
+        verdict: {
+          verdict: "revise",
+          feedback: "try again",
+          ts: "2026-08-28T00:01:00Z",
+        },
+      },
+    ];
+
+    expect(mergeAuthoritativeTurnMetadata(live, events)).toEqual([
+      {
+        id: "live-failed",
+        kind: "error",
+        content: "provider is overloaded",
+        ts: "2026-08-28T00:00:00Z",
+        turnId: "t-failed",
+        outcome: "failed",
+        errorKind: "server_overloaded",
+      },
+    ]);
+  });
+
   it("matches repeated identical live answers from newest to oldest", () => {
     const rows: TranscriptRow[] = [
       { id: "live-1", kind: "assistant", content: "same" },

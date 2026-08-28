@@ -41,6 +41,7 @@ import {
   resolveApproval as apiResolveApproval,
   submitTurn,
   type OutboundAttachmentRef,
+  type SessionHistoryEvent,
   type SessionView as SessionSummary,
   type ScheduledItem,
   type TurnVerdict,
@@ -63,6 +64,54 @@ function formatAttachmentSize(size: number): string {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function overlayHistoryEvents(
+  windowEvents: SessionHistoryEvent[],
+  metadataEvents: SessionHistoryEvent[],
+): SessionHistoryEvent[] {
+  if (metadataEvents.length === 0) return windowEvents;
+  const merged = [...windowEvents];
+  const indexByTurnId = new Map(merged.map((event, index) => [event.turn_id, index]));
+  for (const event of metadataEvents) {
+    const index = indexByTurnId.get(event.turn_id);
+    if (index === undefined) {
+      indexByTurnId.set(event.turn_id, merged.length);
+      merged.push(event);
+    } else {
+      merged[index] = event;
+    }
+  }
+  return merged;
+}
+
+function reseedTranscriptRows(
+  windowEvents: SessionHistoryEvent[],
+  metadataEvents: SessionHistoryEvent[],
+  currentRows: TranscriptRow[],
+  rowsAtRequest: ReadonlyMap<string, TranscriptRow>,
+): { rows: TranscriptRow[]; shouldApplyOnMount: boolean } {
+  const authoritativeEvents = overlayHistoryEvents(windowEvents, metadataEvents);
+  const seeded = historyToRows(authoritativeEvents);
+  const changedSinceRequest = currentRows.filter(
+    (row) => rowsAtRequest.get(row.id) !== row,
+  );
+  const annotated = mergeAuthoritativeTurnMetadata(
+    changedSinceRequest,
+    authoritativeEvents,
+  );
+  const seededTurnIds = new Set(
+    seeded.flatMap((row) => (row.turnId ? [row.turnId] : [])),
+  );
+  const preserved = annotated.filter(
+    (row) => !row.turnId || !seededTurnIds.has(row.turnId),
+  );
+  return {
+    rows: [...seeded, ...preserved],
+    // An empty mount history intentionally keeps the localStorage fallback,
+    // unless something live arrived while that initial request was in flight.
+    shouldApplyOnMount: seeded.length > 0 || changedSinceRequest.length > 0,
+  };
 }
 
 /** A row's server-side timestamp (WEB-TS-1, `row.ts` — RFC 3339) rendered as
@@ -167,6 +216,7 @@ export default function SessionView({
   const [pendingTitle, setPendingTitle] = useState<string | null>(null);
   const [busyMark, setBusyMark] = useState<number | null>(null);
   const [rows, setRows] = useState<TranscriptRow[]>(() => loadRows(sid));
+  const rowsRef = useRef(rows);
   const verdictPendingRef = useRef(new Set<string>());
   const verdictMutationVersionRef = useRef(new Map<string, number>());
   const [verdictBusy, setVerdictBusy] = useState<Record<string, boolean>>({});
@@ -218,13 +268,25 @@ export default function SessionView({
   // Full/metadata refreshes and backwards pagination are independent request
   // lanes. A live answer may refresh canonical turn ids while an older page is
   // in flight; it must not invalidate that page or strand its loading flag.
+  const historyWindowRequestRef = useRef(0);
   const historyMetadataRequestRef = useRef(0);
   const historyPaginationRequestRef = useRef(0);
+  const historyMetadataEventsRef = useRef<SessionHistoryEvent[]>([]);
+  const historyWindowKey = `${sid}:${Math.max(connectionEpoch, 1)}`;
+  const historyWindowKeyRef = useRef(historyWindowKey);
+  useLayoutEffect(() => {
+    historyWindowKeyRef.current = historyWindowKey;
+  }, [historyWindowKey]);
+  useLayoutEffect(() => {
+    rowsRef.current = rows;
+  }, [rows]);
   const [historyPage, setHistoryPage] = useState({
+    windowKey: "",
     hasMore: false,
     nextBefore: null as string | null,
     loadingEarlier: false,
   });
+  const historyWindowReady = historyPage.windowKey === historyWindowKey;
   useEffect(() => {
     eventsRef.current = events;
   }, [events]);
@@ -232,24 +294,45 @@ export default function SessionView({
   // ---- authoritative seed: mirrored history (mount-scoped) -----------------
   useEffect(() => {
     let cancelled = false;
+    const mountWindowKey = `${sid}:1`;
     // ChatConsole keys this component by sid, but keep the component safe for
     // direct prop reuse too: an old sid's backwards page must never mutate the
     // new sid's rows or cursor after its deferred request settles.
     const paginationRequest = ++historyPaginationRequestRef.current;
+    ++historyMetadataRequestRef.current;
+    historyMetadataEventsRef.current = [];
+    const rowsAtRequest = new Map(rowsRef.current.map((row) => [row.id, row]));
     queueMicrotask(() => {
       if (cancelled || paginationRequest !== historyPaginationRequestRef.current) return;
-      setHistoryPage({ hasMore: false, nextBefore: null, loadingEarlier: false });
+      setHistoryPage({
+        windowKey: mountWindowKey,
+        hasMore: false,
+        nextBefore: null,
+        loadingEarlier: false,
+      });
     });
-    const request = ++historyMetadataRequestRef.current;
+    const request = ++historyWindowRequestRef.current;
     const verdictVersions = new Map(verdictMutationVersionRef.current);
     getHistory(sid)
       .then((h) => {
-        if (cancelled || request !== historyMetadataRequestRef.current) return;
-        const seeded = historyToRows(h.events);
-        if (seeded.length > 0) {
-          setRows((current) => preserveNewerVerdicts(seeded, current, verdictVersions));
-        }
+        if (
+          cancelled
+          || request !== historyWindowRequestRef.current
+          || mountWindowKey !== historyWindowKeyRef.current
+        ) return;
+        setRows((current) => {
+          const seeded = reseedTranscriptRows(
+            h.events,
+            historyMetadataEventsRef.current,
+            current,
+            rowsAtRequest,
+          );
+          return seeded.shouldApplyOnMount
+            ? preserveNewerVerdicts(seeded.rows, current, verdictVersions)
+            : current;
+        });
         setHistoryPage({
+          windowKey: mountWindowKey,
           hasMore: h.has_more === true,
           nextBefore: h.next_before ?? null,
           loadingEarlier: false,
@@ -271,24 +354,48 @@ export default function SessionView({
     if (connectionEpoch <= 1) return;
     let cancelled = false;
     // A reconnect replaces the whole window and its cursor. Invalidate any
-    // older page immediately and release its loading affordance even if the
-    // stale request later aborts, rejects, or resolves.
-    ++historyPaginationRequestRef.current;
+    // older page and pre-reconnect metadata overlay immediately. The metadata
+    // lane remains independent: a fresh live answer after this point can
+    // start a new overlay without cancelling the full-window request.
+    const paginationRequest = ++historyPaginationRequestRef.current;
+    ++historyMetadataRequestRef.current;
+    historyMetadataEventsRef.current = [];
+    const rowsAtRequest = new Map(rowsRef.current.map((row) => [row.id, row]));
     queueMicrotask(() => {
-      if (cancelled) return;
-      setHistoryPage((current) =>
-        current.loadingEarlier ? { ...current, loadingEarlier: false } : current,
-      );
+      if (
+        cancelled
+        || paginationRequest !== historyPaginationRequestRef.current
+        || historyWindowKey !== historyWindowKeyRef.current
+      ) return;
+      setHistoryPage({
+        windowKey: historyWindowKey,
+        hasMore: false,
+        nextBefore: null,
+        loadingEarlier: false,
+      });
     });
-    const request = ++historyMetadataRequestRef.current;
+    const request = ++historyWindowRequestRef.current;
     const verdictVersions = new Map(verdictMutationVersionRef.current);
     getHistory(sid)
       .then((h) => {
-        if (cancelled || request !== historyMetadataRequestRef.current) return;
-        foldedRef.current = eventsRef.current.length;
-        const seeded = historyToRows(h.events);
-        setRows((current) => preserveNewerVerdicts(seeded, current, verdictVersions));
+        if (
+          cancelled
+          || request !== historyWindowRequestRef.current
+          || historyWindowKey !== historyWindowKeyRef.current
+        ) return;
+        const foldBarrier = eventsRef.current.length;
+        setRows((current) => {
+          const seeded = reseedTranscriptRows(
+            h.events,
+            historyMetadataEventsRef.current,
+            current,
+            rowsAtRequest,
+          );
+          return preserveNewerVerdicts(seeded.rows, current, verdictVersions);
+        });
+        foldedRef.current = foldBarrier;
         setHistoryPage({
+          windowKey: historyWindowKey,
           hasMore: h.has_more === true,
           nextBefore: h.next_before ?? null,
           loadingEarlier: false,
@@ -300,17 +407,27 @@ export default function SessionView({
     return () => {
       cancelled = true;
     };
-  }, [sid, connectionEpoch, preserveNewerVerdicts]);
+  }, [sid, connectionEpoch, historyWindowKey, preserveNewerVerdicts]);
 
   const loadEarlier = useCallback(() => {
-    if (!historyPage.hasMore || !historyPage.nextBefore || historyPage.loadingEarlier) return;
+    if (
+      !historyWindowReady
+      || historyWindowKey !== historyWindowKeyRef.current
+      || !historyPage.hasMore
+      || !historyPage.nextBefore
+      || historyPage.loadingEarlier
+    ) return;
     const before = historyPage.nextBefore;
     const request = ++historyPaginationRequestRef.current;
+    const requestWindowKey = historyWindowKey;
     const verdictVersions = new Map(verdictMutationVersionRef.current);
     setHistoryPage((current) => ({ ...current, loadingEarlier: true }));
     getHistory(sid, { before })
       .then((history) => {
-        if (request !== historyPaginationRequestRef.current) return;
+        if (
+          request !== historyPaginationRequestRef.current
+          || requestWindowKey !== historyWindowKeyRef.current
+        ) return;
         const earlier = historyToRows(history.events);
         if (earlier.length > 0) {
           setRows((current) => [
@@ -319,6 +436,7 @@ export default function SessionView({
           ]);
         }
         setHistoryPage({
+          windowKey: requestWindowKey,
           hasMore: history.has_more === true,
           nextBefore: history.next_before ?? null,
           loadingEarlier: false,
@@ -328,12 +446,15 @@ export default function SessionView({
         /* The cursor remains retryable; finally releases the affordance. */
       })
       .finally(() => {
-        if (request !== historyPaginationRequestRef.current) return;
+        if (
+          request !== historyPaginationRequestRef.current
+          || requestWindowKey !== historyWindowKeyRef.current
+        ) return;
         setHistoryPage((current) =>
           current.loadingEarlier ? { ...current, loadingEarlier: false } : current,
         );
       });
-  }, [sid, historyPage, preserveNewerVerdicts]);
+  }, [sid, historyPage, historyWindowKey, historyWindowReady, preserveNewerVerdicts]);
 
   // ---- live SSE → append into this sid's transcript ------------------------
   useEffect(() => {
@@ -379,6 +500,7 @@ export default function SessionView({
     getHistory(sid)
       .then((history) => {
         if (cancelled || request !== historyMetadataRequestRef.current) return;
+        historyMetadataEventsRef.current = history.events;
         setRows((current) =>
           preserveNewerVerdicts(
             mergeAuthoritativeTurnMetadata(current, history.events),
@@ -789,7 +911,7 @@ export default function SessionView({
               data-testid="chat-scroll"
             >
               <div className="chat-inner">
-                {historyPage.hasMore ? (
+                {historyWindowReady && historyPage.hasMore ? (
                   <button
                     type="button"
                     className="btn ghost mini self-center"

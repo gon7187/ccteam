@@ -110,12 +110,28 @@ export function isCommanderBootstrapCapabilityError(
     return false;
   }
 
-  const message = error instanceof Error ? error.message : String(error);
+  const shape = error && typeof error === "object" ? (error as Record<string, unknown>) : null;
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof shape?.message === "string"
+        ? shape.message
+        : String(error);
+  const status = typeof shape?.status === "number" ? shape.status : null;
+  const code = typeof shape?.code === "string" ? shape.code : "";
+  const vendor = typeof shape?.vendor === "string" ? shape.vendor : "";
   if (
-    /(?:^|\b)(?:UNAUTHENTICATED|FORBIDDEN|NOT_FOUND)(?:\b|$)/i.test(message)
-    || /\bHTTP\s+(?:401|403|404)\b/i.test(message)
+    status === 429
+    || status === 408
+    || status === 401
+    || status === 403
+    || status === 404
+    || (status !== null && status >= 500)
+    || /(?:^|\b)(?:UNAUTHENTICATED|FORBIDDEN|NOT_FOUND)(?:\b|$)/i.test(message)
+    || /\bHTTP\s+(?:401|403|404|429)\b/i.test(message)
     || /\bHTTP\s+5\d\d\b/i.test(message)
-    || /\b(?:authentication|authorization|unauthorized|not authenticated|access denied|permission denied|credentials?|api key|subscription|rate.?limit|quota|budget|timed?\s*out|timeout)\b/i.test(message)
+    || /\b(?:authentication|authorization|unauthorized|not authenticated|access denied|permission denied|credentials?|api key|subscription|rate.?limit|too many requests|overload(?:ed|ing)?|quota|budget|timed?\s*out|timeout)\b/i.test(message)
+    || /^(?:RATE.?LIMIT(?:ED)?|TOO.?MANY(?:_REQUESTS)?|OVERLOAD(?:ED)?|UNAUTHENTICATED|FORBIDDEN|QUOTA|BUDGET|ETIMEDOUT|ECONN\w*|INTERNAL(?:_SERVER_ERROR)?|NETWORK(?:_ERROR)?|SERVICE_UNAVAILABLE)$/i.test(code)
     || /\b(?:ACL|guards?|guardrails?|delegation[ _-]?depth|depth[ _-]?limit|maximum[ _-]?depth|delegation[ _-]?cycle|cycles?|cyclic|child(?:ren)?[ _-]?limit)\b/i.test(message)
     || /\b(?:network|failed to fetch|fetch failed|connection[ _-]?(?:failed|refused|reset)|ECONN\w*|internal(?: server| state)? error|service unavailable)\b/i.test(message)
     || /\bproject\b[^\n]{0,80}\bnot visible\b/i.test(message)
@@ -131,6 +147,15 @@ export function isCommanderBootstrapCapabilityError(
     "i",
   );
   if (capabilityPattern.test(message)) return true;
+
+  const typedVendorUnavailable =
+    vendor.toLowerCase() === "claude"
+    && /^(?:VENDOR_UNAVAILABLE|VENDOR_NOT_AVAILABLE|VENDOR_NOT_INSTALLED)$/i.test(code);
+  const textVendorUnavailable =
+    /\b(?:claude\s+vendor|vendor\s+claude)\b[^\n]{0,80}\b(?:unavailable|not available|not installed|missing|unsupported)\b/i.test(
+      message,
+    );
+  if (typedVendorUnavailable || textVendorUnavailable) return true;
 
   const claudeAbsent = installedVendors !== null && !installedVendors.includes("claude");
   return claudeAbsent
@@ -171,17 +196,29 @@ export interface HomeTurnLaunchReceipt {
 }
 
 function sanitizeLaunchCause(error: unknown): string {
-  const raw = error instanceof Error ? error.message : String(error);
+  const raw = (error instanceof Error ? error.message : String(error)).replace(/\r\n?/g, "\n");
   const printable = Array.from(raw, (character) => {
+    if (character === "\n") return character;
     const code = character.charCodeAt(0);
     return code < 32 || code === 127 ? " " : character;
   }).join("");
-  const flattened = printable
+  const redacted = printable
+    .split("\n")
+    .map((line) =>
+      line
+        .replace(
+          /\b(authorization|proxy-authorization|set-cookie|cookie)\s*:\s*.*$/i,
+          "$1: [redacted]",
+        )
+        .replace(
+          /["']?\b(access_token|refresh_token|client_secret|api[ _-]?key|password|passwd|secret|token|set-cookie|cookie)\b["']?(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+          "$1$2[redacted]",
+        )
+        .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, "$1 [redacted]"),
+    )
+    .join(" ")
     .replace(/\s+/g, " ")
     .trim();
-  const redacted = flattened
-    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
-    .replace(/\b(token|authorization|api[ _-]?key)\s*[:=]\s*\S+/gi, "$1=[redacted]");
   return redacted.slice(0, 240) || "unknown";
 }
 
