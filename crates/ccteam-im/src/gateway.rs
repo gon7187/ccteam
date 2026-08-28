@@ -1022,6 +1022,14 @@ pub struct Gateway {
     /// the daemon's lifetime) but admission is fail-CLOSED until a clean read
     /// resolves it — see [`Self::refresh_unknown_retirement_shared`].
     retirement_unknown: BTreeSet<String>,
+    /// Single-flight registry of the unknown-retirement re-probes: one entry
+    /// per slug whose marker is being read on the blocking pool right now.
+    /// A `spawn_blocking` probe cannot be cancelled and parks on the marker's
+    /// `flock` with no timeout, so without this every caller that ran out of
+    /// budget would leave one more worker parked behind the same lock. Later
+    /// callers await the receiver instead of spawning a second probe; the
+    /// probe's owner task applies the verdict and removes the entry.
+    retirement_probes_in_flight: BTreeMap<String, tokio::sync::watch::Receiver<bool>>,
     /// Test hook fired on the blocking worker that resolves unknown delegation
     /// parents during a retire, so a test can prove the gateway mutex is FREE
     /// while that disk work runs. Compiled out of production builds.
@@ -2822,6 +2830,7 @@ impl Gateway {
             retiring_projects: BTreeSet::new(),
             retired_projects: BTreeSet::new(),
             retirement_unknown: BTreeSet::new(),
+            retirement_probes_in_flight: BTreeMap::new(),
             #[cfg(test)]
             orphan_scan_probe: None,
             #[cfg(test)]
@@ -5716,24 +5725,25 @@ impl Gateway {
     ///
     /// Pass `Some(slug)` to probe one project, `None` to sweep the whole set.
     ///
-    /// The caller's queue budget owns the whole helper: both lock acquisitions
-    /// go through [`GatewayDeadline::lock`] and the blocking probe is bounded
-    /// by the same instant, because `progress_state_is_retired_shared` parks
-    /// on an exclusive `flock` with no timeout of its own. Running out of
-    /// budget leaves the slug unknown — already the fail-closed outcome — so a
-    /// contended lock can never stall the caller past its own deadline.
+    /// The caller's queue budget bounds the CALLER only: lock acquisitions go
+    /// through [`GatewayDeadline::lock`] and the wait for the verdict stops at
+    /// the same instant, because `progress_state_is_retired_shared` parks on
+    /// an exclusive `flock` with no timeout of its own. Running out of budget
+    /// leaves the slug unknown — already the fail-closed outcome. The probe
+    /// itself is single-flight per slug (`retirement_probes_in_flight`) and
+    /// owned by a detached task: a `spawn_blocking` worker cannot be
+    /// cancelled, so repeated callers must join the outstanding probe rather
+    /// than park one more blocking-pool thread each behind the same lock.
     ///
-    /// The apply phase RE-VALIDATES: the probe runs off the lock, so the world
-    /// may have moved. A slug that left `retirement_unknown` meanwhile had its
-    /// state decided by somebody else, and a slug whose retire is in flight
-    /// owns its own teardown — neither may be overwritten by a stale verdict.
+    /// Verdicts are applied by [`Self::apply_unknown_retirement_verdicts`],
+    /// which re-validates against the live state.
     async fn refresh_unknown_retirement_shared(
         gateway: &Arc<tokio::sync::Mutex<Self>>,
         slug: Option<&str>,
         deadline: GatewayDeadline,
     ) {
-        let (targets, paths, probe) = {
-            let Ok(guard) = deadline.lock(gateway).await else {
+        let waiters = {
+            let Ok(mut guard) = deadline.lock(gateway).await else {
                 return;
             };
             if guard.retirement_unknown.is_empty() {
@@ -5747,16 +5757,63 @@ impl Gateway {
             let Some(paths) = guard.project_paths.clone() else {
                 return;
             };
-            (targets, paths, guard.retirement_refresh_probe())
-        };
-        let probe_targets = targets.clone();
-        let Ok(Ok(verdicts)) = tokio::time::timeout_at(
-            deadline.expires_at.into(),
-            tokio::task::spawn_blocking(move || {
-                if let Some(probe) = probe {
-                    probe();
+            // Single-flight per slug: a probe already on the blocking pool is
+            // joined, never duplicated. Only slugs nobody is probing get a
+            // fresh owner task.
+            let mut waiters = Vec::with_capacity(targets.len());
+            let mut owned = Vec::new();
+            for slug in targets {
+                if let Some(receiver) = guard.retirement_probes_in_flight.get(&slug) {
+                    waiters.push(receiver.clone());
+                    continue;
                 }
-                probe_targets
+                let (sender, receiver) = tokio::sync::watch::channel(false);
+                guard
+                    .retirement_probes_in_flight
+                    .insert(slug.clone(), receiver.clone());
+                waiters.push(receiver);
+                owned.push((slug, sender));
+            }
+            if !owned.is_empty() {
+                tokio::spawn(Self::run_unknown_retirement_probe(
+                    Arc::clone(gateway),
+                    owned,
+                    paths,
+                    guard.retirement_refresh_probe(),
+                ));
+            }
+            waiters
+        };
+        // Wait for the verdicts inside the caller's budget only. Running out
+        // of budget leaves the slug unknown (already the fail-closed outcome);
+        // the owner task still applies the verdict when the probe returns.
+        for mut waiter in waiters {
+            if tokio::time::timeout_at(deadline.expires_at.into(), waiter.changed())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Owner half of one unknown-retirement probe: reads the markers on a
+    /// blocking worker, applies the verdicts under the lock, then releases
+    /// the single-flight entries and wakes every waiter. Detached from any
+    /// caller on purpose — the blocking read cannot be cancelled, so its
+    /// result must land even after every caller ran out of budget.
+    async fn run_unknown_retirement_probe(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        owned: Vec<(String, tokio::sync::watch::Sender<bool>)>,
+        paths: CcteamPaths,
+        probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        let probe_targets: Vec<String> = owned.iter().map(|(slug, _)| slug.clone()).collect();
+        let verdicts = tokio::task::spawn_blocking(move || {
+            if let Some(probe) = probe {
+                probe();
+            }
+            probe_targets
                 .into_iter()
                 .map(|slug| {
                     let retired =
@@ -5766,44 +5823,59 @@ impl Gateway {
                     (slug, retired)
                 })
                 .collect::<Vec<_>>()
-            }),
-        )
-        .await
-        else {
-            return;
-        };
-        let Ok(mut guard) = deadline.lock(gateway).await else {
-            return;
-        };
+        })
+        .await;
+        {
+            let mut guard = gateway.lock().await;
+            for (slug, _) in &owned {
+                guard.retirement_probes_in_flight.remove(slug);
+            }
+            match verdicts {
+                Ok(verdicts) => guard.apply_unknown_retirement_verdicts(verdicts),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "ccteam-im: project retirement re-probe worker failed; admission stays blocked"
+                ),
+            }
+        }
+        for (_, sender) in owned {
+            let _ = sender.send(true);
+        }
+    }
+
+    /// Apply off-lock probe verdicts, RE-VALIDATING each one: the world may
+    /// have moved while the probe ran. A slug that left `retirement_unknown`
+    /// meanwhile had its state decided by somebody else, and a slug whose
+    /// retire is in flight owns its own teardown — neither may be overwritten
+    /// by a stale verdict.
+    fn apply_unknown_retirement_verdicts(&mut self, verdicts: Vec<(String, Result<bool>)>) {
         for (slug, verdict) in verdicts {
-            // The probe ran off the lock: a slug that is no longer unknown was
-            // decided while it was in flight, and this verdict is stale.
-            if !guard.retirement_unknown.contains(&slug) {
+            if !self.retirement_unknown.contains(&slug) {
                 continue;
             }
             match verdict {
                 Ok(false) => {
-                    guard.retirement_unknown.remove(&slug);
+                    self.retirement_unknown.remove(&slug);
                     tracing::info!(
                         %slug,
                         "ccteam-im: project retirement marker became readable; project is active again"
                     );
                 }
                 Ok(true) => {
-                    guard.retirement_unknown.remove(&slug);
-                    guard.retired_projects.insert(slug.clone());
+                    self.retirement_unknown.remove(&slug);
+                    self.retired_projects.insert(slug.clone());
                     // An in-flight retire owns the teardown ORDER: it still has
                     // to snapshot `delegations`/`projects` to cancel orphaned
                     // delegations. Dropping the routes here would wipe that
                     // snapshot and strand every one of them.
-                    if guard.retiring_projects.contains(&slug) {
+                    if self.retiring_projects.contains(&slug) {
                         tracing::info!(
                             %slug,
                             "ccteam-im: project retirement marker became readable during its own retire; leaving teardown to it"
                         );
                         continue;
                     }
-                    guard.remove_project_routes(&slug);
+                    self.remove_project_routes(&slug);
                     tracing::info!(
                         %slug,
                         "ccteam-im: project retirement marker became readable; project is retired"
@@ -12288,13 +12360,26 @@ impl Gateway {
             tokio::time::timeout_at(deadline.expires_at.into(), claims.lock_for_sid(session_id))
                 .await
                 .map_err(|_| GatewayRequestError::QueueDeadline)?;
-        let (plan, principals, cleanup_tasks) = {
-            let mut g = deadline.lock(&gateway).await?;
-            (
-                g.plan_resume_dead_session(session_id)?,
-                g.principals(),
-                g.cleanup_tasks.clone(),
-            )
+        // Every submit entry (directive branch, the needs_resume site and the
+        // post-`ThreadUnavailableBeforeDispatch` retry) funnels through here,
+        // so this is the one place the dead-thread admission gate gets its
+        // off-lock re-probe. `plan_resume_dead_session` gates before any side
+        // effect, so a refusal is safe to retry once after the heal.
+        let planned = deadline
+            .lock(&gateway)
+            .await?
+            .plan_resume_dead_session_snapshot(session_id);
+        let (plan, principals, cleanup_tasks) = match planned {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if !Self::heal_unknown_retirement(&gateway, &error, deadline).await {
+                    return Err(error);
+                }
+                deadline
+                    .lock(&gateway)
+                    .await?
+                    .plan_resume_dead_session_snapshot(session_id)?
+            }
         };
         let Some(plan) = plan else {
             return Ok(());
@@ -12322,6 +12407,22 @@ impl Gateway {
     /// a generation marker from the current thread. Returns `Ok(None)` when the
     /// child is already live (a concurrent resume already finished). Does **not**
     /// claim the sid (claim is async; the shared/`&mut self` wrappers own it).
+    #[allow(clippy::type_complexity)]
+    fn plan_resume_dead_session_snapshot(
+        &mut self,
+        session_id: &str,
+    ) -> Result<(
+        Option<ResumeDeadPlan>,
+        Arc<crate::principals::SessionPrincipals>,
+        CleanupTaskTracker,
+    )> {
+        Ok((
+            self.plan_resume_dead_session(session_id)?,
+            self.principals(),
+            self.cleanup_tasks.clone(),
+        ))
+    }
+
     fn plan_resume_dead_session(&mut self, session_id: &str) -> Result<Option<ResumeDeadPlan>> {
         let s = self
             .sessions
@@ -40687,6 +40788,149 @@ mod tests {
             gateway.lock().await.retirement_unknown.contains("alpha"),
             "an unfinished probe must leave the fence closed"
         );
+    }
+
+    /// W5 [0] — the dead-thread resume is the third admission gate on the
+    /// submit path and it used to escape unhealed: a session still rostered
+    /// in `sessions` whose vendor thread died was refused forever once its
+    /// project sat in `retirement_unknown`, even with a readable marker.
+    #[tokio::test]
+    async fn submit_self_heals_unknown_retirement_on_the_dead_thread_resume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        // Session stays rostered, but its vendor thread is gone ...
+        fake.live.store(false, Ordering::SeqCst);
+        // ... and a transient probe failure closed the fence on its project.
+        gateway.retirement_unknown.insert("alpha".to_string());
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        Gateway::submit_to_sid_shared(
+            Arc::clone(&gateway),
+            &sid,
+            "ping".to_string(),
+            GatewayDeadline::start(),
+        )
+        .await
+        .expect("the dead-thread resume must re-probe the marker and go through");
+
+        assert!(!gateway.lock().await.retirement_unknown.contains("alpha"));
+        assert_eq!(fake.submissions.lock().await.len(), 1);
+        assert!(
+            fake.live.load(Ordering::SeqCst),
+            "the resume must have revived the thread"
+        );
+    }
+
+    /// W5 [1] — the marker probe cannot be cancelled once it is on the
+    /// blocking pool, so N concurrent refreshes of one slug used to spawn N
+    /// workers that could all park on the same `flock`. At most one probe per
+    /// slug may be outstanding; later callers await that probe's verdict.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_retirement_refresh_single_flights_concurrent_probes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        gateway.retirement_unknown.insert("alpha".to_string());
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let probes = Arc::new(AtomicUsize::new(0));
+        {
+            let probes = Arc::clone(&probes);
+            gateway
+                .lock()
+                .await
+                .set_retirement_refresh_probe(Arc::new(move || {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(300));
+                }));
+        }
+
+        tokio::join!(
+            Gateway::refresh_unknown_retirement_shared(
+                &gateway,
+                Some("alpha"),
+                GatewayDeadline::start(),
+            ),
+            Gateway::refresh_unknown_retirement_shared(
+                &gateway,
+                Some("alpha"),
+                GatewayDeadline::start(),
+            ),
+        );
+
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "one slug, one outstanding probe"
+        );
+        let guard = gateway.lock().await;
+        assert!(
+            !guard.retirement_unknown.contains("alpha"),
+            "both callers must observe the shared verdict"
+        );
+        assert!(guard.retirement_probes_in_flight.is_empty());
+    }
+
+    /// W5 [1] — a probe that outlives the caller's budget keeps running on the
+    /// blocking pool. The next caller must NOT spawn a second worker behind
+    /// it; it observes "still unknown" and leaves. When the probe finally
+    /// returns, its verdict still lands even though nobody is waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_retirement_refresh_does_not_respawn_a_probe_past_the_deadline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+        gateway.retirement_unknown.insert("alpha".to_string());
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let probes = Arc::new(AtomicUsize::new(0));
+        {
+            let probes = Arc::clone(&probes);
+            gateway
+                .lock()
+                .await
+                .set_retirement_refresh_probe(Arc::new(move || {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(800));
+                }));
+        }
+        let short = || GatewayDeadline {
+            expires_at: Instant::now() + Duration::from_millis(100),
+        };
+
+        Gateway::refresh_unknown_retirement_shared(&gateway, Some("alpha"), short()).await;
+        assert!(gateway.lock().await.retirement_unknown.contains("alpha"));
+        Gateway::refresh_unknown_retirement_shared(&gateway, Some("alpha"), short()).await;
+        assert!(gateway.lock().await.retirement_unknown.contains("alpha"));
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "a retry inside an outstanding probe must not spawn another worker"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let guard = gateway.lock().await;
+        assert!(
+            !guard.retirement_unknown.contains("alpha"),
+            "the late verdict must still be applied"
+        );
+        assert!(guard.retirement_probes_in_flight.is_empty());
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
     }
     /// G5c — resolving a delegation parent that is neither live nor in the
     /// retired project falls through to `SessionCatalog`, one blocking
