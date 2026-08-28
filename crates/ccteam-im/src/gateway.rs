@@ -845,6 +845,9 @@ const IM_STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 /// every streamed token into a disk write and a file lock.
 const TURN_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const DELEGATION_NOTIFY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+/// Budget for one off-lock re-probe of an unreadable retirement marker; a
+/// contended progress lock past this leaves the slug unknown (fail-closed).
+const UNKNOWN_RETIREMENT_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 const DELEGATION_NOTIFY_MAX_ATTEMPTS: u8 = 3;
 
 fn delegation_notify_error_is_retryable(error: &anyhow::Error) -> bool {
@@ -5813,14 +5816,27 @@ impl Gateway {
             if let Some(probe) = probe {
                 probe();
             }
+            // Bounded acquisition: an exclusive writer (rotation, repair) must
+            // never park this worker. Past the budget the slug simply stays
+            // unknown — the fail-closed state the caller already holds.
+            let deadline = std::time::Instant::now() + UNKNOWN_RETIREMENT_PROBE_BUDGET;
             probe_targets
                 .into_iter()
-                .map(|slug| {
-                    let retired =
-                        ccteam_harness::execution::progress_bridge::progress_state_is_retired_shared(
-                            &paths.progress_jsonl(&slug),
-                        );
-                    (slug, retired)
+                .filter_map(|slug| {
+                    match ccteam_harness::execution::progress_bridge::progress_state_is_retired_shared_try(
+                        &paths.progress_jsonl(&slug),
+                        deadline,
+                    ) {
+                        Ok(Some(retired)) => Some((slug, Ok(retired))),
+                        Ok(None) => {
+                            tracing::warn!(
+                                %slug,
+                                "ccteam-im: project retirement re-probe could not take the progress lock in time; admission stays blocked"
+                            );
+                            None
+                        }
+                        Err(error) => Some((slug, Err(error))),
+                    }
                 })
                 .collect::<Vec<_>>()
         })

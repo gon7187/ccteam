@@ -1067,6 +1067,38 @@ pub fn progress_state_is_retired_shared(active_path: &Path) -> Result<bool> {
     }
 }
 
+/// Bounded variant of [`progress_state_is_retired_shared`] for callers that
+/// must never park a thread behind an exclusive writer (a rotation, a
+/// repair). The shared lock is acquired non-blocking in a short retry loop
+/// until `deadline`; `Ok(None)` means the verdict could not be read in time
+/// and the caller keeps whatever fail-closed state it already holds. Real
+/// I/O errors and torn markers are still `Err`.
+pub fn progress_state_is_retired_shared_try(
+    active_path: &Path,
+    deadline: std::time::Instant,
+) -> Result<Option<bool>> {
+    const RETRY_INTERVAL: Duration = Duration::from_millis(10);
+    let Some(lock_file) = open_existing_progress_lock(active_path, false)? else {
+        return Ok(Some(false));
+    };
+    let lock_path = progress_lock_path(active_path);
+    loop {
+        if let Some(_lock) = ProgressFileLock::try_lock_shared(&lock_file)
+            .with_context(|| format!("lock {}", lock_path.display()))?
+        {
+            return match read_progress_lock_state_locked(&lock_file, active_path)? {
+                ProgressLockState::LegacyEmpty | ProgressLockState::Active => Ok(Some(false)),
+                ProgressLockState::Retired => Ok(Some(true)),
+            };
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(RETRY_INTERVAL.min(deadline - now));
+    }
+}
+
 /// Why a slug cannot host a fresh progress generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressSlugReservation {
@@ -4628,6 +4660,17 @@ impl ProgressFileLock {
         Self::flock(file, libc::LOCK_SH)
     }
 
+    /// Non-blocking shared acquisition: `Ok(None)` when an exclusive holder
+    /// currently owns the lock, so a bounded reader can retry until its own
+    /// deadline instead of parking a thread.
+    fn try_lock_shared(file: &std::fs::File) -> std::io::Result<Option<Self>> {
+        match Self::flock(file, libc::LOCK_SH | libc::LOCK_NB) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     fn flock(file: &std::fs::File, operation: libc::c_int) -> std::io::Result<Self> {
         let fd = file.as_raw_fd();
         let rc = unsafe { libc::flock(fd, operation) };
@@ -4659,6 +4702,13 @@ impl ProgressFileLock {
     }
 
     fn lock_shared(_file: &std::fs::File) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "progress state locking is unsupported on this platform",
+        ))
+    }
+
+    fn try_lock_shared(_file: &std::fs::File) -> std::io::Result<Option<Self>> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "progress state locking is unsupported on this platform",
@@ -7637,6 +7687,58 @@ mod tests {
             assert!(progress_slug_is_reserved(&unsafe_path).is_err());
             assert_eq!(std::fs::read(outside).unwrap(), b"keep");
         }
+    }
+
+    #[test]
+    fn bounded_shared_read_yields_none_behind_an_exclusive_holder_and_a_verdict_once_free() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let active = tmp.path().join("state").join("progress").join("demo.jsonl");
+        append_event(&active, &json!({"event": "fixture"})).unwrap();
+
+        let writer = open_progress_lock(&active).unwrap();
+        let held = ProgressFileLock::lock(&writer).unwrap();
+        let started = std::time::Instant::now();
+        let verdict = progress_state_is_retired_shared_try(
+            &active,
+            std::time::Instant::now() + Duration::from_millis(150),
+        )
+        .unwrap();
+        assert_eq!(verdict, None, "an exclusive holder must not be waited out");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the bounded reader must return near its deadline, not park"
+        );
+        drop(held);
+
+        assert_eq!(
+            progress_state_is_retired_shared_try(
+                &active,
+                std::time::Instant::now() + Duration::from_millis(150),
+            )
+            .unwrap(),
+            Some(false)
+        );
+        mark_progress_retired(&active).unwrap();
+        assert_eq!(
+            progress_state_is_retired_shared_try(
+                &active,
+                std::time::Instant::now() + Duration::from_millis(150),
+            )
+            .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            progress_state_is_retired_shared_try(
+                &tmp.path()
+                    .join("state")
+                    .join("progress")
+                    .join("absent.jsonl"),
+                std::time::Instant::now(),
+            )
+            .unwrap(),
+            Some(false),
+            "no lock inode = not retired, no waiting"
+        );
     }
 
     #[test]
