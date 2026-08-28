@@ -1290,13 +1290,20 @@ fn run_doctor(opts: commands::DoctorOptions) -> Result<()> {
         }
         return Ok(());
     }
+    // The repair sweep is per-slug best effort, but a slug it could not sweep
+    // must never look like a clean run: print the whole report, then let the
+    // failure count feed the exit code so scripted `--repair-progress && …`
+    // flows stop instead of proceeding over an unswept home.
+    let mut repair_failed = 0_u64;
     if opts.repair_progress {
-        print!("{}", doctor::repair_progress(&paths)?);
+        let (body, failed) = doctor::repair_progress(&paths)?;
+        print!("{body}");
+        repair_failed = failed;
     }
     // Any other invocation is the full readiness checkup.
     let (body, any_fail) = doctor::run_readiness_checkup(&paths);
     print!("{body}");
-    if any_fail {
+    if any_fail || repair_failed > 0 {
         std::process::exit(1);
     }
     Ok(())
