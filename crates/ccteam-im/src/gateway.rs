@@ -7749,6 +7749,11 @@ impl Gateway {
             }
         };
         let model_id = role_model_id(Some(&role_detail));
+        // Fingerprints describe the exact immutable inputs handed to the new
+        // vendor process. Capture them before teardown/start: the role or skill
+        // files may change while the vendor awaits startup, and a post-start
+        // read would attribute the turn to inputs it never saw.
+        let fingerprints = Self::capture_spawn_fingerprints(cwd.clone(), role.clone()).await?;
 
         // Tear down the old pane + its event pump before re-spawning so the
         // same-sid pane is recreated cleanly and no stale pump keeps draining
@@ -7851,13 +7856,12 @@ impl Gateway {
             meta.model = model_id;
             meta.effort = effort;
             meta.mode = mode;
-            meta.role_sha =
-                ccteam_harness::execution::experience::role_fingerprint(&meta_dir, &meta_role);
-            meta.skills_sha = ccteam_harness::execution::experience::skills_fingerprint(&meta_dir);
+            meta.role_sha = fingerprints.role_sha.clone();
+            meta.skills_sha = fingerprints.skills_sha.clone();
             meta.last_active = chrono::Utc::now().to_rfc3339();
             let _ = self.persist_session_meta(&meta_dir, &meta);
         }
-        self.spawn_event_pump(&sid);
+        self.spawn_event_pump_with_fingerprints(&sid, Some(fingerprints));
         Ok(sid)
     }
 
@@ -8054,6 +8058,7 @@ impl Gateway {
         // notifier (the pump is detached + holds no gateway lock, so it can't
         // deliver the notification itself). `None` when no notifier is wired.
         let delegation_tx = self.delegation_tx.clone();
+        let cleanup_tasks = self.cleanup_tasks.clone();
         let pump_vendor = session.vendor;
         let pump_host = session.host.clone();
         let heartbeat_interval = self.turn_heartbeat_interval;
@@ -8615,7 +8620,6 @@ impl Gateway {
                         // v0.9 T5 — BEFORE clearing, capture duration + signals
                         // and append one kind:turn experience record (derived
                         // index; failure never breaks the pump).
-                        let mut terminal_completion_metadata = None;
                         if let Some(terminal) = terminal_accounting.as_ref() {
                             if terminal_closes_active {
                                 active_terminal_turn_id = None;
@@ -8669,8 +8673,6 @@ impl Gateway {
                                         },
                                     ),
                                 };
-                            terminal_completion_metadata = Some(terminal_metadata.clone());
-
                             let model_owned = terminal
                                 .model
                                 .as_deref()
@@ -8724,168 +8726,26 @@ impl Gateway {
                                     &terminal_metadata,
                                 )
                             });
-                            // The message was mirrored provisionally when it
-                            // arrived so delegation ordering remained durable.
-                            // At the vendor boundary append one terminal row
-                            // under the adapter's canonical id. History hides
-                            // provisional rows and exposes this exact row to the
-                            // verdict API, Experience and progress joins.
-                            let terminal_turn_record = is_completed.then(|| {
-                                ccteam_harness::execution::turns_mirror::TurnRecord {
-                                    turn_id: terminal.turn_id.clone(),
-                                    ts: chrono::Utc::now(),
-                                    vendor: vendor_str(session.vendor).to_string(),
-                                    role: session.role.clone(),
-                                    user: String::new(),
-                                    assistant: turn_last_answer
-                                        .as_ref()
-                                        .map(|(_, text)| text.clone())
-                                        .unwrap_or_default(),
-                                    usage: serde_json::to_value(terminal.usage)
-                                        .unwrap_or(serde_json::Value::Null),
-                                    tool_calls: Vec::new(),
-                                    attachments: Vec::new(),
-                                    outcome: Some("completed".to_string()),
-                                    error_kind: None,
-                                    error: None,
-                                }
-                            });
-                            let projection_dir = project_dir.clone();
-                            let projection_progress = progress_path.clone();
-                            let projection_sid = session_id.clone();
-                            let projection_turn_id = terminal.turn_id.clone();
-                            let terminal_protocol = session.protocol.is_terminal();
-                            let projection = tokio::task::spawn_blocking(move || {
-                                // One blocking transaction owns the flock and all
-                                // canonical/derived filesystem writes. Tokio workers
-                                // only await its result; a slow filesystem cannot
-                                // starve unrelated status or session requests.
-                                let experience_lock = projection_dir.as_ref().and_then(|dir| {
-                                    match ccteam_harness::execution::experience::lock_experience(dir)
-                                    {
-                                        Ok(lock) => Some(lock),
-                                        Err(err) => {
-                                            tracing::warn!(
-                                                session = %projection_sid,
-                                                error = %err,
-                                                "ccteam-im: failed to lock derived terminal projection"
-                                            );
-                                            None
-                                        }
-                                    }
-                                });
-                                // Terminal protocol's Stop hook owns its canonical
-                                // progress row. A paneless progress path is independent
-                                // of the registered project directory: losing the
-                                // directory degrades turns/Experience only, never the
-                                // progress SoT. When a directory exists, the derived
-                                // lock remains held across canonical and projection
-                                // writes.
-                                let mut canonical_progress_ready = terminal_protocol;
-                                if let (Some(path), Some(event)) =
-                                    (projection_progress.as_ref(), progress_event.as_ref())
-                                {
-                                    match ccteam_core::progress::append_chat_turn_completed_if_absent(
-                                        path, event,
-                                    ) {
-                                        Ok(admission)
-                                            if !admission.appended && !terminal_closes_active =>
-                                        {
-                                            return (true, false);
-                                        }
-                                        Ok(_) => canonical_progress_ready = true,
-                                        Err(err) => tracing::warn!(
-                                            session = %projection_sid,
-                                            error = %err,
-                                            "stream-json pump: failed to mirror canonical chat_turn_completed"
-                                        ),
-                                    }
-                                }
-                                let mut canonical_turn_ready = false;
-                                if let Some(dir) = projection_dir.as_ref() {
-                                    if let Some(turn_record) = terminal_turn_record.as_ref() {
-                                        match ccteam_harness::execution::turns_mirror::append_turn(
-                                            dir,
-                                            &projection_sid,
-                                            turn_record,
-                                        ) {
-                                            Ok(_) => canonical_turn_ready = true,
-                                            Err(err) => tracing::warn!(
-                                                session = %projection_sid,
-                                                error = %err,
-                                                "ccteam-im: failed to mirror canonical terminal turn"
-                                            ),
-                                        }
-                                    }
-                                    if let Some(experience_lock) = experience_lock
-                                        .as_ref()
-                                        .filter(|_| canonical_progress_ready || canonical_turn_ready)
-                                    {
-                                        if let Err(err) = ccteam_harness::execution::experience::append_experience_locked(
-                                            dir,
-                                            experience_lock,
-                                            &record,
-                                        ) {
-                                            tracing::warn!(
-                                                session = %projection_sid,
-                                                error = %err,
-                                                "ccteam-im: failed to append experience.jsonl"
-                                            );
-                                        }
-                                    } else if experience_lock.is_some() {
-                                        tracing::warn!(
-                                            session = %projection_sid,
-                                            turn_id = %projection_turn_id,
-                                            "ccteam-im: skipped derived experience without a canonical terminal write"
-                                        );
-                                    }
-                                }
-                                (false, canonical_turn_ready)
-                            })
-                            .await;
-                            let (ignored_duplicate, canonical_turn_ready) = match projection {
-                                Ok(outcome) => outcome,
-                                Err(err) => {
-                                    tracing::warn!(
-                                        session = %session_id,
-                                        error = %err,
-                                        "ccteam-im: terminal persistence task failed"
-                                    );
-                                    (false, false)
-                                }
+                            let failure = thread_event_failure(&evt).cloned();
+                            let finished_answer = if is_completed {
+                                turn_last_answer.take()
+                            } else {
+                                turn_last_answer = None;
+                                None
                             };
-                            if ignored_duplicate {
-                                tracing::debug!(
-                                    session = %session_id,
-                                    turn_id = %terminal.turn_id,
-                                    "pump: ignored durable duplicate terminal boundary"
-                                );
-                                continue;
-                            }
-                            if canonical_turn_ready {
-                                turn_covered.push(terminal.turn_id.clone());
-                            }
-
-                            if is_completed {
-                                let completed_origin =
-                                    take_turn_origin(&session, Some(&terminal.turn_id));
-                                let mirror_answer = mirror_last_answer.take();
-                                // v0.9.5 feedback fix — the vendor turn is DONE and
-                                // the child is idle: flush ONE boundary signal
-                                // carrying the turn's final answer (the last
-                                // mirrored message) + the whole turn's mirrored ids
-                                // for batch dedup. Interim messages already flowed
-                                // as non-boundary signals (an `all` watch consumes
-                                // those); the default `final` watch notifies here
-                                // and ONLY here.
-                                let finished = turn_last_answer.take();
-                                let covered = std::mem::take(&mut turn_covered);
-                                let notes = turn_notes;
-                                turn_notes = 0;
-                                if let (Some(dtx), Some((_provisional_turn, final_text))) =
-                                    (delegation_tx.as_ref(), finished.as_ref())
-                                {
-                                    let _ = dtx.send(crate::delegation::DelegationSignal {
+                            let completed_delivery = is_completed.then(|| {
+                                (
+                                    take_turn_origin(&session, Some(&terminal.turn_id)),
+                                    mirror_last_answer.take(),
+                                )
+                            });
+                            let notes = turn_notes;
+                            turn_notes = 0;
+                            let mut covered = std::mem::take(&mut turn_covered);
+                            covered.push(terminal.turn_id.clone());
+                            let boundary_signal = if is_completed {
+                                finished_answer.as_ref().map(|(_, final_text)| {
+                                    crate::delegation::DelegationSignal {
                                         child_sid: session_id.clone(),
                                         turn_id: terminal.turn_id.clone(),
                                         tail: final_text.clone(),
@@ -8894,46 +8754,121 @@ impl Gateway {
                                         boundary: true,
                                         vendor_error: false,
                                         interim_notes: notes.saturating_sub(1),
-                                        covered_turns: covered,
-                                    });
+                                        covered_turns: covered.clone(),
+                                    }
+                                })
+                            } else {
+                                failure.as_ref().map(|error| {
+                                    crate::delegation::DelegationSignal {
+                                        child_sid: session_id.clone(),
+                                        turn_id: terminal.turn_id.clone(),
+                                        tail: error.message.clone(),
+                                        vendor: pump_vendor,
+                                        host: pump_host.clone(),
+                                        boundary: true,
+                                        vendor_error: true,
+                                        interim_notes: notes,
+                                        covered_turns: covered.clone(),
+                                    }
+                                })
+                            };
+                            // The message was mirrored provisionally when it
+                            // arrived. The cleanup-owned finalizer appends one
+                            // canonical terminal row under the adapter id, then
+                            // projects Experience/meta and finally signals the
+                            // parent. Aborting this pump only drops the waiter.
+                            let terminal_turn_record =
+                                ccteam_harness::execution::turns_mirror::TurnRecord {
+                                    turn_id: terminal.turn_id.clone(),
+                                    ts: chrono::Utc::now(),
+                                    vendor: vendor_str(session.vendor).to_string(),
+                                    role: session.role.clone(),
+                                    user: String::new(),
+                                    assistant: if is_completed {
+                                        finished_answer
+                                            .as_ref()
+                                            .map(|(_, text)| text.clone())
+                                            .unwrap_or_default()
+                                    } else {
+                                        failure
+                                            .as_ref()
+                                            .map(|error| error.message.clone())
+                                            .unwrap_or_default()
+                                    },
+                                    usage: serde_json::to_value(terminal.usage)
+                                        .unwrap_or(serde_json::Value::Null),
+                                    tool_calls: Vec::new(),
+                                    attachments: Vec::new(),
+                                    outcome: Some(terminal.outcome.to_string()),
+                                    error_kind: failure
+                                        .as_ref()
+                                        .map(|error| error.kind.clone()),
+                                    error: failure
+                                        .as_ref()
+                                        .map(|error| error.message.clone()),
+                                };
+                            let persistence = TerminalPersistencePlan {
+                                project_dir: project_dir.clone(),
+                                progress_path: progress_path.clone(),
+                                progress_event,
+                                sid: session_id.clone(),
+                                slug: session.project.clone(),
+                                turn_record: terminal_turn_record,
+                                experience_record: record,
+                                vendor: session.vendor,
+                                progress_projection: progress_projection.clone(),
+                                session_catalog: Arc::clone(&session_catalog),
+                            };
+                            let finalizer_tx = delegation_tx.clone();
+                            let finalizer = cleanup_tasks.spawn_result(async move {
+                                let outcome = match tokio::task::spawn_blocking(move || {
+                                    persist_terminal_finalization(persistence)
+                                })
+                                .await
+                                {
+                                    Ok(outcome) => outcome,
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            error = %err,
+                                            "ccteam-im: terminal persistence task failed"
+                                        );
+                                        TerminalCanonicalOutcome::Degraded
+                                    }
+                                };
+                                if outcome == TerminalCanonicalOutcome::NewlyCanonical {
+                                    if let (Some(tx), Some(signal)) =
+                                        (finalizer_tx.as_ref(), boundary_signal)
+                                    {
+                                        let _ = tx.send(signal);
+                                    }
                                 }
-                                if let Some((final_text, reply_to)) = mirror_answer {
-                                    mirror_internal_web_answer(
-                                        &tx,
-                                        mirror_paths.as_ref(),
-                                        &session,
-                                        &reply_to,
-                                        completed_origin,
-                                        &session_id,
-                                        seq,
-                                        &final_text,
-                                    );
-                                }
+                                outcome
+                            });
+                            let canonical = finalizer
+                                .await
+                                .unwrap_or(TerminalCanonicalOutcome::Degraded);
+                            if canonical == TerminalCanonicalOutcome::AlreadyCanonical
+                                && !terminal_closes_active
+                            {
+                                tracing::debug!(
+                                    session = %session_id,
+                                    turn_id = %terminal.turn_id,
+                                    "pump: ignored durable duplicate terminal boundary"
+                                );
+                                continue;
                             }
-                        }
-                        // v0.8.11 E4 — for a paneless session (no hooks:
-                        // stream-json AND acp), the pump mirrors each terminal
-                        // turn's accounting to progress.jsonl with the sid, so the
-                        // session-list activity classifier (which keys off the
-                        // latest sid-tagged event) sees it as active and
-                        // `last_activity_seconds` tracks — and the per-session
-                        // cost/token accounting has its `usage` row for EVERY
-                        // vendor (v0.9.5 feedback: codex/grok/opencode/kimi
-                        // sessions previously never accrued a ledger row on the
-                        // acp path). Tmux sessions get this from their Stop
-                        // hook → gate on protocol to avoid a double-write.
-                        if terminal_completion_metadata.is_some() {
-                            // Fold the canonical row just appended into meta.json
-                            // now; a one-turn session has no later answer on which
-                            // to piggyback this accounting refresh.
-                            if let Some(dir) = project_dir.as_ref() {
-                                refresh_session_activity_meta(
-                                    dir,
-                                    &session.project,
+                            if let Some((completed_origin, Some((final_text, reply_to)))) =
+                                completed_delivery
+                            {
+                                mirror_internal_web_answer(
+                                    &tx,
+                                    mirror_paths.as_ref(),
+                                    &session,
+                                    &reply_to,
+                                    completed_origin,
                                     &session_id,
-                                    session.vendor,
-                                    progress_projection.as_deref(),
-                                    &session_catalog,
+                                    seq,
+                                    &final_text,
                                 );
                             }
                         }
@@ -8964,22 +8899,13 @@ impl Gateway {
 
                             seq = seq.saturating_add(1);
                             session.visible_events.fetch_add(1, Ordering::SeqCst);
-                            // v0.8.8 F1 — 落盘这条 assistant 回复到
-                            // `.ccteam/chat/<sid>/turns.jsonl`(生产唯一 live
-                            // writer)。这是 SPA / cto session_collect 历史读侧的
-                            // 数据源,缺它历史永远为空。`append_turn` 是 O_APPEND
-                            // 原子单写(PIPE_BUF-atomic)、不持 gateway 锁,放热路
-                            // 径安全;目录已按 sid 隔离,故 TurnRecord 不带
-                            // session_id 字段。普通 assistant 行用 pump 内单调
-                            // `seq` 派生临时 id,并显式标为 interim;终态失败
-                            // 用 adapter 的 canonical id。失败只 warn,绝不阻断
-                            // 回复投递。
-                            if let Some(dir) = project_dir.as_ref() {
-                                let failure = thread_event_failure(&evt);
-                                let record_turn_id = terminal_accounting
-                                    .as_ref()
-                                    .map(|terminal| terminal.turn_id.clone())
-                                    .unwrap_or_else(|| format!("{session_id}-{seq}"));
+                            // Ordinary assistant messages are provisional rows.
+                            // A completed/failed vendor boundary was already
+                            // persisted by the cleanup-owned finalizer above;
+                            // never let this delivery path claim that key again.
+                            if terminal_accounting.is_none() {
+                                if let Some(dir) = project_dir.as_ref() {
+                                    let record_turn_id = format!("{session_id}-{seq}");
                                 let record = ccteam_harness::execution::turns_mirror::TurnRecord {
                                     turn_id: record_turn_id,
                                     ts: chrono::Utc::now(),
@@ -8992,13 +8918,9 @@ impl Gateway {
                                     usage: serde_json::Value::Null,
                                     tool_calls: Vec::new(),
                                     attachments: Vec::new(),
-                                    outcome: Some(if failure.is_some() {
-                                        "failed".to_string()
-                                    } else {
-                                        "interim".to_string()
-                                    }),
-                                    error_kind: failure.map(|err| err.kind.clone()),
-                                    error: failure.map(|err| err.message.clone()),
+                                    outcome: Some("interim".to_string()),
+                                    error_kind: None,
+                                    error: None,
                                 };
                                 match ccteam_harness::execution::turns_mirror::append_turn(
                                     dir,
@@ -9014,56 +8936,22 @@ impl Gateway {
                                         // this turn. Fire-and-forget; the notifier
                                         // filters non-watched sids.
                                         //
-                                        // v0.9.5 feedback fix — notification unit =
-                                        // the TASK: a TurnFailed text IS the
-                                        // turn boundary (flush immediately, folding
-                                        // any interim notes); an ordinary assistant
-                                        // message flows as an interim signal (only
-                                        // an `all` watch notifies) and is remembered
-                                        // as the boundary candidate flushed on
-                                        // `TurnCompleted` above.
-                                        let is_boundary_evt = matches!(
-                                            &evt,
-                                            ThreadEvent::TurnFailed { .. }
-                                        );
                                         turn_covered.push(record.turn_id.clone());
-                                        if is_boundary_evt {
-                                            let notes = turn_notes;
-                                            turn_notes = 0;
-                                            turn_last_answer = None;
-                                            let covered = std::mem::take(&mut turn_covered);
-                                            if let Some(dtx) = delegation_tx.as_ref() {
-                                                let _ = dtx.send(crate::delegation::DelegationSignal {
-                                                    child_sid: session_id.clone(),
-                                                    turn_id: record.turn_id.clone(),
-                                                    tail: text.clone(),
-                                                    vendor: pump_vendor,
-                                                    host: pump_host.clone(),
-                                                    boundary: true,
-                                                    vendor_error: true,
-                                                    interim_notes: notes,
-                                                    covered_turns: covered,
-                                                });
-                                            }
-                                        } else {
-                                            turn_notes = turn_notes.saturating_add(1);
-                                            turn_last_answer = Some((
-                                                record.turn_id.clone(),
-                                                text.clone(),
-                                            ));
-                                            if let Some(dtx) = delegation_tx.as_ref() {
-                                                let _ = dtx.send(crate::delegation::DelegationSignal {
-                                                    child_sid: session_id.clone(),
-                                                    turn_id: record.turn_id.clone(),
-                                                    tail: text.clone(),
-                                                    vendor: pump_vendor,
-                                                    host: pump_host.clone(),
-                                                    boundary: false,
-                                                    vendor_error: false,
-                                                    interim_notes: 0,
-                                                    covered_turns: vec![record.turn_id.clone()],
-                                                });
-                                            }
+                                        turn_notes = turn_notes.saturating_add(1);
+                                        turn_last_answer =
+                                            Some((record.turn_id.clone(), text.clone()));
+                                        if let Some(dtx) = delegation_tx.as_ref() {
+                                            let _ = dtx.send(crate::delegation::DelegationSignal {
+                                                child_sid: session_id.clone(),
+                                                turn_id: record.turn_id.clone(),
+                                                tail: text.clone(),
+                                                vendor: pump_vendor,
+                                                host: pump_host.clone(),
+                                                boundary: false,
+                                                vendor_error: false,
+                                                interim_notes: 0,
+                                                covered_turns: vec![record.turn_id.clone()],
+                                            });
                                         }
                                     }
                                     Err(err) => {
@@ -9084,6 +8972,7 @@ impl Gateway {
                                     progress_projection.as_deref(),
                                     &session_catalog,
                                 );
+                                }
                             }
                             // Resolve the live reply target ONCE (reply_to → owner
                             // fallback, same as pump_target) and reuse it for the
@@ -18385,6 +18274,151 @@ struct TerminalTurnAccounting {
     outcome: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalCanonicalOutcome {
+    NewlyCanonical,
+    AlreadyCanonical,
+    Degraded,
+}
+
+struct TerminalPersistencePlan {
+    project_dir: Option<PathBuf>,
+    progress_path: Option<PathBuf>,
+    progress_event: Option<serde_json::Value>,
+    sid: String,
+    slug: String,
+    turn_record: ccteam_harness::execution::turns_mirror::TurnRecord,
+    experience_record: ccteam_harness::execution::experience::ExperienceRecord,
+    vendor: AgentVendor,
+    progress_projection: Option<Arc<crate::progress_projection::ProgressProjection>>,
+    session_catalog: Arc<crate::session_catalog::SessionCatalog>,
+}
+
+/// Append one canonical terminal row under a per-sid exclusion window.
+///
+/// The bounded 256-row tail is the durable twin of [`RecentTerminalDedup`]: it
+/// makes live cancellation/re-attachment exactly-once without turning every
+/// turn into an O(full-history) scan. A process crash still has the documented
+/// at-least-once/reconcile contract (a replay older than this window may append
+/// again). Interim/user rows with the same vendor id do not count; only an
+/// existing completed/failed boundary owns the key.
+fn append_terminal_turn_if_absent(
+    project_dir: &Path,
+    sid: &str,
+    record: &ccteam_harness::execution::turns_mirror::TurnRecord,
+) -> Result<TerminalCanonicalOutcome> {
+    ccteam_harness::execution::turns_mirror::ensure_dir(project_dir, sid)?;
+    #[cfg(unix)]
+    let _lock_file = {
+        use std::os::fd::AsRawFd;
+
+        let lock_path = ccteam_harness::execution::turns_mirror::chat_dir(project_dir, sid)
+            .join("terminal.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open {}", lock_path.display()))?;
+        let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("lock {}", lock_path.display()));
+        }
+        lock
+    };
+    // Windows has no std file-lock API. The daemon is the sole live turns
+    // writer, so a process-stable fallback preserves the same live exactly-once
+    // contract there; crash recovery remains at-least-once as documented above.
+    #[cfg(not(unix))]
+    let _process_lock = {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    };
+    let already = ccteam_harness::execution::turns_mirror::last_n_turns(
+        project_dir,
+        sid,
+        RecentTerminalDedup::CAPACITY,
+    )?
+    .into_iter()
+    .any(|row| {
+        row.turn_id == record.turn_id
+            && matches!(row.outcome.as_deref(), Some("completed" | "failed"))
+    });
+    if already {
+        return Ok(TerminalCanonicalOutcome::AlreadyCanonical);
+    }
+    ccteam_harness::execution::turns_mirror::append_turn(project_dir, sid, record)?;
+    Ok(TerminalCanonicalOutcome::NewlyCanonical)
+}
+
+fn persist_terminal_finalization(plan: TerminalPersistencePlan) -> TerminalCanonicalOutcome {
+    let experience_lock = plan.project_dir.as_ref().and_then(|dir| {
+        match ccteam_harness::execution::experience::lock_experience(dir) {
+            Ok(lock) => Some(lock),
+            Err(err) => {
+                tracing::warn!(
+                    session = %plan.sid,
+                    error = %err,
+                    "ccteam-im: failed to lock derived terminal projection"
+                );
+                None
+            }
+        }
+    });
+    if let (Some(path), Some(event)) = (plan.progress_path.as_ref(), plan.progress_event.as_ref()) {
+        if let Err(err) = ccteam_core::progress::append_chat_turn_completed_if_absent(path, event) {
+            tracing::warn!(
+                session = %plan.sid,
+                error = %err,
+                "stream-json pump: failed to mirror canonical chat_turn_completed"
+            );
+        }
+    }
+    let Some(project_dir) = plan.project_dir.as_ref() else {
+        return TerminalCanonicalOutcome::Degraded;
+    };
+    let canonical = match append_terminal_turn_if_absent(project_dir, &plan.sid, &plan.turn_record)
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::warn!(
+                session = %plan.sid,
+                error = %err,
+                "ccteam-im: failed to mirror canonical terminal turn"
+            );
+            return TerminalCanonicalOutcome::Degraded;
+        }
+    };
+    if canonical == TerminalCanonicalOutcome::NewlyCanonical {
+        if let Some(lock) = experience_lock.as_ref() {
+            if let Err(err) = ccteam_harness::execution::experience::append_experience_locked(
+                project_dir,
+                lock,
+                &plan.experience_record,
+            ) {
+                tracing::warn!(
+                    session = %plan.sid,
+                    error = %err,
+                    "ccteam-im: failed to append experience.jsonl"
+                );
+            }
+        }
+    }
+    refresh_session_activity_meta(
+        project_dir,
+        &plan.slug,
+        &plan.sid,
+        plan.vendor,
+        plan.progress_projection.as_deref(),
+        &plan.session_catalog,
+    );
+    canonical
+}
+
 /// Bounded duplicate fence for the serial canonical event stream.
 ///
 /// A turn may emit a terminal failure followed by one late cleanup boundary;
@@ -27419,6 +27453,259 @@ mod tests {
         tokio::task::spawn_blocking(move || locker.join().unwrap())
             .await
             .unwrap();
+    }
+
+    async fn assert_aborted_pump_finishes_watched_terminal_boundary(failed: bool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(if failed {
+            FakeAdapter::new(AgentVendor::Claude).with_turn_failure("vendor failed")
+        } else {
+            FakeAdapter::new(AgentVendor::Claude).with_turn_boundary()
+        });
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(event_tx);
+        let (delegation_tx, mut delegation_rx) = tokio::sync::mpsc::unbounded_channel();
+        gateway.set_delegation_notifier_tx(delegation_tx);
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        assert!(gateway.arm_delegation_watch(
+            &sid,
+            "parent-sid",
+            ccteam_harness::NotifyMode::Final,
+            Some("watched task".into()),
+            None,
+        ));
+        let turn_id = format!("turn-{}", gateway.sessions[&sid].thread.identity);
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        let lock_dir = project_dir.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let locker = std::thread::spawn(move || {
+            let _lock = ccteam_harness::execution::experience::lock_experience(&lock_dir)
+                .expect("hold experience projection lock");
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("experience projection lock held");
+
+        Gateway::submit_web_sid_shared(
+            Arc::clone(&gateway),
+            &sid,
+            "work".into(),
+            false,
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let terminal_pending = fake.events.lock().await.iter().any(|(_, event)| {
+                    matches!(
+                        event,
+                        ThreadEvent::TurnCompleted { .. } | ThreadEvent::TurnFailed { .. }
+                    )
+                });
+                let in_flight = gateway.lock().await.session_turn_in_flight(&sid);
+                if !terminal_pending && !in_flight {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pump consumed the terminal event and entered persistence");
+
+        Gateway::stop_session_shared(Arc::clone(&gateway), &sid)
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+        tokio::task::spawn_blocking(move || locker.join().unwrap())
+            .await
+            .unwrap();
+        Gateway::drain_cleanup_tasks_shared(&gateway).await;
+
+        let terminal_rows = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let rows =
+                    ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &sid)
+                        .unwrap();
+                let terminal = rows
+                    .iter()
+                    .filter(|row| {
+                        row.turn_id == turn_id
+                            && matches!(row.outcome.as_deref(), Some("completed" | "failed"))
+                    })
+                    .count();
+                if terminal > 0 {
+                    break (rows, terminal);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cleanup-owned finalizer writes the canonical terminal turn");
+        assert_eq!(terminal_rows.1, 1, "terminal row must not be duplicated");
+
+        let signal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let signal = delegation_rx
+                    .recv()
+                    .await
+                    .expect("delegation channel remains open");
+                if signal.boundary {
+                    break signal;
+                }
+            }
+        })
+        .await
+        .expect("cleanup-owned finalizer emits the watched boundary");
+        assert_eq!(signal.turn_id, turn_id);
+        assert_eq!(signal.vendor_error, failed);
+        tokio::task::yield_now().await;
+        while let Ok(signal) = delegation_rx.try_recv() {
+            assert!(
+                !signal.boundary,
+                "one canonical terminal row owns exactly one live boundary signal"
+            );
+        }
+
+        let meta = gateway
+            .lock()
+            .await
+            .session_catalog
+            .get(&sid)
+            .expect("stopped session metadata remains catalogued")
+            .meta;
+        assert_eq!(
+            meta.turn_count,
+            terminal_rows.0.len() as u64,
+            "terminal metadata refresh must finish after an aborted pump"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_pump_finishes_watched_completed_boundary_once() {
+        assert_aborted_pump_finishes_watched_terminal_boundary(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_pump_finishes_watched_failed_boundary_once() {
+        assert_aborted_pump_finishes_watched_terminal_boundary(true).await;
+    }
+
+    #[test]
+    fn terminal_canonical_append_is_bounded_and_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let record = ccteam_harness::execution::turns_mirror::TurnRecord {
+            turn_id: "turn-stable".into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: String::new(),
+            user: String::new(),
+            assistant: "done".into(),
+            usage: serde_json::Value::Null,
+            tool_calls: Vec::new(),
+            attachments: Vec::new(),
+            outcome: Some("completed".into()),
+            error_kind: None,
+            error: None,
+        };
+
+        assert_eq!(
+            append_terminal_turn_if_absent(tmp.path(), "s1", &record).unwrap(),
+            TerminalCanonicalOutcome::NewlyCanonical
+        );
+        assert_eq!(
+            append_terminal_turn_if_absent(tmp.path(), "s1", &record).unwrap(),
+            TerminalCanonicalOutcome::AlreadyCanonical
+        );
+        assert_eq!(
+            ccteam_harness::execution::turns_mirror::last_n_turns(tmp.path(), "s1", 8)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.turn_id == "turn-stable" && row.verdictable())
+                .count(),
+            1
+        );
+
+        assert_eq!(
+            append_terminal_turn_if_absent(tmp.path(), "s2", &record).unwrap(),
+            TerminalCanonicalOutcome::NewlyCanonical
+        );
+        for index in 0..RecentTerminalDedup::CAPACITY {
+            let mut interim = record.clone();
+            interim.turn_id = format!("interim-{index}");
+            interim.outcome = Some("interim".into());
+            ccteam_harness::execution::turns_mirror::append_turn(tmp.path(), "s2", &interim)
+                .unwrap();
+        }
+        assert_eq!(
+            append_terminal_turn_if_absent(tmp.path(), "s2", &record).unwrap(),
+            TerminalCanonicalOutcome::NewlyCanonical,
+            "replays older than the bounded durable window keep the at-least-once contract"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_role_switch_keeps_the_pre_start_fingerprint_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        for role in ["reviewer", "helper"] {
+            seed_role(&project_dir, role);
+        }
+        let skill = project_dir.join(".claude/skills/build/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "version one").unwrap();
+        let expected_role =
+            ccteam_harness::execution::experience::role_fingerprint(&project_dir, "helper");
+        let expected_skills =
+            ccteam_harness::execution::experience::skills_fingerprint(&project_dir);
+
+        let start = Arc::new(TestStartBarrier::default());
+        let fake =
+            Arc::new(FakeAdapter::new(AgentVendor::Claude).with_start_barrier(Arc::clone(&start)));
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths);
+        gateway
+            .handle_text("telegram", "chat-a", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        start.arm();
+        let switch = tokio::spawn(async move {
+            gateway
+                .handle_text("telegram", "chat-a", "alice", "/role helper")
+                .await
+                .unwrap();
+            gateway
+        });
+
+        start.wait_until_entered(1).await;
+        seed_role_with_model(&project_dir, "helper", Some("mutated-after-start"));
+        std::fs::write(&skill, "version two").unwrap();
+        start.release_all();
+        let gateway = switch.await.unwrap();
+
+        let meta = gateway
+            .session_catalog
+            .get("s1")
+            .expect("legacy role switch metadata")
+            .meta;
+        assert_eq!(meta.role_sha, expected_role);
+        assert_eq!(meta.skills_sha, expected_skills);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
