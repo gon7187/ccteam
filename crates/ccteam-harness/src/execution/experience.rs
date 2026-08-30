@@ -81,6 +81,12 @@ pub struct TurnExperience {
     /// Per-skill content digests at spawn (see [`skills_fingerprint`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills_sha: Option<BTreeMap<String, String>>,
+    /// Skill ids deterministically observed as invoked during the turn,
+    /// validated against the spawn-time `skills_sha` key set. `None` =
+    /// detection unavailable or nothing observed — availability stays in
+    /// `skills_sha`; this field upgrades attribution, never guesses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoked_skills: Option<Vec<String>>,
     pub signals: TurnSignals,
 }
 
@@ -799,6 +805,8 @@ pub fn rebuild_experience(
         let role_sha = progress_field::<String>(progress, "role_sha", &sid, &turn_id)?;
         let skills_sha =
             progress_field::<BTreeMap<String, String>>(progress, "skills_sha", &sid, &turn_id)?;
+        let invoked_skills =
+            progress_field::<Vec<String>>(progress, "invoked_skills", &sid, &turn_id)?;
         let signals = progress_field::<TurnSignals>(progress, "signals", &sid, &turn_id)?
             .unwrap_or_else(|| TurnSignals {
                 tool_calls: tr.map_or(0, |turn| turn.tool_calls.len() as u64),
@@ -818,6 +826,7 @@ pub fn rebuild_experience(
             duration_ms,
             role_sha,
             skills_sha,
+            invoked_skills,
             signals,
         }));
     }
@@ -904,6 +913,7 @@ mod tests {
             duration_ms: Some(100),
             role_sha: Some("ab12cd34ef56".into()),
             skills_sha: None,
+            invoked_skills: None,
             signals: TurnSignals {
                 tool_calls: 3,
                 steered: false,
@@ -1350,6 +1360,7 @@ mod tests {
                 duration_ms: Some(321),
                 role_sha: Some("role-sha".into()),
                 skills_sha: Some(BTreeMap::from([("research".into(), "skill-sha".into())])),
+                invoked_skills: Some(vec!["research".into()]),
                 signals: Some(TurnSignals {
                     tool_calls: 9,
                     steered: true,
@@ -1380,6 +1391,10 @@ mod tests {
         assert_eq!(turn.signals.tool_calls, 9);
         assert!(turn.signals.steered);
         assert_eq!(turn.duration_ms, Some(321));
+        assert_eq!(
+            turn.invoked_skills.as_deref(),
+            Some(&["research".into()][..])
+        );
     }
 
     #[test]
@@ -1458,6 +1473,7 @@ mod tests {
                 assert_eq!(turn.duration_ms, None);
                 assert_eq!(turn.role_sha, None);
                 assert_eq!(turn.skills_sha, None);
+                assert_eq!(turn.invoked_skills, None);
             }
             other => panic!("expected turn, got {other:?}"),
         }
@@ -1537,6 +1553,7 @@ mod tests {
                         "research".into(),
                         "turn-skill-sha".into(),
                     )])),
+                    invoked_skills: None,
                     signals: None,
                 },
             );

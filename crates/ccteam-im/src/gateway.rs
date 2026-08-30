@@ -10250,6 +10250,7 @@ impl Gateway {
                                     duration_ms,
                                     role_sha: pump_role_sha.clone(),
                                     skills_sha: pump_skills_sha.clone(),
+                                    invoked_skills: None,
                                     signals: Some(
                                         ccteam_core::progress::TurnSignals {
                                             tool_calls,
@@ -10293,6 +10294,7 @@ impl Gateway {
                                     duration_ms,
                                     role_sha: pump_role_sha.clone(),
                                     skills_sha: pump_skills_sha.clone(),
+                                    invoked_skills: None,
                                     signals: ccteam_harness::execution::experience::TurnSignals {
                                         tool_calls,
                                         steered,

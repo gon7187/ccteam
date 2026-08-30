@@ -76,6 +76,7 @@ fn turn(
                 .map(|(id, sha)| ((*id).to_owned(), (*sha).to_owned()))
                 .collect::<BTreeMap<_, _>>()
         }),
+        invoked_skills: None,
         signals: TurnSignals {
             tool_calls: 0,
             steered: false,
