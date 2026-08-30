@@ -735,3 +735,75 @@ async fn evolution_returns_500_for_experience_or_progress_read_errors() {
         assert!(body["error"].is_string());
     }
 }
+
+#[tokio::test]
+async fn evolution_keeps_ghost_invocations_out_of_buckets_but_in_coverage() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    seed_project(&paths, "alpha");
+    let dir = paths.project_dir("alpha");
+    let now = chrono::Utc::now();
+
+    // An invoked id absent from the turn's own skills_sha ("ghost") must never
+    // reach any bucket (buckets are keyed by spawn-time availability), while
+    // the turn still counts toward detection coverage.
+    append_experience(
+        &dir,
+        &amend(
+            turn(
+                "s1",
+                "t1",
+                now,
+                "cto",
+                Some("role-a"),
+                &[("research", "skill-a")],
+                None,
+                Some("completed"),
+                None,
+            ),
+            |t| t.invoked_skills = Some(vec!["ghost".into()]),
+        ),
+    )
+    .unwrap();
+    // skills_sha: None + non-empty invoked list — coverage only, zero buckets.
+    append_experience(
+        &dir,
+        &amend(
+            turn(
+                "s2",
+                "t2",
+                now,
+                "cto",
+                Some("role-a"),
+                &[],
+                None,
+                None,
+                None,
+            ),
+            |t| t.invoked_skills = Some(vec!["research".into()]),
+        ),
+    )
+    .unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let body: Value = fetch_evolution(addr, "alpha")
+        .await
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["invoked_attribution_turns"], 2, "{body}");
+    let skills = body["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 1, "ghost must not mint a bucket: {body}");
+    let research = &skills[0];
+    assert_eq!(research["id"], "research");
+    assert_eq!(research["turn_count"], 1);
+    assert_eq!(
+        research["invoked_turn_count"], 0,
+        "a ghost invocation of another id must not count as invoking research: {body}"
+    );
+}
