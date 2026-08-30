@@ -18,6 +18,7 @@
 - **v0.9.5** kimi-code 第五 vendor harness(`kimi acp` 长驻 stdio 薄壳,复用共享 ACP core:resume→load→new 阶梯 · skip auto-allow / hitl fail-closed · roleless-only · remote NotImplemented)· 五 vendor 全局 MCP 对称注册(+`~/.kimi-code/mcp.json`)· cost None 仿 opencode · 真机 smoke 全链路(spawn/dispatch/collect + live `/model`);dev = kimi-code 单会话一口气(owner 钦点),规划复核确认基线 1433/0
 - **v0.9.3 增量**(未单独 bump)四 vendor 全局 MCP 对称注册(Claude/Codex/Grok/OpenCode 任意主会话可编排)+ `/mcp` 出 auth_layer 修委派父边 + spawn 响应 `caller` 字段
 - **v0.9.2** 项目↔主机绑定(host 归 project、spawn 去 host 参、`project_init` op、卫星项目 import)· live 容量 50 LRU 挤停 · 团队拓扑树 · A2A 返回限幅防父会话膨胀 · 新建项目自由选主机
+- **v0.10.5** 自进化闭环:研究 Google WikiSkill(arXiv 2608.27454,论文无代码)→「引方法不引依赖」。引擎侧 zero-LLM 测量底座(pump 确定性 `invoked_skills` 检测 + evolution 聚合 steered/per-vendor 分层/invoked 子集);用户空间自治闭环 `evolution-troika`(6 角色 + 4 机器门代替人,住 hub 不入 repo,守 R1-R4)。HITL 早退红线故全自治合法
 - **v0.9.1** MCP 单前缀修复(去双前缀)+ 非 ccteam 主会话 admin fallback
 - **v0.9.0** Agent2Agent 底座:`session_*` 5 工具 + per-session principal `(sid,secret)` + 委派语义(路由非引擎)+ 反向连接跨机 + 引擎零内置 persona(废除 cto)
 - **v0.8.x 系列** 协议轴(stream-json 默认 / terminal 维护期)· 插件市场(track-upstream + plugin type)· 多租户软分区(档0/档1)· web chat-shell 统一重写 · IM 通用模式 → `git log` + `docs-local/versions/v0-8-*/`
