@@ -151,6 +151,34 @@ grok mcp doctor                  # the Grok axis: handshake OK, 8 tools discover
 
 ---
 
+## 10. Self-evolution loops (autonomous, user-space)
+
+ccteam's engine never runs a learning loop itself — no built-in judge, no
+scheduled self-improvement, no prompt injection. What it gives a loop you
+build in agent space is the measurement substrate:
+
+- **Per-turn facts** in `<project>/.ccteam/experience.jsonl`: outcome,
+  error kind, steered flag, cost, duration, spawn-time role/skill
+  fingerprints, and — where the event stream deterministically observed a
+  skill invocation (a Skill-tool call or a SKILL.md read matching a
+  spawn-time fingerprint key) — `invoked_skills`, never guessed.
+- **Aggregates** at `GET /api/v1/projects/{slug}/evolution`: failed and
+  steered counts per fingerprint bucket, stratified per vendor (a skill that
+  helps one vendor while harming another cannot net out to "fine"), plus the
+  strict invoked subset next to spawn-time availability.
+- **Loop plumbing** you already know: `session_spawn` with a permission
+  mode, cross-vendor dispatch/collect, per-sid scheduled one-shots, and the
+  daily budget caps as a deterministic backstop.
+
+The loop content itself (orchestrator/maintainer/proposer/verifier skills,
+gate scripts) is ordinary marketplace/user-space material — install a
+package such as `evolution-troika` into `~/.ccteam/skills` and start its
+orchestrator in one project. Two honesty notes: run loops on priced vendors
+so the budget cap actually bites, and treat published benchmark gains from
+skill-evolution papers as non-transferable until your own canary says so.
+
+---
+
 ## Appendix: tool reference (for skill authors / manual orchestration)
 
 You normally never spell these out — your session drives them from your plain-language ask. But if you're **writing a persona or skill** or orchestrating by hand, ccteam exposes eight tools under the `ccteam` MCP server, visible in Claude as `mcp__ccteam__<name>`:
