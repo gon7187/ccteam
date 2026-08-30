@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-cli"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-core"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-cost"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "chrono",
  "serde",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-flow"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-harness"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-hooks"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "anyhow",
  "ccteam-core",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-im"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "ccteam-web"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "anyhow",
  "askama",

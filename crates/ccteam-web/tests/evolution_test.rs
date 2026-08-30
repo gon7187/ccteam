@@ -76,12 +76,25 @@ fn turn(
                 .map(|(id, sha)| ((*id).to_owned(), (*sha).to_owned()))
                 .collect::<BTreeMap<_, _>>()
         }),
+        invoked_skills: None,
         signals: TurnSignals {
             tool_calls: 0,
             steered: false,
             error_recovered: None,
         },
     })
+}
+
+/// Post-edit a `turn(...)` record for the additive-analytics fields
+/// (vendor / steered / invoked_skills) without widening every call site.
+fn amend(record: ExperienceRecord, edit: impl FnOnce(&mut TurnExperience)) -> ExperienceRecord {
+    match record {
+        ExperienceRecord::Turn(mut turn) => {
+            edit(&mut turn);
+            ExperienceRecord::Turn(turn)
+        }
+        other => other,
+    }
 }
 
 async fn fetch_evolution(addr: SocketAddr, slug: &str) -> reqwest::Response {
@@ -344,6 +357,189 @@ async fn evolution_joins_latest_canonical_verdicts_and_keeps_unknowns_honest() {
 }
 
 #[tokio::test]
+async fn evolution_reports_steered_vendor_slices_and_invoked_attribution() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    seed_project(&paths, "alpha");
+    let dir = paths.project_dir("alpha");
+    let now = chrono::Utc::now();
+
+    let research = &[("research", "skill-a")][..];
+    for record in [
+        // claude, failed, detection unavailable.
+        turn(
+            "s1",
+            "t1",
+            now,
+            "cto",
+            Some("role-a"),
+            research,
+            None,
+            Some("failed"),
+            None,
+        ),
+        // codex, failed AND steered, research observed invoked.
+        amend(
+            turn(
+                "s1",
+                "t2",
+                now,
+                "cto",
+                Some("role-a"),
+                research,
+                None,
+                Some("failed"),
+                None,
+            ),
+            |t| {
+                t.vendor = "codex".into();
+                t.signals.steered = true;
+                t.invoked_skills = Some(vec!["research".into()]);
+            },
+        ),
+        // claude, completed but steered, research observed invoked.
+        amend(
+            turn(
+                "s2",
+                "t3",
+                now,
+                "cto",
+                Some("role-a"),
+                research,
+                None,
+                Some("completed"),
+                None,
+            ),
+            |t| {
+                t.signals.steered = true;
+                t.invoked_skills = Some(vec!["research".into()]);
+            },
+        ),
+        // codex, clean turn; detection ran and observed NOTHING invoked —
+        // an empty list is not attribution coverage.
+        amend(
+            turn(
+                "s2",
+                "t4",
+                now,
+                "worker",
+                Some("role-b"),
+                &[("ux", "skill-u")],
+                None,
+                Some("completed"),
+                None,
+            ),
+            |t| {
+                t.vendor = "codex".into();
+                t.invoked_skills = Some(vec![]);
+            },
+        ),
+        // codex, failed, detection unavailable — makes the per-vendor failed
+        // counts of the research bucket distinct (claude 1 vs codex 2).
+        amend(
+            turn(
+                "s3",
+                "t5",
+                now,
+                "cto",
+                Some("role-a"),
+                research,
+                None,
+                Some("failed"),
+                None,
+            ),
+            |t| {
+                t.vendor = "codex".into();
+            },
+        ),
+    ] {
+        append_experience(&dir, &record).unwrap();
+    }
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let body: Value = fetch_evolution(addr, "alpha")
+        .await
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Summary: steered is a soft failure counted like failed; vendor slices
+    // stratify the mixed totals; only non-empty invoked lists are coverage.
+    assert_eq!(body["turn_records"], 5);
+    assert_eq!(body["failed_turns"], 3);
+    assert_eq!(body["steered_turns"], 2);
+    assert_eq!(body["invoked_attribution_turns"], 2, "{body}");
+    let vendors = body["vendors"].as_array().unwrap();
+    assert_eq!(vendors.len(), 2);
+    assert_eq!(vendors[0]["vendor"], "claude", "sorted by vendor name");
+    assert_eq!(vendors[0]["turn_count"], 2);
+    assert_eq!(vendors[0]["failed_turns"], 1);
+    assert_eq!(vendors[0]["steered_turns"], 1);
+    assert_eq!(vendors[1]["vendor"], "codex");
+    assert_eq!(vendors[1]["turn_count"], 3);
+    assert_eq!(vendors[1]["failed_turns"], 2);
+    assert_eq!(vendors[1]["steered_turns"], 1);
+
+    // Role buckets carry steered + vendor slices, but never invoked_* —
+    // invoked attribution is a skill-bucket concept.
+    let roles = body["roles"].as_array().unwrap();
+    let cto = roles.iter().find(|row| row["id"] == "cto").unwrap();
+    assert_eq!(cto["turn_count"], 4);
+    assert_eq!(cto["steered_turns"], 2);
+    let cto_vendors = cto["vendors"].as_array().unwrap();
+    assert_eq!(cto_vendors[0]["vendor"], "claude");
+    assert_eq!(cto_vendors[0]["turn_count"], 2);
+    assert_eq!(cto_vendors[1]["vendor"], "codex");
+    assert_eq!(cto_vendors[1]["failed_turns"], 2);
+    assert!(cto["invoked_turn_count"].is_null(), "role buckets: None");
+    assert!(cto["invoked_failed_turns"].is_null());
+    assert!(cto["invoked_steered_turns"].is_null());
+    let worker = roles.iter().find(|row| row["id"] == "worker").unwrap();
+    assert_eq!(worker["steered_turns"], 0);
+    assert!(worker["invoked_turn_count"].is_null());
+
+    // Skill bucket: a mixed bucket that nets out per vendor stays separate
+    // (claude 1 failed vs codex 2 failed), and invoked_* counts ONLY the
+    // strict subset of turns whose invoked_skills named this bucket's id.
+    let skills = body["skills"].as_array().unwrap();
+    let research = skills
+        .iter()
+        .find(|row| row["id"] == "research" && row["sha"] == "skill-a")
+        .unwrap();
+    assert_eq!(research["turn_count"], 4);
+    assert_eq!(research["failed_turns"], 3);
+    assert_eq!(research["steered_turns"], 2);
+    let research_vendors = research["vendors"].as_array().unwrap();
+    assert_eq!(research_vendors.len(), 2);
+    assert_eq!(research_vendors[0]["vendor"], "claude");
+    assert_eq!(research_vendors[0]["turn_count"], 2);
+    assert_eq!(research_vendors[0]["failed_turns"], 1);
+    assert_eq!(research_vendors[0]["steered_turns"], 1);
+    assert_eq!(research_vendors[1]["vendor"], "codex");
+    assert_eq!(research_vendors[1]["turn_count"], 2);
+    assert_eq!(research_vendors[1]["failed_turns"], 2);
+    assert_eq!(research_vendors[1]["steered_turns"], 1);
+    assert_eq!(research["invoked_turn_count"], 2);
+    assert_eq!(research["invoked_failed_turns"], 1);
+    assert_eq!(research["invoked_steered_turns"], 2);
+
+    // Skill buckets ALWAYS report Some — a skill never observed invoked is
+    // an honest Some(0), not an unknown.
+    let ux = skills.iter().find(|row| row["id"] == "ux").unwrap();
+    assert_eq!(ux["invoked_turn_count"], 0);
+    assert_eq!(ux["invoked_failed_turns"], 0);
+    assert_eq!(ux["invoked_steered_turns"], 0);
+    assert_eq!(ux["vendors"].as_array().unwrap().len(), 1);
+
+    // The availability-fingerprint contract is unchanged.
+    assert_eq!(body["skill_attribution"], "available_at_spawn");
+}
+
+#[tokio::test]
 async fn evolution_counts_only_the_first_record_for_a_replayed_turn() {
     let tmp = tempfile::TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
@@ -538,4 +734,76 @@ async fn evolution_returns_500_for_experience_or_progress_read_errors() {
         let body: Value = response.json().await.unwrap();
         assert!(body["error"].is_string());
     }
+}
+
+#[tokio::test]
+async fn evolution_keeps_ghost_invocations_out_of_buckets_but_in_coverage() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    seed_project(&paths, "alpha");
+    let dir = paths.project_dir("alpha");
+    let now = chrono::Utc::now();
+
+    // An invoked id absent from the turn's own skills_sha ("ghost") must never
+    // reach any bucket (buckets are keyed by spawn-time availability), while
+    // the turn still counts toward detection coverage.
+    append_experience(
+        &dir,
+        &amend(
+            turn(
+                "s1",
+                "t1",
+                now,
+                "cto",
+                Some("role-a"),
+                &[("research", "skill-a")],
+                None,
+                Some("completed"),
+                None,
+            ),
+            |t| t.invoked_skills = Some(vec!["ghost".into()]),
+        ),
+    )
+    .unwrap();
+    // skills_sha: None + non-empty invoked list — coverage only, zero buckets.
+    append_experience(
+        &dir,
+        &amend(
+            turn(
+                "s2",
+                "t2",
+                now,
+                "cto",
+                Some("role-a"),
+                &[],
+                None,
+                None,
+                None,
+            ),
+            |t| t.invoked_skills = Some(vec!["research".into()]),
+        ),
+    )
+    .unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let body: Value = fetch_evolution(addr, "alpha")
+        .await
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["invoked_attribution_turns"], 2, "{body}");
+    let skills = body["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 1, "ghost must not mint a bucket: {body}");
+    let research = &skills[0];
+    assert_eq!(research["id"], "research");
+    assert_eq!(research["turn_count"], 1);
+    assert_eq!(
+        research["invoked_turn_count"], 0,
+        "a ghost invocation of another id must not count as invoking research: {body}"
+    );
 }

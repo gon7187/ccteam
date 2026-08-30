@@ -143,6 +143,18 @@
 
 ---
 
+## 10. 自进化闭环(自治、全在用户空间)
+
+ccteam 引擎自己**不**跑任何学习闭环——没有内置 judge、没有排程的自我改进、不注入 prompt。引擎给你在 agent 空间自建闭环的,是测量底座:
+
+- **逐 turn 事实**:`<project>/.ccteam/experience.jsonl` —— outcome、error kind、steered、成本、时长、spawn 时 role/skill 指纹;当事件流**确定性地**观察到某个 skill 被调用(Skill 工具调用、或 Read 命中指纹键对应的 SKILL.md 路径)时另记 `invoked_skills`,从不靠猜。
+- **聚合面**:`GET /api/v1/projects/{slug}/evolution` —— 每个指纹桶的 failed / steered 计数**按 vendor 分层**(帮了一个 vendor、伤了另一个的 skill 不能被净值掩盖),并在 spawn 可用性旁边给出严格的 invoked 子集。
+- **闭环管件**:`session_spawn`(带 permission mode)、跨 vendor dispatch/collect、per-sid 一次性排程、以及作为确定性兜底的每日预算上限。
+
+闭环内容本身(orchestrator / maintainer / proposer / verifier 的 skill 与 gate 脚本)是普通的市场/用户空间物料——装一个如 `evolution-troika` 的包进 `~/.ccteam/skills`,在一个项目里启动它的 orchestrator 即可。两句实话:闭环跑在有价表的 vendor 上,预算上限才真的咬得住;论文里的 skill-evolution 收益数字在你自己的 canary 说话之前一律当作不可迁移。
+
+---
+
 ## 附录:工具速查(给 persona / skill 作者与想手搓的人)
 
 平时你不用报工具名——会话听懂人话自己调。但如果你在**写 persona / skill** 或想手动编排,ccteam 在 `ccteam` 这个 MCP server 下暴露 8 个工具,在 Claude 里叫 `mcp__ccteam__<名字>`:

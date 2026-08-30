@@ -81,6 +81,12 @@ pub struct TurnExperience {
     /// Per-skill content digests at spawn (see [`skills_fingerprint`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills_sha: Option<BTreeMap<String, String>>,
+    /// Skill ids deterministically observed as invoked during the turn,
+    /// validated against the spawn-time `skills_sha` key set. `None` =
+    /// detection unavailable or nothing observed — availability stays in
+    /// `skills_sha`; this field upgrades attribution, never guesses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoked_skills: Option<Vec<String>>,
     pub signals: TurnSignals,
 }
 
@@ -669,6 +675,56 @@ fn hex12(digest: impl AsRef<[u8]>) -> String {
     hex_full(digest).chars().take(12).collect()
 }
 
+// ── invoked-skill detection ──────────────────────────────────────────────────
+
+/// Deterministically detect skill invocations in one observed tool call.
+///
+/// Two detectors, BOTH validated against `available` (the spawn-time
+/// [`skills_fingerprint`] key set) so an id that was not installed at spawn
+/// is never emitted (fail-honest: misses are allowed, false positives are
+/// not):
+///
+/// 1. **Skill-tool invocation** — the tool named exactly `"Skill"` whose args
+///    mention an available id as a standalone token (delimited by quotes,
+///    slashes, or whitespace; a substring of a longer word never matches).
+/// 2. **`SKILL.md` path read** — any tool whose args reference
+///    `.claude/skills/<id>/` or `.agents/skills/<id>/`.
+///
+/// Output is sorted + deduped; empty vec = nothing detected.
+pub fn detect_invoked_skills(
+    tool_name: &str,
+    args_text: &str,
+    available: &BTreeSet<&str>,
+) -> Vec<String> {
+    let mut detected: BTreeSet<&str> = BTreeSet::new();
+    for id in available {
+        if id.is_empty() {
+            continue;
+        }
+        let path_read = [".claude/skills/", ".agents/skills/"]
+            .iter()
+            .any(|root| args_text.contains(&format!("{root}{id}/")));
+        if path_read || (tool_name == "Skill" && contains_standalone_token(args_text, id)) {
+            detected.insert(id);
+        }
+    }
+    detected.into_iter().map(str::to_string).collect()
+}
+
+/// Whether `token` occurs in `text` delimited on both sides by a quote, a
+/// slash, or whitespace (string boundaries count as delimiters).
+fn contains_standalone_token(text: &str, token: &str) -> bool {
+    let is_delim = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '/');
+    text.match_indices(token).any(|(idx, _)| {
+        let before_ok = text[..idx].chars().next_back().is_none_or(is_delim);
+        let after_ok = text[idx + token.len()..]
+            .chars()
+            .next()
+            .is_none_or(is_delim);
+        before_ok && after_ok
+    })
+}
+
 // ── rebuild (offline / disaster recovery) ────────────────────────────────────
 
 /// Regenerate all `kind: "turn"` records from `chat/<sid>/turns.jsonl` +
@@ -799,6 +855,8 @@ pub fn rebuild_experience(
         let role_sha = progress_field::<String>(progress, "role_sha", &sid, &turn_id)?;
         let skills_sha =
             progress_field::<BTreeMap<String, String>>(progress, "skills_sha", &sid, &turn_id)?;
+        let invoked_skills =
+            progress_field::<Vec<String>>(progress, "invoked_skills", &sid, &turn_id)?;
         let signals = progress_field::<TurnSignals>(progress, "signals", &sid, &turn_id)?
             .unwrap_or_else(|| TurnSignals {
                 tool_calls: tr.map_or(0, |turn| turn.tool_calls.len() as u64),
@@ -818,6 +876,7 @@ pub fn rebuild_experience(
             duration_ms,
             role_sha,
             skills_sha,
+            invoked_skills,
             signals,
         }));
     }
@@ -904,6 +963,7 @@ mod tests {
             duration_ms: Some(100),
             role_sha: Some("ab12cd34ef56".into()),
             skills_sha: None,
+            invoked_skills: None,
             signals: TurnSignals {
                 tool_calls: 3,
                 steered: false,
@@ -948,6 +1008,83 @@ mod tests {
             }
             _ => panic!("expected verdict"),
         }
+    }
+
+    #[test]
+    fn detect_skill_tool_invocation_only_when_available() {
+        let available: BTreeSet<&str> = ["research", "ci-watcher"].into_iter().collect();
+        let args = r#"{"command":"research"}"#;
+        assert_eq!(
+            detect_invoked_skills("Skill", args, &available),
+            vec!["research".to_string()]
+        );
+        // `/research` token form also counts as an invocation.
+        assert_eq!(
+            detect_invoked_skills("Skill", r#"{"command":"/research go"}"#, &available),
+            vec!["research".to_string()]
+        );
+        // The same call against a set that lacks the id emits nothing.
+        let other: BTreeSet<&str> = ["ci-watcher"].into_iter().collect();
+        assert!(detect_invoked_skills("Skill", args, &other).is_empty());
+        // A non-Skill tool naming an id (outside a skills path) is not an
+        // invocation.
+        assert!(detect_invoked_skills("Bash", args, &available).is_empty());
+    }
+
+    #[test]
+    fn detect_skill_path_read_for_both_roots_any_tool() {
+        let available: BTreeSet<&str> = ["research"].into_iter().collect();
+        assert_eq!(
+            detect_invoked_skills(
+                "Read",
+                r#"{"file_path":".claude/skills/research/SKILL.md"}"#,
+                &available
+            ),
+            vec!["research".to_string()]
+        );
+        assert_eq!(
+            detect_invoked_skills(
+                "Bash",
+                r#"{"command":"cat .agents/skills/research/SKILL.md"}"#,
+                &available
+            ),
+            vec!["research".to_string()]
+        );
+        // An id absent from the available set is never emitted, even on an
+        // exact path match.
+        let other: BTreeSet<&str> = ["ci-watcher"].into_iter().collect();
+        assert!(detect_invoked_skills(
+            "Read",
+            r#"{"file_path":".claude/skills/research/SKILL.md"}"#,
+            &other
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn detect_rejects_substring_of_longer_word() {
+        let available: BTreeSet<&str> = ["research"].into_iter().collect();
+        assert!(
+            detect_invoked_skills("Skill", r#"{"command":"research-notes"}"#, &available)
+                .is_empty()
+        );
+        assert!(detect_invoked_skills(
+            "Read",
+            r#"{"file_path":".claude/skills/research-notes/SKILL.md"}"#,
+            &available
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn detect_output_is_sorted_and_deduped() {
+        let available: BTreeSet<&str> = ["research", "ci-watcher"].into_iter().collect();
+        // Both detectors hit "research"; path read hits "ci-watcher" too.
+        let args = r#"{"command":"research .claude/skills/research/ .agents/skills/ci-watcher/"}"#;
+        assert_eq!(
+            detect_invoked_skills("Skill", args, &available),
+            vec!["ci-watcher".to_string(), "research".to_string()]
+        );
     }
 
     #[test]
@@ -1350,6 +1487,7 @@ mod tests {
                 duration_ms: Some(321),
                 role_sha: Some("role-sha".into()),
                 skills_sha: Some(BTreeMap::from([("research".into(), "skill-sha".into())])),
+                invoked_skills: Some(vec!["research".into()]),
                 signals: Some(TurnSignals {
                     tool_calls: 9,
                     steered: true,
@@ -1380,6 +1518,10 @@ mod tests {
         assert_eq!(turn.signals.tool_calls, 9);
         assert!(turn.signals.steered);
         assert_eq!(turn.duration_ms, Some(321));
+        assert_eq!(
+            turn.invoked_skills.as_deref(),
+            Some(&["research".into()][..])
+        );
     }
 
     #[test]
@@ -1458,6 +1600,7 @@ mod tests {
                 assert_eq!(turn.duration_ms, None);
                 assert_eq!(turn.role_sha, None);
                 assert_eq!(turn.skills_sha, None);
+                assert_eq!(turn.invoked_skills, None);
             }
             other => panic!("expected turn, got {other:?}"),
         }
@@ -1537,6 +1680,7 @@ mod tests {
                         "research".into(),
                         "turn-skill-sha".into(),
                     )])),
+                    invoked_skills: None,
                     signals: None,
                 },
             );

@@ -9668,6 +9668,13 @@ impl Gateway {
             // v0.9 T5 — baseline activity_events at the start of each turn
             // (approximation for signals.tool_calls).
             let mut activity_at_turn_start: Option<u64> = None;
+            // E1 — skill ids deterministically observed as invoked in the
+            // current turn (fed from tool-call events below, validated
+            // against the spawn-time skills_sha key set). Consumed only by
+            // the CLOSING terminal boundary; an interim terminal leaves it
+            // accumulating. Stays empty (→ invoked_skills None) when the
+            // session has no spawn-time skill set.
+            let mut turn_invoked_skills: BTreeSet<String> = BTreeSet::new();
             // v0.9.5 feedback fix — delegation notifications fire on the VENDOR
             // TURN boundary, not per mirrored assistant message (codex narrates
             // checkpoints as separate messages inside one turn; per-message
@@ -9960,6 +9967,33 @@ impl Gateway {
                         // Track open tool/command work so a long silent tool
                         // run does not look like a hung turn.
                         track_open_work_items(&mut open_work_items, &evt);
+                        // E1 — invoked-skill detection: run every observed
+                        // tool call's INPUT through the pure detector, before
+                        // the turns.jsonl mirror excerpts it. Started items
+                        // only — a completed item can carry a result payload
+                        // that echoes skill paths the turn never invoked.
+                        if let Some(skills) = pump_skills_sha.as_ref().filter(|m| !m.is_empty()) {
+                            if let ThreadEvent::ItemStarted { item } = &evt {
+                                let observed = match &item.details {
+                                    ThreadItemDetails::ToolCall { name, args } => {
+                                        Some((name.as_str(), args.to_string()))
+                                    }
+                                    ThreadItemDetails::CommandExecution { cmd, .. } => {
+                                        Some(("CommandExecution", cmd.clone()))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((name, args_text)) = observed {
+                                    let available: BTreeSet<&str> =
+                                        skills.keys().map(String::as_str).collect();
+                                    turn_invoked_skills.extend(
+                                        ccteam_harness::execution::experience::detect_invoked_skills(
+                                            name, &args_text, &available,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
                         // v0.8.19 `/status` — record the wall-clock of this event
                         // right beside the liveness counter. `/status` derives the
                         // 🔴 stuck state from it the SAME way the watchdog does (a
@@ -10234,6 +10268,16 @@ impl Gateway {
                             } else {
                                 0
                             };
+                            // E1 — same gating as tool_calls/steered: only
+                            // the closing boundary consumes the accumulated
+                            // set; a non-closing interim terminal must not.
+                            let invoked_skills = if terminal_closes_active {
+                                let set = std::mem::take(&mut turn_invoked_skills);
+                                (!set.is_empty())
+                                    .then(|| set.into_iter().collect::<Vec<String>>())
+                            } else {
+                                None
+                            };
 
                             if terminal_closes_active {
                                 activity_at_turn_start = None;
@@ -10250,6 +10294,7 @@ impl Gateway {
                                     duration_ms,
                                     role_sha: pump_role_sha.clone(),
                                     skills_sha: pump_skills_sha.clone(),
+                                    invoked_skills: invoked_skills.clone(),
                                     signals: Some(
                                         ccteam_core::progress::TurnSignals {
                                             tool_calls,
@@ -10293,6 +10338,7 @@ impl Gateway {
                                     duration_ms,
                                     role_sha: pump_role_sha.clone(),
                                     skills_sha: pump_skills_sha.clone(),
+                                    invoked_skills,
                                     signals: ccteam_harness::execution::experience::TurnSignals {
                                         tool_calls,
                                         steered,
@@ -23921,6 +23967,10 @@ mod tests {
         /// Off by default so the sync-drain tests (which only take the first
         /// text-bearing event) don't leave a stale `TurnCompleted` queued.
         emit_turn_boundary: bool,
+        /// E1 — events queued BEFORE the answer on each submit (e.g. a
+        /// `ToolCall` item), so the pump observes mid-turn tool activity
+        /// ahead of the terminal boundary.
+        pre_answer_events: Vec<ThreadEvent>,
         /// Emit the structured paneless turn-start boundary before reply data.
         /// Opt-in so timing-sensitive tests can pause between start/completion.
         emit_turn_started: bool,
@@ -24013,6 +24063,7 @@ mod tests {
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
                 spawn_tunings: Arc::new(Mutex::new(Vec::new())),
                 emit_turn_boundary: false,
+                pre_answer_events: Vec::new(),
                 emit_turn_started: false,
                 turn_failure: None,
                 out_of_order_failure: None,
@@ -24035,6 +24086,13 @@ mod tests {
         /// (v0.8.11 E4 — drives the stream-json pump's progress.jsonl mirror).
         fn with_turn_boundary(mut self) -> Self {
             self.emit_turn_boundary = true;
+            self
+        }
+
+        /// Queue an extra event emitted before the answer on each submit
+        /// (E1 — drives the pump's invoked-skill detection under test).
+        fn with_pre_answer_event(mut self, evt: ThreadEvent) -> Self {
+            self.pre_answer_events.push(evt);
             self
         }
 
@@ -24354,6 +24412,12 @@ mod tests {
                     },
                 ));
             } else {
+                for evt in &self.pre_answer_events {
+                    self.events
+                        .lock()
+                        .await
+                        .push_back((h.identity.clone(), evt.clone()));
+                }
                 self.events.lock().await.push_back((
                     h.identity.clone(),
                     ThreadEvent::ItemCompleted {
@@ -28685,7 +28749,21 @@ mod tests {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
         };
-        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_turn_boundary()
+                // E1 — a Skill-tool invocation of the spawn-listed id, seen
+                // by the pump before the terminal boundary.
+                .with_pre_answer_event(ThreadEvent::ItemStarted {
+                    item: ThreadItem {
+                        id: "tool-1".to_string(),
+                        details: ThreadItemDetails::ToolCall {
+                            name: "Skill".to_string(),
+                            args: serde_json::json!({ "command": "ci-watcher" }),
+                        },
+                    },
+                }),
+        );
         let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
         gateway.enable_project_creation(paths);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
@@ -28754,6 +28832,11 @@ mod tests {
                 assert_eq!(t.role, "reviewer");
                 assert_eq!(t.role_sha, meta.role_sha);
                 assert_eq!(t.skills_sha, meta.skills_sha);
+                assert_eq!(
+                    t.invoked_skills,
+                    Some(vec!["ci-watcher".to_string()]),
+                    "a Skill-tool call naming a spawn-listed id must be attributed"
+                );
                 assert_eq!(t.outcome.as_deref(), Some("completed"));
                 assert!(t.duration_ms.is_some(), "live completion records duration");
                 // FakeAdapter emits usage + claude-sonnet-4-6 → priceable.

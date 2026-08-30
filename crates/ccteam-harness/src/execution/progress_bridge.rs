@@ -338,6 +338,11 @@ pub struct ChatTurnCompletionMetadata {
     pub role_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills_sha: Option<BTreeMap<String, String>>,
+    /// Skill ids deterministically observed as invoked during the turn's live
+    /// event stream, validated against the spawn-time `skills_sha` key set.
+    /// `None` = detection unavailable or nothing observed — never guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoked_skills: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signals: Option<TurnSignals>,
 }
@@ -4855,6 +4860,13 @@ pub fn build_chat_turn_completed_event_with_metadata(
     if let Some(skills_sha) = &metadata.skills_sha {
         ev["skills_sha"] = serde_json::to_value(skills_sha).unwrap_or(Value::Null);
     }
+    if let Some(invoked) = metadata
+        .invoked_skills
+        .as_ref()
+        .filter(|list| !list.is_empty())
+    {
+        ev["invoked_skills"] = serde_json::to_value(invoked).unwrap_or(Value::Null);
+    }
     if let Some(signals) = &metadata.signals {
         ev["signals"] = serde_json::to_value(signals).unwrap_or(Value::Null);
     }
@@ -8769,6 +8781,7 @@ mod tests {
             "duration_ms",
             "role_sha",
             "skills_sha",
+            "invoked_skills",
             "signals",
         ] {
             assert!(legacy.get(key).is_none(), "{key} must remain unknown");
@@ -8779,6 +8792,7 @@ mod tests {
             duration_ms: Some(1_234),
             role_sha: Some("abc123".into()),
             skills_sha: Some(BTreeMap::from([("research".into(), "def456".into())])),
+            invoked_skills: Some(vec!["research".into()]),
             signals: Some(TurnSignals {
                 tool_calls: 7,
                 steered: true,
@@ -8799,6 +8813,7 @@ mod tests {
         assert_eq!(enriched["duration_ms"], 1_234);
         assert_eq!(enriched["role_sha"], "abc123");
         assert_eq!(enriched["skills_sha"]["research"], "def456");
+        assert_eq!(enriched["invoked_skills"][0], "research");
         assert_eq!(enriched["signals"]["tool_calls"], 7);
         assert_eq!(enriched["signals"]["steered"], true);
     }

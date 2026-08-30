@@ -65,6 +65,7 @@ fn rebuild_after_repeated_rotation_uses_only_terminal_rows_and_preserves_project
                     "audit".into(),
                     "skill-sha-at-turn".into(),
                 )])),
+                invoked_skills: None,
                 signals: None,
             },
         ),
