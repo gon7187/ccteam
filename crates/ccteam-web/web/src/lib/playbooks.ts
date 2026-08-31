@@ -34,7 +34,7 @@ export const PLAYBOOKS: ReadonlyArray<Playbook> = [
     id: "commander",
     key: "tplCommander",
     Icon: Crown,
-    vendors: ["claude", "codex"],
+    vendors: ["claude", "codex", "opencode"],
     model: "opus",
     effort: "max",
   },

@@ -59,6 +59,12 @@ describe("I18N dictionary", () => {
     expect(t("ru", "charterHonesty")).toContain("MCP status");
   });
 
+  it("keeps the Commander GLM scout model in every language", () => {
+    for (const lang of ["zh", "ru", "en"] as const) {
+      expect(t(lang, "tplCommanderP")).toContain("zai-coding-plan/glm-5.3-flash");
+    }
+  });
+
   it("covers zh and en with the same key set", () => {
     const zhKeys = Object.keys(I18N.zh).sort();
     const enKeys = Object.keys(I18N.en).sort();

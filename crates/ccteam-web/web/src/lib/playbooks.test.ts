@@ -158,6 +158,14 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
     ] as const) {
       expect(I18N[lang].tplCommanderP).not.toContain(unconditionalRespawn);
     }
+    for (const [lang, phrases] of [
+      ["zh", ["zai-coding-plan/glm-5.3-flash", "在第一次改动代码之前", "read-only", "2–5", "commit sha 或 tag", "license", "Codex Luna", "停止编码并如实上报", "session_list 与 session_collect", "绝不承担主编码"]],
+      ["ru", ["zai-coding-plan/glm-5.3-flash", "до первой правки кода", "read-only", "2–5", "commit sha или tag", "license", "Codex Luna", "останови работу над кодом", "session_list и session_collect", "никогда — основной код"]],
+      ["en", ["zai-coding-plan/glm-5.3-flash", "before the first code edit", "read-only", "2–5", "commit sha or tag", "license", "Codex Luna", "stop coding and report honestly", "session_list and session_collect", "never primary coding"]],
+    ] as const) {
+      for (const phrase of phrases) expect(I18N[lang].tplCommanderP).toContain(phrase);
+      expect(I18N[lang].tplCommanderD).toContain("GLM");
+    }
   });
 
   it("builds the Commander fallback from the installed Codex catalog", () => {

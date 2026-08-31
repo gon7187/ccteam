@@ -185,12 +185,12 @@ describe("HomeView (landing page)", () => {
     for (const vendor of ["claude", "codex", "grok", "kimi", "opencode"]) {
       expect(grid).toContain(`data-vendor="${vendor}"`);
     }
-    // The commander fields the Claude brain + Codex crews.
+    // The commander fields the Claude brain + Codex crews + GLM scout.
     const commander = grid.slice(
       grid.indexOf('data-testid="tpl-commander"'),
       grid.indexOf('data-testid="tpl-advisor"'),
     );
-    for (const vendor of ["claude", "codex"]) {
+    for (const vendor of ["claude", "codex", "opencode"]) {
       expect(commander).toContain(`data-vendor="${vendor}"`);
     }
     expect(commander).not.toContain('data-vendor="grok"');
