@@ -110,7 +110,7 @@ Default: omit `model` — vendor defaults track their latest releases.
 
 Six openings ship as cards on the web console (Home, and Team → Charter) — each prefills the launcher with a vendor lineup; the plan itself is always yours, said in plain language:
 
-- **Commander & crews** (总控-工班) — a strong-reasoning controller plans, decomposes and accepts; codex builds, grok scouts the ecosystem; completion notifications flow back to the controller. The expensive model pays only for decomposition and acceptance — volume work rides cheaper specialists.
+- **Commander & crews** (总控-工班) — a strong-reasoning controller plans, decomposes and accepts; before the first code edit of each top-level coding task a read-only OpenCode GLM (`zai-coding-plan/glm-5.3-flash`) scout returns 2–5 pinned GitHub precedents (URL, commit/tag, path, license), with exactly one Codex Luna scout fallback only when no usable GLM session exists; codex builds; completion notifications flow back to the controller and Opus + Sol hold the final gate. The expensive model pays only for decomposition and acceptance — volume work rides cheaper specialists.
 - **Daily driver & advisor** (主力-顾问) — grok or codex drives the routine work; when it hits a wall, spawn an advisor session on the same repo, take the plan, let the driver execute, stop the advisor. The expensive model bills only for the hard minutes.
 - **Cross review** (交叉互审) — one vendor writes, a different vendor reviews the diff cold, disagreements return to the controller. Different models make uncorrelated mistakes; the overlap catches what self-review rubber-stamps.
 - **Bake-off** (并行竞标) — the same hard problem to 2–3 vendors in parallel; compare, keep the best, merge the good ideas. Worth it when the solution space is wide.

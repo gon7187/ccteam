@@ -258,7 +258,7 @@ After connecting IM, you can drive sessions, send files, and approve tools from 
 
 Telegram replies render a Markdown subset (bold/italic/code/fences/links/quotes/lists) as Telegram HTML and automatically fall back to plain text if Telegram rejects the markup.
 
-Telegram also has a persistent quick-template keyboard. Send `/keys` to show the configured templates, tap one to arm its prefix for the next plain message, or send `/keys off` to remove the keyboard and discard an armed prefix. The default templates are Commander, Driver+advisor, Cross review, Bake-off, Triangulate, and Pyramid. Customize them in `~/.ccteam/config.yaml`; changes are picked up without restarting the daemon:
+Telegram also has a persistent quick-template keyboard. Send `/keys` to show the configured templates, tap one to arm its prefix for the next plain message, or send `/keys off` to remove the keyboard and discard an armed prefix. The default templates are Commander, Driver+advisor, Cross review, Bake-off, Triangulate, and Pyramid. The Commander template directs the controller to run a read-only OpenCode GLM (`zai-coding-plan/glm-5.3-flash`) scout before the first code edit of each top-level coding task — it returns 2–5 pinned GitHub precedents (URL, commit/tag, path, license); exactly one Codex Luna scout fallback applies only when no usable GLM session exists, and Opus + Codex Sol remain the final approval gate. Customize the templates in `~/.ccteam/config.yaml`; changes are picked up without restarting the daemon:
 
 ```yaml
 im:
