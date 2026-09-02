@@ -70,44 +70,81 @@ pub fn plain_with_refresh(text: impl Into<String>, refresh_command: &str) -> Ric
     }
 }
 
-/// Facts needed to render the focused session card.
+/// Facts needed to render the focused session card (§3.5d compact layout —
+/// no empty-line separators, buttons ride inline in each row, secondary
+/// facts live in one expandable quote). The renderer owns layout; every
+/// field here is raw data, not a pre-formatted line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusView {
     /// Stable ccteam session id.
     pub sid: String,
-    /// Project slug.
-    pub project: String,
     /// Harness vendor.
     pub vendor: String,
-    /// Current lifecycle label.
-    pub state: String,
     /// Active model, or an honest placeholder.
     pub model: String,
     /// Requested reasoning effort, or an honest placeholder.
     pub effort: String,
-    /// Context usage percent, or an honest placeholder.
-    pub context: String,
+    /// Optional user-facing session title.
+    pub title: Option<String>,
+    /// Project slug.
+    pub slug: String,
     /// Project directory.
     pub path: String,
-    /// Session host.
+    /// Session host; `"local"` renders no host suffix anywhere.
     pub host: String,
-    /// Detail sections, one line each; empty strings separate sections.
-    pub detail_lines: Vec<String>,
-    /// Project-scoped trailing 24-hour cost from the progress ledger.
+    /// Raw activity classification (`"working"`/`"idle"`/`"stale"`/
+    /// `"stuck"`, §3.5b) — rendered via [`activity_badge`], never a
+    /// pre-formatted display string.
+    pub activity: String,
+    /// Context usage percent, or an honest placeholder.
+    pub context: String,
+    /// Project-scoped trailing 24-hour cost + token count, pre-formatted as
+    /// `"$1.23 · 45k токенов"` (or the caveat form), WITHOUT the leading
+    /// `"💰 24ч"` label — the renderer adds that.
     pub cost_24h: String,
+    /// The oldest in-flight `RunningTask`'s own description (or kind) +
+    /// elapsed, e.g. `"cargo test --workspace, 2 мин"`, already capped to
+    /// ≤60 chars. `None` when nothing is running.
+    pub running_task: Option<String>,
+    /// Session goal: `(met, condition text)`.
+    pub goal: Option<(bool, String)>,
+    /// One entry per account, e.g. `"CC: 5h 17% (19:00)"` — the renderer
+    /// joins them with `" · "`.
+    pub usage: Vec<String>,
+    /// Direct children of this session.
+    pub children: Vec<StatusChild>,
+    /// TOTAL visible sessions in this session's project, INCLUDING this one
+    /// (R1-2 — matches both what `/sessions` lists for the project and the
+    /// `projects_total` counter beside it, which is also a total).
+    pub project_sessions_total: usize,
+    /// Projects visible to this chat.
+    pub projects_total: usize,
+    /// Human-readable "started N ago", from the session's actual spawn time.
+    pub launched: String,
+    /// Elapsed/silent-duration phrase for a working or stuck session —
+    /// `None` for idle (its label alone repeats line 2 with nothing new).
+    /// Rendered as an EXTRA `·`-joined part in the expandable quote,
+    /// alongside — never instead of — `launched`.
+    pub activity_detail: Option<String>,
+    /// Session role, or an honest placeholder.
+    pub role: String,
     /// Vendor resume UUID, or an honest placeholder.
     pub resume: String,
-    /// Direct children and the detail line that describes each one.
-    pub children: Vec<StatusChild>,
 }
 
-/// A direct child rendered in the status detail section.
+/// A direct child rendered as one compact row in the status card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusChild {
     /// Stable ccteam session id.
     pub sid: String,
-    /// Index into [`StatusView::detail_lines`].
-    pub detail_line_index: usize,
+    /// Harness vendor.
+    pub vendor: String,
+    /// Active model, or an honest placeholder.
+    pub model: String,
+    /// Raw activity classification — see [`StatusView::activity`].
+    pub activity: String,
+    /// Optional user-facing session title.
+    pub title: Option<String>,
 }
 
 /// One compact session-list row.
@@ -232,113 +269,256 @@ pub struct CommandView {
     pub help: String,
 }
 
-/// Render the focused-session card.
+/// Optional `" — <title>"` suffix, truncated the same way a session row's
+/// title is (`truncate_session_title`) — shared by the header line and each
+/// child row so a status card never wraps to a second Telegram bubble on a
+/// long title.
+fn status_title_suffix(title: Option<&str>) -> Option<String> {
+    title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(truncate_session_title)
+}
+
+/// Render the focused-session card (§3.5d): one line per fact, buttons ride
+/// inline in the row they belong to, secondary detail lives in a single
+/// expandable quote.
 pub fn render_status(view: &StatusView) -> RichReply {
-    let mut details = view.detail_lines.clone();
-    details.push(String::new());
-    details.push(view.cost_24h.clone());
-    details.push(String::new());
-    details.push(format!("🔁 resume {}", view.resume));
-    let mut markdown_detail_lines = Vec::with_capacity(details.len() * 2);
-    let mut inline_rows = Vec::new();
-    for (index, line) in details.iter().enumerate() {
-        markdown_detail_lines.push(escape_status_markdown(line));
-        if let Some(child) = view
-            .children
-            .iter()
-            .find(|child| child.detail_line_index == index)
-        {
-            if let Some(stop) = command_button_styled(
-                &format!("⛔ {}", child.sid),
-                format!("?/stop {}", child.sid),
-                Some(ButtonStyle::Danger),
-            ) {
-                let row = vec![stop];
-                if let Some(rendered) = inline_button_row(row.iter().cloned().map(Some)) {
-                    markdown_detail_lines.push(rendered);
-                }
-                inline_rows.push(row);
-            }
-        }
-    }
-    let markdown_details = markdown_detail_lines.join("\n");
-    let mut markdown_lines = vec![
-        format!(
-            "🧭 {} · {} · {}",
-            escape_status_markdown(&view.sid),
-            escape_status_markdown(&view.project),
-            escape_status_markdown(&view.vendor),
-        ),
-        format!(
-            "{} · {} · {} · ctx {}",
-            escape_status_markdown(&view.state),
-            escape_status_markdown(&view.model),
-            escape_status_markdown(&view.effort),
-            escape_status_markdown(&view.context),
-        ),
-        format!("📁 {}", escape_status_markdown(&view.path)),
-    ];
-    if view.host != "local" && !view.host.is_empty() {
-        markdown_lines.push(format!("🖥 host: {}", escape_status_markdown(&view.host)));
-    }
-    markdown_lines.push(String::new());
-    markdown_lines.push(markdown_details);
-    let mut markdown = markdown_lines.join("\n");
-    let mut plain_lines = vec![
-        format!("🧭 {} · {} · {}", view.sid, view.project, view.vendor),
-        format!(
-            "{} · {} · {} · ctx {}",
-            view.state, view.model, view.effort, view.context
-        ),
-        format!("📁 {}", view.path),
-    ];
-    if view.host != "local" && !view.host.is_empty() {
-        plain_lines.push(format!("🖥 host: {}", view.host));
-    }
-    plain_lines.push(String::new());
-    plain_lines.extend(details);
-    let plain = plain_lines.join("\n");
-    let stop = command_button_styled(
+    let stop_inline = command_button_styled(
+        "⛔",
+        format!("?/stop {}", view.sid),
+        Some(ButtonStyle::Danger),
+    );
+    let stop_classic = command_button_styled(
         "⛔ Стоп",
         format!("?/stop {}", view.sid),
         Some(ButtonStyle::Danger),
     );
-    let mut button_rows = vec![
-        command_row([
-            command_button("📋 Сессии", "/sessions"),
-            command_button("📁 Проекты", "/projects"),
-            redraw_button("🔄 Обновить", "/status"),
-        ]),
-        command_row([command_button("✏️ Новая", "?/new"), stop]),
-    ];
-    let mut trailing_rows = Vec::new();
-    if !view.children.is_empty() {
-        // `/stop children` (NOT `/stop all`, which stops every session
-        // visible to this chat, including the parent itself) — direct
-        // children of the CURRENT session only.
-        if let Some(stop_all) = command_button_styled(
-            "⛔ Остановить все дочерние",
-            "?/stop children",
+
+    // Line 1 — identity + inline stop.
+    let title = status_title_suffix(view.title.as_deref());
+    let header_plain = match &title {
+        Some(t) => format!(
+            "🧭 {} · {} · {} · {} — {t}",
+            view.sid, view.vendor, view.model, view.effort
+        ),
+        None => format!(
+            "🧭 {} · {} · {} · {}",
+            view.sid, view.vendor, view.model, view.effort
+        ),
+    };
+    let mut header_markdown = match &title {
+        Some(t) => format!(
+            "🧭 {} · {} · {} · {} — {}",
+            escape_status_markdown(&view.sid),
+            escape_status_markdown(&view.vendor),
+            escape_status_markdown(&view.model),
+            escape_status_markdown(&view.effort),
+            escape_status_markdown(t),
+        ),
+        None => format!(
+            "🧭 {} · {} · {} · {}",
+            escape_status_markdown(&view.sid),
+            escape_status_markdown(&view.vendor),
+            escape_status_markdown(&view.model),
+            escape_status_markdown(&view.effort),
+        ),
+    };
+    if let Some(button) = &stop_inline {
+        header_markdown.push(' ');
+        header_markdown.push_str(&inline_text_button(button));
+    }
+
+    // Line 2 — activity badge + context + cost. Unlike a `/sessions` row,
+    // `ctx` is NEVER omitted here even when unknown — an honest `ctx —`
+    // placeholder, not a silent drop (SPEC-3.5d-roleless — "never
+    // fabricated" extends to "never silently missing" too).
+    let (icon, label) = activity_badge(&view.activity);
+    let line2_plain = format!(
+        "{icon} {label} · ctx {} · 💰 24ч {}",
+        view.context, view.cost_24h
+    );
+    let line2_markdown = format!(
+        "{icon} {label} · ctx {} · 💰 24ч {}",
+        escape_status_markdown(&view.context),
+        escape_status_markdown(&view.cost_24h)
+    );
+
+    // Line 3 — project slug + path (+ host, only when not local).
+    let show_host = view.host != "local" && !view.host.is_empty();
+    let line3_plain = if show_host {
+        format!("📁 {} · {} · host: {}", view.slug, view.path, view.host)
+    } else {
+        format!("📁 {} · {}", view.slug, view.path)
+    };
+    let line3_markdown = if show_host {
+        format!(
+            "📁 {} · {} · host: {}",
+            escape_status_markdown(&view.slug),
+            escape_status_markdown(&view.path),
+            escape_status_markdown(&view.host),
+        )
+    } else {
+        format!(
+            "📁 {} · {}",
+            escape_status_markdown(&view.slug),
+            escape_status_markdown(&view.path),
+        )
+    };
+
+    let mut plain_lines = vec![header_plain, line2_plain, line3_plain];
+    let mut markdown_lines = vec![header_markdown, line2_markdown, line3_markdown];
+
+    // Conditional lines — only when there's data.
+    if let Some(task) = &view.running_task {
+        let line = format!("▶ {task}");
+        markdown_lines.push(escape_status_markdown(&line));
+        plain_lines.push(line);
+    }
+    if let Some((met, condition)) = &view.goal {
+        let marker = if *met { "✅" } else { "🎯" };
+        let line = format!("{marker} {condition}");
+        markdown_lines.push(escape_status_markdown(&line));
+        plain_lines.push(line);
+    }
+    if !view.usage.is_empty() {
+        let line = format!("⚡️ {}", view.usage.join(" · "));
+        markdown_lines.push(escape_status_markdown(&line));
+        plain_lines.push(line);
+    }
+
+    // Children — header always renders (it carries the counters even with
+    // no children); its "⛔ все" only when there IS a direct child to stop.
+    markdown_lines.push(String::new());
+    plain_lines.push(String::new());
+    let children_header = format!(
+        "👥 Дочерние {} · сессий проекта {} · проектов {}",
+        view.children.len(),
+        view.project_sessions_total,
+        view.projects_total,
+    );
+    let stop_all_children = (!view.children.is_empty())
+        .then(|| command_button_styled("⛔ все", "?/stop children", Some(ButtonStyle::Danger)))
+        .flatten();
+    let mut children_header_markdown = escape_status_markdown(&children_header);
+    if let Some(button) = &stop_all_children {
+        children_header_markdown.push(' ');
+        children_header_markdown.push_str(&inline_text_button(button));
+    }
+    markdown_lines.push(children_header_markdown);
+    plain_lines.push(children_header);
+
+    let mut child_stop_rows = Vec::with_capacity(view.children.len());
+    for child in &view.children {
+        let (c_icon, c_label) = activity_badge(&child.activity);
+        let title = status_title_suffix(child.title.as_deref());
+        let title_plain = title
+            .as_deref()
+            .map(|t| format!(" — {t}"))
+            .unwrap_or_default();
+        let title_markdown = title
+            .as_deref()
+            .map(|t| format!(" — {}", escape_status_markdown(t)))
+            .unwrap_or_default();
+        plain_lines.push(format!(
+            "  • {} · {} · {} · {c_icon} {c_label}{title_plain}",
+            child.sid, child.vendor, child.model
+        ));
+        let mut line_markdown = format!(
+            "  • {} · {} · {} · {c_icon} {c_label}{title_markdown}",
+            escape_status_markdown(&child.sid),
+            escape_status_markdown(&child.vendor),
+            escape_status_markdown(&child.model),
+        );
+        let stop = command_button_styled(
+            "⛔",
+            format!("?/stop {}", child.sid),
             Some(ButtonStyle::Danger),
-        ) {
-            trailing_rows.push(vec![stop_all]);
+        );
+        if let Some(button) = &stop {
+            line_markdown.push(' ');
+            line_markdown.push_str(&inline_text_button(button));
         }
+        markdown_lines.push(line_markdown);
+        child_stop_rows.push(command_row([command_button_styled(
+            &format!("⛔ {}", child.sid),
+            format!("?/stop {}", child.sid),
+            Some(ButtonStyle::Danger),
+        )]));
     }
-    let global_rows = button_rows.clone();
-    let inline_buttons = !inline_rows.is_empty();
-    button_rows = inline_rows;
-    button_rows.extend(global_rows.clone());
-    button_rows.extend(trailing_rows.clone());
-    if inline_buttons {
-        let mut all_trailing = global_rows;
-        all_trailing.extend(trailing_rows);
-        append_inline_rows(&mut markdown, &all_trailing);
+
+    // Details — one expandable quote (§3.5d mock: `Запущено: … · Роль: …
+    // · host: … · resume <uuid>`, unconditional — SPEC-3.5D-2 fix: the
+    // "host only if not local" carve-out belongs to line 3 alone, NOT to
+    // this quote, which always shows it).
+    //
+    // SPEC-3.5D-R2-2 fix — `activity_detail` (the working/stuck elapsed
+    // phrase) is folded into the SAME `Запущено:` part as a comma suffix
+    // (`Запущено: 2 ч назад, работает 2m`), not pushed as its own
+    // `·`-joined part: the spec's quote names exactly four parts
+    // (`Запущено` / `Роль` / `host` / `resume`), and a fifth part would
+    // silently grow that count for any session with a live or stuck turn.
+    let launched_part = match &view.activity_detail {
+        Some(detail) => format!("Запущено: {}, {detail}", view.launched),
+        None => format!("Запущено: {}", view.launched),
+    };
+    let details_line = [
+        launched_part,
+        format!("Роль: {}", view.role),
+        format!("host: {}", view.host),
+        format!("resume {}", view.resume),
+    ]
+    .join(" · ");
+    // R2-2 fix — this blank line must separate the quote from whatever
+    // precedes it UNCONDITIONALLY (children header, or the last child row):
+    // every other block-level splice in this file (`render_sessions`,
+    // `append_inline_rows`, `build_rich_send_body`) uses `\n\n`, and making
+    // this one conditional on `!view.children.is_empty()` was the sole
+    // exception — the minimal (childless) card packed the quote into the
+    // SAME paragraph as the counters line, so whether it opened a real
+    // block depended on how a downstream Markdown-agnostic renderer
+    // happened to treat a lone `\n`.
+    markdown_lines.push(String::new());
+    plain_lines.push(String::new());
+    markdown_lines.push(format!(
+        "<blockquote expandable>{}</blockquote>",
+        escape_status_markdown(&details_line)
+    ));
+    plain_lines.push(details_line);
+
+    let mut markdown = markdown_lines.join("\n");
+    let plain = plain_lines.join("\n");
+
+    let bottom_row = command_row([
+        command_button("📋 Сессии", "/sessions"),
+        command_button("📁 Проекты", "/projects"),
+        redraw_button("🔄 Обновить", "/status"),
+        command_button("✏️ Новая", "?/new"),
+    ]);
+
+    append_inline_rows(&mut markdown, std::slice::from_ref(&bottom_row));
+
+    let mut button_rows = Vec::with_capacity(3 + child_stop_rows.len());
+    if let Some(stop) = stop_classic {
+        button_rows.push(vec![stop]);
     }
+    button_rows.extend(child_stop_rows);
+    if let Some(stop_all) = command_button_styled(
+        "⛔ Остановить все дочерние",
+        "?/stop children",
+        Some(ButtonStyle::Danger),
+    )
+    .filter(|_| !view.children.is_empty())
+    {
+        button_rows.push(vec![stop_all]);
+    }
+    button_rows.push(bottom_row);
+
     RichReply {
         markdown,
         plain,
         button_rows,
-        inline_buttons,
+        inline_buttons: true,
         reply_keyboard: None,
     }
 }
@@ -972,10 +1152,12 @@ mod tests {
     use crate::transport::ButtonStyle;
 
     use super::{
-        activity_badge, render_fs_browser, render_help, render_projects, render_sessions,
-        render_status, CommandView, DetachedSessionRow, FsBrowserView, FsEntryView, ProjectRow,
-        ProjectsView, SessionRow, SessionsView, StatusChild, StatusView,
+        activity_badge, command_button, command_row, redraw_button, render_fs_browser, render_help,
+        render_projects, render_sessions, render_status, CommandView, DetachedSessionRow,
+        FsBrowserView, FsEntryView, ProjectRow, ProjectsView, SessionRow, SessionsView,
+        StatusChild, StatusView,
     };
+    use crate::transport::MessageOption;
 
     /// SPEC-4/SPEC-3.5b — pins the whole documented palette (§3.5b's table
     /// plus the unknown fallback) so a future edit can't silently drift an
@@ -1067,116 +1249,235 @@ mod tests {
         );
     }
 
-    #[test]
-    fn status_has_russian_card_and_commands() {
-        let reply = render_status(&StatusView {
+    /// Base fixture for a childless, option-free card — every other status
+    /// test starts here and overrides only what it needs.
+    fn minimal_status_view() -> StatusView {
+        StatusView {
             sid: "s42".into(),
-            project: "ccteam".into(),
             vendor: "claude".into(),
-            state: "🟢 ожидание".into(),
             model: "opus".into(),
             effort: "high".into(),
-            context: "38%".into(),
+            title: None,
+            slug: "ccteam".into(),
             path: "/root/projects/ccteam".into(),
             host: "local".into(),
-            detail_lines: vec![
-                "Запущено: ожидает · Роль: reviewer".into(),
-                "".into(),
-                "⚡️ Использование:".into(),
-                "CC: 5h 17% (19:00) · неделя 78% (06/29) · max".into(),
-                "".into(),
-                "👥 Дочерние (2):".into(),
-                "  • s56 · codex · gpt-5.6-terra · 🔵 работает · title".into(),
-                "".into(),
-                "  • s57 · codex · gpt-5.6-luna · 🟢 ожидание · other".into(),
-                "".into(),
-                "↓ Другие сессии проекта: 2 → /sessions".into(),
-                "↓ Все проекты: 3 → /projects".into(),
-            ],
-            cost_24h: "💰 Расход проекта 24ч: $1.23".into(),
+            activity: "idle".into(),
+            context: "38%".into(),
+            cost_24h: "$1.23 · 45k токенов".into(),
+            running_task: None,
+            goal: None,
+            usage: Vec::new(),
+            children: Vec::new(),
+            project_sessions_total: 1,
+            projects_total: 1,
+            launched: "2 ч назад".into(),
+            activity_detail: None,
+            role: "—".into(),
             resume: "123e4567-e89b-12d3-a456-426614174000".into(),
-            children: vec![StatusChild {
-                sid: "s56".into(),
-                detail_line_index: 6,
-            }],
-        });
+        }
+    }
+
+    /// SPEC-3.5d — no children, no optional lines: exactly 3 header lines +
+    /// one blank + the children counter line + one more blank + the
+    /// expandable quote, then one bottom button row. Pins the whole compact
+    /// markdown byte-for-byte so a future edit can't silently drop or
+    /// reorder a section. R2-2 fix — the blank before the quote is now
+    /// unconditional (was only present with children present), so the
+    /// quote opens its OWN block in the minimal case too, matching every
+    /// other block-level splice in this file (`\n\n`, never a lone `\n`).
+    #[test]
+    fn status_minimal_card_has_exact_compact_layout() {
+        let reply = render_status(&minimal_status_view());
 
         assert_eq!(
             reply.markdown,
-            "🧭 s42 · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 /root/projects/ccteam\n\nЗапущено: ожидает · Роль: reviewer\n\n⚡️ Использование:\nCC: 5h 17% (19:00) · неделя 78% (06/29) · max\n\n👥 Дочерние (2):\n  • s56 · codex · gpt-5.6-terra · 🔵 работает · title\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop s56\" style=\"danger\">⛔ s56</tg-button></tg-button-row>\n\n  • s57 · codex · gpt-5.6-luna · 🟢 ожидание · other\n\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\n\n💰 Расход проекта 24ч: $1.23\n\n🔁 resume 123e4567-e89b-12d3-a456-426614174000\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:/sessions\">📋 Сессии</tg-button><tg-button type=\"callback_data\" data=\"cmd:/projects\">📁 Проекты</tg-button><tg-button type=\"callback_data\" data=\"cmd:~/status\">🔄 Обновить</tg-button></tg-button-row>\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/new\">✏️ Новая</tg-button><tg-button type=\"callback_data\" data=\"cmd:?/stop s42\" style=\"danger\">⛔ Стоп</tg-button></tg-button-row>\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop children\" style=\"danger\">⛔ Остановить все дочерние</tg-button></tg-button-row>"
+            concat!(
+                "🧭 s42 · claude · opus · high ",
+                "<tg-button type=\"callback_data\" data=\"cmd:?/stop s42\" style=\"danger\">⛔</tg-button>\n",
+                "🟢 ожидание · ctx 38% · 💰 24ч $1.23 · 45k токенов\n",
+                "📁 ccteam · /root/projects/ccteam\n\n",
+                "👥 Дочерние 0 · сессий проекта 1 · проектов 1\n\n",
+                "<blockquote expandable>Запущено: 2 ч назад · Роль: — · host: local · resume 123e4567-e89b-12d3-a456-426614174000</blockquote>\n\n",
+                "<tg-button-row>",
+                "<tg-button type=\"callback_data\" data=\"cmd:/sessions\">📋 Сессии</tg-button>",
+                "<tg-button type=\"callback_data\" data=\"cmd:/projects\">📁 Проекты</tg-button>",
+                "<tg-button type=\"callback_data\" data=\"cmd:~/status\">🔄 Обновить</tg-button>",
+                "<tg-button type=\"callback_data\" data=\"cmd:?/new\">✏️ Новая</tg-button>",
+                "</tg-button-row>"
+            )
         );
-        assert_eq!(reply.plain.lines().next(), Some("🧭 s42 · ccteam · claude"));
-        assert!(reply
-            .plain
-            .contains("🔁 resume 123e4567-e89b-12d3-a456-426614174000"));
-        assert_eq!(reply.button_rows[2][0].data, "cmd:?/new");
-        assert_eq!(reply.button_rows[2][1].data, "cmd:?/stop s42");
-        assert!(reply.markdown.contains("<tg-button-row>"));
-        assert!(
-            reply.markdown.find("s56").unwrap()
-                < reply.markdown.find("data=\"cmd:?/stop s56\"").unwrap()
+        assert_eq!(
+            reply.plain,
+            concat!(
+                "🧭 s42 · claude · opus · high\n",
+                "🟢 ожидание · ctx 38% · 💰 24ч $1.23 · 45k токенов\n",
+                "📁 ccteam · /root/projects/ccteam\n\n",
+                "👥 Дочерние 0 · сессий проекта 1 · проектов 1\n\n",
+                "Запущено: 2 ч назад · Роль: — · host: local · resume 123e4567-e89b-12d3-a456-426614174000"
+            )
         );
-        assert!(reply.plain.contains("s56"));
-        assert!(!reply.plain.contains("<tg-button-row>"));
-        assert_eq!(reply.button_rows[3][0].label, "⛔ Остановить все дочерние");
-        assert_eq!(reply.button_rows[3][0].data, "cmd:?/stop children");
-        assert_eq!(reply.button_rows[3][0].style, Some(ButtonStyle::Danger));
+        assert!(!reply.plain.contains('<'));
+        assert_eq!(
+            reply.button_rows,
+            vec![
+                vec![MessageOption {
+                    data: "cmd:?/stop s42".into(),
+                    label: "⛔ Стоп".into(),
+                    id: "?/stop s42".into(),
+                    style: Some(ButtonStyle::Danger),
+                }],
+                command_row([
+                    command_button("📋 Сессии", "/sessions"),
+                    command_button("📁 Проекты", "/projects"),
+                    redraw_button("🔄 Обновить", "/status"),
+                    command_button("✏️ Новая", "?/new"),
+                ]),
+            ]
+        );
+        assert!(reply.inline_buttons);
         assert!(reply.button_rows.iter().all(|row| row.len() <= 8));
         assert!(reply
             .button_rows
             .iter()
             .flatten()
             .all(|button| button.data.len() <= 64));
-        assert_eq!(super::escape_markdown("x*y[]"), "x\\*y\\[\\]");
     }
 
+    /// SPEC-3.5D-R2-2 — a working/stuck session's `activity_detail` is
+    /// folded into the SAME "Запущено: …" part as a comma suffix, not
+    /// pushed as its own `·`-joined part: the quote keeps exactly the
+    /// spec's four `·`-joined parts (`Запущено` / `Роль` / `host` /
+    /// `resume`) whether or not the session has a live/stuck turn.
     #[test]
-    fn status_escapes_html_tags_in_child_titles() {
-        let reply = render_status(&StatusView {
-            sid: "s78".into(),
-            project: "ccteam".into(),
-            vendor: "codex".into(),
-            state: "🟢 ожидание".into(),
-            model: "gpt-5.6-terra".into(),
-            effort: "—".into(),
-            context: "—".into(),
-            path: "/tmp/ccteam".into(),
-            host: "local".into(),
-            detail_lines: vec!["  • s79 · x</blockquote><tg-button-row>".into()],
-            cost_24h: "💰 Расход проекта 24ч: $0.00".into(),
-            resume: "—".into(),
-            children: Vec::new(),
-        });
+    fn status_card_folds_activity_detail_into_launched_part() {
+        let mut view = minimal_status_view();
+        view.activity_detail = Some("работает 2m".into());
+        let reply = render_status(&view);
 
-        assert!(!reply.markdown.contains("<blockquote"));
-        assert!(!reply.markdown.contains("</blockquote>"));
-        assert!(!reply.markdown.contains("🖥 host: local"));
-        assert!(!reply.markdown.contains("<tg-button-row>"));
+        let quote_line = reply
+            .plain
+            .lines()
+            .last()
+            .expect("quote is the last plain line");
+        assert_eq!(
+            quote_line,
+            "Запущено: 2 ч назад, работает 2m · Роль: — · host: local · resume 123e4567-e89b-12d3-a456-426614174000",
+            "activity_detail rides the Запущено part as a comma suffix, quote still has exactly the spec's four `·`-joined parts"
+        );
+    }
+
+    /// SPEC-3.5d — two children render two `⛔ <sid>` rows and the header
+    /// grows an `⛔ все` button; the classic `button_rows` fallback carries
+    /// the SAME `data` as the buttons embedded inline in the markdown, so a
+    /// circuit-breaker fallback to classic mode never orphans a control.
+    #[test]
+    fn status_two_children_add_stop_lines_and_all_button() {
+        let mut view = minimal_status_view();
+        view.project_sessions_total = 3;
+        view.projects_total = 4;
+        view.children = vec![
+            StatusChild {
+                sid: "s56".into(),
+                vendor: "codex".into(),
+                model: "terra".into(),
+                activity: "working".into(),
+                title: Some("план гейта".into()),
+            },
+            StatusChild {
+                sid: "s57".into(),
+                vendor: "codex".into(),
+                model: "luna".into(),
+                activity: "idle".into(),
+                title: Some("ревью".into()),
+            },
+        ];
+        let reply = render_status(&view);
+
+        let children_header = "👥 Дочерние 2 · сессий проекта 3 · проектов 4";
+        assert!(reply.markdown.contains(children_header));
         assert!(reply
             .markdown
-            .contains("&lt;/blockquote&gt;&lt;tg-button-row&gt;"));
+            .contains("data=\"cmd:?/stop children\" style=\"danger\">⛔ все"));
+        assert!(reply
+            .markdown
+            .contains("• s56 · codex · terra · 🔵 работает — план гейта"));
+        assert!(reply
+            .markdown
+            .contains("• s57 · codex · luna · 🟢 ожидание — ревью"));
+        // Exactly two bare `⛔` child-stop buttons (one per child), distinct
+        // from the header stop and the "все" button.
+        assert_eq!(reply.markdown.matches("data=\"cmd:?/stop s56\"").count(), 1);
+        assert_eq!(reply.markdown.matches("data=\"cmd:?/stop s57\"").count(), 1);
+        assert!(reply.plain.contains(children_header));
+        assert!(reply.plain.contains("s56"));
+        assert!(reply.plain.contains("s57"));
+        assert!(!reply.plain.contains('<'));
+        // Header block is ordered before the children section, which is
+        // ordered before the quote.
+        let header_pos = reply.markdown.find("🧭 s42").unwrap();
+        let children_pos = reply.markdown.find(children_header).unwrap();
+        let quote_pos = reply.markdown.find("<blockquote expandable>").unwrap();
+        assert!(header_pos < children_pos && children_pos < quote_pos);
+
+        // Classic fallback: stop row, one row per child, "stop all", bottom row.
+        assert_eq!(reply.button_rows.len(), 5);
+        assert_eq!(reply.button_rows[0][0].data, "cmd:?/stop s42");
+        assert_eq!(reply.button_rows[1][0].data, "cmd:?/stop s56");
+        assert_eq!(reply.button_rows[1][0].label, "⛔ s56");
+        assert_eq!(reply.button_rows[2][0].data, "cmd:?/stop s57");
+        assert_eq!(reply.button_rows[3][0].data, "cmd:?/stop children");
+        assert_eq!(reply.button_rows[3][0].label, "⛔ Остановить все дочерние");
+        assert_eq!(reply.button_rows[4][0].data, "cmd:/sessions");
+
+        // Classic `button_rows` carry the exact same `data` values as the
+        // inline buttons embedded in the markdown — no control is orphaned
+        // by a circuit-breaker fallback to classic mode.
+        let inline_data: std::collections::BTreeSet<&str> = reply
+            .markdown
+            .split("data=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        let classic_data: std::collections::BTreeSet<&str> = reply
+            .button_rows
+            .iter()
+            .flatten()
+            .map(|button| button.data.as_str())
+            .collect();
+        assert_eq!(inline_data, classic_data);
     }
 
     #[test]
-    fn status_shows_non_local_host() {
-        let reply = render_status(&StatusView {
-            sid: "s1".into(),
-            project: "ccteam".into(),
-            vendor: "codex".into(),
-            state: "🟢 ожидание".into(),
-            model: "gpt-5.6-terra".into(),
-            effort: "medium".into(),
-            context: "23%".into(),
-            path: "/root/projects/ccteam".into(),
-            host: "edge".into(),
-            detail_lines: vec!["Запущено: ожидание · Роль: —".into()],
-            cost_24h: "💰 Расход проекта 24ч: $0.00".into(),
-            resume: "—".into(),
-            children: Vec::new(),
-        });
+    fn status_escapes_html_and_markdown_special_chars_in_free_text() {
+        let mut view = minimal_status_view();
+        // Short enough to survive `status_title_suffix`'s 20-char cap intact.
+        view.title = Some("</blockquote><b>".into());
+        view.running_task = Some("build[1]*bold*".into());
+        let reply = render_status(&view);
 
-        assert!(reply.markdown.contains("🖥 host: edge"));
-        assert!(reply.plain.contains("🖥 host: edge"));
+        assert!(!reply.markdown.contains("</blockquote><b>"));
+        assert!(reply.markdown.contains("&lt;/blockquote&gt;&lt;b&gt;"));
+        assert!(reply.markdown.contains("build\\[1\\]\\*bold\\*"));
+        // Only ONE real `<blockquote expandable>` tag exists (the trailing
+        // details quote) — the escaped title text must not reopen a second one.
+        assert_eq!(reply.markdown.matches("<blockquote expandable>").count(), 1);
+        assert_eq!(reply.markdown.matches("</blockquote>").count(), 1);
+        // .plain carries the raw, unescaped text for every non-Telegram channel.
+        assert!(reply.plain.contains("</blockquote><b>"));
+        assert!(reply.plain.contains("build[1]*bold*"));
+    }
+
+    #[test]
+    fn status_shows_non_local_host_in_project_line_and_quote() {
+        let mut view = minimal_status_view();
+        view.host = "edge".into();
+        let reply = render_status(&view);
+
+        assert!(reply
+            .markdown
+            .contains("📁 ccteam · /root/projects/ccteam · host: edge"));
+        assert!(reply.markdown.contains("resume") && reply.markdown.contains("host: edge"));
+        assert!(reply.plain.contains("host: edge"));
     }
 
     #[test]

@@ -15591,36 +15591,39 @@ impl Gateway {
         // Same in-flight verdict the child rows / MCP / web get
         // ([`Gateway::live_turn`]) — this line only dresses it with durations.
         let live = self.live_turn(s, Instant::now());
-        // review-fix F3 — take BOTH the icon and the label from
-        // `activity_badge` (not just the icon), so a palette rename
-        // propagates here instead of leaving this card's wording to drift
-        // out of sync with `/sessions`' `markdown_session_line`/
-        // `plain_session_line` (im_views.rs), which already source both
-        // halves. Only the trailing duration/detail suffix stays local.
-        let (state, detail) = match live {
-            None => {
-                let (icon, label) = im_views::activity_badge("idle");
-                (icon, label.to_string())
-            }
+        // §3.5d — `activity` is the RAW token [`im_views::activity_badge`]
+        // renders the line-2 badge from (never a pre-formatted display
+        // string, so a palette rename can't drift this card out of sync
+        // with `/sessions`); `activity_detail` is the elapsed/silent-duration
+        // phrase, `None` for idle (its label alone would just repeat line 2
+        // with no new information) and `Some` for working/stuck, where
+        // `im_views` folds it into the SAME "Запущено: …" part as a comma
+        // suffix (R1 fix — `launched` used to be fed this phrase directly,
+        // which read as "Запущено: ожидание" for the common idle case and
+        // never carried an actual launch time; SPEC-3.5D-R2-2 fix — it then
+        // rode as its OWN extra `·`-joined part, growing the quote past the
+        // spec's four).
+        let (activity, activity_detail) = match live {
+            None => ("idle", None),
             // Running subagents ⇒ definitively working (overrides silence).
             Some(l) if l.is_stuck() && !turn_scoped_running => {
-                let (icon, label) = im_views::activity_badge("stuck");
+                let label = im_views::activity_badge("stuck").1;
                 (
-                    icon,
-                    format!(
+                    "stuck",
+                    Some(format!(
                         "{label}: нет событий {}",
                         humanize_dur(std::time::Duration::from_secs(l.silent_seconds))
-                    ),
+                    )),
                 )
             }
             Some(l) => {
-                let (icon, label) = im_views::activity_badge("working");
+                let label = im_views::activity_badge("working").1;
                 (
-                    icon,
-                    format!(
+                    "working",
+                    Some(format!(
                         "{label} {}",
                         humanize_dur(std::time::Duration::from_secs(l.elapsed_seconds))
-                    ),
+                    )),
                 )
             }
         };
@@ -15657,13 +15660,14 @@ impl Gateway {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "—".to_string());
         let child_activity = self.session_activity_snapshot(&direct_children);
-        let child_summary = direct_children
+        let children: Vec<StatusChild> = direct_children
             .iter()
             .map(|child| {
                 let activity = child_activity
                     .get(&child.id)
                     .map(String::as_str)
-                    .unwrap_or("idle");
+                    .unwrap_or("idle")
+                    .to_string();
                 let child_model = probes
                     .statuses
                     .get(&child.id)
@@ -15673,92 +15677,100 @@ impl Gateway {
                     .filter(|model| !model.is_empty())
                     .map(|model| strip_vendor_prefix(vendor_str(child.vendor), model).to_string())
                     .unwrap_or_else(|| "—".to_string());
-                let title = self
-                    .session_title(child)
-                    .and_then(|title| truncate_title(&title))
-                    .unwrap_or_else(|| "—".to_string());
-                (
-                    child.id.clone(),
-                    format!(
-                        "{} · {} · {child_model} · {} · {title}",
-                        child.id,
-                        vendor_str(child.vendor),
-                        activity_marker(activity)
-                    ),
-                )
+                StatusChild {
+                    sid: child.id.clone(),
+                    vendor: vendor_str(child.vendor).to_string(),
+                    model: child_model,
+                    activity,
+                    title: self
+                        .session_title(child)
+                        .and_then(|title| truncate_title(&title)),
+                }
             })
-            .collect::<Vec<_>>();
+            .collect();
         let role = if s.role.is_empty() { "—" } else { &s.role };
         let resume = thread_vendor_uuid(&s.thread).unwrap_or_else(|| "—".to_string());
-        let mut detail_lines = vec![format!("Запущено: {detail} · Роль: {role}")];
-        let running_task_lines = format_running_tasks(running)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        if !running_task_lines.is_empty() {
-            detail_lines.push(String::new());
-            detail_lines.extend(running_task_lines);
-        }
-        if let Some(goal) = status.and_then(|status| status.goal.as_ref()) {
-            let condition = goal.condition.trim();
-            if !condition.is_empty() {
-                let marker = if goal.met { "✅" } else { "🎯" };
-                let shown: String = if condition.chars().count() > 60 {
-                    format!("{}…", condition.chars().take(59).collect::<String>())
-                } else {
-                    condition.to_string()
+        // §3.5d — the `▶` row shows the OLDEST running task's own
+        // description/kind + elapsed (`format_running_tasks`' first line
+        // after its `🤖 Выполняется: …` header, oldest first — same "on top"
+        // rule), capped to 60 chars. R1 fix — this must NOT read
+        // `format_running_tasks(running).lines().next()`: that string's
+        // first line is always the aggregate counts header itself (`🤖
+        // Выполняется: subagent (1)`), never a task; the per-task
+        // description/elapsed the spec's `▶ cargo test --workspace, 2 мин`
+        // mock shows only appears on later lines, which this row never saw.
+        // The full multi-task breakdown that used to fill the old card's
+        // detail section stays gone from `/status` (still available via
+        // other surfaces) — only the single lead task rides this row.
+        //
+        // R2-1 fix — the lead task must be the OLDEST TURN-SCOPED one first
+        // (same `outlives_turn` axis `turn_scoped_running` above already
+        // partitions on), falling back to the oldest outliving-turn task
+        // only when nothing turn-scoped is running. Picking the plain
+        // oldest across the whole slice let a long-lived background
+        // shell/monitor permanently hide the subagent actually driving the
+        // CURRENT turn. A `(+N)` suffix is appended whenever more than one
+        // task is running, so the row admits it is a lead task, not the
+        // whole picture.
+        let running_task = {
+            let lead = running
+                .iter()
+                .filter(|t| !t.outlives_turn())
+                .min_by_key(|t| t.started)
+                .or_else(|| running.iter().min_by_key(|t| t.started));
+            lead.map(|t| {
+                let kind = match t.task_type.as_str() {
+                    "local_workflow" => "workflow",
+                    "local_bash" => "фон",
+                    _ if t.kind.is_empty() => "subagent",
+                    _ => t.kind.as_str(),
                 };
-                detail_lines.push(String::new());
-                detail_lines.push(format!("{marker} {shown}"));
-            }
-        }
-        let usage_lines = probes
+                let elapsed = humanize_dur(t.started.elapsed());
+                let desc = t.description.trim();
+                let label = if desc.is_empty() { kind } else { desc };
+                let line = format!("{label}, {elapsed}");
+                let line = if line.chars().count() > 60 {
+                    format!("{}…", line.chars().take(59).collect::<String>())
+                } else {
+                    line
+                };
+                if running.len() > 1 {
+                    format!("{line} (+{})", running.len() - 1)
+                } else {
+                    line
+                }
+            })
+        };
+        let goal = status
+            .and_then(|status| status.goal.as_ref())
+            .and_then(|goal| {
+                let condition = goal.condition.trim();
+                (!condition.is_empty()).then(|| {
+                    let shown: String = if condition.chars().count() > 60 {
+                        format!("{}…", condition.chars().take(59).collect::<String>())
+                    } else {
+                        condition.to_string()
+                    };
+                    (goal.met, shown)
+                })
+            });
+        let usage = probes
             .account_usages
             .iter()
             .filter_map(|(label, usage)| {
                 format_account_usage(usage).map(|usage| format!("{label}: {usage}"))
             })
             .collect::<Vec<_>>();
-        if !usage_lines.is_empty() {
-            detail_lines.push(String::new());
-            detail_lines.push("⚡️ Использование:".to_string());
-            detail_lines.extend(usage_lines);
-        }
-        let mut children = Vec::new();
-        if !child_summary.is_empty() {
-            detail_lines.push(String::new());
-            detail_lines.push(format!("👥 Дочерние ({}):", child_summary.len()));
-            for (index, (sid, child)) in child_summary.into_iter().enumerate() {
-                if index > 0 {
-                    detail_lines.push(String::new());
-                }
-                let detail_line_index = detail_lines.len();
-                detail_lines.push(format!("  • {child}"));
-                children.push(StatusChild {
-                    sid,
-                    detail_line_index,
-                });
-            }
-        }
-        let same_project_sessions = visible
+        // R1-2 fix — TOTAL visible sessions in this project, INCLUDING the
+        // current one, matching both what `/sessions` lists for the project
+        // and the `проектов <k>` counter next to it (also a total, not an
+        // "others" count) — a bare `+1` on the old "other sessions" count
+        // would leave the field's name lying about what it holds.
+        let project_sessions_total = visible
             .iter()
-            .filter(|other| other.project == s.project && other.id != s.id)
+            .filter(|other| other.project == s.project)
             .count();
-        if same_project_sessions > 0 {
-            detail_lines.push(String::new());
-            detail_lines.push(format!(
-                "↓ Другие сессии проекта: {same_project_sessions} → /sessions"
-            ));
-        }
-        if same_project_sessions == 0 {
-            detail_lines.push(String::new());
-        }
-        detail_lines.push(format!(
-            "↓ Все проекты: {} → /projects",
-            self.visible_project_slugs(chat).len()
-        ));
+        let projects_total = self.visible_project_slugs(chat).len();
         let cost_24h = self
             .progress_projection
             .as_ref()
@@ -15785,29 +15797,60 @@ impl Gateway {
                     )
                 };
                 format!(
-                    "💰 Расход проекта 24ч: {usd} · {} токенов",
+                    "{usd} · {} токенов",
                     format_token_volume(snapshot.tokens_24h)
                 )
             })
-            .unwrap_or_else(|| "💰 Расход проекта 24ч: нет данных".to_string());
+            .unwrap_or_else(|| "нет данных".to_string());
+        // SPEC-3.5D-1 fix — `launched` is the session's actual spawn time
+        // (`meta.created_at`, the same RFC3339 field `session_views` reads
+        // for the REST/web session list), formatted as "<elapsed> назад" —
+        // NOT the activity-elapsed/silent-duration phrase (that rides
+        // `activity_detail` instead, see above). An unparseable/missing
+        // `created_at` (never blocks the card) degrades to an honest `—`.
+        let launched = self
+            .session_catalog
+            .get(&s.id)
+            .map(|entry| entry.meta.created_at)
+            .filter(|c| !c.is_empty())
+            .and_then(|c| chrono::DateTime::parse_from_rfc3339(&c).ok())
+            .map(|dt| {
+                let secs = chrono::Utc::now()
+                    .signed_duration_since(dt.with_timezone(&chrono::Utc))
+                    .num_seconds()
+                    .max(0) as u64;
+                format!(
+                    "{} назад",
+                    humanize_dur_ru(std::time::Duration::from_secs(secs))
+                )
+            })
+            .unwrap_or_else(|| "—".to_string());
         im_views::render_status(&StatusView {
             sid: s.id.clone(),
-            project: s.project.clone(),
             vendor: vendor_str(s.vendor).to_string(),
-            state: format!("{state} {detail}"),
             model: model.to_string(),
             effort: effort.to_string(),
-            context,
+            title: self.session_title(s),
+            slug: s.project.clone(),
             path,
             host: if s.host.is_empty() {
                 "local".to_string()
             } else {
                 s.host.clone()
             },
-            detail_lines,
+            activity: activity.to_string(),
+            context,
             cost_24h,
-            resume,
+            running_task,
+            goal,
+            usage,
             children,
+            project_sessions_total,
+            projects_total,
+            launched,
+            activity_detail,
+            role: role.to_string(),
+            resume,
         })
     }
 
@@ -21037,15 +21080,6 @@ fn strip_vendor_prefix<'a>(vendor: &str, model: &'a str) -> &'a str {
     }
 }
 
-/// Icon + Russian label for a raw activity classification, formatted as one
-/// unit (`"🔵 работает"`) for the child-activity detail line. Reads from
-/// [`im_views::activity_badge`], the single palette source (§3.5b, F4/SPEC-2)
-/// — no icon literal lives here any more.
-fn activity_marker(activity: &str) -> String {
-    let (icon, label) = im_views::activity_badge(activity);
-    format!("{icon} {label}")
-}
-
 /// Split a `/rename` argument into an explicit `[<sid>] <title>` pair. A
 /// leading `s<N>` token counts as a TARGET only when a title follows it, so
 /// `/rename s3` still titles the current session `s3` rather than trying to
@@ -22213,66 +22247,6 @@ fn gateway_turn_timeout_duration() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
-/// Humanize a [`Duration`](std::time::Duration) for the `/status` fleet line:
-/// `45s`, `1m12s`, `6m`, `2h3m`. Compact (no leading-zero noise); seconds are
-/// dropped once the span is ≥ 1h to keep the line tidy. Sub-second rounds to
-/// `0s`.
-/// Render the `/status` running-task block — claude's own task lifecycle
-/// mirrored verbatim (NOT a fold), oldest first (longest-running on top).
-/// Empty string when nothing runs. Three buckets by `task_type`: subagents
-/// (`local_agent`, turn-scoped), workflows (`local_workflow`) and background
-/// shells (`local_bash` = Bash run_in_background + Monitor watches) — the
-/// latter two outlive the spawning turn, so an idle session still shows its
-/// in-flight `make test` here instead of a bare `🟢 idle`.
-fn format_running_tasks(running: &[RunningTask]) -> String {
-    if running.is_empty() {
-        return String::new();
-    }
-    let workflows = running
-        .iter()
-        .filter(|t| t.task_type == "local_workflow")
-        .count();
-    let bg_shells = running
-        .iter()
-        .filter(|t| t.task_type == "local_bash")
-        .count();
-    let subagents = running.len() - workflows - bg_shells;
-    let mut kinds: Vec<String> = Vec::new();
-    if subagents > 0 {
-        kinds.push(format!("subagent ({subagents})"));
-    }
-    if workflows > 0 {
-        kinds.push(format!("workflow ({workflows})"));
-    }
-    if bg_shells > 0 {
-        kinds.push(format!("фоновые задачи ({bg_shells})"));
-    }
-    let mut out = format!("\n   🤖 Выполняется: {}", kinds.join(" + "));
-    let mut tasks: Vec<&RunningTask> = running.iter().collect();
-    tasks.sort_by_key(|t| t.started);
-    for t in tasks {
-        let kind = match t.task_type.as_str() {
-            "local_workflow" => "workflow",
-            "local_bash" => "фон",
-            _ if t.kind.is_empty() => "subagent",
-            _ => t.kind.as_str(),
-        };
-        let elapsed = humanize_dur(t.started.elapsed());
-        let desc = t.description.trim();
-        if desc.is_empty() {
-            out.push_str(&format!("\n      · {kind} · {elapsed}"));
-        } else {
-            let shown: String = if desc.chars().count() > 40 {
-                format!("{}…", desc.chars().take(39).collect::<String>())
-            } else {
-                desc.to_string()
-            };
-            out.push_str(&format!("\n      · {kind}「{shown}」· {elapsed}"));
-        }
-    }
-    out
-}
-
 /// Render the account-usage payload after its vendor label:
 /// `5h 17% (19:00) · неделя 78% (06/29) · max`. Each field is omitted when
 /// the vendor didn't report it; an empty result means no usage line.
@@ -22329,6 +22303,39 @@ fn format_token_volume(tokens: u64) -> String {
     }
 }
 
+/// Humanize a [`Duration`](std::time::Duration) with Russian unit words, for
+/// the `/status` expandable quote's `Запущено: <…> назад` (§3.5d mock:
+/// `Запущено: 2 ч назад`). SPEC-3.5D-R2-1 fix — `launched` used to reuse the
+/// compact-English [`humanize_dur`] (`2h` etc), so a Russian card carried an
+/// English abbreviation on its one human-facing timestamp. Same compact
+/// shape as `humanize_dur` (drop seconds once ≥ 1h, drop the smaller unit
+/// once it's zero), just spelled `ч`/`мин`/`с`.
+fn humanize_dur_ru(d: std::time::Duration) -> String {
+    let total = d.as_secs();
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        if m > 0 {
+            format!("{h} ч {m} мин")
+        } else {
+            format!("{h} ч")
+        }
+    } else if m > 0 {
+        if s > 0 {
+            format!("{m} мин {s} с")
+        } else {
+            format!("{m} мин")
+        }
+    } else {
+        format!("{s} с")
+    }
+}
+
+/// Humanize a [`Duration`](std::time::Duration) for the `/status` fleet line:
+/// `45s`, `1m12s`, `6m`, `2h3m`. Compact (no leading-zero noise); seconds are
+/// dropped once the span is ≥ 1h to keep the line tidy. Sub-second rounds to
+/// `0s`.
 fn humanize_dur(d: std::time::Duration) -> String {
     let total = d.as_secs();
     let h = total / 3600;
@@ -32847,7 +32854,11 @@ mod tests {
         assert!(!rendered.contains("73%"), "{rendered}");
         assert!(!rendered.contains("stale-effort"), "{rendered}");
         assert!(!rendered.contains("stale-running-task"), "{rendered}");
-        assert!(rendered.contains("· — · — · ctx —"), "{rendered}");
+        // §3.5d — an honest `model`/`effort` placeholder header, and an
+        // honest `ctx —` placeholder rather than leaking the stale
+        // generation's own `73%`.
+        assert!(rendered.contains("· claude · — · —"), "{rendered}");
+        assert!(rendered.contains("ctx —"), "{rendered}");
     }
 
     /// v0.8.7 review-fix (R-M3) — `session_resolve(sid).project` is the value
@@ -34929,8 +34940,7 @@ mod tests {
         assert_eq!(idle.len(), 1, "one message: {idle:?}");
         // /status remains the CURRENT session's card, not the fleet table.
         assert!(
-            idle[0]
-                .contains("🧭 s1 · alpha · claude\n🟢 ожидание · claude-opus-4-8 · max · ctx 41%"),
+            idle[0].contains("🧭 s1 · claude · claude-opus-4-8 · max\n🟢 ожидание · ctx 41%"),
             "current-session header: {idle:?}"
         );
 
@@ -34973,19 +34983,31 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
             .unwrap();
-        assert!(
-            stuck[0].contains("🔴 зависание: нет событий "),
-            "stuck state: {stuck:?}"
-        );
+        // §3.5d — the compact line-2 badge carries just the icon + label;
+        // the silent-duration phrase rides the expandable quote folded into
+        // the SAME "Запущено: …" part as a comma suffix — never instead of
+        // the real launch time (R1 fix: `Запущено:` used to be fed this
+        // phrase directly; SPEC-3.5D-R2-2 fix: it used to ride as its own
+        // extra `·`-joined part, growing the quote past the spec's four).
+        assert!(stuck[0].contains("🔴 зависание"), "stuck badge: {stuck:?}");
         // review-fix F3 — the label must come FROM `activity_badge`, so a
         // future palette rename shows up here without editing this test.
         assert!(
-            stuck[0].contains(&format!("🔴 {}:", im_views::activity_badge("stuck").1)),
+            stuck[0].contains(&format!("🔴 {}", im_views::activity_badge("stuck").1)),
             "/status label must match the activity_badge palette: {stuck:?}"
         );
         assert!(
-            stuck[0].contains("нет событий 6m"),
-            "silent duration: {stuck:?}"
+            stuck[0].contains("Запущено:") && stuck[0].contains("назад"),
+            "an honest launch time, not the activity phrase: {stuck:?}"
+        );
+        assert!(
+            stuck[0].contains("Запущено:") && stuck[0].contains("назад, зависание: нет событий 6m"),
+            "silent duration folded into the SAME Запущено part, comma-joined: {stuck:?}"
+        );
+        assert_eq!(
+            stuck[0].matches("Запущено:").count(),
+            1,
+            "exactly one Запущено part in the quote, not a second `·`-joined one: {stuck:?}"
         );
 
         // (4) A FRESHLY submitted turn whose `last_event_at` still holds the
@@ -35059,7 +35081,7 @@ mod tests {
             .unwrap();
         assert!(
             out[0].contains(
-                "👥 Дочерние (1):\n  • s2 · claude · opus-4-8[1m] · 🔵 работает · delegated investigation"
+                "👥 Дочерние 1 · сессий проекта 2 · проектов 1\n  • s2 · claude · opus-4-8[1m] · 🔵 работает — delegated investiga…"
             ),
             "working child is visible from its root status: {out:?}"
         );
@@ -35135,7 +35157,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            torn[0].contains(&format!("{child} · claude · — · 🔵 работает ·")),
+            torn[0].contains(&format!("{child} · claude · — · 🔵 работает")),
             "a torn line elsewhere in the stream must not blind the child row: {torn:?}"
         );
 
@@ -35154,7 +35176,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            silent[0].contains(&format!("{child} · claude · — · 🔵 работает ·")),
+            silent[0].contains(&format!("{child} · claude · — · 🔵 работает")),
             "an in-flight turn outranks a stream that says nothing: {silent:?}"
         );
 
@@ -35169,7 +35191,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            idle[0].contains(&format!("{child} · claude · — · 🟢 ожидание ·")),
+            idle[0].contains(&format!("{child} · claude · — · 🟢 ожидание")),
             "no open turn ⇒ the file verdict stands: {idle:?}"
         );
     }
@@ -35190,7 +35212,7 @@ mod tests {
             .unwrap();
         assert!(
             out[0].contains(&format!(
-                "🧭 s1 · alpha · claude\n🟢 ожидание · — · — · ctx —\n📁 {}\n\n",
+                "🧭 s1 · claude · — · —\n🟢 ожидание · ctx — · 💰 24ч нет данных\n📁 alpha · {}\n\n",
                 proj.path().display()
             )),
             "status card header changed: {out:?}"
@@ -35198,7 +35220,7 @@ mod tests {
         assert!(out[0].contains("Роль: reviewer"), "role missing: {out:?}");
         assert!(out[0].contains("resume —"), "resume fact missing: {out:?}");
         assert!(
-            out[0].contains("💰 Расход проекта 24ч: нет данных"),
+            out[0].contains("💰 24ч нет данных"),
             "honest missing ledger state missing: {out:?}"
         );
     }
@@ -35232,7 +35254,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("💰 Расход проекта 24ч: $1.25 · 13.1M токенов"),
+            out[0].contains("💰 24ч $1.25 · 13.1M токенов"),
             "project ledger cost missing: {out:?}"
         );
     }
@@ -35267,7 +35289,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("💰 Расход проекта 24ч: $— · 1.2k токенов"),
+            out[0].contains("💰 24ч $— · 1.2k токенов"),
             "unknown cost must remain unknown while tokens stay visible: {out:?}"
         );
     }
@@ -35315,7 +35337,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("💰 Расход проекта 24ч: ≥$1.25 (+1 без цены) · 2.0k токенов"),
+            out[0].contains("💰 24ч ≥$1.25 (+1 без цены) · 2.0k токенов"),
             "mixed window must be shown as a lower bound: {out:?}"
         );
     }
@@ -35337,11 +35359,11 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
+            out[0].contains("🧭 s1 · claude · — · —\n🟢 ожидание"),
             "roleless session remains a usable status card: {out:?}"
         );
         assert!(
-            out[0].contains("🟢 ожидание · — · — · ctx —"),
+            out[0].contains("🟢 ожидание · ctx —"),
             "statusless fields stay honest placeholders: {out:?}"
         );
     }
@@ -35363,7 +35385,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].starts_with("🧭 s1 · alpha · claude\n"),
+            out[0].starts_with("🧭 s1 · claude · — · —\n"),
             "leads with the you-are-here header before the existing body: {out:?}"
         );
     }
@@ -35408,60 +35430,109 @@ mod tests {
         assert_eq!(format_token_volume(13_100_000), "13.1M");
     }
 
-    /// `/status` running-task block — background workflows (`local_workflow`)
-    /// are counted and labeled separately from subagents; a workflow's empty
-    /// `subagent_type` must NOT fall back to the "subagent" label.
-    #[test]
-    fn format_running_tasks_distinguishes_workflows_from_subagents() {
-        fn task(id: &str, kind: &str, desc: &str, task_type: &str) -> RunningTask {
+    /// §3.5d R1-1 fix — the `▶` row is built directly from the OLDEST
+    /// `RunningTask` (kind/description + elapsed, `"desc, elapsed"`,
+    /// matching the spec mock `▶ cargo test --workspace, 2 мин`), never
+    /// from `format_running_tasks`' rendered text (whose first line is only
+    /// the aggregate `🤖 Выполняется: …` counts header, never a task). This
+    /// exercises the same task-picking + label logic through the real
+    /// `/status` path rather than a standalone formatter.
+    #[tokio::test]
+    async fn gateway_status_running_task_row_shows_oldest_task_not_the_counts_header() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-running-task-row");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let older = std::time::Instant::now() - std::time::Duration::from_secs(120);
+        fake.set_running_tasks(vec![
             RunningTask {
-                task_id: id.into(),
-                kind: kind.into(),
-                description: desc.into(),
-                task_type: task_type.into(),
+                task_id: "older".into(),
+                kind: "code-reviewer".into(),
+                description: "cargo test --workspace".into(),
+                task_type: "local_agent".into(),
+                started: older,
+                backgrounded: false,
+            },
+            RunningTask {
+                task_id: "newer".into(),
+                kind: "code-reviewer".into(),
+                description: "a second, newer task".into(),
+                task_type: "local_agent".into(),
                 started: std::time::Instant::now(),
                 backgrounded: false,
-            }
-        }
-        // Nothing running → nothing rendered.
-        assert_eq!(format_running_tasks(&[]), "");
-        // Subagents only → the pre-workflow header, kind from subagent_type.
-        let subs = [task("a1", "code-reviewer", "review auth", "local_agent")];
-        let s = format_running_tasks(&subs);
-        assert!(s.contains("Выполняется: subagent (1)"), "{s}");
-        assert!(s.contains("code-reviewer「review auth」"), "{s}");
-        // Mixed → both kinds counted in the header; the workflow row is labeled
-        // "workflow" even though its subagent_type is empty.
-        let mixed = [
-            task("a1", "", "find bugs", "local_agent"),
-            task("w1", "", "audit the codebase", "local_workflow"),
-        ];
-        let s = format_running_tasks(&mixed);
+            },
+        ])
+        .await;
+
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
         assert!(
-            s.contains("Выполняется: subagent (1) + workflow (1)"),
-            "{s}"
+            out[0].contains("▶ cargo test --workspace, 2m"),
+            "the OLDEST task's own description + elapsed, not the aggregate header: {out:?}"
         );
-        assert!(s.contains("subagent「find bugs」"), "{s}");
-        assert!(s.contains("workflow「audit the codebase」"), "{s}");
-        // Workflows only (e.g. an idle session with a background run).
-        let wf = [task("w1", "", "migrate call sites", "local_workflow")];
-        let s = format_running_tasks(&wf);
-        assert!(s.contains("Выполняется: workflow (1)"), "{s}");
-        // Background shells (`local_bash` — Bash run_in_background / Monitor)
-        // get their own bucket + row label; an idle session with an in-flight
-        // `make test` renders it instead of a bare `🟢 idle`.
-        let bg = [
-            task("b1", "", "make test full suite", "local_bash"),
-            task("b2", "", "watch /tmp/maketest.log", "local_bash"),
-            task("a1", "code-reviewer", "review auth", "local_agent"),
-        ];
-        let s = format_running_tasks(&bg);
         assert!(
-            s.contains("Выполняется: subagent (1) + фоновые задачи (2)"),
-            "{s}"
+            !out[0].contains("Выполняется"),
+            "the aggregate counts header text must never appear on the compact card: {out:?}"
         );
-        assert!(s.contains("фон「make test full suite」"), "{s}");
-        assert!(s.contains("фон「watch /tmp/maketest.log」"), "{s}");
+    }
+
+    /// R2-1 fix — a long-lived TURN-OUTLIVING background task (older than
+    /// everything else) must never mask a turn-scoped subagent that is
+    /// actually driving the CURRENT turn: the `▶` row picks the oldest
+    /// TURN-SCOPED task first, and admits more are running via a `(+N)`
+    /// suffix rather than silently dropping the count.
+    #[tokio::test]
+    async fn gateway_status_running_task_row_prefers_turn_scoped_over_older_background() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway =
+            Gateway::new(fake.clone(), "alpha", "/tmp/alpha-running-task-turn-scoped");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let ancient = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        let recent = std::time::Instant::now() - std::time::Duration::from_secs(120);
+        fake.set_running_tasks(vec![
+            // Outlives the turn (background shell) and is OLDER — must be
+            // passed over in favor of the turn-scoped subagent below.
+            RunningTask {
+                task_id: "bg-shell".into(),
+                kind: "".into(),
+                description: "tail -f build.log".into(),
+                task_type: "local_bash".into(),
+                started: ancient,
+                backgrounded: false,
+            },
+            // Turn-scoped (blocking `local_agent`, not backgrounded) and
+            // NEWER than the background shell, but is the one actually
+            // driving the current turn.
+            RunningTask {
+                task_id: "subagent".into(),
+                kind: "code-reviewer".into(),
+                description: "cargo test --workspace".into(),
+                task_type: "local_agent".into(),
+                started: recent,
+                backgrounded: false,
+            },
+        ])
+        .await;
+
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            out[0].contains("▶ cargo test --workspace, 2m (+1)"),
+            "the turn-scoped subagent leads, with a (+1) admitting the background shell is also running: {out:?}"
+        );
+        assert!(
+            !out[0].contains("tail -f build.log"),
+            "the older background task must not be the lead row: {out:?}"
+        );
     }
 
     /// The outlives-turn vocabulary the working-signal check shares with the
@@ -35526,7 +35597,7 @@ mod tests {
             .unwrap();
         assert_eq!(owner.len(), 1);
         assert!(
-            owner[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
+            owner[0].contains("🧭 s1 · claude · — · —\n🟢 ожидание"),
             "got: {owner:?}"
         );
     }
@@ -35552,7 +35623,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
+            out[0].contains("🧭 s1 · claude · — · —\n🟢 ожидание"),
             "got: {out:?}"
         );
         assert!(out[0].contains(uuid), "resume UUID missing from: {out:?}");
