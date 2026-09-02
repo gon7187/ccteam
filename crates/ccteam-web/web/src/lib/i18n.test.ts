@@ -59,9 +59,10 @@ describe("I18N dictionary", () => {
     expect(t("ru", "charterHonesty")).toContain("MCP status");
   });
 
-  it("keeps the Commander GLM scout model in every language", () => {
+  it("keeps the Commander GLM scout model and plan-file path in every language", () => {
     for (const lang of ["zh", "ru", "en"] as const) {
       expect(t(lang, "tplCommanderP")).toContain("zai-coding-plan/glm-5.3-flash");
+      expect(t(lang, "tplCommanderP")).toContain(".ccteam/plans/");
     }
   });
 

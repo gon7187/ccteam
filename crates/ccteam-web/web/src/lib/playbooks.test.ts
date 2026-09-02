@@ -87,7 +87,8 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
     for (const role of ["Opus", "Luna", "Terra", "Sonnet", "Sol", "Fable", "Haiku"]) {
       expect(prompt, role).toContain(role);
     }
-    expect(prompt).toContain("до 10");
+    expect(prompt).toContain("не более 3");
+    expect(prompt).not.toContain("до 10 Luna");
     expect(prompt).toContain("максимальн");
     expect(prompt).toContain("status");
     expect(prompt).toContain("Codex");
@@ -159,12 +160,72 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
       expect(I18N[lang].tplCommanderP).not.toContain(unconditionalRespawn);
     }
     for (const [lang, phrases] of [
-      ["zh", ["zai-coding-plan/glm-5.3-flash", "在第一次改动代码之前", "read-only", "2–5", "commit sha 或 tag", "license", "Codex Luna", "停止编码并如实上报", "session_list 与 session_collect", "已确认回复不符合上述报告要求", "此例外仅限编码前侦察", "绝不承担主编码"]],
-      ["ru", ["zai-coding-plan/glm-5.3-flash", "до первой правки кода", "read-only", "2–5", "commit sha или tag", "license", "Codex Luna", "останови работу над кодом", "session_list и session_collect", "ответ не соответствует требованиям к отчёту", "Это исключение только для разведки перед кодом", "никогда — основной код"]],
-      ["en", ["zai-coding-plan/glm-5.3-flash", "before the first code edit", "read-only", "2–5", "commit sha or tag", "license", "Codex Luna", "stop coding and report honestly", "session_list and session_collect", "response is confirmed non-compliant with the report requirements", "This exception applies only to pre-code scouting", "never primary coding"]],
+      ["zh", ["zai-coding-plan/glm-5.3-flash", "在第一次改动代码之前", "read-only", "2–5", "commit sha 或 tag", "license", "Codex Luna", "停止编码并如实上报", "session_list 与 session_collect", "已确认回复不符合上述报告要求", "此例外仅限编码前侦察"]],
+      ["ru", ["zai-coding-plan/glm-5.3-flash", "до первой правки кода", "read-only", "2–5", "commit sha или tag", "license", "Codex Luna", "останови работу над кодом", "session_list и session_collect", "ответ не соответствует требованиям к отчёту", "Это исключение только для разведки перед кодом"]],
+      ["en", ["zai-coding-plan/glm-5.3-flash", "before the first code edit", "read-only", "2–5", "commit sha or tag", "license", "Codex Luna", "stop coding and report honestly", "session_list and session_collect", "response is confirmed non-compliant with the report requirements", "This exception applies only to pre-code scouting"]],
     ] as const) {
       for (const phrase of phrases) expect(I18N[lang].tplCommanderP).toContain(phrase);
       expect(I18N[lang].tplCommanderD).toContain("GLM");
+    }
+  });
+
+  it("the commander prefill carries the v2 contract in every language: plan file, Sol gate+advisor, worktrees, git agent, dual fresh gate, monitoring", () => {
+    const matrix = {
+      zh: [
+        "Claude Fable", ".ccteam/plans/", "Amendments", "id、执行者、依赖、文件、完成标准",
+        "上限 2 轮", "Fable 的立场、Sol 的立场、需要决定什么", "不设人工暂停",
+        "最多 3 个并行", "-wt/", "task/", "integration/", "--test-threads=4", "顾问 sid", "绝对路径",
+        "任何偏离计划之前必须问", "建议不具约束力", "升级给指挥官", "明确清单",
+        "git 代理 Claude Sonnet", "merge commit", "两位终审都批准同一修订且全量本地检查为绿", "CI 只有在项目里存在", "tag 与 release 不在本任务内",
+        "全新的 Claude Opus 和全新的 Codex Sol", "顾问不参与验收", "重新构建 integration/",
+        "session_list", "last_active", "free -m", "15%", "session_stop", "stale", "stuck", "activity 为 stale", "30 分钟", "waiting_approval: true 不算挂起", "delegation.max_children", "执行者在终审门批准代码后",
+        "用 session_stop 停止侦察员", "git init", "Fable 改用 Claude Opus", "任何 Sol 角色改用全新的 Claude Opus",
+      ],
+      ru: [
+        "Claude Fable", ".ccteam/plans/", "Amendments", "id, исполнитель, зависимости, файлы, критерий готовности",
+        "потолок 2 круга", "позиция Fable, позиция Sol, что нужно решить", "Пауз на человека нет",
+        "не более 3 параллельно", "-wt/", "task/", "integration/", "--test-threads=4", "sid советника", "абсолютный путь плана",
+        "обязательно перед любым отклонением от плана", "совет не обязателен к исполнению", "эскалирует командиру", "явным списком задач",
+        "git-агента Claude Sonnet", "merge commit, не squash", "оба финальных ревьюера одобрили одну ревизию и полный набор локальных проверок зелёный", "CI — третье условие, только если он в проекте есть", "Tag и release вне",
+        "свежие сессии — Claude Opus и Codex Sol", "советник в приёмке не участвует", "заново собирает integration/",
+        "session_list", "last_active", "free -m", "15 процентов", "session_stop", "stale", "stuck", "activity stale", "30 минут", "waiting_approval: true зависшей не считается", "delegation.max_children", "исполнители после одобрения кода финальным гейтом",
+        "останови разведчика через session_stop", "git init не делай", "Fable — Claude Opus", "любой роли Sol — свежий Claude Opus",
+      ],
+      en: [
+        "Claude Fable", ".ccteam/plans/", "Amendments", "id, implementer, dependencies, files, definition of done",
+        "cap of 2 rounds", "Fable's position, Sol's position, what needs deciding", "No human pause",
+        "at most 3 in parallel", "-wt/", "task/", "integration/", "--test-threads=4", "advisor's sid", "absolute plan path",
+        "mandatory before any deviation from the plan", "advice is not binding", "escalates to the commander", "explicit list of tasks",
+        "git agent, Claude Sonnet", "merge commit, not squash", "both final reviewers approved the same revision and the full local check suite is green", "CI is a third condition only if the project has one", "Tag and release are outside",
+        "fresh sessions — Claude Opus and Codex Sol", "advisor does not take part in acceptance", "rebuilds integration/",
+        "session_list", "last_active", "free -m", "15 percent", "session_stop", "stale", "stuck", "activity stale", "30 minutes", "waiting_approval: true does not count as hung", "delegation.max_children", "implementers after the final gate approves the code",
+        "stop the scout with session_stop", "never run git init", "Claude Opus for Fable", "fresh Claude Opus for any Sol role",
+      ],
+    } as const;
+    for (const [lang, phrases] of Object.entries(matrix) as [keyof typeof matrix, readonly string[]][]) {
+      const prompt = I18N[lang].tplCommanderP;
+      for (const phrase of phrases) expect(prompt, `${lang}: ${phrase}`).toContain(phrase);
+      // Порядок фаз держится во всех языках.
+      const order = lang === "zh"
+        ? ["第 1 步", "第 2 步", "第 3 步", "第 4 步", "第 5 步", "第 6 步", "监控"]
+        : lang === "ru"
+          ? ["Шаг 1", "Шаг 2", "Шаг 3", "Шаг 4", "Шаг 5", "Шаг 6", "Мониторинг"]
+          : ["Step 1", "Step 2", "Step 3", "Step 4", "Step 5", "Step 6", "Monitoring"];
+      let last = -1;
+      for (const marker of order) {
+        const at = prompt.indexOf(marker);
+        expect(at, `${lang}: ${marker}`).toBeGreaterThan(last);
+        last = at;
+      }
+      const gate = prompt.slice(prompt.indexOf(order[5]));
+      const gatePhrases = lang === "zh"
+        ? ["上限 2 轮", "三段报告", "重新构建 integration/"]
+        : lang === "ru"
+          ? ["потолок 2 круга", "трёх абзацев", "заново собирает integration/"]
+          : ["cap of 2 rounds", "three-paragraph report", "rebuilds integration/"];
+      for (const phrase of gatePhrases) expect(gate, `${lang} final gate: ${phrase}`).toContain(phrase);
+      expect(I18N[lang].tplCommanderD).toContain("Fable");
+      expect(I18N[lang].tplCommanderD).toContain("Sol");
     }
   });
 

@@ -104,7 +104,7 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 > 同样适用于测试:**「登记为 flake」常常是病根没找到** —— `resume_*` / `hook_*` 挂了整族的账,实为确定性缺陷(读错路径 + panic 泄漏 fault 开关 / 继承宿主 `CCTEAM_HOOKLESS`)。定性前先问「宿主给了它什么」。
 
 1. **每个改动映射**(commit/PR 描述均可):`requirements.md` 某条痛点 + `tech-design.md` 某节;改协议**以代码为 SoT**(同步 tech-design 末尾「协议→代码」指针表)
-2. **commit 用英语;agent prompt 用英语**(**产品化、简洁,非冗长**;hub vendored prompt 随上游);项目文档(CLAUDE.md / `docs/`)用中文
+2. **commit 用英语;agent prompt 用英语**(**产品化、简洁,非冗长**;hub vendored prompt 随上游);**新文档、新章节一律用俄语**(owner 决策 2026-09-02:`docs/`、`docs/superpowers/` spec 与 plan;既有中文文档与本文(AGENTS.md)保持原语言、只做就地修改,整体翻译另立卡)
 3. **Pre-v1.0 = 开发阶段,不留技术债**:无真实用户群,**允许大胆做更好的抽象**。**不做历史迁移** — 新旧状态数据不兼容时**不写迁移步骤/兼容分支**,直接「清旧数据(`~/.ccteam/` + 各项目 `.ccteam/`)→ 重 `ccteam init`」;deprecated 直接删,breaking rename 不留 alias。tier-1 文档**只描述当前架构**,EOL 内容去版本 dir
 4. **不写 backwards-compat shim**
 5. **优先编辑现有文件,不轻易新建**
@@ -134,7 +134,7 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 ### 版本开发流程(版本化迭代不变;`.loop/` 只是承载)
 
 - **大改 doc-first,小/中改 owner 直驱**:架构级 = PRD + dev-plan 落 `docs-local/versions/v0-x-y/`(gitignored)待 owner review;拍板后**规划把 PRD 拆成卡进 `.loop/backlog.md`**(冲突域/规格/DoD/建议入口),wave = 一组卡。owner `/goal` 直驱的小/中改 = 独立卡可直接 build(owner 选)。落地走 worktree-per-wave + subagent 派工(**briefing 自包含**:规格/坐标/验收直接写进 brief)→ `workspace.package.version` bump(commit `vX.Y.Z:` 前缀)→ §五.7 ship gate 回填。
-- **分支与推送 = dev + PR 攒版本**(owner 决策 2026-07-22;合并方式 owner 决策 2026-07-24):新功能/修复一律提交并推送 `dev`;**周期开始(首个新提交)即开 dev→main draft PR**(`check.yml` 只跑 main push + PR —— draft PR 让每次推 dev 都过 CI 三 job),多个提交累计 = 一个版本,收口转 ready;**merge 仅由 owner 执行,方式 = merge commit(非 squash)**——main 含 dev 完整历史,合并后 dev 即 main 祖先,**免和解直接续用**(squash 时代每轮的平凡和解合并不再需要;每版一行时间轴的家 = `.loop/history.md`,main 历史不承担此职)。**main 不直推**;`gh pr create` 可用(改 `.github/workflows/*` 仍需 SSH push,见 §六)。**tag + 部署 HELD,等 owner 显式「部署」**(merge 到 main 不等于发布)。
+- **分支与推送 = dev + PR 攒版本**(owner 决策 2026-07-22;合并方式 owner 决策 2026-07-24):新功能/修复一律提交并推送 `dev`;**周期开始(首个新提交)即开 dev→main draft PR**(`check.yml` 只跑 main push + PR —— draft PR 让每次推 dev 都过 CI 三 job),多个提交累计 = 一个版本,收口转 ready;**merge 到 main 由 owner 手动执行,或由「Командир」编队的 git-агент 执行(owner 决策 2026-09-02;条件 = 全新 Opus + Sol 终审门都批准同一修订、且本地全量检查绿,CI 仅在仓库真的会跑时作第三条件;git-агент 每个通过双门的顶层任务 merge 一次 dev→main,与 v0.10.5 周期内 PR #10–#12 同版本多次合并的现行做法一致 —— 「多个提交累计 = 一个版本」指版本号只在 ship gate bump,不指 merge 次数);其余任何场景仍只有 owner;方式 = merge commit(非 squash)**——main 含 dev 完整历史,合并后 dev 即 main 祖先,**免和解直接续用**(squash 时代每轮的平凡和解合并不再需要;每版一行时间轴的家 = `.loop/history.md`,main 历史不承担此职)。**main 不直推**;`gh pr create` 可用(改 `.github/workflows/*` 仍需 SSH push,见 §六)。**tag + 部署 HELD,等 owner 显式「部署」**(merge 到 main 不等于发布)。
 - **wave 范式**:每 wave 一份 `wave-N-handoff.md`(Decided / Rejected / Risks / Files / Remaining 五段固定)+ 一个 commit;subagent briefing 必含 wave acceptance gate + 上 wave handoff link。**红线:每 wave baseline ≥ 上 wave**(test pass count + clippy 0 warnings),否则不推。架构级大改可把 tier-1 文档**全量重写**放最后一 wave(docs 反映已落地代码)。
 
 ## 六、易踩的坑(实战累积)
