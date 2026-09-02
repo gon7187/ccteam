@@ -1019,7 +1019,7 @@ fn session_title_suffix(title: &str, prefix_len: usize) -> String {
         if title.is_empty() {
             String::new()
         } else {
-            format!(" — {}", escape_markdown(&title))
+            format!(" — {}", escape_status_markdown(&title))
         }
     }
 }
@@ -1622,6 +1622,50 @@ mod tests {
             "special chars must be escaped, not left raw: {html}"
         );
         assert!(!html.contains("<script>"), "unescaped tag leaked: {html}");
+    }
+
+    /// A session title is user-controlled text; it must not be able to
+    /// close the expandable quote or smuggle a rich control tag.
+    #[test]
+    fn sessions_title_cannot_inject_rich_tags() {
+        let sessions = vec![SessionRow {
+            sid: "s1".into(),
+            vendor_model: "claude/opus".into(),
+            status: "idle".into(),
+            context: "38%".into(),
+            title: Some("</blockquote><tg-button>x".into()),
+            current: true,
+            tree_depth: 0,
+            host: None,
+        }];
+        let reply = render_sessions(&SessionsView {
+            project: "ccteam".into(),
+            sessions,
+            elsewhere: 0,
+            detached: Vec::new(),
+        });
+        assert!(
+            !reply.markdown.contains("</blockquote>"),
+            "title closed the quote: {}",
+            reply.markdown
+        );
+        assert!(
+            reply.markdown.contains("&lt;/blockquote&gt;"),
+            "title must be entity-escaped: {}",
+            reply.markdown
+        );
+        // Two inline buttons on the session line + the two-button bottom row.
+        assert_eq!(
+            reply.markdown.matches("<tg-button ").count(),
+            4,
+            "only the real buttons may exist: {}",
+            reply.markdown
+        );
+        assert!(
+            !reply.markdown.contains("<tg-button>"),
+            "{}",
+            reply.markdown
+        );
     }
 
     #[test]
