@@ -6677,8 +6677,16 @@ impl Gateway {
                     replies,
                 ));
             }
-            match im_callbacks::parse(&reply.data) {
-                im_callbacks::CallbackAction::Command(command) => {
+            let action = im_callbacks::parse(&reply.data);
+            // R2-2 — see `resolve_cmd_callback`'s twin comment: redraw-ness
+            // is decided by which callback NAMESPACE the tapped button used
+            // (`Redraw` = the screen's own "🔄 Обновить"), never by the
+            // command text, so a cross-screen nav button running the same
+            // command from a DIFFERENT screen never redraws it away.
+            let is_redraw = matches!(&action, im_callbacks::CallbackAction::Redraw(_));
+            match action {
+                im_callbacks::CallbackAction::Command(command)
+                | im_callbacks::CallbackAction::Redraw(command) => {
                     if !Self::is_gateway_command(&command) {
                         return Ok(vec![RichReply::plain("Неизвестная команда")]);
                     }
@@ -6707,13 +6715,20 @@ impl Gateway {
                         }
                     };
                     // §3.5c — mirror `resolve_cmd_callback`'s twin fix: a
-                    // `cmd:<command>` tap (e.g. "🔄 Обновить") edits the
-                    // tapped message in place instead of appending a new
-                    // one, whenever there's exactly one reply to show and no
+                    // `cmd:~<command>` tap that *redraws* the screen it was
+                    // tapped from (e.g. "🔄 Обновить") edits the tapped
+                    // message in place instead of appending a new one,
+                    // whenever there's exactly one reply to show and no
                     // group-chat ephemeral answer is in play (that path
                     // already routes through `route_callback_replies` below
-                    // unchanged).
-                    if reply.callback_ephemeral.is_none() {
+                    // unchanged). Plain `cmd:<command>` taps — action
+                    // commands (`/use <sid>`, `/cd <slug>`, …) AND
+                    // cross-screen nav buttons running the same command from
+                    // a DIFFERENT screen (R2-2) — are not redraws: editing
+                    // in place would wipe out the list or picker the button
+                    // was tapped from, so they always fall through to a
+                    // normal send.
+                    if reply.callback_ephemeral.is_none() && is_redraw {
                         if let ([only], Some(_)) =
                             (replies.as_slice(), telegram_callback_message_id(message_id))
                         {
@@ -13644,6 +13659,12 @@ impl Gateway {
         callback: Option<&crate::transport::CallbackEphemeral>,
     ) -> Result<Vec<RichReply>> {
         let cid = crate::transport::safe_correlation_id(message_id);
+        // R2-2 — decided from the tapped BUTTON's own namespace
+        // (`CallbackAction::Redraw`, `cmd:~<command>`), never from `cmd`'s
+        // text: a cross-screen nav button running the same command (e.g.
+        // "📋 Сессии" on the `/status` card) parses as a plain `Command` and
+        // must never redraw the card it was tapped from away.
+        let is_redraw = matches!(&action, im_callbacks::CallbackAction::Redraw(_));
         match action {
             im_callbacks::CallbackAction::Choice { .. } => Ok(Vec::new()),
             im_callbacks::CallbackAction::Confirm(cmd) => {
@@ -13745,7 +13766,8 @@ impl Gateway {
                     }
                 }
             }
-            im_callbacks::CallbackAction::Command(cmd) => {
+            im_callbacks::CallbackAction::Command(cmd)
+            | im_callbacks::CallbackAction::Redraw(cmd) => {
                 let first = cmd.split_whitespace().next().unwrap_or_default();
                 if !Self::is_gateway_command(first) {
                     log_command_callback(&cid, chat, "command", "invalid", None, "invalid");
@@ -13757,16 +13779,26 @@ impl Gateway {
                 {
                     Ok(Some(reply)) => {
                         log_command_callback(&cid, chat, "command", first, None, "reply");
-                        // §3.5c — a `cmd:<command>` tap (e.g. the "🔄
-                        // Обновить" button on `/sessions`/`/status`) edits
-                        // the tapped message in place, the same shape
-                        // `emit_fs_reply` uses for the fs browser, instead
-                        // of appending a brand-new message on every refresh.
-                        // Only reachable when `callback` is `None` (a group
-                        // chat's ephemeral answer already routes through
+                        // §3.5c — a `cmd:~<command>` tap (the screen's own
+                        // "🔄 Обновить" button, `is_redraw`) edits the tapped
+                        // message in place, the same shape `emit_fs_reply`
+                        // uses for the fs browser, instead of appending a
+                        // brand-new message on every refresh. Plain
+                        // `cmd:<command>` taps — action commands (`/use
+                        // <sid>`, `/cd <slug>`, …) AND cross-screen nav
+                        // buttons that happen to run the same command from a
+                        // DIFFERENT screen (R2-2) — are never redraws:
+                        // editing in place would destroy the list or picker
+                        // the button was tapped from, so those fall through
+                        // to a normal send below. Only reachable when
+                        // `callback` is `None` (a group chat's ephemeral
+                        // answer already routes through
                         // `route_callback_replies` below); no resolvable
-                        // platform message id falls back to a normal send.
-                        if callback.is_none() && telegram_callback_message_id(message_id).is_some()
+                        // platform message id also falls back to a normal
+                        // send.
+                        if callback.is_none()
+                            && is_redraw
+                            && telegram_callback_message_id(message_id).is_some()
                         {
                             self.emit_fs_reply(chat, message_id, callback, reply);
                             Ok(Vec::new())
@@ -15137,13 +15169,17 @@ impl Gateway {
         }
         if visible.is_empty() && detached_here == 0 {
             if elsewhere > 0 {
-                return RichReply::plain(format!(
-                    "📁 Текущий проект: {cur}\nВ этом проекте нет сессий — ↓ в других проектах: {elsewhere} → /sessions all"
-                ));
+                return im_views::plain_with_refresh(
+                    format!(
+                        "📁 Текущий проект: {cur}\nВ этом проекте нет сессий — ↓ в других проектах: {elsewhere} → /sessions all"
+                    ),
+                    "/sessions",
+                );
             }
-            return RichReply::plain(format!(
-                "📁 Текущий проект: {cur}\nНет сессий — создайте через /new"
-            ));
+            return im_views::plain_with_refresh(
+                format!("📁 Текущий проект: {cur}\nНет сессий — создайте через /new"),
+                "/sessions",
+            );
         }
         // Preserve the priority ordering while rendering the IM list as a
         // delegation tree. A malformed cycle becomes a flat tail instead of
@@ -15495,7 +15531,7 @@ impl Gateway {
             .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .collect();
         if visible.is_empty() {
-            return RichReply::plain("Нет сессий — создайте через /new");
+            return im_views::plain_with_refresh("Нет сессий — создайте через /new", "/status");
         }
         // /status = the chat's CURRENT (focused) session in DEPTH; /sessions is
         // the full fleet list. Resolve the focused sid; if none is set (or it has
@@ -15515,11 +15551,17 @@ impl Gateway {
             let cur = self.current_project_label(chat);
             let in_proj = visible.iter().filter(|s| s.project == cur).count();
             return if in_proj > 0 {
-                RichReply::plain(format!(
-                    "📁 Текущий проект: {cur}\nНет текущей сессии — выберите через /use <id> (в проекте: {in_proj}; все — /sessions)"
-                ))
+                im_views::plain_with_refresh(
+                    format!(
+                        "📁 Текущий проект: {cur}\nНет текущей сессии — выберите через /use <id> (в проекте: {in_proj}; все — /sessions)"
+                    ),
+                    "/status",
+                )
             } else {
-                RichReply::plain(format!("📁 Текущий проект: {cur}\nВ этом проекте нет сессий — отправьте сообщение или /new"))
+                im_views::plain_with_refresh(
+                    format!("📁 Текущий проект: {cur}\nВ этом проекте нет сессий — отправьте сообщение или /new"),
+                    "/status",
+                )
             };
         };
 
@@ -15549,23 +15591,38 @@ impl Gateway {
         // Same in-flight verdict the child rows / MCP / web get
         // ([`Gateway::live_turn`]) — this line only dresses it with durations.
         let live = self.live_turn(s, Instant::now());
+        // review-fix F3 — take BOTH the icon and the label from
+        // `activity_badge` (not just the icon), so a palette rename
+        // propagates here instead of leaving this card's wording to drift
+        // out of sync with `/sessions`' `markdown_session_line`/
+        // `plain_session_line` (im_views.rs), which already source both
+        // halves. Only the trailing duration/detail suffix stays local.
         let (state, detail) = match live {
-            None => (im_views::activity_badge("idle").0, "ожидание".to_string()),
+            None => {
+                let (icon, label) = im_views::activity_badge("idle");
+                (icon, label.to_string())
+            }
             // Running subagents ⇒ definitively working (overrides silence).
-            Some(l) if l.is_stuck() && !turn_scoped_running => (
-                im_views::activity_badge("stuck").0,
-                format!(
-                    "ЗАВИСАНИЕ: нет событий {}",
-                    humanize_dur(std::time::Duration::from_secs(l.silent_seconds))
-                ),
-            ),
-            Some(l) => (
-                im_views::activity_badge("working").0,
-                format!(
-                    "работает {}",
-                    humanize_dur(std::time::Duration::from_secs(l.elapsed_seconds))
-                ),
-            ),
+            Some(l) if l.is_stuck() && !turn_scoped_running => {
+                let (icon, label) = im_views::activity_badge("stuck");
+                (
+                    icon,
+                    format!(
+                        "{label}: нет событий {}",
+                        humanize_dur(std::time::Duration::from_secs(l.silent_seconds))
+                    ),
+                )
+            }
+            Some(l) => {
+                let (icon, label) = im_views::activity_badge("working");
+                (
+                    icon,
+                    format!(
+                        "{label} {}",
+                        humanize_dur(std::time::Duration::from_secs(l.elapsed_seconds))
+                    ),
+                )
+            }
         };
 
         let model = status
@@ -33502,7 +33559,7 @@ mod tests {
         let reply = gateway.render_sessions(&chat, false).await;
         assert!(reply.markdown.contains("data=\"cmd:/use s2\""));
         assert!(reply.markdown.contains("data=\"cmd:/use s1\""));
-        assert_eq!(reply.button_rows[2][0].data, "cmd:/sessions");
+        assert_eq!(reply.button_rows[2][0].data, "cmd:~/sessions");
         assert_eq!(reply.button_rows[2][1].data, "cmd:?/new");
 
         let typed = gateway
@@ -33579,7 +33636,14 @@ mod tests {
                 .map(|index| SessionRow {
                     sid: format!("s{index}"),
                     vendor_model: "claude.—".into(),
-                    status: "🟢 ожидание".into(),
+                    // R2-4/R2-2 (2nd) — `status` is a RAW activity
+                    // classification (`working`/`idle`/`stale`/`stuck`),
+                    // rendered through `activity_badge`, not a pre-rendered
+                    // display string; the pre-§3.5b `"🟢 ожидание"` literal
+                    // used to silently render `⚪ неизвестно` here without
+                    // this test (which only counts button-row lengths)
+                    // ever noticing.
+                    status: "idle".into(),
                     context: "—".into(),
                     title: None,
                     current: false,
@@ -33599,6 +33663,17 @@ mod tests {
             .iter()
             .flatten()
             .all(|button| button.data.len() <= 64));
+        // R2-4 — the fixture claims every session is `idle`; assert the
+        // rendered state actually says so (🟢 ожидание, never the `⚪
+        // неизвестно` fallback an un-migrated display-string `status` would
+        // silently produce), so a future regression back to a display
+        // string can't hide behind a test that only counts button rows.
+        assert!(
+            reply.markdown.matches("🟢").count() >= 9,
+            "{}",
+            reply.markdown
+        );
+        assert!(!reply.markdown.contains('⚪'), "{}", reply.markdown);
     }
 
     /// Tapping a picker button switches project / session through the SAME
@@ -33718,7 +33793,8 @@ mod tests {
         assert_eq!(via_button, typed);
     }
 
-    /// SPEC-3.5c/R2-1 — a `cmd:/sessions` tap FROM a Telegram callback (a
+    /// SPEC-3.5c/R2-1/R2-2 — a `cmd:~/sessions` tap (the `/sessions`
+    /// screen's OWN "🔄 Обновить" button) FROM a Telegram callback (a
     /// resolvable `tg-cb-<id>` message id, no group ephemeral context) edits
     /// the tapped message in place instead of appending a new one: no reply
     /// comes back through the normal channel, and the fake transport
@@ -33740,7 +33816,7 @@ mod tests {
                 "",
                 &[],
                 Some(&ChoiceReply {
-                    data: "cmd:/sessions".to_string(),
+                    data: "cmd:~/sessions".to_string(),
                     callback_ephemeral: None,
                 }),
             )
@@ -33753,12 +33829,83 @@ mod tests {
 
         let edit = events.try_recv().expect("expected an edit event");
         match edit.kind {
-            GatewayEventKind::EditMessage { ref message_id, .. } => {
+            GatewayEventKind::EditMessage {
+                ref message_id,
+                ref rich_markdown,
+                inline_buttons,
+            } => {
                 assert_eq!(message_id, "999");
+                // R2-1 — the empty `/sessions` state used to edit in place
+                // with `button_rows` empty, stripping the tapped message of
+                // its only entry points back into a session (no keyboard on
+                // either the classic `reply_markup` or Rich Messages leg).
+                // `plain_with_refresh` now attaches the same "🔄 Обновить" /
+                // "✏️ Новая" footer every non-empty screen ends with, on
+                // BOTH the classic leg (`button_rows`, checked below) and
+                // the Rich Messages leg (`inline_buttons` + the embedded
+                // `<tg-button-row>` tag, checked here).
+                assert!(inline_buttons, "rich edit leg must still carry a keyboard");
+                assert!(
+                    rich_markdown
+                        .as_deref()
+                        .is_some_and(|md| md.contains("<tg-button-row>")),
+                    "{rich_markdown:?}"
+                );
             }
             other => panic!("expected EditMessage, got {other:?}"),
         }
         assert!(edit.content.contains("Нет сессий"), "{}", edit.content);
+        assert_eq!(
+            edit.button_rows[0][0].data, "cmd:~/sessions",
+            "the classic (reply_markup) leg must also keep its refresh button: {:?}",
+            edit.button_rows
+        );
+    }
+
+    /// R2-2 — a plain `cmd:/sessions` tap (e.g. the "📋 Сессии" cross-screen
+    /// nav button rendered on the `/status` card, or "💬 Сессии" on the
+    /// fs-browser switch acknowledgement) must NEVER edit the tapped
+    /// message in place, even though it runs the exact same `/sessions`
+    /// command the `/sessions` screen's own `cmd:~/sessions` "🔄 Обновить"
+    /// button does. Redraw-in-place is reserved for the `~`-namespaced
+    /// self-refresh callback ([`im_callbacks::CallbackAction::Redraw`]);
+    /// every other `cmd:` tap — action commands and cross-screen nav alike —
+    /// sends a fresh message so the screen the button was tapped from
+    /// survives the tap. Regression test for the bug
+    /// `cmd_sessions_callback_edits_the_tapped_message_in_place` above would
+    /// NOT have caught: before the `~` namespace existed, this exact
+    /// `cmd:/sessions` payload redrew in place unconditionally.
+    #[tokio::test]
+    async fn cmd_sessions_plain_callback_never_redraws_the_tapped_message() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/sessions".to_string(),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !replies.is_empty(),
+            "a cross-screen nav tap must come back as a normal reply, not vanish into an in-place edit: {replies:?}"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "a plain (non-`~`) cmd: tap must never fire an EditMessage event"
+        );
     }
 
     /// `cmd:?<command>` renders a Russian confirmation with `[✅ Да][❌
@@ -34827,8 +34974,14 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            stuck[0].contains("🔴 ЗАВИСАНИЕ: нет событий "),
+            stuck[0].contains("🔴 зависание: нет событий "),
             "stuck state: {stuck:?}"
+        );
+        // review-fix F3 — the label must come FROM `activity_badge`, so a
+        // future palette rename shows up here without editing this test.
+        assert!(
+            stuck[0].contains(&format!("🔴 {}:", im_views::activity_badge("stuck").1)),
+            "/status label must match the activity_badge palette: {stuck:?}"
         );
         assert!(
             stuck[0].contains("нет событий 6m"),
@@ -38031,6 +38184,48 @@ mod tests {
         assert_eq!(nav.page, 1);
     }
 
+    /// SPEC-3.5c regression — the SAME edit-in-place fix applies to fs
+    /// browser navigation (`nav:fs:i:*`, e.g. a pagination tap), not just
+    /// `cmd:/sessions`: a resolvable `tg-cb-<id>` message id edits the
+    /// tapped message via `emit_fs_page`'s `emit_fs_reply` call, the exact
+    /// path `resolve_cmd_callback`/`handle_message_shared` now reuse rather
+    /// than inventing a second edit mechanism.
+    #[tokio::test]
+    async fn fs_browser_nav_i_callback_edits_the_tapped_message_in_place() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("child")).unwrap();
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-cb-321",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:i:0:{}", fs_fp(&paths.projects_root, "")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "edited in place — nothing comes back as a fresh reply: {replies:?}"
+        );
+
+        let edit = events.try_recv().expect("expected an edit event");
+        match edit.kind {
+            GatewayEventKind::EditMessage { ref message_id, .. } => {
+                assert_eq!(message_id, "321");
+            }
+            other => panic!("expected EditMessage, got {other:?}"),
+        }
+        assert!(edit.content.contains("child"), "{}", edit.content);
+    }
+
     #[tokio::test]
     async fn fs_browser_nav_up_at_root_is_a_no_op() {
         let (_tmp, paths, mut gateway) = fs_browser_test_rig();
@@ -38848,13 +39043,17 @@ mod tests {
         assert_eq!(nav.rel, std::path::PathBuf::from("child"));
     }
 
-    /// SPEC-3.5c/R2-1 — the SAME edit-in-place fix, through the production
-    /// `Arc<Mutex<Gateway>>`-locked entry point `handle_message_shared`
-    /// daemon.rs actually calls (as opposed to `handle_message`'s single-
-    /// `&mut self` twin, covered by `cmd_sessions_callback_edits_the_
-    /// tapped_message_in_place` above) — the two dispatch this finding
-    /// named separately (gateway.rs's `resolve_cmd_callback` AND
-    /// `handle_message_shared`'s own `CallbackAction::Command` arm).
+    /// SPEC-3.5c/R2-1/R2-2 — the SAME edit-in-place fix, through the
+    /// production `Arc<Mutex<Gateway>>`-locked entry point
+    /// `handle_message_shared` daemon.rs actually calls (as opposed to
+    /// `handle_message`'s single-`&mut self` twin, covered by
+    /// `cmd_sessions_callback_edits_the_tapped_message_in_place` above) —
+    /// the two dispatch this finding named separately (gateway.rs's
+    /// `resolve_cmd_callback` AND `handle_message_shared`'s own
+    /// `CallbackAction::Redraw` arm). Uses `cmd:~/sessions` — the
+    /// `/sessions` screen's OWN self-refresh button — not plain
+    /// `cmd:/sessions`, which R2-2 made a non-redraw since it also serves
+    /// cross-screen nav buttons that must never edit the tapped screen away.
     #[tokio::test]
     async fn cmd_sessions_callback_edits_in_place_through_handle_message_shared() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -38872,7 +39071,7 @@ mod tests {
             "",
             &[],
             Some(&ChoiceReply {
-                data: "cmd:/sessions".to_string(),
+                data: "cmd:~/sessions".to_string(),
                 callback_ephemeral: None,
             }),
         )
@@ -38891,6 +39090,176 @@ mod tests {
             other => panic!("expected EditMessage, got {other:?}"),
         }
         assert!(edit.content.contains("Нет сессий"), "{}", edit.content);
+    }
+
+    /// review-fix F1 — a `cmd:/use <sid>` tap is an ACTION, not a redraw of
+    /// the screen it was tapped from (`/sessions`): editing the tapped
+    /// message in place would destroy the session list the button lives
+    /// on. Both dispatch copies (`resolve_cmd_callback`, exercised via
+    /// `handle_message`, and `handle_message_shared`'s own
+    /// `CallbackAction::Command` arm) must fall through to a normal reply
+    /// — no `EditMessage` — even with a resolvable `tg-cb-<id>` message id.
+    #[tokio::test]
+    async fn cmd_use_callback_does_not_edit_the_tapped_message() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-cb-999",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/use s1".to_string(),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replies,
+            vec!["Используется сессия s1"],
+            "an action command still comes back as a reply, not an edit"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "no EditMessage should be emitted for an action command"
+        );
+    }
+
+    /// review-fix F1, production path — the same guarantee as
+    /// `cmd_use_callback_does_not_edit_the_tapped_message` through the
+    /// `Arc<Mutex<Gateway>>`-locked entry point `daemon.rs` actually calls.
+    #[tokio::test]
+    async fn cmd_use_callback_does_not_edit_through_handle_message_shared() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let mut events = gateway.lock().await.subscribe_events();
+
+        let replies = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-1",
+            "alice",
+            "tg-cb-999",
+            "",
+            &[],
+            Some(&ChoiceReply {
+                data: "cmd:/use s1".to_string(),
+                callback_ephemeral: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replies,
+            vec![RichReply::plain("Используется сессия s1")],
+            "an action command still comes back as a reply, not an edit"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "no EditMessage should be emitted for an action command"
+        );
+    }
+
+    /// R2-2, production path — the same guarantee as
+    /// `cmd_sessions_plain_callback_never_redraws_the_tapped_message`
+    /// through the `Arc<Mutex<Gateway>>`-locked entry point `daemon.rs`
+    /// actually calls: a plain `cmd:/sessions` tap (a cross-screen nav
+    /// button, e.g. "📋 Сессии" on the `/status` card) must never edit the
+    /// tapped message in place, even though `handle_message_shared`'s own
+    /// `CallbackAction::Command | CallbackAction::Redraw` arm runs the exact
+    /// same `/sessions` command the screen's `cmd:~/sessions` self-refresh
+    /// button does.
+    #[tokio::test]
+    async fn cmd_sessions_plain_callback_never_redraws_through_handle_message_shared() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let gateway = Gateway::new(fake, "alpha", proj.path());
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let mut events = gateway.lock().await.subscribe_events();
+
+        let replies = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "42",
+            "42",
+            "tg-cb-777",
+            "",
+            &[],
+            Some(&ChoiceReply {
+                data: "cmd:/sessions".to_string(),
+                callback_ephemeral: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !replies.is_empty(),
+            "a cross-screen nav tap must come back as a normal reply, not vanish into an in-place edit: {replies:?}"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "a plain (non-`~`) cmd: tap must never fire an EditMessage event"
+        );
+    }
+
+    /// review-fix F2 — the fs browser nav (`nav:fs:i:*`) edit-in-place
+    /// behaviour, through the SAME production `Arc<Mutex<Gateway>>` entry
+    /// point `daemon.rs` actually calls, with a resolvable `tg-cb-<id>`
+    /// message id (`fs_browser_nav_works_through_handle_message_shared`
+    /// above uses a bare "1" id, which never resolves to a callback and so
+    /// never exercises the edit-in-place branch at all).
+    #[tokio::test]
+    async fn fs_browser_nav_callback_edits_in_place_through_handle_message_shared() {
+        let (_tmp, paths, gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("child")).unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let mut events = gateway.lock().await.subscribe_events();
+
+        let replies = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-1",
+            "alice",
+            "tg-cb-321",
+            "",
+            &[],
+            Some(&ChoiceReply {
+                data: format!("nav:fs:i:0:{}", fs_fp(&paths.projects_root, "")),
+                callback_ephemeral: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            replies.is_empty(),
+            "edited in place — nothing comes back as a fresh reply: {replies:?}"
+        );
+
+        let edit = events.try_recv().expect("expected an edit event");
+        match edit.kind {
+            GatewayEventKind::EditMessage { ref message_id, .. } => {
+                assert_eq!(message_id, "321");
+            }
+            other => panic!("expected EditMessage, got {other:?}"),
+        }
+        assert!(edit.content.contains("child"), "{}", edit.content);
     }
 
     #[test]

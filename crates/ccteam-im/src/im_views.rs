@@ -40,6 +40,36 @@ impl RichReply {
     }
 }
 
+/// A plain-text reply carrying the same "🔄 Обновить" / "✏️ Новая" footer
+/// every non-empty `/sessions`/`/status` card ends with. R2-1 — the empty
+/// states of those two screens used to fall back to bare [`RichReply::plain`]
+/// (no `button_rows`), and a §3.5c in-place edit forwards `button_rows`
+/// verbatim on both the classic (`reply_markup`) and Rich Messages
+/// (`<tg-button-row>` tags embedded via `inline_buttons`) legs — so tapping
+/// "🔄 Обновить" on the LAST session's list, or a fresh `/status` with none
+/// running, stripped the tapped message down to plain text with no way back
+/// in. `refresh_command` lets each screen point the footer's first button at
+/// itself (`/sessions` vs `/status`).
+pub fn plain_with_refresh(text: impl Into<String>, refresh_command: &str) -> RichReply {
+    let plain = text.into();
+    let row = command_row([
+        redraw_button("🔄 Обновить", refresh_command),
+        command_button("✏️ Новая", "?/new"),
+    ]);
+    let inline_buttons = !row.is_empty();
+    let mut markdown = escape_status_markdown(&plain);
+    if inline_buttons {
+        append_inline_rows(&mut markdown, std::slice::from_ref(&row));
+    }
+    RichReply {
+        markdown,
+        plain,
+        button_rows: vec![row],
+        inline_buttons,
+        reply_keyboard: None,
+    }
+}
+
 /// Facts needed to render the focused session card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusView {
@@ -87,7 +117,12 @@ pub struct SessionRow {
     pub sid: String,
     /// Vendor and model in one compact cell.
     pub vendor_model: String,
-    /// Current lifecycle label.
+    /// Raw activity classification — `"working"` / `"idle"` / `"stale"` /
+    /// `"stuck"` (§3.5b) — NOT a pre-rendered display string. Rendered via
+    /// [`activity_badge`]; any other value (including a legacy
+    /// pre-rendered string like `"🟢 ожидание"`) falls through to its `⚪
+    /// неизвестно` fallback (R2-4 — a caller that passes a display string
+    /// here silently gets that fallback instead of the state it meant).
     pub status: String,
     /// Context usage percent, or an honest placeholder.
     pub context: String,
@@ -272,7 +307,7 @@ pub fn render_status(view: &StatusView) -> RichReply {
         command_row([
             command_button("📋 Сессии", "/sessions"),
             command_button("📁 Проекты", "/projects"),
-            command_button("🔄 Обновить", "/status"),
+            redraw_button("🔄 Обновить", "/status"),
         ]),
         command_row([command_button("✏️ Новая", "?/new"), stop]),
     ];
@@ -340,7 +375,7 @@ pub fn render_sessions(view: &SessionsView) -> RichReply {
         plain.push_str(&tail.join("\n"));
     }
     let global_rows = vec![command_row([
-        command_button("🔄 Обновить", "/sessions"),
+        redraw_button("🔄 Обновить", "/sessions"),
         command_button("✏️ Новая", "?/new"),
     ])];
     let mut trailing_rows = global_rows.clone();
@@ -606,6 +641,24 @@ fn command_row<const N: usize>(buttons: [Option<MessageOption>; N]) -> Vec<Messa
 
 fn command_button(label: &str, command: impl AsRef<str>) -> Option<MessageOption> {
     command_button_styled(label, command, None)
+}
+
+/// A self-refresh button (§3.5c) — runs `command` exactly like
+/// [`command_button`] does, but tags the callback `cmd:~<command>`
+/// ([`crate::im_callbacks::CallbackAction::Redraw`]) instead of plain
+/// `cmd:<command>`. R2-2 — this namespace is what lets the gateway edit the
+/// tapped message in place: it is reserved for a screen's OWN "🔄 Обновить"
+/// button, never for a button that merely happens to run the same command
+/// from a DIFFERENT screen (e.g. the `/status` card's "📋 Сессии" link,
+/// which must open a fresh `/sessions` message, not overwrite the card).
+fn redraw_button(label: &str, command: impl AsRef<str>) -> Option<MessageOption> {
+    let data = format!("cmd:~{}", command.as_ref());
+    (data.len() <= 64).then(|| MessageOption {
+        data,
+        label: label.to_string(),
+        id: command.as_ref().to_string(),
+        style: None,
+    })
 }
 
 fn command_button_styled(
@@ -938,14 +991,29 @@ mod tests {
         assert_eq!(activity_badge("anything-else"), ("⚪", "неизвестно"));
     }
 
+    /// Icons production code must never hardcode outside [`activity_badge`]
+    /// itself: its five live outputs (`working`/`idle`/`stale`/`stuck` and
+    /// the `⚪` "неизвестно" fallback) plus the retired `🟡`
+    /// `waiting`-shaped icon SPEC-3.5b removed. The single list both guard
+    /// tests below scan for, so they cannot drift apart (R2-3 — before this
+    /// constant existed, each guard hand-rolled its own five-character
+    /// array and both omitted `⚪`, so a bare `⚪ неизвестно` written
+    /// directly into production code instead of routed through
+    /// `activity_badge` passed both gates silently). Deliberately a
+    /// TEST-ONLY constant, not exposed to production code: hoisting it
+    /// there would put its own `⚪`/`🔵`/… literals inside the very
+    /// production-code window `im_views_production_code_has_no_hardcoded_activity_icons`
+    /// scans, self-tripping the guard it exists to serve.
+    const ACTIVITY_ICON_GUARD_CHARS: [char; 6] = ['🔵', '🟢', '🟠', '🔴', '⚪', '🟡'];
+
     /// SPEC-4 — `gateway.rs`'s session/status render sites must source every
     /// state icon from [`activity_badge`], never re-inline one of its
     /// literals. Scans gateway.rs's PRODUCTION code (everything before its
     /// own `#[cfg(test)]\nmod tests {` — comment lines, which legitimately
-    /// reference these icons in prose, are skipped) for the five palette
-    /// emoji as bare characters; `waiting`'s old `🟡`-shaped hardcoding at
-    /// gateway.rs:15230/15233/15240/20582 (pre-fix) is exactly the class of
-    /// regression this catches.
+    /// reference these icons in prose, are skipped) for
+    /// [`ACTIVITY_ICON_GUARD_CHARS`] as bare characters; `waiting`'s old
+    /// `🟡`-shaped hardcoding at gateway.rs:15230/15233/15240/20582
+    /// (pre-fix) is exactly the class of regression this catches.
     #[test]
     fn gateway_production_code_has_no_hardcoded_activity_icons() {
         let source = include_str!("gateway.rs");
@@ -956,15 +1024,46 @@ mod tests {
         let offenders: Vec<&str> = production
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
-            .filter(|line| {
-                ['🔵', '🟢', '🟠', '🔴', '🟡']
-                    .iter()
-                    .any(|c| line.contains(*c))
-            })
+            .filter(|line| ACTIVITY_ICON_GUARD_CHARS.iter().any(|c| line.contains(*c)))
             .collect();
         assert!(
             offenders.is_empty(),
             "gateway.rs production code hardcodes a state icon outside activity_badge: {offenders:?}"
+        );
+    }
+
+    /// review-fix F4 — the same guard as
+    /// `gateway_production_code_has_no_hardcoded_activity_icons`, but for
+    /// THIS file: it renders `markdown_session_line`/`plain_session_line`,
+    /// the `/sessions` row §3.5b names, so a literal icon slipped in here
+    /// (e.g. a stray `🟡` pin) would re-introduce the exact
+    /// two-icons-per-line drift §3.5b removed while the gateway.rs-only
+    /// scan above stays green. Excludes `activity_badge`'s own body (the
+    /// one legitimate place the palette literals live) and this file's
+    /// `#[cfg(test)]` tail (assertions legitimately quote the icons).
+    #[test]
+    fn im_views_production_code_has_no_hardcoded_activity_icons() {
+        let source = include_str!("im_views.rs");
+        let boundary = source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("im_views.rs must have its main `mod tests` block");
+        let production = &source[..boundary];
+        let badge_start = production
+            .find("pub fn activity_badge")
+            .expect("activity_badge must still live in production code");
+        let badge_end = production[badge_start..]
+            .find("\n}\n")
+            .map(|rel| badge_start + rel + "\n}\n".len())
+            .expect("activity_badge must have a closing brace on its own line");
+        let scanned = format!("{}{}", &production[..badge_start], &production[badge_end..]);
+        let offenders: Vec<&str> = scanned
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| ACTIVITY_ICON_GUARD_CHARS.iter().any(|c| line.contains(*c)))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "im_views.rs production code hardcodes a state icon outside activity_badge: {offenders:?}"
         );
     }
 
@@ -1004,7 +1103,7 @@ mod tests {
 
         assert_eq!(
             reply.markdown,
-            "🧭 s42 · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 /root/projects/ccteam\n\nЗапущено: ожидает · Роль: reviewer\n\n⚡️ Использование:\nCC: 5h 17% (19:00) · неделя 78% (06/29) · max\n\n👥 Дочерние (2):\n  • s56 · codex · gpt-5.6-terra · 🔵 работает · title\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop s56\" style=\"danger\">⛔ s56</tg-button></tg-button-row>\n\n  • s57 · codex · gpt-5.6-luna · 🟢 ожидание · other\n\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\n\n💰 Расход проекта 24ч: $1.23\n\n🔁 resume 123e4567-e89b-12d3-a456-426614174000\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:/sessions\">📋 Сессии</tg-button><tg-button type=\"callback_data\" data=\"cmd:/projects\">📁 Проекты</tg-button><tg-button type=\"callback_data\" data=\"cmd:/status\">🔄 Обновить</tg-button></tg-button-row>\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/new\">✏️ Новая</tg-button><tg-button type=\"callback_data\" data=\"cmd:?/stop s42\" style=\"danger\">⛔ Стоп</tg-button></tg-button-row>\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop children\" style=\"danger\">⛔ Остановить все дочерние</tg-button></tg-button-row>"
+            "🧭 s42 · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 /root/projects/ccteam\n\nЗапущено: ожидает · Роль: reviewer\n\n⚡️ Использование:\nCC: 5h 17% (19:00) · неделя 78% (06/29) · max\n\n👥 Дочерние (2):\n  • s56 · codex · gpt-5.6-terra · 🔵 работает · title\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop s56\" style=\"danger\">⛔ s56</tg-button></tg-button-row>\n\n  • s57 · codex · gpt-5.6-luna · 🟢 ожидание · other\n\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\n\n💰 Расход проекта 24ч: $1.23\n\n🔁 resume 123e4567-e89b-12d3-a456-426614174000\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:/sessions\">📋 Сессии</tg-button><tg-button type=\"callback_data\" data=\"cmd:/projects\">📁 Проекты</tg-button><tg-button type=\"callback_data\" data=\"cmd:~/status\">🔄 Обновить</tg-button></tg-button-row>\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/new\">✏️ Новая</tg-button><tg-button type=\"callback_data\" data=\"cmd:?/stop s42\" style=\"danger\">⛔ Стоп</tg-button></tg-button-row>\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop children\" style=\"danger\">⛔ Остановить все дочерние</tg-button></tg-button-row>"
         );
         assert_eq!(reply.plain.lines().next(), Some("🧭 s42 · ccteam · claude"));
         assert!(reply
@@ -1121,7 +1220,7 @@ mod tests {
         assert!(reply
             .markdown
             .contains("сообщения встанут в очередь; /stop s77 завершит"));
-        assert_eq!(reply.button_rows[10][0].data, "cmd:/sessions");
+        assert_eq!(reply.button_rows[10][0].data, "cmd:~/sessions");
         assert_eq!(reply.button_rows[10][1].data, "cmd:?/new");
         assert!(reply
             .plain
@@ -1175,7 +1274,7 @@ mod tests {
                 "🔵 s2 · codex/gpt-5.6-terra · работает ",
                 "<tg-button type=\"callback_data\" data=\"cmd:?/stop s2\" style=\"danger\">⛔</tg-button> ",
                 "<tg-button type=\"callback_data\" data=\"cmd:/use s2\" style=\"link\">Переключиться</tg-button>\n\n",
-                "<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:/sessions\">🔄 Обновить</tg-button><tg-button type=\"callback_data\" data=\"cmd:?/new\">✏️ Новая</tg-button></tg-button-row>"
+                "<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:~/sessions\">🔄 Обновить</tg-button><tg-button type=\"callback_data\" data=\"cmd:?/new\">✏️ Новая</tg-button></tg-button-row>"
             )
         );
         assert_eq!(reply.button_rows[0][0].data, "cmd:?/stop s1");
