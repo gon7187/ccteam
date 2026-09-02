@@ -1,5 +1,7 @@
 //! Pure rich-message renderers for the IM gateway views.
 
+use std::path::PathBuf;
+
 use crate::transport::{ButtonStyle, MessageOption, ReplyKeyboard};
 
 /// A rendered response with Telegram-rich and universal plain representations.
@@ -141,6 +143,49 @@ pub struct ProjectsView {
     pub projects: Vec<ProjectRow>,
 }
 
+/// One filesystem entry rendered in the operator folder browser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsEntryView {
+    /// Directory name.
+    pub name: String,
+    /// Registered project slug, when this directory is already a project —
+    /// ANY local project, regardless of whether `slug` is ACL-visible to the
+    /// browsing chat (FS-SEC-R2-1: `slug` must reflect registration truthfully
+    /// so a hidden project never renders as an empty, enterable folder).
+    pub slug: Option<String>,
+    /// `false` only when `slug` names a project this chat cannot see
+    /// (`Gateway::visible_project_slugs`) — such an entry renders inert: no
+    /// "✅ Переключиться" (it isn't this chat's to switch into) and no
+    /// "📁 Открыть" either (it's registered, not a plain folder to browse
+    /// into). Meaningless when `slug` is `None`.
+    pub visible: bool,
+}
+
+/// Facts needed to render one page of the operator filesystem folder browser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsBrowserView {
+    /// Browser root, e.g. `/root/projects`.
+    pub root_display: String,
+    /// Path below the root currently shown; empty at the root.
+    pub rel: PathBuf,
+    /// Directory entries on this page.
+    pub entries: Vec<FsEntryView>,
+    /// Current page number, matching the displayed "k" in "страница k/n".
+    pub page: usize,
+    /// Total page count.
+    pub pages: usize,
+    /// The listed directory itself, when it is already a registered project.
+    pub current_slug: Option<String>,
+    /// The chat's current project slug; the matching entry renders bold.
+    pub chat_project: Option<String>,
+    /// Directory-read error, replacing the entry list when present.
+    pub error: Option<String>,
+    /// [`crate::fs_browser::fingerprint`] of `rel` + `entries` — embedded in
+    /// each `nav:fs:i:<n>:<fp>`/`nav:fs:pick:<n>:<fp>` callback so a tap is
+    /// validated against the exact page it was rendered from (FS-SEC-2).
+    pub page_fingerprint: String,
+}
+
 /// One gateway command's help metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandView {
@@ -273,12 +318,7 @@ pub fn render_sessions(view: &SessionsView) -> RichReply {
     for session in &shown {
         markdown.push_str("\n\n");
         markdown.push_str(&markdown_session_line(session));
-        let row = session_button_options(session);
-        if let Some(inline) = inline_button_row(row.iter().cloned().map(Some)) {
-            markdown.push('\n');
-            markdown.push_str(&inline);
-            button_rows.push(row);
-        }
+        button_rows.push(session_button_options(session));
         plain.push_str("\n\n");
         plain.push_str(&plain_session_line(session));
     }
@@ -363,6 +403,149 @@ pub fn render_projects(view: &ProjectsView) -> RichReply {
     }
 }
 
+/// Render one page of the operator filesystem folder browser.
+pub fn render_fs_browser(view: &FsBrowserView) -> RichReply {
+    let rel_display = view.rel.to_string_lossy();
+    let rel_display = rel_display.trim_matches('/');
+    let has_rel = !rel_display.is_empty();
+    let header_plain = if has_rel {
+        format!("📂 {}/{}", view.root_display, rel_display)
+    } else {
+        format!("📂 {}", view.root_display)
+    };
+
+    // R2-3 — `up`/`here` carry the SAME page fingerprint the `i:`/`pick:`
+    // buttons do, so a tap on an older browser message is validated against
+    // a fresh render of `rel`/`page` instead of acting on whatever the
+    // chat's shared nav cursor currently points at (which a newer browser
+    // message from the same chat may since have moved).
+    let fp = &view.page_fingerprint;
+    let up_button = has_rel
+        .then(|| nav_option("⬆️ Вверх", format!("fs:up:{fp}"), None))
+        .flatten();
+
+    let mut markdown = escape_status_markdown(&header_plain);
+    let mut plain = header_plain;
+    let mut button_rows = Vec::new();
+    if let Some(button) = &up_button {
+        markdown.push(' ');
+        markdown.push_str(&inline_text_button(button));
+        button_rows.push(vec![button.clone()]);
+    }
+
+    if let Some(error) = &view.error {
+        let error_line = format!("⛔ нет доступа: {error}");
+        markdown.push_str("\n\n");
+        markdown.push_str(&escape_status_markdown(&error_line));
+        plain.push_str("\n\n");
+        plain.push_str(&error_line);
+        return RichReply {
+            markdown,
+            plain,
+            button_rows,
+            inline_buttons: true,
+            reply_keyboard: None,
+        };
+    }
+
+    if view.pages > 1 {
+        let page_line = format!("страница {}/{}", view.page, view.pages);
+        markdown.push('\n');
+        markdown.push_str(&escape_status_markdown(&page_line));
+        plain.push('\n');
+        plain.push_str(&page_line);
+    }
+
+    for (index, entry) in view.entries.iter().enumerate() {
+        markdown.push_str("\n\n");
+        plain.push_str("\n\n");
+        let bold = entry.slug.is_some() && view.chat_project.as_deref() == entry.slug.as_deref();
+        let name_markdown = escape_status_markdown(&entry.name);
+        let name_markdown = if bold {
+            format!("**{name_markdown}**")
+        } else {
+            name_markdown
+        };
+        // FS-SEC-R2-1 — a registered-but-not-visible project (a tenant's,
+        // hidden from this operator by `visible_project_slugs`) renders
+        // inert: `icon` alone, no nav option at all. It must NOT fall into
+        // the `entry.slug.is_none()` "📁 Открыть" branch (that would let
+        // the operator descend into and then "make a project" of a
+        // directory that already IS someone else's project) or the
+        // "✅ Переключиться" branch (nothing to switch this chat into).
+        let nav_choice = if entry.slug.is_some() && !entry.visible {
+            None
+        } else if entry.slug.is_some() {
+            Some((
+                "✅",
+                "Переключиться",
+                format!("fs:pick:{index}:{fp}"),
+                "переключиться",
+            ))
+        } else {
+            Some(("📁", "Открыть", format!("fs:i:{index}:{fp}"), "открыть"))
+        };
+        let icon = nav_choice.as_ref().map_or("🔒", |(icon, ..)| icon);
+        markdown.push_str(icon);
+        markdown.push(' ');
+        markdown.push_str(&name_markdown);
+        plain.push_str(icon);
+        plain.push(' ');
+        plain.push_str(&entry.name);
+        if let Some((icon, label, action, classic_suffix)) = nav_choice {
+            if let Some(button) = nav_option(label, action, None) {
+                markdown.push(' ');
+                markdown.push_str(&inline_text_button(&button));
+                button_rows.push(vec![MessageOption {
+                    label: format!("{icon} {} → {classic_suffix}", entry.name),
+                    ..button
+                }]);
+            }
+        }
+    }
+
+    let mut trailing = Vec::new();
+    if view.pages > 1 {
+        // SPEC-3.5 — both arrows always render when there's more than one
+        // page (matching the root mock). Tapping ◀ on page 1 or ▶ on the
+        // last page re-requests the page already on screen: `fs:pg:` clamps
+        // into `1..=pages` (`fs_browser::list_capped`), and the daemon now
+        // treats Telegram's resulting "message is not modified" as success
+        // rather than falling back to a duplicate new message (F3's
+        // original concern, since resolved) — so an edge tap is a harmless
+        // no-op, not the broken send F3 was guarding against.
+        if let Some(button) =
+            nav_option("◀", format!("fs:pg:{}", view.page.saturating_sub(1)), None)
+        {
+            trailing.push(button);
+        }
+        if let Some(button) = nav_option("▶", format!("fs:pg:{}", view.page + 1), None) {
+            trailing.push(button);
+        }
+    }
+    if has_rel && view.current_slug.is_none() {
+        if let Some(button) = nav_option("📌 Сделать проектом", format!("fs:here:{fp}"), None)
+        {
+            trailing.push(button);
+        }
+    }
+    if !trailing.is_empty() {
+        if let Some(rendered) = inline_button_row(trailing.iter().cloned().map(Some)) {
+            markdown.push_str("\n\n");
+            markdown.push_str(&rendered);
+        }
+        button_rows.push(trailing);
+    }
+
+    RichReply {
+        markdown,
+        plain,
+        button_rows,
+        inline_buttons: true,
+        reply_keyboard: None,
+    }
+}
+
 /// Render grouped gateway help from command metadata.
 pub fn render_help(commands: &[CommandView]) -> RichReply {
     const GROUPS: [(&str, &[&str]); 3] = [
@@ -440,37 +623,85 @@ fn command_button_styled(
 }
 
 fn markdown_session_line(session: &SessionRow) -> String {
+    let (icon, state) = session_state(session);
     let sid = session_display_sid(session);
     let vendor_model = session_vendor_model_compact(session);
-    let state = session_state(session);
-    let prefix = format!("{sid} · {vendor_model} · {state}");
-    format!(
-        "**{}** · {} · {}{}",
-        escape_markdown(&sid),
+    let prefix = format!("{icon} {sid} · {vendor_model} · {state}");
+    let sid_markdown = if session.current {
+        format!("**{}**", escape_markdown(&sid))
+    } else {
+        escape_markdown(&sid)
+    };
+    let mut line = format!(
+        "{icon} {} · {} · {}{}",
+        sid_markdown,
         escape_markdown(&vendor_model),
         escape_markdown(&state),
         session_title_suffix(&session_title(session), prefix.chars().count()),
-    )
+    );
+    for button in session_inline_button_options(session) {
+        line.push(' ');
+        line.push_str(&inline_text_button(&button));
+    }
+    line
+}
+
+/// The two inline paragraph buttons for a session line: bare `⛔` (danger)
+/// and `Переключиться` (default → rendered `style="link"`), same callback
+/// data as [`session_button_options`]'s classic-fallback labels.
+fn session_inline_button_options(session: &SessionRow) -> Vec<MessageOption> {
+    let mut buttons = session_button_options(session);
+    if let Some(stop) = buttons.first_mut() {
+        stop.label = "⛔".to_string();
+    }
+    if let Some(switch) = buttons.get_mut(1) {
+        switch.label = "Переключиться".to_string();
+    }
+    buttons
+}
+
+/// One state icon + label for a session/child activity classification
+/// (§3.5b) — the single source every place that renders session state reads
+/// from, so `working`/`idle`/`stale`/`stuck` never render two contradicting
+/// icons on the same line again (`/sessions` used to render `🔵 работает`,
+/// activity labels `🟡 работает`, each classifier guessing on its own).
+/// Exactly the spec's five rows — a session pinned to the top of
+/// `/sessions` for a pending HITL approval still falls through to its real
+/// `working`/`idle`/`stuck` classification here (SPEC-3.5b-waiting-arm —
+/// an undocumented `waiting` arm used to alias `idle`'s "ожидание" word
+/// under a different, ⏳, icon reserved for the restart/detached tail).
+pub fn activity_badge(activity: &str) -> (&'static str, &'static str) {
+    match activity {
+        "working" => ("🔵", "работает"),
+        "idle" => ("🟢", "ожидание"),
+        "stale" => ("🟠", "устарело"),
+        "stuck" => ("🔴", "зависание"),
+        // SPEC-3.5b — `⏳` is deliberately absent here: it's reserved for
+        // "session finishing a turn started before restart" / the detached
+        // tail (neither is a live-session activity), never a member of this
+        // palette. See `activity_badge_covers_the_documented_palette` below.
+        _ => ("⚪", "неизвестно"),
+    }
 }
 
 fn plain_session_line(session: &SessionRow) -> String {
+    let (icon, label) = activity_badge(&session.status);
+    let status_text = format!("{icon} {label}");
     let title = session_title(session);
     let title_or_context = if title == "—" {
         session.context.clone()
     } else {
         let prefix = format!(
-            "{} | {} | {} | ",
+            "{} | {} | {status_text} | ",
             session_display_sid(session),
             session_vendor_model(session),
-            session.status
         );
         truncate_session_title_to(&title, 60usize.saturating_sub(prefix.chars().count()))
     };
     format!(
-        "{} | {} | {} | {}",
+        "{} | {} | {status_text} | {}",
         session_display_sid(session),
         session_vendor_model(session),
-        session.status,
         title_or_context,
     )
 }
@@ -507,12 +738,17 @@ fn session_title(session: &SessionRow) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-fn session_state(session: &SessionRow) -> String {
-    if session.context == "—" {
-        session.status.clone()
+/// Icon + display text for one session line — the single place
+/// `markdown_session_line` reads the leading icon from, so it can never
+/// disagree with the state word next to it (F4/SPEC-2).
+fn session_state(session: &SessionRow) -> (&'static str, String) {
+    let (icon, label) = activity_badge(&session.status);
+    let text = if session.context == "—" {
+        label.to_string()
     } else {
-        format!("{} · ctx {}", session.status, session.context)
-    }
+        format!("{label} · ctx {}", session.context)
+    };
+    (icon, text)
 }
 
 fn truncate_session_title(title: &str) -> String {
@@ -594,6 +830,46 @@ where
     Some(row)
 }
 
+/// Build a `nav:`-prefixed callback option for the filesystem browser
+/// (mirrors [`command_button_styled`]'s `cmd:` prefix for gateway commands).
+fn nav_option(
+    label: &str,
+    action: impl Into<String>,
+    style: Option<ButtonStyle>,
+) -> Option<MessageOption> {
+    let action = action.into();
+    let data = format!("nav:{action}");
+    (data.len() <= 64).then(|| MessageOption {
+        data,
+        label: label.to_string(),
+        id: action,
+        style,
+    })
+}
+
+/// Render one `<tg-button>` embedded mid-paragraph (RichTextButton), as
+/// opposed to [`inline_button_row`]'s block `<tg-button-row>`. Defaults to
+/// `style="link"` when the option carries no explicit style, matching the
+/// Telegram Rich Messages convention for inline text buttons.
+fn inline_text_button(option: &MessageOption) -> String {
+    let mut tag = String::from("<tg-button type=\"callback_data\" data=\"");
+    tag.push_str(&escape_button_attribute(&option.data));
+    tag.push('"');
+    let style = match option.style {
+        Some(ButtonStyle::Primary) => "primary",
+        Some(ButtonStyle::Success) => "success",
+        Some(ButtonStyle::Danger) => "danger",
+        None => "link",
+    };
+    tag.push_str(" style=\"");
+    tag.push_str(style);
+    tag.push('"');
+    tag.push('>');
+    tag.push_str(&escape_button_attribute(&option.label));
+    tag.push_str("</tg-button>");
+    tag
+}
+
 fn escape_button_attribute(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -615,7 +891,7 @@ fn escape_code(value: &str) -> String {
     value.replace('`', "\\`").replace(['\r', '\n'], " ")
 }
 
-fn escape_status_markdown(value: &str) -> String {
+pub(crate) fn escape_status_markdown(value: &str) -> String {
     escape_markdown(value)
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -638,13 +914,59 @@ fn escape_markdown(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use crate::transport::ButtonStyle;
 
     use super::{
-        render_help, render_projects, render_sessions, render_status, CommandView,
-        DetachedSessionRow, ProjectRow, ProjectsView, SessionRow, SessionsView, StatusChild,
-        StatusView,
+        activity_badge, render_fs_browser, render_help, render_projects, render_sessions,
+        render_status, CommandView, DetachedSessionRow, FsBrowserView, FsEntryView, ProjectRow,
+        ProjectsView, SessionRow, SessionsView, StatusChild, StatusView,
     };
+
+    /// SPEC-4/SPEC-3.5b — pins the whole documented palette (§3.5b's table
+    /// plus the unknown fallback) so a future edit can't silently drift an
+    /// icon or a label without a test failing, and can't re-add a
+    /// `waiting`-shaped arm without deliberately updating this table too.
+    #[test]
+    fn activity_badge_covers_the_documented_palette() {
+        assert_eq!(activity_badge("working"), ("🔵", "работает"));
+        assert_eq!(activity_badge("idle"), ("🟢", "ожидание"));
+        assert_eq!(activity_badge("stale"), ("🟠", "устарело"));
+        assert_eq!(activity_badge("stuck"), ("🔴", "зависание"));
+        assert_eq!(activity_badge("waiting"), ("⚪", "неизвестно"));
+        assert_eq!(activity_badge("anything-else"), ("⚪", "неизвестно"));
+    }
+
+    /// SPEC-4 — `gateway.rs`'s session/status render sites must source every
+    /// state icon from [`activity_badge`], never re-inline one of its
+    /// literals. Scans gateway.rs's PRODUCTION code (everything before its
+    /// own `#[cfg(test)]\nmod tests {` — comment lines, which legitimately
+    /// reference these icons in prose, are skipped) for the five palette
+    /// emoji as bare characters; `waiting`'s old `🟡`-shaped hardcoding at
+    /// gateway.rs:15230/15233/15240/20582 (pre-fix) is exactly the class of
+    /// regression this catches.
+    #[test]
+    fn gateway_production_code_has_no_hardcoded_activity_icons() {
+        let source = include_str!("gateway.rs");
+        let boundary = source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("gateway.rs must have its main `mod tests` block");
+        let production = &source[..boundary];
+        let offenders: Vec<&str> = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| {
+                ['🔵', '🟢', '🟠', '🔴', '🟡']
+                    .iter()
+                    .any(|c| line.contains(*c))
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "gateway.rs production code hardcodes a state icon outside activity_badge: {offenders:?}"
+        );
+    }
 
     #[test]
     fn status_has_russian_card_and_commands() {
@@ -665,7 +987,7 @@ mod tests {
                 "CC: 5h 17% (19:00) · неделя 78% (06/29) · max".into(),
                 "".into(),
                 "👥 Дочерние (2):".into(),
-                "  • s56 · codex · gpt-5.6-terra · 🟡 работает · title".into(),
+                "  • s56 · codex · gpt-5.6-terra · 🔵 работает · title".into(),
                 "".into(),
                 "  • s57 · codex · gpt-5.6-luna · 🟢 ожидание · other".into(),
                 "".into(),
@@ -682,7 +1004,7 @@ mod tests {
 
         assert_eq!(
             reply.markdown,
-            "🧭 s42 · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 /root/projects/ccteam\n\nЗапущено: ожидает · Роль: reviewer\n\n⚡️ Использование:\nCC: 5h 17% (19:00) · неделя 78% (06/29) · max\n\n👥 Дочерние (2):\n  • s56 · codex · gpt-5.6-terra · 🟡 работает · title\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop s56\" style=\"danger\">⛔ s56</tg-button></tg-button-row>\n\n  • s57 · codex · gpt-5.6-luna · 🟢 ожидание · other\n\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\n\n💰 Расход проекта 24ч: $1.23\n\n🔁 resume 123e4567-e89b-12d3-a456-426614174000\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:/sessions\">📋 Сессии</tg-button><tg-button type=\"callback_data\" data=\"cmd:/projects\">📁 Проекты</tg-button><tg-button type=\"callback_data\" data=\"cmd:/status\">🔄 Обновить</tg-button></tg-button-row>\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/new\">✏️ Новая</tg-button><tg-button type=\"callback_data\" data=\"cmd:?/stop s42\" style=\"danger\">⛔ Стоп</tg-button></tg-button-row>\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop children\" style=\"danger\">⛔ Остановить все дочерние</tg-button></tg-button-row>"
+            "🧭 s42 · ccteam · claude\n🟢 ожидание · opus · high · ctx 38%\n📁 /root/projects/ccteam\n\nЗапущено: ожидает · Роль: reviewer\n\n⚡️ Использование:\nCC: 5h 17% (19:00) · неделя 78% (06/29) · max\n\n👥 Дочерние (2):\n  • s56 · codex · gpt-5.6-terra · 🔵 работает · title\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop s56\" style=\"danger\">⛔ s56</tg-button></tg-button-row>\n\n  • s57 · codex · gpt-5.6-luna · 🟢 ожидание · other\n\n↓ Другие сессии проекта: 2 → /sessions\n↓ Все проекты: 3 → /projects\n\n💰 Расход проекта 24ч: $1.23\n\n🔁 resume 123e4567-e89b-12d3-a456-426614174000\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:/sessions\">📋 Сессии</tg-button><tg-button type=\"callback_data\" data=\"cmd:/projects\">📁 Проекты</tg-button><tg-button type=\"callback_data\" data=\"cmd:/status\">🔄 Обновить</tg-button></tg-button-row>\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/new\">✏️ Новая</tg-button><tg-button type=\"callback_data\" data=\"cmd:?/stop s42\" style=\"danger\">⛔ Стоп</tg-button></tg-button-row>\n\n<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop children\" style=\"danger\">⛔ Остановить все дочерние</tg-button></tg-button-row>"
         );
         assert_eq!(reply.plain.lines().next(), Some("🧭 s42 · ccteam · claude"));
         assert!(reply
@@ -764,12 +1086,7 @@ mod tests {
             .map(|n| SessionRow {
                 sid: format!("s{n}"),
                 vendor_model: "claude.opus".into(),
-                status: if n == 1 {
-                    "⏳ ожидание"
-                } else {
-                    "🟢 ожидание"
-                }
-                .into(),
+                status: if n == 1 { "working" } else { "idle" }.into(),
                 context: "38%".into(),
                 title: (n == 1).then(|| "active work".into()),
                 current: n == 1,
@@ -790,16 +1107,16 @@ mod tests {
         assert!(!reply.markdown.contains("| sid |"));
         assert!(reply
             .markdown
-            .contains("**s1** · claude/opus · ⏳ ожидание · ctx 38% — active work"));
+            .contains("🔵 **s1** · claude/opus · работает · ctx 38% — active work"));
         assert!(reply.markdown.contains("data=\"cmd:?/stop s1\""));
         assert!(reply.markdown.contains("data=\"cmd:/use s1\""));
         assert!(reply.markdown.contains("<blockquote expandable>"));
         assert!(reply
             .markdown
-            .contains("**s10** · claude/opus · 🟢 ожидание · ctx 38%"));
+            .contains("🟢 s10 · claude/opus · ожидание · ctx 38%"));
         assert!(reply
             .markdown
-            .contains("**└─ s2** · claude/opus @edge · 🟢 ожидание · ctx 38%"));
+            .contains("🟢 └─ s2 · claude/opus @edge · ожидание · ctx 38%"));
         assert!(reply.markdown.contains("pid 4242"));
         assert!(reply
             .markdown
@@ -826,7 +1143,7 @@ mod tests {
                 SessionRow {
                     sid: "s1".into(),
                     vendor_model: "claude.opus-4-8".into(),
-                    status: "🟢 ожидание".into(),
+                    status: "idle".into(),
                     context: "38%".into(),
                     title: Some("active work".into()),
                     current: true,
@@ -836,7 +1153,7 @@ mod tests {
                 SessionRow {
                     sid: "s2".into(),
                     vendor_model: "codex.gpt-5.6-terra".into(),
-                    status: "🔵 работает".into(),
+                    status: "working".into(),
                     context: "—".into(),
                     title: None,
                     current: false,
@@ -852,13 +1169,19 @@ mod tests {
             reply.markdown,
             concat!(
                 "**Сессии** · `ccteam`\n\n",
-                "**s1** · claude/opus-4-8 · 🟢 ожидание · ctx 38% — active work\n",
-                "<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop s1\" style=\"danger\">⛔ Стоп</tg-button><tg-button type=\"callback_data\" data=\"cmd:/use s1\">💬 Переключиться</tg-button></tg-button-row>\n\n",
-                "**s2** · codex/gpt-5.6-terra · 🔵 работает\n",
-                "<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:?/stop s2\" style=\"danger\">⛔ Стоп</tg-button><tg-button type=\"callback_data\" data=\"cmd:/use s2\">💬 Переключиться</tg-button></tg-button-row>\n\n",
+                "🟢 **s1** · claude/opus-4-8 · ожидание · ctx 38% — active work ",
+                "<tg-button type=\"callback_data\" data=\"cmd:?/stop s1\" style=\"danger\">⛔</tg-button> ",
+                "<tg-button type=\"callback_data\" data=\"cmd:/use s1\" style=\"link\">Переключиться</tg-button>\n\n",
+                "🔵 s2 · codex/gpt-5.6-terra · работает ",
+                "<tg-button type=\"callback_data\" data=\"cmd:?/stop s2\" style=\"danger\">⛔</tg-button> ",
+                "<tg-button type=\"callback_data\" data=\"cmd:/use s2\" style=\"link\">Переключиться</tg-button>\n\n",
                 "<tg-button-row><tg-button type=\"callback_data\" data=\"cmd:/sessions\">🔄 Обновить</tg-button><tg-button type=\"callback_data\" data=\"cmd:?/new\">✏️ Новая</tg-button></tg-button-row>"
             )
         );
+        assert_eq!(reply.button_rows[0][0].data, "cmd:?/stop s1");
+        assert_eq!(reply.button_rows[0][0].label, "⛔ Стоп");
+        assert_eq!(reply.button_rows[0][1].data, "cmd:/use s1");
+        assert_eq!(reply.button_rows[0][1].label, "💬 Переключиться");
         assert!(!reply.plain.contains("<tg-button-row>"));
     }
 
@@ -873,10 +1196,10 @@ mod tests {
         let sessions = vec![SessionRow {
             sid: "s1".into(),
             vendor_model: "claude.<script>&\"".into(),
-            status: "🟢 ожидание".into(),
+            status: "idle".into(),
             context: "38%".into(),
             title: None,
-            current: false,
+            current: true,
             tree_depth: 0,
             host: None,
         }];
@@ -899,6 +1222,208 @@ mod tests {
             "special chars must be escaped, not left raw: {html}"
         );
         assert!(!html.contains("<script>"), "unescaped tag leaked: {html}");
+    }
+
+    #[test]
+    fn fs_browser_root_page_has_no_up_or_here_but_has_pager() {
+        let reply = render_fs_browser(&FsBrowserView {
+            root_display: "/root/projects".into(),
+            rel: PathBuf::new(),
+            entries: vec![
+                FsEntryView {
+                    name: "4g".into(),
+                    slug: Some("4g".into()),
+                    visible: true,
+                },
+                FsEntryView {
+                    name: "ccteam".into(),
+                    slug: Some("ccteam".into()),
+                    visible: true,
+                },
+                FsEntryView {
+                    name: "RKN".into(),
+                    slug: None,
+                    visible: true,
+                },
+            ],
+            page: 1,
+            pages: 6,
+            current_slug: None,
+            chat_project: Some("ccteam".into()),
+            error: None,
+            page_fingerprint: "abcd".into(),
+        });
+
+        assert!(reply
+            .markdown
+            .starts_with("📂 /root/projects\nстраница 1/6"));
+        assert!(!reply.markdown.contains("nav:fs:up"));
+        assert!(!reply.markdown.contains("nav:fs:here"));
+        // SPEC-3.5 — page 1 of 6: both arrows render (◀ clamps back to page
+        // 1, a harmless no-op re-render — see the F3 comment in
+        // `render_fs_browser`).
+        assert!(reply.markdown.contains("data=\"nav:fs:pg:0\""));
+        assert!(reply.markdown.contains("data=\"nav:fs:pg:2\""));
+        assert!(reply.markdown.contains("**ccteam**"));
+        assert!(reply.markdown.contains("data=\"nav:fs:pick:0:abcd\""));
+        assert!(reply.markdown.contains("data=\"nav:fs:pick:1:abcd\""));
+        assert!(reply.markdown.contains("data=\"nav:fs:i:2:abcd\""));
+        assert!(reply.plain.contains("страница 1/6"));
+        assert!(!reply.plain.contains('<'));
+        assert_eq!(reply.button_rows[0][0].data, "nav:fs:pick:0:abcd");
+        assert_eq!(reply.button_rows[1][0].data, "nav:fs:pick:1:abcd");
+        assert_eq!(reply.button_rows[2][0].data, "nav:fs:i:2:abcd");
+        assert_eq!(reply.button_rows[2][0].label, "📁 RKN → открыть");
+        let pager = &reply.button_rows[3];
+        assert_eq!(pager.len(), 2, "page 1 of 6 must render both ◀ and ▶");
+        assert_eq!(pager[0].data, "nav:fs:pg:0");
+        assert_eq!(pager[1].data, "nav:fs:pg:2");
+        assert!(reply.inline_buttons);
+    }
+
+    #[test]
+    fn fs_browser_last_page_pager_has_both_buttons() {
+        let reply = render_fs_browser(&FsBrowserView {
+            root_display: "/root/projects".into(),
+            rel: PathBuf::new(),
+            entries: vec![FsEntryView {
+                name: "zzz".into(),
+                slug: None,
+                visible: true,
+            }],
+            page: 3,
+            pages: 3,
+            current_slug: None,
+            chat_project: None,
+            error: None,
+            page_fingerprint: "beef".into(),
+        });
+        let pager = reply.button_rows.last().unwrap();
+        // SPEC-3.5 — the last page still renders ▶ (clamps back to page 3,
+        // a harmless re-render no-op).
+        assert_eq!(pager.len(), 2, "last page must render both ◀ and ▶");
+        assert_eq!(pager[0].data, "nav:fs:pg:2");
+        assert_eq!(pager[1].data, "nav:fs:pg:4");
+    }
+
+    #[test]
+    fn fs_browser_nested_page_has_up_and_here_but_no_pager() {
+        let reply = render_fs_browser(&FsBrowserView {
+            root_display: "/root/projects".into(),
+            rel: PathBuf::from("ccteam-wt"),
+            entries: vec![
+                FsEntryView {
+                    name: "dev".into(),
+                    slug: None,
+                    visible: true,
+                },
+                FsEntryView {
+                    name: "fs-browser".into(),
+                    slug: None,
+                    visible: true,
+                },
+            ],
+            page: 1,
+            pages: 1,
+            current_slug: None,
+            chat_project: None,
+            error: None,
+            page_fingerprint: "abcd".into(),
+        });
+
+        assert!(reply
+            .markdown
+            .starts_with("📂 /root/projects/ccteam-wt <tg-button"));
+        assert!(reply.markdown.contains("data=\"nav:fs:up:abcd\""));
+        assert!(!reply.markdown.contains("страница"));
+        assert!(reply.markdown.contains("data=\"nav:fs:here:abcd\""));
+        assert!(!reply.markdown.contains("nav:fs:pg:"));
+        assert_eq!(reply.button_rows[0][0].data, "nav:fs:up:abcd");
+        let last = reply.button_rows.last().unwrap();
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].data, "nav:fs:here:abcd");
+    }
+
+    #[test]
+    fn fs_browser_hidden_registered_entry_is_inert() {
+        // FS-SEC-R2-1 — a directory that IS a registered project, but not
+        // visible to this chat (a tenant-owned project the operator can't
+        // see), must render as a locked, non-interactive entry: no
+        // "✅ Переключиться" (nothing to switch this chat into) and no
+        // "📁 Открыть" either (it's a real project, not a plain folder the
+        // operator should be offered to bootstrap over).
+        let reply = render_fs_browser(&FsBrowserView {
+            root_display: "/root/projects".into(),
+            rel: PathBuf::new(),
+            entries: vec![FsEntryView {
+                name: "tenant-secret".into(),
+                slug: Some("tenant-secret".into()),
+                visible: false,
+            }],
+            page: 1,
+            pages: 1,
+            current_slug: None,
+            chat_project: None,
+            error: None,
+            page_fingerprint: "abcd".into(),
+        });
+
+        assert!(reply.markdown.contains("🔒"));
+        assert!(reply.markdown.contains("tenant-secret"));
+        assert!(!reply.markdown.contains("fs:pick:"));
+        assert!(!reply.markdown.contains("fs:i:"));
+        assert!(
+            reply.button_rows.is_empty(),
+            "a hidden-registered entry offers no button at all: {:?}",
+            reply.button_rows
+        );
+    }
+
+    #[test]
+    fn fs_browser_registered_dir_in_current_project_suppresses_here() {
+        let reply = render_fs_browser(&FsBrowserView {
+            root_display: "/root/projects".into(),
+            rel: PathBuf::from("ccteam"),
+            entries: Vec::new(),
+            page: 1,
+            pages: 1,
+            current_slug: Some("ccteam".into()),
+            chat_project: None,
+            error: None,
+            page_fingerprint: "abcd".into(),
+        });
+
+        assert!(!reply.markdown.contains("nav:fs:here"));
+        assert!(reply
+            .button_rows
+            .iter()
+            .all(|row| row[0].data != "nav:fs:here"));
+    }
+
+    #[test]
+    fn fs_browser_read_error_replaces_entries_and_drops_nav_row() {
+        let reply = render_fs_browser(&FsBrowserView {
+            root_display: "/root/projects".into(),
+            rel: PathBuf::from("secret"),
+            entries: Vec::new(),
+            page: 1,
+            pages: 1,
+            current_slug: None,
+            chat_project: None,
+            error: Some("Permission denied (os error 13)".into()),
+            page_fingerprint: "abcd".into(),
+        });
+
+        assert!(reply
+            .markdown
+            .contains("⛔ нет доступа: Permission denied (os error 13)"));
+        assert!(reply.markdown.contains("data=\"nav:fs:up:abcd\""));
+        assert!(!reply.markdown.contains("nav:fs:here"));
+        assert_eq!(reply.button_rows.len(), 1);
+        assert_eq!(reply.button_rows[0][0].data, "nav:fs:up:abcd");
+        assert!(reply
+            .plain
+            .contains("⛔ нет доступа: Permission denied (os error 13)"));
     }
 
     #[test]

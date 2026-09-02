@@ -661,10 +661,12 @@ impl TelegramChannel {
         recipient: &str,
         message_id: &str,
         markdown: &str,
+        inline_buttons: bool,
         button_rows: &[Vec<MessageOption>],
     ) -> Result<Option<String>, String> {
         let url = self.api_url("editMessageText");
-        let body = build_rich_edit_body(recipient, message_id, markdown, button_rows);
+        let body =
+            build_rich_edit_body(recipient, message_id, markdown, inline_buttons, button_rows);
         let resp = self
             .http
             .post(&url)
@@ -1648,6 +1650,12 @@ fn plain_body(mut body: serde_json::Value, text: &str) -> serde_json::Value {
 }
 
 fn plain_text_for_request(source: &str) -> String {
+    // F5 — this is the LAST resort when Telegram rejects the HTML attempt:
+    // sent as-is with no `parse_mode`, so any Rich Messages markup left in
+    // `source` (a caller may have embedded `<tg-button>`/`<tg-button-row>`
+    // tags in markdown, expecting `render_markdown` to strip them — which
+    // this retry bypasses) would otherwise leak as literal text.
+    let source = &crate::telegram_html::strip_rich_tags(source);
     if source.encode_utf16().count() > MAX_MESSAGE_UTF16 {
         truncate_plain_message(source)
     } else {
@@ -1923,9 +1931,18 @@ fn build_rich_edit_body(
     recipient: &str,
     message_id: &str,
     markdown: &str,
+    inline_buttons: bool,
     button_rows: &[Vec<MessageOption>],
 ) -> serde_json::Value {
-    let buttons_html = button_rows_to_tg_html(button_rows);
+    // F2/SPEC-3 — `inline_buttons` means every button already rides inline
+    // `<tg-button>` tags inside `markdown` (mirrors `build_rich_send_body`'s
+    // same check); appending `button_rows` again here would render each
+    // button twice.
+    let buttons_html = if inline_buttons {
+        String::new()
+    } else {
+        button_rows_to_tg_html(button_rows)
+    };
     let full_markdown = if buttons_html.is_empty() {
         markdown.to_string()
     } else {
@@ -2376,15 +2393,22 @@ impl Channel for TelegramChannel {
         recipient: &str,
         message_id: &str,
         content: &str,
+        rich_markdown: Option<&str>,
+        inline_buttons: bool,
         button_rows: &[Vec<MessageOption>],
     ) -> anyhow::Result<Option<String>> {
         // TG-GATE-V2 W1/W5 — same rich→classic ladder as `send` (see there
         // for the fallback contract + once-per-reason-kind logging), now
         // carrying `button_rows` (e.g. the progress edit's `[⛔ Прервать]`)
-        // through both legs.
+        // through both legs. F5/F2 — the rich attempt reads `rich_markdown`
+        // when given (falling back to `content` for every pre-existing
+        // caller, which never set it) and, when `inline_buttons` is set,
+        // must NOT also append `button_rows` as a trailing block — the
+        // markdown already embeds every button as inline `<tg-button>` tags.
         if !self.rich_circuit_open() {
+            let markdown = rich_markdown.unwrap_or(content);
             match self
-                .try_edit_rich(recipient, message_id, content, button_rows)
+                .try_edit_rich(recipient, message_id, markdown, inline_buttons, button_rows)
                 .await
             {
                 Ok(id) => {
@@ -3393,13 +3417,13 @@ mod tests {
 
     #[test]
     fn rich_edit_body_has_no_buttons_and_parses_message_id() {
-        let body = build_rich_edit_body("42", "tg-99", "**edited**", &[]);
+        let body = build_rich_edit_body("42", "tg-99", "**edited**", false, &[]);
         assert_eq!(body["chat_id"], "42");
         assert_eq!(body["message_id"].as_i64(), None, "tg-99 isn't numeric");
         assert_eq!(body["rich_message"]["markdown"], "**edited**");
         assert!(body.get("text").is_none());
 
-        let body = build_rich_edit_body("42", "99", "**edited**", &[]);
+        let body = build_rich_edit_body("42", "99", "**edited**", false, &[]);
         assert_eq!(body["message_id"], 99);
     }
 
@@ -3409,10 +3433,29 @@ mod tests {
     #[test]
     fn rich_edit_body_appends_button_rows() {
         let rows = vec![vec![opt("cmd:?/interrupt", "⛔ Прервать", None)]];
-        let body = build_rich_edit_body("42", "99", "working...", &rows);
+        let body = build_rich_edit_body("42", "99", "working...", false, &rows);
         let markdown = body["rich_message"]["markdown"].as_str().unwrap();
         assert!(markdown.starts_with("working...\n\n<tg-button-row>"));
         assert!(markdown.contains(">⛔ Прервать</tg-button>"));
+    }
+
+    /// F2/SPEC-3 — `inline_buttons: true` must NOT append `button_rows` as a
+    /// trailing block: the markdown already embeds every button as inline
+    /// `<tg-button>` tags (the fs-browser page render), so appending them
+    /// again would show each button twice.
+    #[test]
+    fn rich_edit_body_skips_button_rows_when_inline_buttons_set() {
+        let rows = vec![vec![opt("nav:fs:up", "⬆️ Вверх", None)]];
+        let body = build_rich_edit_body(
+            "42",
+            "99",
+            "📂 /root <tg-button type=\"callback_data\" data=\"nav:fs:up\">⬆️ Вверх</tg-button>",
+            true,
+            &rows,
+        );
+        let markdown = body["rich_message"]["markdown"].as_str().unwrap();
+        assert!(!markdown.contains("<tg-button-row>"));
+        assert_eq!(markdown.matches("nav:fs:up").count(), 1);
     }
 
     /// The classic edit fallback attaches the same `inline_keyboard` shape

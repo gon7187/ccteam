@@ -359,10 +359,19 @@ impl Channel for DraftStopChannel {
         recipient: &str,
         message_id: &str,
         content: &str,
+        rich_markdown: Option<&str>,
+        inline_buttons: bool,
         button_rows: &[Vec<ccteam_im::transport::MessageOption>],
     ) -> anyhow::Result<Option<String>> {
         self.inner
-            .edit_message(recipient, message_id, content, button_rows)
+            .edit_message(
+                recipient,
+                message_id,
+                content,
+                rich_markdown,
+                inline_buttons,
+                button_rows,
+            )
             .await
     }
 }
