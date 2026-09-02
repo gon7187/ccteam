@@ -234,7 +234,9 @@ pub fn bootstrap_project(
     request: &str,
     team: &str,
 ) -> Result<PathBuf> {
-    bootstrap_project_at_dir(paths, &paths.project_dir(slug), slug, request, team)
+    let dir = bootstrap_project_at_dir(paths, &paths.project_dir(slug), slug, request, team)?;
+    crate::config::register_local_project(&paths.root, slug, dir.clone(), team)?;
+    Ok(dir)
 }
 
 /// Materialize the daemon-side state home for a remote project without

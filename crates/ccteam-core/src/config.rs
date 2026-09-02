@@ -534,6 +534,29 @@ pub fn preflight_project_upsert(ccteam_root: &Path, slug: &str) -> Result<()> {
 /// collision — the caller (e.g. `ccteam init`) should detect the
 /// collision earlier so the user gets a clearer error, but this is
 /// the last line of defense.
+/// Register a local project at `path`. `collect_projects` reads config.yaml
+/// only, so anything that materializes `<path>/.ccteam/state.json` and wants
+/// it listed must also call this.
+pub fn register_local_project(
+    ccteam_root: &Path,
+    slug: &str,
+    path: PathBuf,
+    team: &str,
+) -> Result<()> {
+    append_project(
+        ccteam_root,
+        ProjectEntry {
+            slug: slug.to_string(),
+            path,
+            host: default_project_host(),
+            remote_slug: None,
+            remote_path: None,
+            team: team.to_string(),
+            installed_at: Utc::now(),
+        },
+    )
+}
+
 pub fn append_project(ccteam_root: &Path, entry: ProjectEntry) -> Result<()> {
     let _lock = ConfigFileLock::acquire(ccteam_root)?;
     let mut cfg = load(ccteam_root)?;

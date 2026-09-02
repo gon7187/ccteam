@@ -171,15 +171,16 @@ fn bearer(hex: &str) -> String {
     format!("Bearer ccteam:{hex}")
 }
 
-/// Register "demo" on disk (legacy-fallback discovery: `collect_projects`
-/// walks `projects_root` for any dir with a parseable `.ccteam/state.json`,
-/// no `config.yaml` entry required — mirrors `tenant_acl_test.rs`).
+/// Register `slug` on disk and in config.yaml (`collect_projects` reads the
+/// registry only).
 fn register_project(paths: &CcteamPaths, slug: &str, owner: Option<&str>) -> std::path::PathBuf {
     let state_path = paths.project_state(slug);
     std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
     let mut st = ProjectState::initial_for_team(slug.to_string(), "dev".to_string());
     st.owner = owner.map(str::to_string);
     st.save(&state_path).unwrap();
+    ccteam_core::config::register_local_project(&paths.root, slug, paths.project_dir(slug), "dev")
+        .unwrap();
     paths.projects_root.join(slug)
 }
 

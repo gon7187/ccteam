@@ -151,12 +151,10 @@ pub struct ProjectSummary {
 /// `path` (which may live outside `paths.projects_root` — adopted
 /// repos in `~/code/...` etc.).
 ///
-/// **Legacy fallback**: for slugs not yet registered, also walk
-/// `paths.projects_root` and include any directory whose
-/// `.ccteam/state.json` parses. This keeps V0.4.1 installs working
-/// until `ccteam doctor --migrate-v041-to-v042` (F74) folds them
-/// into config.yaml. After migration the walk finds nothing new and
-/// becomes a no-op.
+/// `config.yaml` is the ONLY source: `paths.projects_root` is never
+/// walked. The old walk keyed on directory names, and a directory
+/// name is not a slug (`4G/` → slug `4g`), so every project whose
+/// directory differed from its slug by case was listed twice.
 ///
 /// Skips entries that lack `state.json` or whose `state.json` fails
 /// to parse — those get a warn-level log line but do not abort the
@@ -164,7 +162,6 @@ pub struct ProjectSummary {
 /// to re-sort.
 pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
     let mut out = Vec::new();
-    let mut seen_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // 1. config.yaml::projects[] is the canonical SoT (V0.4.2 F73).
     let cfg = crate::config::load(&paths.root).unwrap_or_else(|err| {
@@ -219,54 +216,7 @@ pub fn collect_projects(paths: &CcteamPaths) -> Result<Vec<ProjectSummary>> {
                 continue;
             }
         };
-        seen_slugs.insert(state.slug.clone());
         out.push(summary_from_state(paths, state));
-    }
-
-    // 2. Legacy fallback: walk projects_root for unregistered slugs.
-    let dir = &paths.projects_root;
-    if dir.exists() {
-        for entry in
-            std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?
-        {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let Some(slug) = entry.file_name().to_str().map(String::from) else {
-                continue;
-            };
-            if seen_slugs.contains(&slug) {
-                continue;
-            }
-            // Shared read, same reasoning as the registered branch above.
-            match ccteam_harness::execution::progress_bridge::progress_state_is_retired_shared(
-                &paths.progress_jsonl(&slug),
-            ) {
-                Ok(false) => {}
-                Ok(true) => continue,
-                Err(err) => {
-                    tracing::warn!(
-                        slug,
-                        error = %err,
-                        "legacy project progress generation is unreadable; skipping fail-closed"
-                    );
-                    continue;
-                }
-            }
-            let state_path = paths.project_state(&slug);
-            if !state_path.exists() {
-                continue;
-            }
-            let state = match ProjectState::load(&state_path) {
-                Ok(s) => s,
-                Err(err) => {
-                    tracing::warn!(slug, error = %err, "skip project: state.json failed to load");
-                    continue;
-                }
-            };
-            out.push(summary_from_state(paths, state));
-        }
     }
 
     out.sort_by(|a, b| a.state.slug.cmp(&b.state.slug));
@@ -1440,6 +1390,12 @@ mod tests {
         }
     }
 
+    /// Register `slug` at `path` in config.yaml (the only source
+    /// `collect_projects` reads).
+    fn register(paths: &CcteamPaths, slug: &str, path: std::path::PathBuf) {
+        crate::config::register_local_project(&paths.root, slug, path, "dev").unwrap();
+    }
+
     #[test]
     fn collect_projects_empty_when_root_missing() {
         let tmp = TempDir::new().unwrap();
@@ -1448,13 +1404,36 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    /// An unregistered directory under `projects_root` is invisible even
+    /// with a parseable `state.json`: config.yaml is the only source.
     #[test]
-    fn collect_projects_skips_dirs_without_state_json() {
+    fn collect_projects_ignores_unregistered_dirs_under_projects_root() {
         let tmp = TempDir::new().unwrap();
         let paths = fake_paths(tmp.path());
         fs::create_dir_all(paths.projects_root.join("orphan")).unwrap();
+        ProjectState::initial("stray".into())
+            .save(&paths.project_state("stray"))
+            .unwrap();
         let out = collect_projects(&paths).unwrap();
         assert!(out.is_empty());
+    }
+
+    /// Regression: `/root/projects/4G` registered as slug `4g`. The old
+    /// projects_root walk keyed on the directory name, missed the
+    /// case-different slug in its dedup set and listed the project twice.
+    #[test]
+    fn collect_projects_lists_project_once_when_dir_name_differs_from_slug() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fake_paths(tmp.path());
+        let dir = paths.projects_root.join("4G");
+        fs::create_dir_all(dir.join(".ccteam")).unwrap();
+        ProjectState::initial("4g".into())
+            .save(&dir.join(".ccteam").join("state.json"))
+            .unwrap();
+        register(&paths, "4g", dir);
+        let out = collect_projects(&paths).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].state.slug, "4g");
     }
 
     #[test]
@@ -1465,6 +1444,7 @@ mod tests {
         let state_path = paths.project_state(slug);
         let state = ProjectState::initial(slug.to_string());
         state.save(&state_path).unwrap();
+        register(&paths, slug, paths.project_dir(slug));
 
         let out = collect_projects(&paths).unwrap();
         assert_eq!(out.len(), 1);
@@ -1484,6 +1464,7 @@ mod tests {
         let mut state = ProjectState::initial(slug.to_string());
         state.created_at = Utc::now() - chrono::Duration::hours(2);
         state.save(&paths.project_state(slug)).unwrap();
+        register(&paths, slug, paths.project_dir(slug));
         // …but a progress event landed 10s ago.
         let recent = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
         let pp = paths.progress_jsonl(slug);
@@ -1521,6 +1502,7 @@ mod tests {
         let mut state = ProjectState::initial(slug.to_string());
         state.created_at = Utc::now() - chrono::Duration::hours(2);
         state.save(&paths.project_state(slug)).unwrap();
+        register(&paths, slug, paths.project_dir(slug));
         // Last event 40 min ago → past the 15-min suspicious + 30-min escalate.
         let old = (Utc::now() - chrono::Duration::minutes(40)).to_rfc3339();
         let pp = paths.progress_jsonl(slug);
@@ -1588,8 +1570,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = fake_paths(tmp.path());
 
-        // One registered project (config.yaml branch) + one legacy project
-        // discovered by the projects_root walk: both consult the lock.
+        // Two registered projects, one outside projects_root and one under
+        // it: both consult the lock.
         let registered_dir = tmp.path().join("external").join("registered");
         std::fs::create_dir_all(registered_dir.join(".ccteam")).unwrap();
         ProjectState::initial("registered".into())
@@ -1611,6 +1593,7 @@ mod tests {
         ProjectState::initial("legacy".into())
             .save(&paths.project_state("legacy"))
             .unwrap();
+        register(&paths, "legacy", paths.project_dir("legacy"));
 
         // `append_event` creates each slug's stable lock with an ACTIVE marker,
         // so the reader actually opens and locks it instead of short-circuiting
@@ -1645,39 +1628,6 @@ mod tests {
             let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
         }
         reader.join().unwrap();
-    }
-
-    /// V0.4.2 F73 fallback path: legacy projects under `projects_root`
-    /// without a config.yaml entry are still discovered. A project
-    /// that exists in BOTH the registry and the walk path is reported
-    /// once (registry wins, no duplicate).
-    #[test]
-    fn collect_projects_dedups_registered_and_walked_slugs() {
-        let tmp = TempDir::new().unwrap();
-        let paths = fake_paths(tmp.path());
-        let slug = "shared";
-        // Live project under projects_root (legacy fs walk path).
-        let state_path = paths.project_state(slug);
-        let state = ProjectState::initial(slug.to_string());
-        state.save(&state_path).unwrap();
-        // Register the SAME slug in config.yaml pointing at the same dir.
-        crate::config::append_project(
-            &paths.root,
-            crate::config::ProjectEntry {
-                slug: slug.into(),
-                path: paths.project_dir(slug),
-                host: crate::config::default_project_host(),
-                remote_slug: None,
-                remote_path: None,
-                team: "dev".into(),
-                installed_at: Utc::now(),
-            },
-        )
-        .unwrap();
-
-        let out = collect_projects(&paths).unwrap();
-        assert_eq!(out.len(), 1, "registry hit must not double-count");
-        assert_eq!(out[0].state.slug, slug);
     }
 
     /// A registered project whose state.json went missing emits a

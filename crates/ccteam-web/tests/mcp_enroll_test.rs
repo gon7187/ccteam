@@ -198,6 +198,8 @@ fn seed_project(paths: &CcteamPaths, slug: &str, owner: &str) {
     let mut state = ccteam_core::ProjectState::initial(slug.to_string());
     state.owner = Some(owner.to_string());
     state.save(&state_path).unwrap();
+    ccteam_core::config::register_local_project(&paths.root, slug, paths.project_dir(slug), "dev")
+        .unwrap();
 }
 
 /// An `AppState` with a live gateway holding one registered project.

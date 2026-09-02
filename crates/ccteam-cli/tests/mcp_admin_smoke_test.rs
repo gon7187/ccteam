@@ -52,6 +52,8 @@ fn bootstrap(paths: &CcteamPaths, slug: &str) {
     std::fs::create_dir_all(&ccteam_dir).unwrap();
     std::fs::write(ccteam_dir.join("workflow.yaml"), FIXTURE_WF).unwrap();
     std::fs::write(ccteam_dir.join("state.json"), minimal_state_json(slug)).unwrap();
+    ccteam_core::config::register_local_project(&paths.root, slug, paths.project_dir(slug), "dev")
+        .unwrap();
 }
 
 fn tmp_paths() -> (TempDir, CcteamPaths) {
