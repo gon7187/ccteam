@@ -110,7 +110,7 @@
 
 六个起手式在 web 控制台做成了卡片(首页,以及 团队 → 分工)——点「起手」预填 vendor 阵容;怎么打仍然是你一句人话的事:
 
-- **总控-工班** —— 强推理总控做拆解/分工/监控/验收;每个顶层任务:只读 OpenCode GLM(`zai-coding-plan/glm-5.3-flash`)侦察员回报 2–5 个钉版 GitHub 先例(URL、commit/tag、路径、license;仅当没有可用 GLM 会话时才有恰好一次 Codex Luna 侦察兜底),Claude Fable 把计划写进 `.ccteam/plans/`(每任务 id / 执行者 / 依赖 / 文件 / 完成标准,批准后的修改进 Amendments 段),Codex Sol 评审计划(上限两轮,之后给人三段报告)并留任执行者的顾问,Luna/Terra/Sonnet/Haiku 各在自己的 git worktree 里执行,Sonnet git 代理在全新 Opus + Sol 批准同一修订后集成并合并,总控在每个决策点检查主机负载与会话存活。贵模型只花在拆解、把关与验收上,量活走便宜的专长工。
+- **总控-工班** —— 强推理总控做拆解/分工/监控/验收;每个顶层任务:只读 OpenCode GLM(`zai-coding-plan/glm-5.3-flash`)侦察员回报 2–5 个钉版 GitHub 先例(URL、commit/tag、路径、license;仅当没有可用 GLM 会话时才有恰好一次 Codex Luna 侦察兜底),Claude Fable 把计划写进 `.ccteam/plans/`(每任务 id / 执行者 / 依赖 / 文件 / 完成标准,批准后的修改进 Amendments 段),Codex Sol 评审计划(上限两轮,之后给人三段报告)并留任执行者的顾问,Luna/Terra/Sonnet/Haiku 各在自己的 git worktree 里执行,Sonnet git 代理在全新 Opus + Sol 批准同一修订且本地检查为绿后集成并合并,总控在每个决策点检查主机负载与会话存活。贵模型只花在拆解、把关与验收上,量活走便宜的专长工。
 - **主力-顾问** —— grok/codex 日常主力;卡壳时在同一仓库 spawn 一个顾问会话,拿到方案让主力执行,顾问用完即停。贵模型只为难的那几分钟付费。
 - **交叉互审** —— A 家写码,换 B 家冷眼 review diff,分歧回总控裁。不同模型的错误互不相关,交叉能兜住自审看不见的。
 - **并行竞标** —— 同一道难题并行派给 2–3 家,对比择优、好点子合流。解空间宽的时候最值。
