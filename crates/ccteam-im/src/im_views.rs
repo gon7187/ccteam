@@ -557,8 +557,15 @@ pub fn render_sessions(view: &SessionsView) -> RichReply {
         )
     }));
     if !tail.is_empty() {
+        // Hidden rows carry user-set titles too — entity-escape them like the
+        // visible rows, or a `/rename` to `</blockquote><tg-button …>` on the
+        // 11th session breaks out of the quote (audit 2026-09-03 R4).
+        let tail_markdown = tail
+            .iter()
+            .map(|line| escape_status_markdown(line))
+            .collect::<Vec<_>>();
         markdown.push_str("\n\n<blockquote expandable>");
-        markdown.push_str(&tail.join("\n"));
+        markdown.push_str(&tail_markdown.join("\n"));
         markdown.push_str("</blockquote>");
         plain.push_str("\nПодробнее:\n");
         plain.push_str(&tail.join("\n"));
@@ -1674,6 +1681,50 @@ mod tests {
 
     /// A session title is user-controlled text; it must not be able to
     /// close the expandable quote or smuggle a rich control tag.
+    /// Audit 2026-09-03 R4 — the hidden tail (11th session onward) rides the
+    /// expandable quote through `plain_session_line`, which does no escaping;
+    /// it must be entity-escaped exactly like the visible rows are.
+    #[test]
+    fn sessions_hidden_tail_titles_cannot_inject_rich_tags() {
+        let row = |n: usize, title: &str| SessionRow {
+            sid: format!("s{n}"),
+            vendor_model: "claude/opus".into(),
+            status: "idle".into(),
+            context: "38%".into(),
+            title: Some(title.into()),
+            current: n == 1,
+            tree_depth: 0,
+            host: None,
+        };
+        let mut sessions = (1..=10)
+            .map(|n| row(n, &format!("task {n}")))
+            .collect::<Vec<_>>();
+        sessions.push(row(11, "</blockquote><tg-button>x"));
+        let reply = render_sessions(&SessionsView {
+            project: "ccteam".into(),
+            sessions,
+            elsewhere: 0,
+            detached: Vec::new(),
+        });
+        assert!(
+            !reply.markdown.contains("</blockquote><tg-button>x"),
+            "hidden title escaped the quote: {}",
+            reply.markdown
+        );
+        // The row truncates the title, so only the escaped closing tag is
+        // asserted — that is the byte sequence that could close the quote.
+        assert!(
+            reply.markdown.contains("&lt;/blockquote&gt;"),
+            "hidden title must be entity-escaped: {}",
+            reply.markdown
+        );
+        assert_eq!(
+            reply.markdown.matches("</blockquote>").count(),
+            1,
+            "exactly the one closing tag render_sessions wrote"
+        );
+    }
+
     #[test]
     fn sessions_title_cannot_inject_rich_tags() {
         let sessions = vec![SessionRow {

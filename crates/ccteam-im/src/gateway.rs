@@ -10639,18 +10639,29 @@ impl Gateway {
                             let mut covered = std::mem::take(&mut turn_covered);
                             covered.push(terminal.turn_id.clone());
                             let boundary_signal = if is_completed {
-                                finished_answer.as_ref().map(|(_, final_text)| {
-                                    crate::delegation::DelegationSignal {
-                                        child_sid: session_id.clone(),
-                                        turn_id: terminal.turn_id.clone(),
-                                        tail: final_text.clone(),
-                                        vendor: pump_vendor,
-                                        host: pump_host.clone(),
-                                        boundary: true,
-                                        vendor_error: false,
-                                        interim_notes: notes.saturating_sub(1),
-                                        covered_turns: covered.clone(),
-                                    }
+                                // A completed vendor turn ALWAYS wakes the parent,
+                                // text answer or not: codex items the adapter cannot
+                                // name degrade to an EMPTY AgentMessage, so
+                                // `turn_last_answer` stays None and the parent used
+                                // to wait forever on a boundary that had already
+                                // happened (audit 2026-09-03 R1). The failure arm
+                                // below already fires unconditionally.
+                                let tail = finished_answer
+                                    .as_ref()
+                                    .map(|(_, final_text)| final_text.clone())
+                                    .unwrap_or_else(|| {
+                                        "(запуск завершён без текстового ответа)".to_string()
+                                    });
+                                Some(crate::delegation::DelegationSignal {
+                                    child_sid: session_id.clone(),
+                                    turn_id: terminal.turn_id.clone(),
+                                    tail,
+                                    vendor: pump_vendor,
+                                    host: pump_host.clone(),
+                                    boundary: true,
+                                    vendor_error: false,
+                                    interim_notes: notes.saturating_sub(1),
+                                    covered_turns: covered.clone(),
                                 })
                             } else {
                                 failure.as_ref().map(|error| {
@@ -15611,6 +15622,15 @@ impl Gateway {
         // rode as its OWN extra `·`-joined part, growing the quote past the
         // spec's four).
         let (activity, activity_detail) = match live {
+            // No turn in flight but a task that outlives the turn (background
+            // shell, workflow) is still running — the session IS doing
+            // something. "ожидание" here is what read as "nothing happening"
+            // while a child ran the test suite (owner 2026-09-03; the `▶`
+            // row already named the task, the badge contradicted it).
+            None if running.iter().any(|t| t.outlives_turn()) => {
+                let label = im_views::activity_badge("working").1;
+                ("working", Some(format!("{label}, фоновая задача")))
+            }
             None => ("idle", None),
             // Running subagents ⇒ definitively working (overrides silence).
             Some(l) if l.is_stuck() && !turn_scoped_running => {
@@ -22258,21 +22278,26 @@ fn gateway_turn_timeout_duration() -> std::time::Duration {
 /// `5h 17% (19:00) · неделя 78% (06/29) · max`. Each field is omitted when
 /// the vendor didn't report it; an empty result means no usage line.
 fn format_account_usage(u: &AccountUsage) -> Option<String> {
+    format_account_usage_in(u, *chrono::Local::now().offset())
+}
+
+/// `tz` = the offset reset stamps are shown in (the daemon host's local zone
+/// in production). Vendors report UTC; printing the raw clock digits read as
+/// local time to an operator three hours east (audit 2026-09-03 R12).
+fn format_account_usage_in(u: &AccountUsage, tz: chrono::FixedOffset) -> Option<String> {
     // Short reset hint from an ISO-8601 `resets_at`: HH:MM for the 5-hour window,
-    // MM/DD for the weekly. Empty when unparseable.
-    fn reset_hm(iso: &Option<String>) -> String {
-        iso.as_deref()
-            .and_then(|s| s.split('T').nth(1))
-            .map(|t| format!(" ({})", &t[..t.len().min(5)]))
-            .unwrap_or_default()
+    // MM/DD for the weekly, both in `tz`. An unparseable stamp is shown raw.
+    fn reset_at(iso: &Option<String>, tz: chrono::FixedOffset, fmt: &str) -> String {
+        let Some(s) = iso.as_deref() else {
+            return String::new();
+        };
+        match chrono::DateTime::parse_from_rfc3339(s) {
+            Ok(t) => format!(" ({})", t.with_timezone(&tz).format(fmt)),
+            Err(_) => format!(" ({s})"),
+        }
     }
-    fn reset_md(iso: &Option<String>) -> String {
-        iso.as_deref()
-            .and_then(|s| s.split('T').next())
-            .and_then(|d| d.get(5..)) // "06-29" from "2026-06-29"
-            .map(|md| format!(" ({})", md.replace('-', "/")))
-            .unwrap_or_default()
-    }
+    let reset_hm = |iso: &Option<String>| reset_at(iso, tz, "%H:%M");
+    let reset_md = |iso: &Option<String>| reset_at(iso, tz, "%m/%d");
     let mut parts: Vec<String> = Vec::new();
     if let Some(p) = u.five_hour_pct {
         parts.push(format!("5h {p}%{}", reset_hm(&u.five_hour_resets_at)));
@@ -25216,6 +25241,10 @@ mod tests {
         /// Off by default so the sync-drain tests (which only take the first
         /// text-bearing event) don't leave a stale `TurnCompleted` queued.
         emit_turn_boundary: bool,
+        /// Audit 2026-09-03 R1 — when set, `submit_turn` emits NO
+        /// `AgentMessage` before the boundary (a codex turn whose only items
+        /// degraded to empty messages): the parent must still be notified.
+        answerless: bool,
         /// E1 — events queued BEFORE the answer on each submit (e.g. a
         /// `ToolCall` item), so the pump observes mid-turn tool activity
         /// ahead of the terminal boundary.
@@ -25312,6 +25341,7 @@ mod tests {
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
                 spawn_tunings: Arc::new(Mutex::new(Vec::new())),
                 emit_turn_boundary: false,
+                answerless: false,
                 pre_answer_events: Vec::new(),
                 emit_turn_started: false,
                 turn_failure: None,
@@ -25335,6 +25365,12 @@ mod tests {
         /// (v0.8.11 E4 — drives the stream-json pump's progress.jsonl mirror).
         fn with_turn_boundary(mut self) -> Self {
             self.emit_turn_boundary = true;
+            self
+        }
+
+        /// Emit the turn boundary with NO text answer before it (R1).
+        fn answerless(mut self) -> Self {
+            self.answerless = true;
             self
         }
 
@@ -25667,18 +25703,20 @@ mod tests {
                         .await
                         .push_back((h.identity.clone(), evt.clone()));
                 }
-                self.events.lock().await.push_back((
-                    h.identity.clone(),
-                    ThreadEvent::ItemCompleted {
-                        item: ThreadItem {
-                            id: "msg-1".to_string(),
-                            details: ThreadItemDetails::AgentMessage(format!(
-                                "{} echo: {text}",
-                                h.identity
-                            )),
+                if !self.answerless {
+                    self.events.lock().await.push_back((
+                        h.identity.clone(),
+                        ThreadEvent::ItemCompleted {
+                            item: ThreadItem {
+                                id: "msg-1".to_string(),
+                                details: ThreadItemDetails::AgentMessage(format!(
+                                    "{} echo: {text}",
+                                    h.identity
+                                )),
+                            },
                         },
-                    },
-                ));
+                    ));
+                }
                 // A real adapter also emits a turn boundary (carrying usage); the
                 // stream-json pump mirrors it to progress.jsonl for paneless
                 // sessions (v0.8.11 E4). Opt-in (`with_turn_boundary`) so the
@@ -35422,12 +35460,32 @@ mod tests {
             weekly_severity: Some("warning".into()),
             credits_pct: Some(46),
         };
-        let s = format_account_usage(&u).unwrap();
-        assert!(s.contains("5h 17% (19:00)"), "{s}");
+        // Reset stamps come from the vendor in UTC and are shown in the
+        // operator's zone (here pinned to +03:00 so the test is host-agnostic).
+        let msk = chrono::FixedOffset::east_opt(3 * 3600).unwrap();
+        let s = format_account_usage_in(&u, msk).unwrap();
+        assert!(s.contains("5h 17% (22:00)"), "{s}");
         assert!(s.contains("неделя 78%⚠ (06/29)"), "{s}");
         assert!(s.contains("лимит 46%"), "{s}");
         assert!(s.ends_with("· max"), "{s}");
         assert_eq!(format_account_usage(&AccountUsage::default()), None);
+        // A day boundary moves with the zone too.
+        let late = AccountUsage {
+            weekly_pct: Some(1),
+            weekly_resets_at: Some("2026-06-29T22:30:00+00:00".into()),
+            ..AccountUsage::default()
+        };
+        let s = format_account_usage_in(&late, msk).unwrap();
+        assert!(s.contains("неделя 1% (06/30)"), "{s}");
+        // An unparseable stamp is shown raw, never silently dropped.
+        let raw = AccountUsage {
+            five_hour_pct: Some(5),
+            five_hour_resets_at: Some("soon".into()),
+            ..AccountUsage::default()
+        };
+        assert!(format_account_usage_in(&raw, msk)
+            .unwrap()
+            .contains("5h 5% (soon)"));
     }
 
     #[test]
@@ -43878,5 +43936,118 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(resume.contains("retired"), "{resume}");
+    }
+
+    /// Audit 2026-09-03 R1 — a child turn that completes WITHOUT a text
+    /// answer (codex items the adapter cannot name degrade to empty
+    /// messages) must still wake the parent: the boundary happened, and a
+    /// parent waiting on it is the same stall as a swallowed boundary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegation_answerless_completed_turn_still_notifies_parent() {
+        use ccteam_harness::execution::turns_mirror::read_all_turns;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
+            Arc::new(FakeAdapter::new(vendor).with_turn_boundary().answerless())
+                as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        let gateway = delegation_gateway_with_factory(&project_dir, factory, true).await;
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        gateway.lock().await.enable_project_creation(paths.clone());
+        let (parent_sid, child_sid) = {
+            let mut gw = gateway.lock().await;
+            let parent = gw
+                .create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap()
+                .sid;
+            let child = gw
+                .create_delegated_session(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Codex,
+                    PermissionMode::Skip,
+                    SessionProtocol::StreamJson,
+                    "web-api".into(),
+                    SpawnTuning::default(),
+                    Some(DelegationParent {
+                        sid: parent.clone(),
+                        depth: 0,
+                        role: String::new(),
+                    }),
+                    Some("silent task".into()),
+                )
+                .await
+                .unwrap()
+                .sid;
+            gw.arm_delegation_watch(
+                &child,
+                &parent,
+                ccteam_harness::NotifyMode::Final,
+                Some("silent task".into()),
+                None,
+            );
+            gw.submit_to_sid(&child, "do it quietly".into())
+                .await
+                .unwrap();
+            (parent, child)
+        };
+
+        let mut notification = None;
+        for _ in 0..200 {
+            let turns = read_all_turns(&project_dir, &parent_sid).unwrap_or_default();
+            if let Some(t) = turns
+                .iter()
+                .find(|t| t.user.contains("[ccteam] делегированная сессия"))
+            {
+                notification = Some(t.user.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let notification = notification
+            .expect("a completed turn with no text answer must still notify the parent");
+        assert!(notification.contains(&child_sid), "{notification}");
+        assert!(
+            notification.contains("без текстового ответа"),
+            "the placeholder tail says honestly that no text came back: {notification}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_status_background_task_without_turn_reads_working() {
+        // Audit 2026-09-03 R5 — no turn in flight, a background shell still
+        // running: the badge must say 🔵 работает, not 🟢 ожидание, or the
+        // card contradicts its own `▶` row.
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-bg-task-no-turn");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        fake.set_running_tasks(vec![RunningTask {
+            task_id: "bg-shell".into(),
+            kind: "".into(),
+            description: "cargo test --workspace".into(),
+            task_type: "local_bash".into(),
+            started: std::time::Instant::now() - std::time::Duration::from_secs(120),
+            backgrounded: true,
+        }])
+        .await;
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(out[0].contains("🔵 работает"), "{out:?}");
+        assert!(out[0].contains("фоновая задача"), "{out:?}");
+        assert!(!out[0].contains("🟢 ожидание"), "{out:?}");
     }
 }

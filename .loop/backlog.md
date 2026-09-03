@@ -15,6 +15,66 @@
 
 ## 当前卡
 
+### CODEX-BODY-1 codex app-server вне контракта «один sid — одно тело»: рестарт демона молча обнуляет контекст thread'а(аудит 2026-09-03)
+- **状态**:待排 · **冲突域**:`crates/ccteam-harness/src/execution(codex_app_server + codex_jsonrpc + session_body) + crates/ccteam-im/src/gateway.rs(shutdown/reconcile)` · **建议入口**:dev-сессия (terra/sonnet) · review sol max · второе мнение opus
+- **Контекст**:`session_body::record` вызывают только stream-json / ACP / pi; codex его не вызывает, `detach_thread` не переопределён (`adapter.rs` дефолт `NotApplicable`), teardown = `kill_on_drop` по node-обёртке `codex.js`, внук (реальный бинарь) SIGKILL не получает. После `make daemon-restart` осиротевший app-server держит write-lock на thread'ах → новый демон получает `thread <id> already has an active writer` → `codex_app_server.rs:1698` молча делает `thread/start` (новый thread, контекст обнулён). В daemon.log 19 таких коллизий, все в окне 7–13 с после `graceful shutdown complete`, ни одной вне рестарта.
+- **Спека**:① `record`/`probe` body для shared app-server-соединения (pid реального бинаря, не обёртки); ② override `detach_thread` с SIGTERM + grace → SIGKILL по дереву процессов; ③ на старте ждать выхода прежнего дерева до `thread/resume`; ④ `already has an active writer` считать retryable с backoff в несколько секунд, а не поводом для `thread/start`; ⑤ `chat_session_reset` при реальной потере контекста остаётся (см. RESET-NOTIFY-1). Симптомная заплатка (kill-список) не принимается — RESTART-1 ⑦ предполагал «app-server выходит по stdin EOF», лог это опроверг.
+- **DoD**:тест «без правки красно»: fake app-server с удержанием writer-lock после detach → второй старт делает resume, не start; harness-тест на detach по дереву процессов; `make test-baseline` только растёт; clippy 0; fmt чисто; usage.md абзац про рестарт для codex.
+
+### SESS-BG-1 `/sessions` и MCP `session_list`: фоновая задача без живого хода читается как «ожидание»(аудит 2026-09-03)
+- **状态**:待排 · **冲突域**:`crates/ccteam-im/src(gateway.rs session_views/status_activity + im_views.rs SessionRow)` · **建议入口**:dev-сессия sonnet · review sol
+- **Контекст**:`/status` уже чинён в `67ce154f`+ (ветка `None if running.iter().any(outlives_turn)` → 🔵 работает, фоновая задача). Строки `/sessions` идут через `live_turn` напрямую (`gateway.rs` ~15306) — ни `session_activity_snapshot`, ни `running_tasks`; `SessionRow` не имеет поля под фоновую задачу, информация структурно не доходит. Владелец: «идут тесты, а везде ожидание».
+- **Спека**:один резолвер активности: строки `/sessions` и `session_list` берут тот же снимок, что дочерние строки `/status` (`session_activity_snapshot`/`classify_session_activity`), плюс булев флаг «есть задача, пережившая ход» в `SessionRow` → бейдж 🔵 с пометкой «фон» без новых данных.
+- **DoD**:gateway-тест: сессия без хода + `set_running_tasks(backgrounded)` → строка `/sessions` 🔵, `session_list` `activity:working`; палитра `activity_badge` не расширяется; `make test-baseline` только растёт.
+
+### CMD-WATCHDOG-1 Сторож зависшего ребёнка будит человека, а не родителя; пороги 15/30 мин в промпте командира не на чем сработать(аудит 2026-09-03)
+- **状态**:待排 · **冲突域**:`crates/ccteam-im/src/gateway.rs(emit_turn_stall_warning + delegation) + crates/ccteam-core/src/config.rs(Commander v2 prompt)` · **建议入口**:планирующая сессия Fable (промпт = governance) + dev-сессия sonnet на доставку
+- **Контекст**:Промпт Commander v2 требует «stuck или тишина от 15 минут — dispatch «доложи статус», от 30 — stop и respawn», но ход командиру дают только входящее сообщение, completion-уведомление и его же `wait_seconds` (потолок 240 с). `emit_turn_stall_warning` (`gateway.rs` ~21486) шлёт `GatewayEvent{Answer}` в `reply_to` (чат), а не turn родителю. Второй, независимый от resume-бага источник «бот ничего не делает, пока не напишу».
+- **Спека**:для сессии с `parent_sid` дублировать stall-сигнал родителю через `submit_to_sid_shared_with_origin` как обычный user-turn (маршрутизация уже замеченного движком факта — не автономное содержание, красная линия «движок не выбирает работу» соблюдена; один сигнал на эпизод тишины, дедуп по turn_id); текст промпта привести к тому, что движок реально даёт (уведомление о зависании вместо «ты сам проверяй по таймеру»).
+- **DoD**:gateway-тест: ребёнок молчит дольше окна → у родителя появляется user-turn `[ccteam] … зависание …` ровно один раз; чат по-прежнему получает своё предупреждение; тест литерала промпта обновлён; `make test-baseline` только растёт.
+
+### TG-429-1 Telegram 429 не читается: `retry_after` игнорируется, неудачный edit порождает ещё один send(аудит 2026-09-03)
+- **状态**:待排 · **冲突域**:`crates/ccteam-im/src(transport/providers/telegram.rs + daemon.rs progress delivery)` · **建议入口**:dev-сессия sonnet · review sol
+- **Контекст**:За 10 дней 1766 ответов 429 в один chat; `grep retry_after|429` по telegram.rs = 0 — девять сайтов `bail!` выбрасывают тело с `parameters.retry_after` (Telegram просил 932 с тишины, бот продолжал). Источник — progress-доставка: `progress seed send failed` 773, `replacement send failed` 47, `edit failed; sending replacement` 25 (`daemon.rs` ~2676-2707): провал edit'а генерирует новый sendMessage. Единственная измеренная само-нагрузка демона (CPU 17 с за 13 ч — он не CPU-bound).
+- **Спека**:один helper разбора ответа Bot API (`error_code`, `parameters.retry_after`) на всех сайтах → `TelegramError::RateLimited{retry_after}`; per-chat `blocked_until` в провайдере, все send/edit/draft до него отсекаются локально; на `RateLimited` не делать replacement-fallback, progress-сообщение ждёт окна.
+- **DoD**:HTTP-стаб 429 с `retry_after` → следующий send в это окно не уходит в сокет и не плодит replacement; после окна доставка возобновляется; `make test-baseline` только растёт.
+
+### STOP-DEADLINE-1 `interrupt`/`stop` берут per-sid turn claim без дедлайна, `submit` — с дедлайном(аудит 2026-09-03)
+- **状态**:待排 · **冲突域**:`crates/ccteam-im/src/gateway.rs(interrupt_session_shared + stop_session_shared + SpawnClaims) + crates/ccteam-web/src/routes/sessions_api.rs` · **建议入口**:dev-сессия sonnet · review sol
+- **Контекст**:`interrupt_session_shared` (`gateway.rs` ~6504) и `stop_session_shared` (~5565) ждут `claims.lock_for_turn(sid)` без таймаута, тогда как submit ходит через `timeout_at(deadline)` → `QueueDeadline`. Claim в submit удерживается через холодный resume + `wait_for_init` (30 с). Транспорт interrupt'а спроектирован out-of-band (`claude_stream_json/mod.rs` ~2206), а gateway снова сериализует. Web `handle_session_stop`/`handle_session_interrupt` без cap, MCP `session_stop` — только внешний бланкет 30 с (118 «slow /mcp session_stop» в логе).
+- **Спека**:`SpawnClaims::try_lock_for_turn(sid, deadline)` рядом с `lock_for_turn`, оба call-site'а на него; обсудить, нужен ли claim interrupt'у вообще; cap на web-роутах с честным 504/`QueueDeadline`.
+- **DoD**:тест: stop во время удерживаемого claim возвращается по дедлайну с читаемой ошибкой, а не висит; web-роут отвечает в пределах cap; `make test-baseline` только растёт.
+
+### RESET-NOTIFY-1 `chat_session_reset` пишется, но ни IM, ни web его не показывают(аудит 2026-09-03)
+- **状态**:待排 · **冲突域**:`crates/ccteam-im/src(gateway.rs recover_and_report / daemon.rs delivery) + crates/ccteam-web` · **建议入口**:dev-сессия sonnet
+- **Контекст**:`build_chat_session_reset_event(_with_reason)` пишут `claude_tui`, `claude_stream_json`, `codex_app_server:1698`, hooks; grep по `ccteam-im`/`ccteam-web` = 0 потребителей, хотя комментарий у call-site'а обещает «so IM / web surfaces show the user “context was lost”». Вместе с CODEX-BODY-1: агент отвечает как чистый лист, пользователь видит только «забыл».
+- **Спека**:довести `ChatSessionReset*` до той же доставки, что `recover_and_report_shared` использует для восстановленных ходов — системная реплика в `reply_to` с причиной; web — lifecycle-кадр.
+- **DoD**:gateway-тест: событие reset в progress → одна системная реплика в чат; vitest на кадр; `make test-baseline` только растёт.
+
+### CODEX-ITEMS-1 Пять живых типов codex-item'ов схлопываются в пустой AgentMessage(аудит 2026-09-03)
+- **状态**:待排 · **冲突域**:`crates/ccteam-harness/src/execution(codex_app_server.rs + codex_typed_events.rs + vendor_compat.rs)` · **建议入口**:dev-сессия terra · review sol
+- **Контекст**:`codex_app_server.rs:3438` ветка `Some(other) => AgentMessage(String::new())` бьёт по `userMessage`(23), `contextCompaction`(20), `subAgentActivity`(19), `collabAgentToolCall`(13), `imageView`(3) — 78 попаданий за 10 дней при дедупе warn'а на процесс. Полезная нагрузка теряется; деградированный `collabAgentToolCall` невидим для `is_openable_work_item` (silence-watchdog). Пустой ответ родителю больше не блокирует уведомление (R1 закрыт в этом PR), но содержание всё ещё теряется.
+- **Спека**:типизировать пять item'ов по реальной схеме app-server-protocol (подтянуть `references/codex/codex-rs`, не угадывать): `subAgentActivity`/`collabAgentToolCall` → ToolCall-item с именем, `contextCompaction` → Reasoning/summary, `userMessage` → игнор без деградации, `imageView` → ссылка.
+- **DoD**:translate-тесты на каждый тип по fixture из референса; warn `unrecognised value` для этих токенов исчезает из лога; `make test-baseline` только растёт.
+
+### DELEG-ORPHAN-1 Delegation watch с навсегда неизвестным родителем переигрывается на каждом рестарте(аудит 2026-09-03)
+- **状态**:待排 · **冲突域**:`crates/ccteam-im/src/gateway.rs(delegation notify + reconcile_delegations)` · **建议入口**:dev-сессия sonnet
+- **Контекст**:При non-retryable ошибке notify (`Неизвестная сессия: s434`) код логирует «retaining watch for startup reconcile» и не снимает watch; `delegation_notify_error_is_retryable` пропускает только четыре типа, голый `anyhow!` всегда non-retryable. Живьём: три разных старта демона, побайтово одинаковая строка `parent=s434 child=s412 attempt=1`; `chat/s412/delegation.json` с `parent_sid=s434` лежит до сих пор.
+- **Спека**:различать «родителя нет в реестре вообще» (снять watch + событие `delegation_orphaned` в progress) и «родитель есть, но не live» (ретраить); cap на число reconcile-попыток с финальным событием.
+- **DoD**:gateway-тест: watch на несуществующего родителя после reconcile снят, событие записано, повторный старт молчит; `make test-baseline` только растёт.
+
+### LATENCY-WAIT-1 Ожидание gateway-мьютекса измеряется, но никогда не warn'ится; часть роутов мимо инструментовки(аудит 2026-09-03)
+- **状态**:待排 · **冲突域**:`crates/ccteam-im/src/latency.rs + crates/ccteam-web/src/routes(agents.rs и другие `gw.lock().await`)` · **建议入口**:dev-сессия sonnet
+- **Контекст**:`record_wait` (`latency.rs:148`) только пишет в кольцо, warn есть лишь на hold (250 мс); `handle_agents_graph` (`routes/agents.rs:268`) берёт `gw.lock().await` напрямую и не попадает ни в wait-, ни в hold-кольцо, при `elapsed_ms=304518` в логе. `gateway_lock_metrics()` читают только два теста.
+- **Спека**:warn на wait в `instrument_gateway_guard` (site уже прокинут в 26 сайтов); свести обходные `gw.lock().await` к `latency::gateway_lock`; `wait.p99` в perf-gate; `build_agents_graph` → `spawn_blocking` (синхронный fs на async-воркере при `daemon.workers=4`).
+- **DoD**:grep-gate на прямой `gw.lock().await` в web-роутах; perf-gate с порогом wait.p99; `make test-baseline` только растёт.
+
+### ENV-HYG-2 Чужой debug-демон на production `mux.sock`, неротируемый daemon.log(аудит 2026-09-03)
+- **状态**:待排 · **冲突域**:`crates/ccteam-cli/tests/peek_backend_test.rs + crates/ccteam-harness/src(daemon.rs is_ephemeral_socket + rmux_backend.rs) + crates/ccteam-core/src/daemon.rs(log)` · **建议入口**:dev-сессия haiku/sonnet
+- **Контекст**:pid 39342 (`debug/ccteam --__internal-daemon ~/.ccteam/run/mux.sock`, ppid 1, ~19 ч) — `default_ccteam_harness_socket_path` читает только `$HOME`, тест пинит `CCTEAM_HOME`, но не `HOME` (`/proc/<pid>/environ` подтверждает); `is_ephemeral_socket` освобождает канонический сокет от reaper'а по дизайну. `daemon.log` не ротируется (3.9 МБ, ≥3 инкарнации в одном файле — 429-е от 08-30 читаются как текущие).
+- **Спека**:пинить `HOME` в тесте; отказ адоптировать listener с чужим fingerprint (сборка/путь бинаря); ротация daemon.log на старте + баннер инкарнации (sha + pid).
+- **DoD**:тест изоляции env для peek_backend; после `ccteam start` в логе первая строка — баннер; старый лог переименован; `make test-baseline` только растёт.
+
 ### TG-KEYS-1 Telegram 常驻快捷键盘:web「快速开始」六模板落 IM(owner 直驱 2026-08-25)
 - **状态**:完成(ac20a585) · **冲突域**:`crates/ccteam-im/src(gateway + daemon + im_views + transport/providers/telegram)+ crates/ccteam-core/src/config.rs + docs/usage.md` · **建议入口**:规划亲自派工(coder terra/sonnet · review sol max · 二审 opus)
 - **背景**:owner Telegram 反馈:web 的六个 quick-start 模板(`web/src/lib/playbooks.ts` + `i18n.ts tpl*P`)在 IM 只能手打;要常驻 reply keyboard(非 inline、非 bot 菜单),且可配置。
