@@ -555,7 +555,9 @@ impl TelegramChannel {
     async fn log_rich_fallback_once(&self, reason: &str) {
         let mut seen = self.rich_fallback_logged.lock().await;
         if seen.insert(reason.to_string()) {
-            tracing::debug!(
+            // warn, not debug: a fallback silently swaps the layout the user
+            // sees and feeds the circuit breaker — it must be visible.
+            tracing::warn!(
                 channel = %self.name,
                 reason,
                 "telegram: rich message send/edit failed, falling back to classic HTML"
@@ -643,7 +645,11 @@ impl TelegramChannel {
                 self.log_ephemeral_fallback_once(&format!("http_{}", status.as_u16()))
                     .await;
             }
-            return Err(format!("http_{}", status.as_u16()));
+            return Err(format!(
+                "http_{}:{}",
+                status.as_u16(),
+                short_description(&text)
+            ));
         }
         if body_reports_failure(&text) {
             if message.callback_ephemeral.is_some() {
@@ -676,8 +682,16 @@ impl TelegramChannel {
             .map_err(|err| format!("network_error:{err}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        if edit_not_modified(status, &text) {
+            // Nothing to change — the rich card is already what we would draw.
+            return Ok(Some(message_id.to_string()));
+        }
         if !status.is_success() {
-            return Err(format!("http_{}", status.as_u16()));
+            return Err(format!(
+                "http_{}:{}",
+                status.as_u16(),
+                short_description(&text)
+            ));
         }
         if body_reports_failure(&text) {
             return Err("ok_false".to_string());
@@ -884,6 +898,9 @@ impl TelegramChannel {
             let resp = self.http.post(&url).json(&plain_body).send().await?;
             status = resp.status();
             text = resp.text().await.unwrap_or_default();
+        }
+        if edit_not_modified(status, &text) {
+            return Ok(Some(message_id.to_string()));
         }
         if !status.is_success() {
             anyhow::bail!("telegram editMessageText {recipient}#{message_id} → {status}: {text}");
@@ -1677,6 +1694,30 @@ fn caption_payload(caption: &str) -> CaptionPayload {
 /// a bare `status.is_success()` check treats that as delivered. Missing or
 /// unparseable `ok` is NOT treated as failure (matches every other Bot API
 /// call site here, which only inspects the HTTP status).
+/// Bot API `editMessageText` answers HTTP 400 `message is not modified` when
+/// the new content and markup equal the current ones. That is a no-op, not a
+/// failure: treating it as one made a `🔄 Обновить` tap on an unchanged card
+/// "fail" the rich edit, fall back to a classic `text` edit (the old layout
+/// suddenly back), and count towards the 3-strikes rich circuit breaker —
+/// three taps degraded EVERY message of the bot to classic for 50 sends
+/// (live probe 2026-09-03).
+fn edit_not_modified(status: reqwest::StatusCode, text: &str) -> bool {
+    status.as_u16() == 400 && text.contains("message is not modified")
+}
+
+/// `description` of a Bot API error body, shortened for a log reason.
+fn short_description(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| {
+            v.get("description")
+                .and_then(|d| d.as_str())
+                .map(str::to_string)
+        })
+        .map(|d| d.chars().take(120).collect())
+        .unwrap_or_default()
+}
+
 fn body_reports_failure(text: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(text)
         .ok()
@@ -3910,6 +3951,24 @@ mod tests {
     /// (`edit_classic`), not just the rich Bot API calls: a Telegram 200 with
     /// `{"ok":false}` must read as a failure everywhere this crate treats an
     /// HTTP 200 as delivered.
+    #[test]
+    fn edit_not_modified_is_a_no_op_not_a_failure() {
+        // Verbatim Bot API answer to editing a rich message with itself
+        // (live probe 2026-09-03).
+        let body = r#"{"ok":false,"error_code":400,"description":"Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"}"#;
+        assert!(edit_not_modified(reqwest::StatusCode::BAD_REQUEST, body));
+        assert!(!edit_not_modified(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: message to edit not found"}"#
+        ));
+        assert!(!edit_not_modified(reqwest::StatusCode::OK, body));
+        assert_eq!(
+            short_description(r#"{"ok":false,"description":"Bad Request: x"}"#),
+            "Bad Request: x"
+        );
+        assert_eq!(short_description("not json"), "");
+    }
+
     #[test]
     fn body_reports_failure_flags_200_with_ok_false() {
         assert!(body_reports_failure(
