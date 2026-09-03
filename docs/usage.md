@@ -314,6 +314,8 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 /inbox cancel <dN>         Cancel (or dismiss a failed) item by short id from the list.
 ```
 
+**Telegram IM: проводник проектов (оператор).** Для оператора `/projects` и голое `/cd` открывают проводник папок, укоренённый в `projects_root`: по одной строке на папку с кнопкой справа («Открыть» для папок, «Переключиться» для зарегистрированных проектов); строка пути содержит «⬆️ Вверх»; кнопка «📌 Сделать проектом» создаёт и регистрирует текущую папку после подтверждения (аналог `/newproject`); навигация никогда не выходит за пределы `projects_root`. Тенанты видят простой список проектов как обычно. При выборе в `/sessions` каждая сессия выводится одной строкой с кнопками «⛔» (прерывание) и «Переключиться» справа.
+
 Time forms for `/inbox <time> …` (daemon local timezone; past times are rejected, bare `HH:MM` does **not** roll to tomorrow):
 
 ```text

@@ -805,15 +805,32 @@ pub trait Channel: Send + Sync {
     /// [`SendMessage::button_rows`] on the fallback `send`; a channel with
     /// no native buttons ignores it or folds it into a numbered text list
     /// (mirrors `options`' existing fallback).
+    ///
+    /// `rich_markdown`/`inline_buttons` (F5/F2) mirror
+    /// [`SendMessage::rich_markdown`]/[`SendMessage::inline_buttons`] —
+    /// `content` stays the plain/classic text, `rich_markdown` is the
+    /// separate Rich Messages representation (which may embed `<tg-button>`
+    /// tags) a rich-capable channel alone should read; `inline_buttons`
+    /// tells it those tags already cover every button, so it must not also
+    /// append `button_rows` as a trailing block. The default degrades by
+    /// folding `rich_markdown` into `SendMessage` the same way `send`'s
+    /// `Answer` path already does.
     async fn edit_message(
         &self,
         recipient: &str,
         _message_id: &str,
         content: &str,
+        rich_markdown: Option<&str>,
+        inline_buttons: bool,
         button_rows: &[Vec<MessageOption>],
     ) -> anyhow::Result<Option<String>> {
-        self.send(&SendMessage::new(content, recipient).with_button_rows(button_rows.to_vec()))
-            .await
+        let mut out = SendMessage::new(content, recipient).with_button_rows(button_rows.to_vec());
+        if let Some(markdown) = rich_markdown {
+            out = out
+                .with_rich_markdown(markdown)
+                .with_inline_buttons(inline_buttons);
+        }
+        self.send(&out).await
     }
 
     /// Register the gateway's own commands in the channel's command menu

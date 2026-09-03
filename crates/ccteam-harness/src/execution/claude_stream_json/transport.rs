@@ -415,8 +415,9 @@ fn mint_request_id() -> String {
 
 async fn drain_stderr<E: AsyncRead + Unpin + Send>(stderr: E) {
     let mut lines = BufReader::new(stderr).lines();
-    // Discard — `--debug-to-stderr` can be voluminous; we only keep stdout
-    // NDJSON. Loop exits on EOF/error.
+    // Discard — claude's occasional stderr warnings are not ours to keep; we only
+    // drain so a full pipe can never block the child (stdout carries the
+    // NDJSON). Loop exits on EOF/error.
     while let Ok(Some(_line)) = lines.next_line().await {}
 }
 

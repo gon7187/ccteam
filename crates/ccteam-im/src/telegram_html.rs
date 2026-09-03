@@ -27,8 +27,18 @@ struct Fragment {
 
 /// Render the supported Markdown subset as Telegram HTML.
 pub fn render_markdown(input: &str) -> RenderedMarkdown {
-    let input = strip_rich_button_rows(input);
+    let input = strip_rich_tags(input);
     render_markdown_at_depth(&input, 0)
+}
+
+/// Remove Rich Messages markup (`<tg-button-row>` blocks and standalone
+/// `<tg-button>` tags) from raw markdown/plain source. `render_markdown`
+/// already does this on its way to HTML; this is for the OTHER place raw
+/// source can reach a user — Telegram's HTML→plain retry on a rejected
+/// send/edit (F5), which sends the raw source text verbatim and would
+/// otherwise leak the tags as literal text.
+pub(crate) fn strip_rich_tags(input: &str) -> String {
+    strip_inline_buttons(&strip_rich_button_rows(input))
 }
 
 fn strip_rich_button_rows(input: &str) -> String {
@@ -44,6 +54,41 @@ fn strip_rich_button_rows(input: &str) -> String {
         let start = cursor + start_offset;
         output.push_str(&input[cursor..start]);
         let content_start = start + OPEN.len();
+        let Some(end_offset) = input[content_start..].find(CLOSE) else {
+            output.push_str(&input[start..]);
+            break;
+        };
+        cursor = content_start + end_offset + CLOSE.len();
+    }
+    output
+}
+
+/// Strip a standalone `<tg-button …>…</tg-button>` (a `RichTextButton`
+/// embedded mid-paragraph, per Rich Messages §4.3) left over once whole
+/// `<tg-button-row>` blocks are gone. The leading space the inline-button
+/// renderers put before each tag would otherwise leave a dangling trailing
+/// space on the classic-fallback line, so trailing spaces/tabs right before
+/// the tag are trimmed along with it.
+fn strip_inline_buttons(input: &str) -> String {
+    const OPEN: &str = "<tg-button ";
+    const CLOSE: &str = "</tg-button>";
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    loop {
+        let Some(start_offset) = input[cursor..].find(OPEN) else {
+            output.push_str(&input[cursor..]);
+            break;
+        };
+        let start = cursor + start_offset;
+        output.push_str(&input[cursor..start]);
+        while matches!(output.chars().next_back(), Some(' ') | Some('\t')) {
+            output.pop();
+        }
+        let Some(tag_close_offset) = input[start..].find('>') else {
+            output.push_str(&input[start..]);
+            break;
+        };
+        let content_start = start + tag_close_offset + 1;
         let Some(end_offset) = input[content_start..].find(CLOSE) else {
             output.push_str(&input[start..]);
             break;
@@ -1046,6 +1091,24 @@ mod tests {
         );
         assert_eq!(rendered.html, "beforeafter");
         assert_eq!(rendered.text_utf16_len, 11);
+        assert!(!rendered.html.contains("tg-button"));
+    }
+
+    #[test]
+    fn strips_standalone_inline_buttons_and_trailing_space_before_them() {
+        let rendered = render_markdown(
+            "line one <tg-button type=\"callback_data\" data=\"nav:fs:i:0\" style=\"link\">Открыть</tg-button>\nnext",
+        );
+        assert_eq!(rendered.html, "line one\nnext");
+        assert!(!rendered.html.contains("tg-button"));
+    }
+
+    #[test]
+    fn strips_two_consecutive_inline_buttons_on_one_line() {
+        let rendered = render_markdown(
+            "s1 · state <tg-button type=\"callback_data\" data=\"cmd:?/stop s1\" style=\"danger\">⛔</tg-button> <tg-button type=\"callback_data\" data=\"cmd:/use s1\" style=\"link\">Переключиться</tg-button>",
+        );
+        assert_eq!(rendered.html, "s1 · state");
         assert!(!rendered.html.contains("tg-button"));
     }
 

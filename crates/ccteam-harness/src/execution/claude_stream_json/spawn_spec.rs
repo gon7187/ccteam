@@ -65,8 +65,13 @@ pub struct StreamJsonSpawnInput<'a> {
 /// long-lived resident process holding stdin open across the whole
 /// multi-turn session, whereas `-p` is one-shot — `--no-chrome` is exactly
 /// the shape the VS Code extension (a persistent client) launches.
-/// `--debug --debug-to-stderr` keeps any diagnostic on stderr (drained by
-/// the transport) so it never pollutes the stdout NDJSON stream.
+/// No `--include-partial-messages` and no `--debug --debug-to-stderr`: the
+/// translator drops every `stream_event` partial unread (final-only
+/// contract), yet each delta frame was still parsed and broadcast to three
+/// subscribers, and the debug firehose on stderr was drained straight into
+/// the bin — pure per-token overhead multiplied by every live session
+/// (audit 2026-09-03 R13). stderr is still drained so a real warning never
+/// blocks the child.
 pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
     let mut argv = vec![
         bin.to_string(),
@@ -77,11 +82,8 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
         // Headless trigger — WITHOUT this, stream-json I/O is ignored and
         // no `system:init` is ever emitted (see the doc comment above).
         "--no-chrome".into(),
-        "--include-partial-messages".into(),
         "--verbose".into(),
         "--replay-user-messages".into(),
-        "--debug".into(),
-        "--debug-to-stderr".into(),
         // Do NOT inherit the user's ambient MCP servers. stream-json gates
         // `system:init` on every MCP server connecting, so ANY ambient server
         // that has to reach the daemon we are spawning from cannot connect: the
@@ -317,10 +319,22 @@ mod tests {
             // All three layers incl. `local` (plugin enablement lives there);
             // local hooks are defused via CCTEAM_HOOKLESS — see build_argv.
             "--setting-sources=user,project,local",
-            "--include-partial-messages",
             "--replay-user-messages",
         ] {
             assert!(argv.iter().any(|a| a == flag), "missing {flag}: {argv:?}");
+        }
+    }
+
+    /// Audit 2026-09-03 R13 — no consumer of `stream_event` partials or of
+    /// the stderr debug firehose exists; neither flag may creep back in.
+    #[test]
+    fn argv_carries_no_partials_or_debug_firehose() {
+        let argv = build_argv("claude", &input("alice", "u-1", false));
+        for flag in ["--include-partial-messages", "--debug", "--debug-to-stderr"] {
+            assert!(
+                !argv.iter().any(|a| a == flag),
+                "{flag} is dead load: {argv:?}"
+            );
         }
     }
 

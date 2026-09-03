@@ -1327,6 +1327,8 @@ impl Channel for LarkChannel {
         _recipient: &str,
         message_id: &str,
         content: &str,
+        _rich_markdown: Option<&str>,
+        _inline_buttons: bool,
         _button_rows: &[Vec<MessageOption>],
     ) -> anyhow::Result<Option<String>> {
         // Lark addresses the edit by `message_id` in the URL path, not by

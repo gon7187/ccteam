@@ -10,6 +10,15 @@
 //!   `resolve_selection` / `resolve_nav_selection` path.
 //! - `cmd:<command>` — run `<command>` (with its args) exactly as if the
 //!   user had typed it.
+//! - `cmd:~<command>` — run `<command>` and, on success, edit the tapped
+//!   message in place instead of sending a new one (§3.5c self-refresh,
+//!   e.g. the "🔄 Обновить" button on `/sessions`/`/status`). R2-2 — this is
+//!   a DISTINCT namespace from plain `cmd:<command>` precisely so that a
+//!   cross-screen navigation button using the same command text (e.g.
+//!   "📋 Сессии" on the `/status` card, which also runs `/sessions`) is never
+//!   mistaken for the screen's own self-refresh button and does not edit the
+//!   screen it was tapped from away; only the button that actually renders
+//!   this namespace gets in-place-edit behaviour.
 //! - `cmd:?<command>` — ask for confirmation before running `<command>`.
 //! - `cmd:!<token>` / `cmd:x<token>` — approve / cancel a gateway-held
 //!   confirmation. The token is opaque and never contains the command.
@@ -25,6 +34,11 @@ pub enum CallbackAction {
     },
     /// Run this command (with its args) exactly as typed text.
     Command(String),
+    /// Run this command exactly as [`Command`](Self::Command) does, but the
+    /// tap is the screen's OWN self-refresh button (§3.5c) rather than
+    /// cross-screen navigation — success may edit the tapped message in
+    /// place instead of sending a new one.
+    Redraw(String),
     /// Ask for confirmation before running this command.
     Confirm(String),
     /// Approve a pending confirmation by its opaque token.
@@ -48,6 +62,7 @@ pub fn parse(data: &str) -> CallbackAction {
         Some('?') => CallbackAction::Confirm(rest[1..].to_string()),
         Some('!') => CallbackAction::Confirmed(rest[1..].to_string()),
         Some('x') => CallbackAction::Cancelled(rest[1..].to_string()),
+        Some('~') => CallbackAction::Redraw(rest[1..].to_string()),
         _ => CallbackAction::Command(rest.to_string()),
     }
 }
@@ -70,6 +85,24 @@ mod tests {
             parse("cmd:/stop s42"),
             CallbackAction::Command("/stop s42".to_string())
         );
+    }
+
+    #[test]
+    fn parses_redraw() {
+        assert_eq!(
+            parse("cmd:~/status"),
+            CallbackAction::Redraw("/status".to_string())
+        );
+    }
+
+    #[test]
+    fn redraw_is_distinct_from_plain_command_on_the_same_text() {
+        // R2-2 — the whole point of the `~` namespace: `/status` reached via
+        // a self-refresh button (`cmd:~/status`) and `/status` reached via a
+        // cross-screen nav button (`cmd:/status`) must never collapse into
+        // the same action, or the gateway can no longer tell a screen's own
+        // "🔄 Обновить" apart from another screen's link to it.
+        assert_ne!(parse("cmd:~/status"), parse("cmd:/status"));
     }
 
     #[test]

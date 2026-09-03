@@ -31,6 +31,11 @@ pub mod credentials;
 pub mod daemon;
 pub mod delegation;
 pub mod external_nodes;
+// bot-fs-project-browser-design (2026-09-02) — pure directory-listing model
+// for the Telegram `/projects` folder browser: no Telegram/gateway knowledge,
+// no LLM, no I/O beyond `std::fs::read_dir`/`canonicalize`. gateway.rs owns
+// the per-chat nav state and callback wiring on top of this.
+pub mod fs_browser;
 pub mod gateway;
 // v0.8.22 P0-2 — the shared "ask the user to approve/deny a tool call" HITL
 // core. Both Claude HITL surfaces (terminal `permission/ask` over mcp.sock,

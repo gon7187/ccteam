@@ -85,6 +85,7 @@
 - **vendor 容量中断 = 委派链故障模式**(v0.9.9 FIX1 尾段 codex「model at capacity」,turn 断在门禁前):恢复路径 = `session_collect` 读账本中间记录 → 接手方按其结论收尾,不重做已完成的归因;工作品外部化(worktree/commit)= 会话可弃性。**产品侧主体已固化**(owner 复盘驱动,`2a2b38a`:TurnFailed/终态 Error 贯穿 DelegationSignal,通知冠 VENDOR ERROR = 修「假成功」;TurnStarted 刷 last_active = 消挤停误排);余量 = A2A-OBS-5/OBS-2 卡。恢复纪律候选固化 → verify/README 运行纪律。
 - **「同机同红」stash 对照只证「非本 diff 所致」,不证「环境态」**(HERM-1 ① 误归因复盘:对照基线 origin/dev 当时可能已含回归;且「CI 绿」快照会过期)——跨环境同断言复现 = 优先判真回归;flake 归档必须记录首见 CI run 边界,定期复核。
 - **委派卡「单 commit 含窄写回」⇒ 卡面 sha 无法自引用**(MCP-CULL-3 卡面 9638ce9 vs 实推 9c2a89e,amend 后漂移,规划 review 校正):委派 brief 应改为「实现 commit → 写回 commit 分离」(与规划自身的 loop: 收口同构),或规划收口时校正 sha。
+- **合成的 turn id 必须跨进程化身唯一,否则「持久去重」把活 turn 当回放吃掉**(2026-09-03 实锤,s412 等 6 小时):stream-json 会话被 daemon 重启后以 `--resume` 重生,新 `StreamTranslator` 从 `sj-1` 重新计数,而 `append_terminal_turn_if_absent` 按 `turn_id` 在 turns.jsonl 最近 256 行里去重 —— 于是**每个** resume 后的 `TurnCompleted` 都被判成 pre-resume 同号 turn 的回放,静默 `continue`(debug 级):无 `completed` 行、无 `chat_turn_completed`、无完成通知(信号只在 NewlyCanonical 发)、`turn_started_at` 永不清 → 父会话等一个不会来的通知,直到用户戳一下。日志里 100% 可复现:所有 `resumed=true` 会话此后 C=0。修在 id 生成层(`incarnation_nonce()` 进 `sj-`/`codex-exec-`/`pi-` 三处;ACP 早已 `t-{millis}-{seq}`),不是在去重层放宽。**同形判据**:凡「持久层按某 id 去重」的地方,列出该 id 的**每个铸造点**,问一句「进程重启后它还唯一吗」;凡「静默 `continue` 丢弃事件」的分支,至少 warn 级 + 说清「若这是活 turn 意味着什么」——本 bug 在 debug 级藏了两天。
 - **规划自身教训**:backlog 批量卡片删除禁用 sed 范围盲切(v0.9.9 蒸馏时 sed 端点被此前 Edit 吃掉的卡头坑掉整段,靠 cp 备份 + Edit 精确重建恢复)—— 结构性 `.loop/` 编辑一律 Edit 工具 + 事后 `writeback.sh`。
 
 ## 流程速查

@@ -34,6 +34,7 @@ use ccteam_harness::{read_session_meta, write_session_meta};
 use futures::{future::join_all, StreamExt};
 use serde::{Deserialize, Serialize};
 
+use crate::fs_browser;
 use crate::im_callbacks;
 use crate::im_views::{
     self, CommandView, DetachedSessionRow, ProjectRow, ProjectsView, RichReply, SessionRow,
@@ -97,9 +98,41 @@ const MAX_COMMAND_CONFIRMATIONS_GLOBAL: usize = 1024;
 #[derive(Debug, Clone)]
 struct PendingCommandConfirmation {
     chat: ChatKey,
-    command: String,
+    payload: PendingConfirmationPayload,
     created_at: Instant,
     ttl: Duration,
+}
+
+/// What a `cmd:!<token>`/`cmd:x<token>` confirmation resolves to.
+///
+/// `CreateProject` (FS-SEC-R2-2) carries the already-resolved `rel`/`abs`
+/// PathBufs directly rather than round-tripping them through a
+/// whitespace-tokenized `"/newproject <slug> <path>"` string the way
+/// `Command` does — a directory name with leading/trailing whitespace (legal
+/// on Linux) survives a `PathBuf` but not a `str::trim()` re-parse, and a
+/// string can't be re-validated against `projects_root` without first
+/// decoding it back into a path. Carrying the path avoids both problems;
+/// `take_command_confirmation`'s caller additionally re-resolves it against
+/// a FRESH directory listing before acting on it (TOCTOU: a symlink swapped
+/// in during the confirmation's TTL must not redirect the write).
+#[derive(Debug, Clone)]
+enum PendingConfirmationPayload {
+    Command(String),
+    CreateProject {
+        slug: String,
+        rel: PathBuf,
+        abs: PathBuf,
+    },
+}
+
+impl PendingConfirmationPayload {
+    /// First token for logging (`log_command_callback`'s `command` field).
+    fn log_command(&self) -> &str {
+        match self {
+            Self::Command(cmd) => cmd.split_whitespace().next().unwrap_or_default(),
+            Self::CreateProject { .. } => "/newproject",
+        }
+    }
 }
 
 impl PendingCommandConfirmation {
@@ -112,6 +145,11 @@ enum ConfirmationResolution {
     Stale,
     Foreign,
     Command(String),
+    CreateProject {
+        slug: String,
+        rel: PathBuf,
+        abs: PathBuf,
+    },
 }
 
 /// `slug -> tenant project principal` resolved once per ACL pass (`None` =
@@ -968,6 +1006,69 @@ enum Principal {
     Guest(String),
 }
 
+/// Per-chat cursor into the operator folder browser (`/projects` §3.2).
+/// In-memory only — a daemon restart forgets it, so the next `/projects`
+/// starts back at the root; nothing durable depends on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FsNav {
+    /// Path below `projects_root` currently shown; empty at the root.
+    rel: PathBuf,
+    /// 1-indexed current page (matches [`fs_browser::Page::page`]).
+    page: usize,
+}
+
+impl Default for FsNav {
+    fn default() -> Self {
+        Self {
+            rel: PathBuf::new(),
+            page: 1,
+        }
+    }
+}
+
+/// Notice shown when a `fs:i:`/`fs:pick:` tap's index no longer matches a
+/// fresh listing (the directory changed between render and click, §3.3) —
+/// the browser re-renders the SAME page instead of acting on a stale index.
+const FS_STALE_NOTICE: &str = "⚠️ список обновился, нажми ещё раз";
+
+/// Split `nav:fs:i:<n>:<fp>`/`nav:fs:pick:<n>:<fp>`'s callback-data tail
+/// (already stripped of the `i:`/`pick:` prefix) back into its index and
+/// fingerprint (FS-SEC-2/F7/F8). `None` on any malformed tail — treated the
+/// same as an out-of-range index by every caller (re-render, don't act).
+fn parse_idx_fp(rest: &str) -> Option<(usize, &str)> {
+    let (idx, fp) = rest.split_once(':')?;
+    if fp.is_empty() {
+        return None;
+    }
+    let idx = idx.parse::<usize>().ok()?;
+    Some((idx, fp))
+}
+
+/// [`fs_browser::resolve`] + [`fs_browser::list`] off the tokio runtime
+/// thread (FS-SEC-4) — both are unbounded blocking syscalls
+/// (`canonicalize`/`read_dir`) otherwise run synchronously while this
+/// gateway's mutex is held, stalling every other chat for as long as the
+/// directory takes to read. `None` = `rel` doesn't resolve to a directory
+/// under `root` at all (escaped/vanished, §3.7 — the caller falls back to
+/// the root page); `Some(Err(_))` = it resolves but `read_dir` failed
+/// (permission denied) — the caller still renders a page, error surfaced.
+async fn fs_resolve_and_list(
+    root: PathBuf,
+    rel: PathBuf,
+    registered: Vec<(String, PathBuf)>,
+    page: usize,
+) -> Option<anyhow::Result<fs_browser::Page>> {
+    match tokio::task::spawn_blocking(move || {
+        fs_browser::resolve(&root, &rel).ok()?;
+        Some(fs_browser::list(&root, &rel, &registered, page))
+    })
+    .await
+    {
+        Ok(inner) => inner,
+        Err(join_err) => Some(Err(anyhow::anyhow!("fs listing task failed: {join_err}"))),
+    }
+}
+
 /// In-memory v8.1 route table for one daemon process.
 pub struct Gateway {
     adapter_factory: Arc<
@@ -1057,6 +1158,9 @@ pub struct Gateway {
     operator_chats: BTreeMap<String, OperatorBinding>,
     current_project: BTreeMap<ChatKey, String>,
     pending_prefix: BTreeMap<ChatKey, String>,
+    /// Per-chat operator folder-browser cursor (`/projects` §3.2) — see
+    /// [`FsNav`].
+    fs_nav: BTreeMap<ChatKey, FsNav>,
     /// chat → its current/focused session id. Shared (`Arc<RwLock>`) so the
     /// detached event pumps can read it to label *out-of-band* answers/errors
     /// — i.e. async events from a session that is no longer the chat's focus,
@@ -1534,6 +1638,21 @@ pub enum GatewayEventKind {
         /// Platform message id of the message to edit (Telegram
         /// `message_id`, as a string).
         message_id: String,
+        /// Rich Messages markdown for a rich-capable channel — the edit-path
+        /// twin of [`crate::transport::SendMessage::rich_markdown`] (F5):
+        /// `content` stays the plain/classic text (what a non-rich channel,
+        /// an ephemeral response, or Telegram's HTML→plain retry leg all
+        /// send verbatim), this carries the separate markdown that may embed
+        /// `<tg-button>` tags. `None` ⇒ `content` doubles as the rich
+        /// attempt too (the pre-existing `cmd:` confirmation edit, which
+        /// never embeds tags).
+        rich_markdown: Option<String>,
+        /// `rich_markdown` already embeds every button as inline
+        /// `<tg-button>` tags (SPEC-3/F2) — the rich edit must not append
+        /// `button_rows` again as a trailing `<tg-button-row>` block. The
+        /// classic edit always uses `button_rows` for its own keyboard
+        /// regardless of this flag.
+        inline_buttons: bool,
     },
     /// Telegram-only private callback response. On delivery failure the daemon
     /// performs the pre-ephemeral edit/send path recorded here.
@@ -2841,6 +2960,7 @@ impl Gateway {
             operator_chats: BTreeMap::new(),
             current_project: BTreeMap::new(),
             pending_prefix: BTreeMap::new(),
+            fs_nav: BTreeMap::new(),
             current_session: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             sessions: BTreeMap::new(),
             next_session_generation: 0,
@@ -4643,8 +4763,16 @@ impl Gateway {
             // `nav:use:<sid>` — with no pending-registry token), so it is
             // resolved here, before the token-keyed choice path.
             if let Some(nav) = reply.data.strip_prefix("nav:") {
-                let replies = match self.resolve_nav_selection(&chat, nav).await {
-                    Ok(replies) => plain_replies(replies),
+                let replies = match self
+                    .resolve_nav_selection(
+                        &chat,
+                        nav,
+                        message_id,
+                        reply.callback_ephemeral.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(replies) => replies,
                     Err(error) => {
                         return self.route_callback_error(
                             &chat,
@@ -6463,6 +6591,30 @@ impl Gateway {
 
         if let Some(reply) = selection {
             if let Some(nav) = reply.data.strip_prefix("nav:") {
+                // `fs:*` (§3.3) self-delivers by editing the tapped message
+                // in place (`Self::emit_fs_reply`) rather than returning a
+                // reply, so it short-circuits before the generic
+                // resolved→route_callback_replies tail below. FS-SEC-4 — the
+                // directory I/O itself (`fs_resolve_and_list`) runs in
+                // `spawn_blocking`, off this lock-holding task's runtime
+                // thread; the gateway mutex is still held for the call's
+                // duration (fs_nav is gateway state that must update
+                // atomically with the render), so this bounds worker-thread
+                // starvation, not lock contention — a single acquisition for
+                // the whole callback is still fine here.
+                if let Some(action) = nav.strip_prefix("fs:") {
+                    gateway
+                        .lock()
+                        .await
+                        .resolve_fs_nav(
+                            &chat,
+                            action,
+                            message_id,
+                            reply.callback_ephemeral.as_ref(),
+                        )
+                        .await;
+                    return Ok(Vec::new());
+                }
                 let resolved = if nav.starts_with("stop:") {
                     Ok(vec!["Этот выбор больше недоступен".to_string()])
                 } else if let Some(slug) = nav.strip_prefix("cd:") {
@@ -6525,8 +6677,16 @@ impl Gateway {
                     replies,
                 ));
             }
-            match im_callbacks::parse(&reply.data) {
-                im_callbacks::CallbackAction::Command(command) => {
+            let action = im_callbacks::parse(&reply.data);
+            // R2-2 — see `resolve_cmd_callback`'s twin comment: redraw-ness
+            // is decided by which callback NAMESPACE the tapped button used
+            // (`Redraw` = the screen's own "🔄 Обновить"), never by the
+            // command text, so a cross-screen nav button running the same
+            // command from a DIFFERENT screen never redraws it away.
+            let is_redraw = matches!(&action, im_callbacks::CallbackAction::Redraw(_));
+            match action {
+                im_callbacks::CallbackAction::Command(command)
+                | im_callbacks::CallbackAction::Redraw(command) => {
                     if !Self::is_gateway_command(&command) {
                         return Ok(vec![RichReply::plain("Неизвестная команда")]);
                     }
@@ -6554,6 +6714,28 @@ impl Gateway {
                             )
                         }
                     };
+                    // §3.5c — mirror `resolve_cmd_callback`'s twin fix: a
+                    // `cmd:~<command>` tap that *redraws* the screen it was
+                    // tapped from (e.g. "🔄 Обновить") edits the tapped
+                    // message in place instead of appending a new one,
+                    // whenever there's exactly one reply to show and no
+                    // group-chat ephemeral answer is in play (that path
+                    // already routes through `route_callback_replies` below
+                    // unchanged). Plain `cmd:<command>` taps — action
+                    // commands (`/use <sid>`, `/cd <slug>`, …) AND
+                    // cross-screen nav buttons running the same command from
+                    // a DIFFERENT screen (R2-2) — are not redraws: editing
+                    // in place would wipe out the list or picker the button
+                    // was tapped from, so they always fall through to a
+                    // normal send.
+                    if reply.callback_ephemeral.is_none() && is_redraw {
+                        if let ([only], Some(_)) =
+                            (replies.as_slice(), telegram_callback_message_id(message_id))
+                        {
+                            guard.emit_fs_reply(&chat, message_id, None, only.clone());
+                            return Ok(Vec::new());
+                        }
+                    }
                     return Ok(guard.route_callback_replies(
                         &chat,
                         reply.callback_ephemeral.as_ref(),
@@ -6566,6 +6748,19 @@ impl Gateway {
                         let mut guard = gateway.lock().await;
                         let command = match guard.take_command_confirmation(&chat, &token) {
                             ConfirmationResolution::Command(command) => command,
+                            ConfirmationResolution::CreateProject { slug, rel, abs } => {
+                                drop(guard);
+                                return Self::resolve_shared_create_project_confirmation(
+                                    &gateway,
+                                    &chat,
+                                    message_id,
+                                    reply.callback_ephemeral.as_ref(),
+                                    slug,
+                                    rel,
+                                    abs,
+                                )
+                                .await;
+                            }
                             ConfirmationResolution::Foreign => return Ok(Vec::new()),
                             ConfirmationResolution::Stale => {
                                 return Ok(guard.emit_stale_confirmation(
@@ -7510,15 +7705,32 @@ impl Gateway {
                     "Текущий turn сессии {sid} {detail} (сессия сохранена; можно продолжить /model и др.)"
                 ))))
             }
-            "/cd" => {
-                let project = parts
-                    .next()
-                    .ok_or_else(|| anyhow!("Для /cd нужен проект"))?;
-                // The switch itself lives in `change_project` (shared with the
-                // clickable project picker's `nav:cd:<slug>` button tap).
-                self.change_project(chat, project)
-                    .map(|reply| Some(RichReply::plain(reply)))
-            }
+            "/cd" => match parts.next() {
+                Some(project) => {
+                    // The switch itself lives in `change_project` (shared
+                    // with the clickable project picker's `nav:cd:<slug>`
+                    // button tap).
+                    self.change_project(chat, project)
+                        .map(|reply| Some(RichReply::plain(reply)))
+                }
+                // Bare `/cd` from the operator opens the folder browser
+                // (§3.2/§3.6) instead of erroring; every other principal
+                // keeps the old "needs an argument" refusal. F6 — only on a
+                // channel that can render buttons: the browser's every
+                // action rides `button_rows`/inline `<tg-button>` tags, so a
+                // web/Lark operator would otherwise get an unusable
+                // directory-name-only listing with no way to act on it.
+                None => {
+                    if matches!(self.principal(chat), Principal::Operator)
+                        && Self::channel_supports_buttons(&chat.channel)
+                    {
+                        if let Some(reply) = self.render_operator_fs_browser(chat).await {
+                            return Ok(Some(reply));
+                        }
+                    }
+                    Err(anyhow!("Для /cd нужен проект"))
+                }
+            },
             "/newproject" => {
                 // `/newproject <slug> <path>` — the path is the remainder
                 // of the line so it may contain spaces. Splitting on the
@@ -7534,15 +7746,14 @@ impl Gateway {
                     .map(str::trim)
                     .filter(|p| !p.is_empty())
                     .ok_or_else(|| anyhow!("Использование: /newproject <slug> <путь_проекта>"))?;
-                // v0.8.20 convergence — own the project by the CANONICAL identity
-                // (`user:<tenant>` for a tenant bot), so the tenant's web console
-                // sees the IM-bot-created project too (web ACL is project-owned).
-                let owner_id = canonical_owner(chat).identity();
                 // Creating a project in a chat means "I want to work here now":
-                // `create_project` switches the chat into the new project (like a
-                // `/cd`), so the next message spawns a session there instead of
-                // landing back in the previous project.
-                self.create_project(chat, slug, path, Some(&owner_id))
+                // `create_project_at` switches the chat into the new project
+                // (like a `/cd`), so the next message spawns a session there
+                // instead of landing back in the previous project. Owner is
+                // the CANONICAL identity (`user:<tenant>` for a tenant bot,
+                // v0.8.20 convergence) — computed inside `create_project_at`.
+                let abs = expand_project_path(path)?;
+                self.create_project_at(chat, slug, abs)
                     .map(|reply| Some(RichReply::plain(reply)))
             }
             "/sessions" => {
@@ -7559,7 +7770,20 @@ impl Gateway {
                 .rebuild_tool_surface(chat)
                 .await
                 .map(|reply| Some(RichReply::plain(reply))),
-            "/projects" => Ok(Some(self.render_projects(chat))),
+            "/projects" => {
+                // Operator on a button-capable channel: folder browser
+                // (§3.2/§3.6, F6). Tenant/guest, and an operator on a
+                // channel that can't render buttons (web, Lark), keep the
+                // flat, ACL-filtered project list unchanged.
+                if matches!(self.principal(chat), Principal::Operator)
+                    && Self::channel_supports_buttons(&chat.channel)
+                {
+                    if let Some(reply) = self.render_operator_fs_browser(chat).await {
+                        return Ok(Some(reply));
+                    }
+                }
+                Ok(Some(self.render_projects(chat)))
+            }
             "/commander" => {
                 if !Self::channel_supports_buttons(&chat.channel) {
                     return Ok(Some(RichReply::plain("Только для Telegram.")));
@@ -8015,25 +8239,40 @@ impl Gateway {
 
     /// Resolve a self-describing project/session switch button. Stop buttons
     /// use the token-keyed pending registry and never enter this path.
-    async fn resolve_nav_selection(&mut self, chat: &ChatKey, nav: &str) -> Result<Vec<String>> {
+    /// `message_id`/`callback` matter only to the `fs:` family
+    /// ([`Self::resolve_fs_nav`]), which delivers by editing the tapped
+    /// message in place instead of returning a reply — every other prefix
+    /// ignores them, unchanged from before that family existed.
+    async fn resolve_nav_selection(
+        &mut self,
+        chat: &ChatKey,
+        nav: &str,
+        message_id: &str,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+    ) -> Result<Vec<RichReply>> {
         if nav.starts_with("stop:") {
-            return Ok(vec!["Этот выбор больше недоступен".to_string()]);
+            return Ok(vec![RichReply::plain("Этот выбор больше недоступен")]);
         }
         if let Some(slug) = nav.strip_prefix("cd:") {
             let mut reply = self.change_project(chat, slug)?;
             if chat.channel != "web" {
                 append_next_hint(&mut reply, NEXT_HINT_SESSIONS);
             }
-            return Ok(vec![reply]);
+            return Ok(vec![RichReply::plain(reply)]);
         }
         if let Some(sid) = nav.strip_prefix("use:") {
             let mut reply = self.use_session(chat, sid).await?;
             if chat.channel != "web" {
                 append_next_hint(&mut reply, NEXT_HINT_STATUS);
             }
-            return Ok(vec![reply]);
+            return Ok(vec![RichReply::plain(reply)]);
         }
-        Ok(vec!["Некорректный выбор".to_string()])
+        if let Some(action) = nav.strip_prefix("fs:") {
+            self.resolve_fs_nav(chat, action, message_id, callback)
+                .await;
+            return Ok(Vec::new());
+        }
+        Ok(vec![RichReply::plain("Некорректный выбор")])
     }
 
     /// Whether a channel renders message `options` as tappable inline-keyboard
@@ -8204,6 +8443,8 @@ impl Gateway {
             content,
             kind: GatewayEventKind::EditMessage {
                 message_id: platform_message_id,
+                rich_markdown: None,
+                inline_buttons: false,
             },
             attachments: Vec::new(),
             options: Vec::new(),
@@ -8308,49 +8549,72 @@ impl Gateway {
         });
     }
 
-    /// Scaffold a ccteam project at `raw_path`, register it in
-    /// `config.yaml`, and make it addressable by `/cd <slug>` in this
-    /// running daemon. `raw_path` may be `~`-relative; it must resolve to
-    /// an absolute directory (existing repos are adopted in place, empty
-    /// dirs are created — `bootstrap_project_at_dir` leaves user files
-    /// alone). Requires [`Gateway::enable_project_creation`].
-    fn create_project(
-        &mut self,
-        chat: &ChatKey,
-        slug: &str,
-        raw_path: &str,
-        owner: Option<&str>,
-    ) -> Result<String> {
+    /// Scaffold a ccteam project at `abs`, register it in `config.yaml`,
+    /// and make it addressable by `/cd <slug>` in this running daemon.
+    /// `abs` must already be an absolute, resolved directory (the `/newproject`
+    /// handler expands `~`/relative input via [`expand_project_path`] before
+    /// calling this; the fs-browser "make this a project" flow already has
+    /// one from [`fs_browser::list`]). Existing repos are adopted in place,
+    /// empty dirs are created — `bootstrap_project_at_dir` leaves user files
+    /// alone. Requires [`Gateway::enable_project_creation`].
+    fn create_project_at(&mut self, chat: &ChatKey, slug: &str, abs: PathBuf) -> Result<String> {
         let paths = self
             .project_paths
             .clone()
             .ok_or_else(|| anyhow!("Создание проектов не настроено в этом daemon"))?;
         let slug = validate_slug_format(slug)?;
         // (v0.8.5) Detect a slug already registered in config.yaml even if it's
-        // not yet in our in-memory cache, so /newproject can't clobber it.
+        // not yet in our in-memory cache, so a project create can't clobber it.
         self.ensure_project_loaded(&slug);
         if self.projects.contains_key(&slug) {
             return Err(anyhow!("Проект уже существует: {slug}"));
         }
-        let abs = expand_project_path(raw_path)?;
+        // FS-SEC-R2-1 — a slug collision isn't the only one that matters: a
+        // NEW project's `abs` matching an EXISTING registered project's
+        // path (any local project, regardless of ACL visibility to `chat`)
+        // must be rejected too. Without this, ANY caller of this function —
+        // fs-browser confirmed-create, typed `/newproject`, or web —
+        // could silently re-run `bootstrap_project_at_dir` over a directory
+        // that is already someone else's project, overwriting its
+        // `.ccteam/state.json` and reassigning ownership to the caller.
+        // Compared against config.yaml directly (like the slug check above,
+        // not the in-memory `self.projects` cache) so this catches a
+        // project registered by another daemon/process too. `abs` may not
+        // exist yet (an empty new project dir is created below), so fall
+        // back to a literal path comparison when it doesn't canonicalize.
+        if let Ok(cfg) = ccteam_core::config::load(&paths.root) {
+            let abs_canon = abs.canonicalize().ok();
+            let collides = cfg.projects.iter().any(|p| {
+                p.host == ccteam_core::LOCAL_HOST
+                    && (p.path == abs
+                        || abs_canon.as_deref().is_some_and(|canon| {
+                            p.path.canonicalize().ok().as_deref() == Some(canon)
+                        }))
+            });
+            if collides {
+                return Err(anyhow!(
+                    "Каталог уже зарегистрирован как проект: {}",
+                    abs.display()
+                ));
+            }
+        }
         bootstrap_project_at_dir(&paths, &abs, &slug, "(created from web/IM chat)", "dev")
             .with_context(|| format!("scaffold project {slug} at {}", abs.display()))?;
         // v0.8.18 柱2 — record the creating chat as owner (explicit field; NOT
         // path-derived). Use the known project dir: the config upsert happens
         // below, so `paths.project_state(slug)` would still resolve the fallback
         // projects-root path and miss an arbitrary-path project's real state.
-        if let Some(owner) = owner {
-            let state_path = ccteam_core::CcteamPaths::project_state_in(&abs);
-            match ccteam_core::ProjectState::load(&state_path) {
-                Ok(mut state) => {
-                    state.owner = Some(owner.to_string());
-                    if let Err(err) = state.save(&state_path) {
-                        tracing::warn!(%slug, error = %err, "set project owner failed");
-                    }
+        let owner = canonical_owner(chat).identity();
+        let state_path = ccteam_core::CcteamPaths::project_state_in(&abs);
+        match ccteam_core::ProjectState::load(&state_path) {
+            Ok(mut state) => {
+                state.owner = Some(owner);
+                if let Err(err) = state.save(&state_path) {
+                    tracing::warn!(%slug, error = %err, "set project owner failed");
                 }
-                Err(err) => {
-                    tracing::warn!(%slug, error = %err, "load state to set owner failed")
-                }
+            }
+            Err(err) => {
+                tracing::warn!(%slug, error = %err, "load state to set owner failed")
             }
         }
         upsert_project(
@@ -10375,18 +10639,29 @@ impl Gateway {
                             let mut covered = std::mem::take(&mut turn_covered);
                             covered.push(terminal.turn_id.clone());
                             let boundary_signal = if is_completed {
-                                finished_answer.as_ref().map(|(_, final_text)| {
-                                    crate::delegation::DelegationSignal {
-                                        child_sid: session_id.clone(),
-                                        turn_id: terminal.turn_id.clone(),
-                                        tail: final_text.clone(),
-                                        vendor: pump_vendor,
-                                        host: pump_host.clone(),
-                                        boundary: true,
-                                        vendor_error: false,
-                                        interim_notes: notes.saturating_sub(1),
-                                        covered_turns: covered.clone(),
-                                    }
+                                // A completed vendor turn ALWAYS wakes the parent,
+                                // text answer or not: codex items the adapter cannot
+                                // name degrade to an EMPTY AgentMessage, so
+                                // `turn_last_answer` stays None and the parent used
+                                // to wait forever on a boundary that had already
+                                // happened (audit 2026-09-03 R1). The failure arm
+                                // below already fires unconditionally.
+                                let tail = finished_answer
+                                    .as_ref()
+                                    .map(|(_, final_text)| final_text.clone())
+                                    .unwrap_or_else(|| {
+                                        "(запуск завершён без текстового ответа)".to_string()
+                                    });
+                                Some(crate::delegation::DelegationSignal {
+                                    child_sid: session_id.clone(),
+                                    turn_id: terminal.turn_id.clone(),
+                                    tail,
+                                    vendor: pump_vendor,
+                                    host: pump_host.clone(),
+                                    boundary: true,
+                                    vendor_error: false,
+                                    interim_notes: notes.saturating_sub(1),
+                                    covered_turns: covered.clone(),
                                 })
                             } else {
                                 failure.as_ref().map(|error| {
@@ -10481,10 +10756,17 @@ impl Gateway {
                             if canonical == TerminalCanonicalOutcome::AlreadyCanonical
                                 && !terminal_closes_active
                             {
-                                tracing::debug!(
+                                // Loud on purpose: a legitimate replay (startup
+                                // reconcile) is rare, while an adapter reusing
+                                // turn ids across incarnations looks EXACTLY like
+                                // this and silently loses every boundary (no
+                                // `completed` row, no completion notification).
+                                tracing::warn!(
                                     session = %session_id,
                                     turn_id = %terminal.turn_id,
-                                    "pump: ignored durable duplicate terminal boundary"
+                                    "pump: dropped terminal boundary as a durable duplicate — \
+                                     turn id already canonical in turns.jsonl; if this turn was \
+                                     started in this incarnation the adapter is reusing turn ids"
                                 );
                                 continue;
                             }
@@ -13395,6 +13677,12 @@ impl Gateway {
         callback: Option<&crate::transport::CallbackEphemeral>,
     ) -> Result<Vec<RichReply>> {
         let cid = crate::transport::safe_correlation_id(message_id);
+        // R2-2 — decided from the tapped BUTTON's own namespace
+        // (`CallbackAction::Redraw`, `cmd:~<command>`), never from `cmd`'s
+        // text: a cross-screen nav button running the same command (e.g.
+        // "📋 Сессии" on the `/status` card) parses as a plain `Command` and
+        // must never redraw the card it was tapped from away.
+        let is_redraw = matches!(&action, im_callbacks::CallbackAction::Redraw(_));
         match action {
             im_callbacks::CallbackAction::Choice { .. } => Ok(Vec::new()),
             im_callbacks::CallbackAction::Confirm(cmd) => {
@@ -13413,8 +13701,17 @@ impl Gateway {
                 Ok(Vec::new())
             }
             im_callbacks::CallbackAction::Confirmed(token) => {
-                let cmd = match self.take_command_confirmation(chat, &token) {
-                    ConfirmationResolution::Command(cmd) => cmd,
+                match self.take_command_confirmation(chat, &token) {
+                    ConfirmationResolution::Command(cmd) => {
+                        self.resolve_confirmed_command(chat, &cid, message_id, callback, cmd)
+                            .await
+                    }
+                    ConfirmationResolution::CreateProject { slug, rel, abs } => {
+                        self.resolve_create_project_confirmation(
+                            chat, &cid, message_id, callback, slug, rel, abs,
+                        )
+                        .await
+                    }
                     ConfirmationResolution::Foreign => {
                         log_command_callback(
                             &cid,
@@ -13424,7 +13721,7 @@ impl Gateway {
                             Some("foreign"),
                             "none",
                         );
-                        return Ok(Vec::new());
+                        Ok(Vec::new())
                     }
                     ConfirmationResolution::Stale => {
                         log_command_callback(
@@ -13435,69 +13732,9 @@ impl Gateway {
                             Some("stale"),
                             "none",
                         );
-                        return Ok(self.emit_stale_confirmation(chat, &cid, callback, message_id));
-                    }
-                };
-                let first = cmd.split_whitespace().next().unwrap_or_default();
-                // TG-GATE-V2 W8 — edit the confirmation message itself
-                // in place (keyboard removed, "✅ <cmd>") instead of
-                // appending a new one; a callback with no resolvable
-                // platform message id (non-Telegram origin) keeps the
-                // prior append-a-new-message behavior.
-                let mut replies = Vec::new();
-                let ack = format!("✅ {cmd}");
-                if callback.is_none() {
-                    match telegram_callback_message_id(message_id) {
-                        Some(platform_message_id) => {
-                            self.emit_confirmation_edit(chat, &cid, platform_message_id, ack)
-                        }
-                        None => replies.push(RichReply::plain(ack)),
+                        Ok(self.emit_stale_confirmation(chat, &cid, callback, message_id))
                     }
                 }
-                // `already_confirmed: true` — this tap WAS the yes/no
-                // answer; a bulk `/stop` must execute directly, not raise a
-                // second confirmation on top of the one just answered.
-                match self
-                    .handle_command_inner(chat, &cmd, true, Some(&cid))
-                    .await
-                {
-                    Ok(Some(reply)) => {
-                        log_command_callback(
-                            &cid,
-                            chat,
-                            "confirmed",
-                            first,
-                            Some("command"),
-                            "reply",
-                        );
-                        replies.push(reply);
-                    }
-                    Ok(None) => {
-                        log_command_callback(
-                            &cid,
-                            chat,
-                            "confirmed",
-                            first,
-                            Some("command"),
-                            "none",
-                        );
-                        replies.push(RichReply::plain("Неизвестная команда"));
-                    }
-                    Err(error) => {
-                        tracing::info!(
-                            cid = %cid,
-                            channel = crate::transport::platform_of(&chat.channel),
-                            action = "confirmed",
-                            command = first,
-                            resolution = "command",
-                            outcome = "error",
-                            error_kind = callback_error_kind(&error),
-                            "ccteam-im: command callback failed"
-                        );
-                        return Err(error);
-                    }
-                }
-                Ok(replies)
             }
             im_callbacks::CallbackAction::Cancelled(token) => {
                 match self.take_command_confirmation(chat, &token) {
@@ -13532,32 +13769,23 @@ impl Gateway {
                             Some("command"),
                             "none",
                         );
-                        match (callback, telegram_callback_message_id(message_id)) {
-                            (Some(callback), Some(platform_message_id)) => {
-                                self.emit_confirmation_ephemeral(
-                                    chat,
-                                    &cid,
-                                    callback.clone(),
-                                    platform_message_id,
-                                    "Отменено".to_string(),
-                                );
-                                Ok(Vec::new())
-                            }
-                            (None, Some(platform_message_id)) => {
-                                self.emit_confirmation_edit(
-                                    chat,
-                                    &cid,
-                                    platform_message_id,
-                                    "Отменено".to_string(),
-                                );
-                                Ok(Vec::new())
-                            }
-                            (_, None) => Ok(vec![RichReply::plain("Отменено")]),
-                        }
+                        Ok(self.emit_cancellation_ack(chat, &cid, callback, message_id))
+                    }
+                    ConfirmationResolution::CreateProject { .. } => {
+                        log_command_callback(
+                            &cid,
+                            chat,
+                            "cancelled",
+                            "/newproject",
+                            Some("create_project"),
+                            "none",
+                        );
+                        Ok(self.emit_cancellation_ack(chat, &cid, callback, message_id))
                     }
                 }
             }
-            im_callbacks::CallbackAction::Command(cmd) => {
+            im_callbacks::CallbackAction::Command(cmd)
+            | im_callbacks::CallbackAction::Redraw(cmd) => {
                 let first = cmd.split_whitespace().next().unwrap_or_default();
                 if !Self::is_gateway_command(first) {
                     log_command_callback(&cid, chat, "command", "invalid", None, "invalid");
@@ -13569,7 +13797,32 @@ impl Gateway {
                 {
                     Ok(Some(reply)) => {
                         log_command_callback(&cid, chat, "command", first, None, "reply");
-                        Ok(vec![reply])
+                        // §3.5c — a `cmd:~<command>` tap (the screen's own
+                        // "🔄 Обновить" button, `is_redraw`) edits the tapped
+                        // message in place, the same shape `emit_fs_reply`
+                        // uses for the fs browser, instead of appending a
+                        // brand-new message on every refresh. Plain
+                        // `cmd:<command>` taps — action commands (`/use
+                        // <sid>`, `/cd <slug>`, …) AND cross-screen nav
+                        // buttons that happen to run the same command from a
+                        // DIFFERENT screen (R2-2) — are never redraws:
+                        // editing in place would destroy the list or picker
+                        // the button was tapped from, so those fall through
+                        // to a normal send below. Only reachable when
+                        // `callback` is `None` (a group chat's ephemeral
+                        // answer already routes through
+                        // `route_callback_replies` below); no resolvable
+                        // platform message id also falls back to a normal
+                        // send.
+                        if callback.is_none()
+                            && is_redraw
+                            && telegram_callback_message_id(message_id).is_some()
+                        {
+                            self.emit_fs_reply(chat, message_id, callback, reply);
+                            Ok(Vec::new())
+                        } else {
+                            Ok(vec![reply])
+                        }
                     }
                     Ok(None) => {
                         log_command_callback(&cid, chat, "command", first, None, "none");
@@ -13614,7 +13867,260 @@ impl Gateway {
         }
     }
 
+    /// Shared "Отменено" delivery for `cmd:x<token>` — a group's ephemeral
+    /// answer, an edit of the confirmation prompt, or (no resolvable
+    /// platform message id) a plain reply, in that priority order.
+    fn emit_cancellation_ack(
+        &self,
+        chat: &ChatKey,
+        cid: &str,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+        message_id: &str,
+    ) -> Vec<RichReply> {
+        match (callback, telegram_callback_message_id(message_id)) {
+            (Some(callback), Some(platform_message_id)) => {
+                self.emit_confirmation_ephemeral(
+                    chat,
+                    cid,
+                    callback.clone(),
+                    platform_message_id,
+                    "Отменено".to_string(),
+                );
+                Vec::new()
+            }
+            (None, Some(platform_message_id)) => {
+                self.emit_confirmation_edit(chat, cid, platform_message_id, "Отменено".to_string());
+                Vec::new()
+            }
+            (_, None) => vec![RichReply::plain("Отменено")],
+        }
+    }
+
+    /// `ConfirmationResolution::Command` resolution — the pre-FS-SEC-R2-2
+    /// generic `cmd:!<token>` execution path (unchanged), extracted out of
+    /// `resolve_cmd_callback` so its `Confirmed` arm can dispatch to this OR
+    /// [`Self::resolve_create_project_confirmation`] without either duplicating
+    /// the other's very different execution shape.
+    async fn resolve_confirmed_command(
+        &mut self,
+        chat: &ChatKey,
+        cid: &str,
+        message_id: &str,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+        cmd: String,
+    ) -> Result<Vec<RichReply>> {
+        let first = cmd.split_whitespace().next().unwrap_or_default();
+        // TG-GATE-V2 W8 — edit the confirmation message itself in place
+        // (keyboard removed, "✅ <cmd>") instead of appending a new one; a
+        // callback with no resolvable platform message id (non-Telegram
+        // origin) keeps the prior append-a-new-message behavior.
+        let mut replies = Vec::new();
+        let ack = format!("✅ {cmd}");
+        if callback.is_none() {
+            match telegram_callback_message_id(message_id) {
+                Some(platform_message_id) => {
+                    self.emit_confirmation_edit(chat, cid, platform_message_id, ack)
+                }
+                None => replies.push(RichReply::plain(ack)),
+            }
+        }
+        // `already_confirmed: true` — this tap WAS the yes/no answer; a
+        // bulk `/stop` must execute directly, not raise a second
+        // confirmation on top of the one just answered.
+        match self.handle_command_inner(chat, &cmd, true, Some(cid)).await {
+            Ok(Some(reply)) => {
+                log_command_callback(cid, chat, "confirmed", first, Some("command"), "reply");
+                replies.push(reply);
+            }
+            Ok(None) => {
+                log_command_callback(cid, chat, "confirmed", first, Some("command"), "none");
+                replies.push(RichReply::plain("Неизвестная команда"));
+            }
+            Err(error) => {
+                tracing::info!(
+                    cid = %cid,
+                    channel = crate::transport::platform_of(&chat.channel),
+                    action = "confirmed",
+                    command = first,
+                    resolution = "command",
+                    outcome = "error",
+                    error_kind = callback_error_kind(&error),
+                    "ccteam-im: command callback failed"
+                );
+                return Err(error);
+            }
+        }
+        Ok(replies)
+    }
+
+    /// `ConfirmationResolution::CreateProject` resolution — `nav:fs:here`'s
+    /// confirmed "make this a project" (FS-SEC-R2-2). Unlike
+    /// [`Self::resolve_confirmed_command`], `slug`/`rel`/`abs` arrive as
+    /// already-resolved values, not a string to re-parse — AND they are
+    /// re-validated against a FRESH [`fs_browser::resolve`] right before
+    /// acting: a symlink swapped in during the confirmation's 5-minute TTL,
+    /// or the directory vanishing, must not silently redirect (or widen)
+    /// the scaffold write `create_project_at` is about to make.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_create_project_confirmation(
+        &mut self,
+        chat: &ChatKey,
+        cid: &str,
+        message_id: &str,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+        slug: String,
+        rel: PathBuf,
+        abs: PathBuf,
+    ) -> Result<Vec<RichReply>> {
+        let mut replies = Vec::new();
+        let ack = format!("✅ /newproject {slug} {}", abs.display());
+        if callback.is_none() {
+            match telegram_callback_message_id(message_id) {
+                Some(platform_message_id) => {
+                    self.emit_confirmation_edit(chat, cid, platform_message_id, ack)
+                }
+                None => replies.push(RichReply::plain(ack)),
+            }
+        }
+        let Some(paths) = self.project_paths.clone() else {
+            log_command_callback(
+                cid,
+                chat,
+                "confirmed",
+                "/newproject",
+                Some("create_project"),
+                "no_paths",
+            );
+            replies.push(RichReply::plain(
+                "Создание проектов не настроено в этом daemon",
+            ));
+            return Ok(replies);
+        };
+        let fresh = {
+            let root = paths.projects_root.clone();
+            let rel = rel.clone();
+            tokio::task::spawn_blocking(move || fs_browser::resolve(&root, &rel))
+                .await
+                .ok()
+                .and_then(Result::ok)
+        };
+        if fresh.as_deref() != Some(abs.as_path()) {
+            log_command_callback(
+                cid,
+                chat,
+                "confirmed",
+                "/newproject",
+                Some("create_project"),
+                "stale_path",
+            );
+            replies.push(self.fs_create_retry_reply(
+                &rel,
+                "⛔ каталог изменился между выбором и подтверждением, откройте /projects заново",
+            ));
+            return Ok(replies);
+        }
+        match self.create_project_at(chat, &slug, abs.clone()) {
+            Ok(_) => {
+                log_command_callback(
+                    cid,
+                    chat,
+                    "confirmed",
+                    "/newproject",
+                    Some("create_project"),
+                    "reply",
+                );
+                // SPEC-1 — the same two-button footer §3.5 gives a switch,
+                // not `create_project_at`'s own plain acknowledgement text.
+                replies.push(self.fs_switch_reply(&slug, &abs, "проект создан и выбран"));
+            }
+            Err(err) => {
+                tracing::info!(
+                    cid = %cid,
+                    channel = crate::transport::platform_of(&chat.channel),
+                    action = "confirmed",
+                    command = "/newproject",
+                    resolution = "create_project",
+                    outcome = "error",
+                    error_kind = callback_error_kind(&err),
+                    "ccteam-im: command callback failed"
+                );
+                // SPEC-3.5 — init-error screen: the full anyhow chain (the
+                // abs path is inside it — `create_project_at` names it in
+                // every `with_context`), bottom row `[⬆️ Вверх][🔁
+                // Повторить]`. `config.yaml` is untouched on every
+                // `create_project_at` failure (registration happens only
+                // after a successful bootstrap), so "Повторить" — another
+                // `nav:fs:here` on the SAME `rel` — lands on the identical
+                // still-unregistered folder and re-offers the confirmation.
+                replies.push(self.fs_create_retry_reply(&rel, &format!("{err:#}")));
+            }
+        }
+        Ok(replies)
+    }
+
+    /// The `[⬆️ Вверх][🔁 Повторить]` reply for a failed/stale
+    /// `nav:fs:here` confirmation (SPEC-3.5's init-error screen) — `up`
+    /// walks back to the folder's parent, `here` re-runs `nav:fs:here` on
+    /// the SAME `rel`, both carrying that folder's OWN fresh fingerprint
+    /// (R2-3) rather than whatever the chat's live nav cursor currently
+    /// shows (which this reply, being a distinct message from the browser
+    /// page, must not assume still matches).
+    fn fs_create_retry_reply(&self, rel: &Path, message: &str) -> RichReply {
+        let plain = message.to_string();
+        let markdown = im_views::escape_status_markdown(&plain);
+        let fp = self
+            .project_paths
+            .as_ref()
+            .and_then(|paths| fs_browser::list(&paths.projects_root, rel, &[], 1).ok())
+            .map(|page| fs_browser::fingerprint(&page.rel, &page.entries))
+            .unwrap_or_default();
+        let up = MessageOption {
+            data: format!("nav:fs:up:{fp}"),
+            label: "⬆️ Вверх".to_string(),
+            id: "fs:up".to_string(),
+            style: None,
+        };
+        let here = MessageOption {
+            data: format!("nav:fs:here:{fp}"),
+            label: "🔁 Повторить".to_string(),
+            id: "fs:here".to_string(),
+            style: None,
+        };
+        RichReply {
+            markdown,
+            plain,
+            button_rows: vec![vec![up, here]],
+            inline_buttons: false,
+            reply_keyboard: None,
+        }
+    }
+
     fn register_command_confirmation(&mut self, chat: ChatKey, command: String) -> String {
+        self.register_confirmation(chat, PendingConfirmationPayload::Command(command))
+    }
+
+    /// FS-SEC-R2-2 — register a `nav:fs:here` "make this a project"
+    /// confirmation carrying the already-resolved `(rel, abs)` PathBufs
+    /// directly, instead of serializing them into a `/newproject` command
+    /// string (see [`PendingConfirmationPayload`]).
+    fn register_create_project_confirmation(
+        &mut self,
+        chat: ChatKey,
+        slug: String,
+        rel: PathBuf,
+        abs: PathBuf,
+    ) -> String {
+        self.register_confirmation(
+            chat,
+            PendingConfirmationPayload::CreateProject { slug, rel, abs },
+        )
+    }
+
+    fn register_confirmation(
+        &mut self,
+        chat: ChatKey,
+        payload: PendingConfirmationPayload,
+    ) -> String {
         let now = Instant::now();
         self.pending_command_confirmations
             .retain(|_, pending| !pending.expired(now));
@@ -13641,7 +14147,7 @@ impl Gateway {
                 token.clone(),
                 PendingCommandConfirmation {
                     chat,
-                    command,
+                    payload,
                     created_at: now,
                     ttl: Duration::from_secs(5 * 60),
                 },
@@ -13691,7 +14197,7 @@ impl Gateway {
         if pending.chat != *chat {
             self.pending_command_confirmations.remove(token);
             tracing::warn!(
-                sid = ?pending.command.split_whitespace().nth(1),
+                command = pending.payload.log_command(),
                 expected_chat = %pending.chat.identity(),
                 actual_chat = %chat.identity(),
                 "command confirmation ignored for foreign tapper"
@@ -13699,7 +14205,12 @@ impl Gateway {
             return ConfirmationResolution::Foreign;
         }
         self.pending_command_confirmations.remove(token);
-        ConfirmationResolution::Command(pending.command)
+        match pending.payload {
+            PendingConfirmationPayload::Command(cmd) => ConfirmationResolution::Command(cmd),
+            PendingConfirmationPayload::CreateProject { slug, rel, abs } => {
+                ConfirmationResolution::CreateProject { slug, rel, abs }
+            }
+        }
     }
 
     /// Ask about a session's ccteam tool face the FIRST time it is activated
@@ -14016,6 +14527,27 @@ impl Gateway {
                 .await)
             }
         }
+    }
+
+    /// [`Self::resolve_create_project_confirmation`], through the
+    /// `Arc<Mutex<Gateway>>`-locked entry point (`handle_message_shared`) —
+    /// the production dispatch path daemon.rs actually calls, as opposed to
+    /// [`Self::resolve_cmd_callback`]'s single-`&mut self` twin.
+    async fn resolve_shared_create_project_confirmation(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        chat: &ChatKey,
+        message_id: &str,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+        slug: String,
+        rel: PathBuf,
+        abs: PathBuf,
+    ) -> Result<Vec<RichReply>> {
+        let cid = crate::transport::safe_correlation_id(message_id);
+        let mut guard = gateway.lock().await;
+        let replies = guard
+            .resolve_create_project_confirmation(chat, &cid, message_id, callback, slug, rel, abs)
+            .await?;
+        Ok(guard.route_callback_replies(chat, callback, message_id, replies))
     }
 
     async fn resolve_selection_shared(
@@ -14655,13 +15187,17 @@ impl Gateway {
         }
         if visible.is_empty() && detached_here == 0 {
             if elsewhere > 0 {
-                return RichReply::plain(format!(
-                    "📁 Текущий проект: {cur}\nВ этом проекте нет сессий — ↓ в других проектах: {elsewhere} → /sessions all"
-                ));
+                return im_views::plain_with_refresh(
+                    format!(
+                        "📁 Текущий проект: {cur}\nВ этом проекте нет сессий — ↓ в других проектах: {elsewhere} → /sessions all"
+                    ),
+                    "/sessions",
+                );
             }
-            return RichReply::plain(format!(
-                "📁 Текущий проект: {cur}\nНет сессий — создайте через /new"
-            ));
+            return im_views::plain_with_refresh(
+                format!("📁 Текущий проект: {cur}\nНет сессий — создайте через /new"),
+                "/sessions",
+            );
         }
         // Preserve the priority ordering while rendering the IM list as a
         // delegation tree. A malformed cycle becomes a flat tail instead of
@@ -14763,19 +15299,30 @@ impl Gateway {
                 .and_then(|context| context.pct())
                 .map(|percent| format!("{percent:.0}%"))
                 .unwrap_or_else(|| "—".to_string());
-            let status_label = if waiting_sids.contains(&s.id) {
-                "⏳ ожидание".to_string()
-            } else {
-                match self.live_turn(s, Instant::now()) {
-                    Some(live) if live.is_stuck() => "🔴 зависание".to_string(),
-                    Some(_) => "🔵 работает".to_string(),
-                    None => "🟢 ожидание".to_string(),
-                }
+            // Raw activity classification, NOT a display string — `im_views`
+            // is the single place that turns this into an icon + Russian
+            // label (§3.5b, F4/SPEC-2), so this and the two other classifiers
+            // below can never render contradicting icons on one line again.
+            //
+            // SPEC-3.5b-waiting-arm-outside-palette — a HITL-pinned session
+            // (`waiting_sids`) sorts to the top of the list (above, `visible.
+            // sort_by_key`) but is NOT its own activity: §3.5b's palette has
+            // exactly `working`/`idle`/`stale`/`stuck`/unknown, and `⏳` is
+            // reserved for "finishing a turn started before restart" /
+            // detached-tail, not a live-session state. Falling through to
+            // the real classification here means a HITL-pinned session
+            // still reads as 🔵 работает (it IS actively running, waiting on
+            // the human) instead of an undocumented icon indistinguishable
+            // from `idle`'s "ожидание".
+            let status_activity = match self.live_turn(s, Instant::now()) {
+                Some(live) if live.is_stuck() => "stuck",
+                Some(_) => "working",
+                None => "idle",
             };
             view_rows.push(SessionRow {
                 sid: s.id.clone(),
                 vendor_model: format!("{}.{}", vendor_str(s.vendor), model),
-                status: status_label,
+                status: status_activity.to_string(),
                 context,
                 title: self.session_title(s),
                 current: current_sid.as_deref() == Some(s.id.as_str()),
@@ -15002,7 +15549,7 @@ impl Gateway {
             .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .collect();
         if visible.is_empty() {
-            return RichReply::plain("Нет сессий — создайте через /new");
+            return im_views::plain_with_refresh("Нет сессий — создайте через /new", "/status");
         }
         // /status = the chat's CURRENT (focused) session in DEPTH; /sessions is
         // the full fleet list. Resolve the focused sid; if none is set (or it has
@@ -15022,11 +15569,17 @@ impl Gateway {
             let cur = self.current_project_label(chat);
             let in_proj = visible.iter().filter(|s| s.project == cur).count();
             return if in_proj > 0 {
-                RichReply::plain(format!(
-                    "📁 Текущий проект: {cur}\nНет текущей сессии — выберите через /use <id> (в проекте: {in_proj}; все — /sessions)"
-                ))
+                im_views::plain_with_refresh(
+                    format!(
+                        "📁 Текущий проект: {cur}\nНет текущей сессии — выберите через /use <id> (в проекте: {in_proj}; все — /sessions)"
+                    ),
+                    "/status",
+                )
             } else {
-                RichReply::plain(format!("📁 Текущий проект: {cur}\nВ этом проекте нет сессий — отправьте сообщение или /new"))
+                im_views::plain_with_refresh(
+                    format!("📁 Текущий проект: {cur}\nВ этом проекте нет сессий — отправьте сообщение или /new"),
+                    "/status",
+                )
             };
         };
 
@@ -15056,23 +15609,50 @@ impl Gateway {
         // Same in-flight verdict the child rows / MCP / web get
         // ([`Gateway::live_turn`]) — this line only dresses it with durations.
         let live = self.live_turn(s, Instant::now());
-        let (state, detail) = match live {
-            None => ("🟢", "ожидание".to_string()),
+        // §3.5d — `activity` is the RAW token [`im_views::activity_badge`]
+        // renders the line-2 badge from (never a pre-formatted display
+        // string, so a palette rename can't drift this card out of sync
+        // with `/sessions`); `activity_detail` is the elapsed/silent-duration
+        // phrase, `None` for idle (its label alone would just repeat line 2
+        // with no new information) and `Some` for working/stuck, where
+        // `im_views` folds it into the SAME "Запущено: …" part as a comma
+        // suffix (R1 fix — `launched` used to be fed this phrase directly,
+        // which read as "Запущено: ожидание" for the common idle case and
+        // never carried an actual launch time; SPEC-3.5D-R2-2 fix — it then
+        // rode as its OWN extra `·`-joined part, growing the quote past the
+        // spec's four).
+        let (activity, activity_detail) = match live {
+            // No turn in flight but a task that outlives the turn (background
+            // shell, workflow) is still running — the session IS doing
+            // something. "ожидание" here is what read as "nothing happening"
+            // while a child ran the test suite (owner 2026-09-03; the `▶`
+            // row already named the task, the badge contradicted it).
+            None if running.iter().any(|t| t.outlives_turn()) => {
+                let label = im_views::activity_badge("working").1;
+                ("working", Some(format!("{label}, фоновая задача")))
+            }
+            None => ("idle", None),
             // Running subagents ⇒ definitively working (overrides silence).
-            Some(l) if l.is_stuck() && !turn_scoped_running => (
-                "🔴",
-                format!(
-                    "ЗАВИСАНИЕ: нет событий {}",
-                    humanize_dur(std::time::Duration::from_secs(l.silent_seconds))
-                ),
-            ),
-            Some(l) => (
-                "🔵",
-                format!(
-                    "работает {}",
-                    humanize_dur(std::time::Duration::from_secs(l.elapsed_seconds))
-                ),
-            ),
+            Some(l) if l.is_stuck() && !turn_scoped_running => {
+                let label = im_views::activity_badge("stuck").1;
+                (
+                    "stuck",
+                    Some(format!(
+                        "{label}: нет событий {}",
+                        humanize_dur(std::time::Duration::from_secs(l.silent_seconds))
+                    )),
+                )
+            }
+            Some(l) => {
+                let label = im_views::activity_badge("working").1;
+                (
+                    "working",
+                    Some(format!(
+                        "{label} {}",
+                        humanize_dur(std::time::Duration::from_secs(l.elapsed_seconds))
+                    )),
+                )
+            }
         };
 
         let model = status
@@ -15107,13 +15687,14 @@ impl Gateway {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "—".to_string());
         let child_activity = self.session_activity_snapshot(&direct_children);
-        let child_summary = direct_children
+        let children: Vec<StatusChild> = direct_children
             .iter()
             .map(|child| {
                 let activity = child_activity
                     .get(&child.id)
                     .map(String::as_str)
-                    .unwrap_or("idle");
+                    .unwrap_or("idle")
+                    .to_string();
                 let child_model = probes
                     .statuses
                     .get(&child.id)
@@ -15123,92 +15704,100 @@ impl Gateway {
                     .filter(|model| !model.is_empty())
                     .map(|model| strip_vendor_prefix(vendor_str(child.vendor), model).to_string())
                     .unwrap_or_else(|| "—".to_string());
-                let title = self
-                    .session_title(child)
-                    .and_then(|title| truncate_title(&title))
-                    .unwrap_or_else(|| "—".to_string());
-                (
-                    child.id.clone(),
-                    format!(
-                        "{} · {} · {child_model} · {} · {title}",
-                        child.id,
-                        vendor_str(child.vendor),
-                        activity_marker(activity)
-                    ),
-                )
+                StatusChild {
+                    sid: child.id.clone(),
+                    vendor: vendor_str(child.vendor).to_string(),
+                    model: child_model,
+                    activity,
+                    title: self
+                        .session_title(child)
+                        .and_then(|title| truncate_title(&title)),
+                }
             })
-            .collect::<Vec<_>>();
+            .collect();
         let role = if s.role.is_empty() { "—" } else { &s.role };
         let resume = thread_vendor_uuid(&s.thread).unwrap_or_else(|| "—".to_string());
-        let mut detail_lines = vec![format!("Запущено: {detail} · Роль: {role}")];
-        let running_task_lines = format_running_tasks(running)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        if !running_task_lines.is_empty() {
-            detail_lines.push(String::new());
-            detail_lines.extend(running_task_lines);
-        }
-        if let Some(goal) = status.and_then(|status| status.goal.as_ref()) {
-            let condition = goal.condition.trim();
-            if !condition.is_empty() {
-                let marker = if goal.met { "✅" } else { "🎯" };
-                let shown: String = if condition.chars().count() > 60 {
-                    format!("{}…", condition.chars().take(59).collect::<String>())
-                } else {
-                    condition.to_string()
+        // §3.5d — the `▶` row shows the OLDEST running task's own
+        // description/kind + elapsed (`format_running_tasks`' first line
+        // after its `🤖 Выполняется: …` header, oldest first — same "on top"
+        // rule), capped to 60 chars. R1 fix — this must NOT read
+        // `format_running_tasks(running).lines().next()`: that string's
+        // first line is always the aggregate counts header itself (`🤖
+        // Выполняется: subagent (1)`), never a task; the per-task
+        // description/elapsed the spec's `▶ cargo test --workspace, 2 мин`
+        // mock shows only appears on later lines, which this row never saw.
+        // The full multi-task breakdown that used to fill the old card's
+        // detail section stays gone from `/status` (still available via
+        // other surfaces) — only the single lead task rides this row.
+        //
+        // R2-1 fix — the lead task must be the OLDEST TURN-SCOPED one first
+        // (same `outlives_turn` axis `turn_scoped_running` above already
+        // partitions on), falling back to the oldest outliving-turn task
+        // only when nothing turn-scoped is running. Picking the plain
+        // oldest across the whole slice let a long-lived background
+        // shell/monitor permanently hide the subagent actually driving the
+        // CURRENT turn. A `(+N)` suffix is appended whenever more than one
+        // task is running, so the row admits it is a lead task, not the
+        // whole picture.
+        let running_task = {
+            let lead = running
+                .iter()
+                .filter(|t| !t.outlives_turn())
+                .min_by_key(|t| t.started)
+                .or_else(|| running.iter().min_by_key(|t| t.started));
+            lead.map(|t| {
+                let kind = match t.task_type.as_str() {
+                    "local_workflow" => "workflow",
+                    "local_bash" => "фон",
+                    _ if t.kind.is_empty() => "subagent",
+                    _ => t.kind.as_str(),
                 };
-                detail_lines.push(String::new());
-                detail_lines.push(format!("{marker} {shown}"));
-            }
-        }
-        let usage_lines = probes
+                let elapsed = humanize_dur(t.started.elapsed());
+                let desc = t.description.trim();
+                let label = if desc.is_empty() { kind } else { desc };
+                let line = format!("{label}, {elapsed}");
+                let line = if line.chars().count() > 60 {
+                    format!("{}…", line.chars().take(59).collect::<String>())
+                } else {
+                    line
+                };
+                if running.len() > 1 {
+                    format!("{line} (+{})", running.len() - 1)
+                } else {
+                    line
+                }
+            })
+        };
+        let goal = status
+            .and_then(|status| status.goal.as_ref())
+            .and_then(|goal| {
+                let condition = goal.condition.trim();
+                (!condition.is_empty()).then(|| {
+                    let shown: String = if condition.chars().count() > 60 {
+                        format!("{}…", condition.chars().take(59).collect::<String>())
+                    } else {
+                        condition.to_string()
+                    };
+                    (goal.met, shown)
+                })
+            });
+        let usage = probes
             .account_usages
             .iter()
             .filter_map(|(label, usage)| {
                 format_account_usage(usage).map(|usage| format!("{label}: {usage}"))
             })
             .collect::<Vec<_>>();
-        if !usage_lines.is_empty() {
-            detail_lines.push(String::new());
-            detail_lines.push("⚡️ Использование:".to_string());
-            detail_lines.extend(usage_lines);
-        }
-        let mut children = Vec::new();
-        if !child_summary.is_empty() {
-            detail_lines.push(String::new());
-            detail_lines.push(format!("👥 Дочерние ({}):", child_summary.len()));
-            for (index, (sid, child)) in child_summary.into_iter().enumerate() {
-                if index > 0 {
-                    detail_lines.push(String::new());
-                }
-                let detail_line_index = detail_lines.len();
-                detail_lines.push(format!("  • {child}"));
-                children.push(StatusChild {
-                    sid,
-                    detail_line_index,
-                });
-            }
-        }
-        let same_project_sessions = visible
+        // R1-2 fix — TOTAL visible sessions in this project, INCLUDING the
+        // current one, matching both what `/sessions` lists for the project
+        // and the `проектов <k>` counter next to it (also a total, not an
+        // "others" count) — a bare `+1` on the old "other sessions" count
+        // would leave the field's name lying about what it holds.
+        let project_sessions_total = visible
             .iter()
-            .filter(|other| other.project == s.project && other.id != s.id)
+            .filter(|other| other.project == s.project)
             .count();
-        if same_project_sessions > 0 {
-            detail_lines.push(String::new());
-            detail_lines.push(format!(
-                "↓ Другие сессии проекта: {same_project_sessions} → /sessions"
-            ));
-        }
-        if same_project_sessions == 0 {
-            detail_lines.push(String::new());
-        }
-        detail_lines.push(format!(
-            "↓ Все проекты: {} → /projects",
-            self.visible_project_slugs(chat).len()
-        ));
+        let projects_total = self.visible_project_slugs(chat).len();
         let cost_24h = self
             .progress_projection
             .as_ref()
@@ -15235,29 +15824,60 @@ impl Gateway {
                     )
                 };
                 format!(
-                    "💰 Расход проекта 24ч: {usd} · {} токенов",
+                    "{usd} · {} токенов",
                     format_token_volume(snapshot.tokens_24h)
                 )
             })
-            .unwrap_or_else(|| "💰 Расход проекта 24ч: нет данных".to_string());
+            .unwrap_or_else(|| "нет данных".to_string());
+        // SPEC-3.5D-1 fix — `launched` is the session's actual spawn time
+        // (`meta.created_at`, the same RFC3339 field `session_views` reads
+        // for the REST/web session list), formatted as "<elapsed> назад" —
+        // NOT the activity-elapsed/silent-duration phrase (that rides
+        // `activity_detail` instead, see above). An unparseable/missing
+        // `created_at` (never blocks the card) degrades to an honest `—`.
+        let launched = self
+            .session_catalog
+            .get(&s.id)
+            .map(|entry| entry.meta.created_at)
+            .filter(|c| !c.is_empty())
+            .and_then(|c| chrono::DateTime::parse_from_rfc3339(&c).ok())
+            .map(|dt| {
+                let secs = chrono::Utc::now()
+                    .signed_duration_since(dt.with_timezone(&chrono::Utc))
+                    .num_seconds()
+                    .max(0) as u64;
+                format!(
+                    "{} назад",
+                    humanize_dur_ru(std::time::Duration::from_secs(secs))
+                )
+            })
+            .unwrap_or_else(|| "—".to_string());
         im_views::render_status(&StatusView {
             sid: s.id.clone(),
-            project: s.project.clone(),
             vendor: vendor_str(s.vendor).to_string(),
-            state: format!("{state} {detail}"),
             model: model.to_string(),
             effort: effort.to_string(),
-            context,
+            title: self.session_title(s),
+            slug: s.project.clone(),
             path,
             host: if s.host.is_empty() {
                 "local".to_string()
             } else {
                 s.host.clone()
             },
-            detail_lines,
+            activity: activity.to_string(),
+            context,
             cost_24h,
-            resume,
+            running_task,
+            goal,
+            usage,
             children,
+            project_sessions_total,
+            projects_total,
+            launched,
+            activity_detail,
+            role: role.to_string(),
+            resume,
         })
     }
 
@@ -15290,6 +15910,676 @@ impl Gateway {
             })
             .collect();
         im_views::render_projects(&ProjectsView { projects })
+    }
+
+    /// `(slug, path)` pairs [`fs_browser::list`] marks folders against —
+    /// LOCAL projects only (a satellite entry's `path` is a directory on a
+    /// REMOTE host, meaningless against a local `projects_root` walk).
+    ///
+    /// FS-SEC-R2-1 — deliberately UNFILTERED by `chat`'s ACL: every local
+    /// project, visible or not, must be recognized as registered so a
+    /// tenant-owned directory this operator can't see is marked `slug =
+    /// Some(_)` by [`fs_browser::list`] and never falls into the
+    /// `entry.slug.is_none()` "plain, unregistered, enterable/bootstrappable
+    /// folder" branch its callers use. Filtering this list by ACL (the
+    /// pre-R2-1 behavior) hid exactly that fact, letting the browser render
+    /// a hidden project as an empty folder offering `📁 Открыть` → `📌
+    /// Сделать проектом` — confirming which re-bootstraps the tenant's
+    /// `.ccteam/state.json` and hands the operator ownership of it. ACL
+    /// visibility is layered back in at each consumption site (which slugs
+    /// render "✅ switchable" vs. inert-🔒 — see [`im_views::FsEntryView::visible`]
+    /// — and which are pickable) via `visible_project_slugs`.
+    fn fs_browser_registered(&self, paths: &CcteamPaths) -> Vec<(String, PathBuf)> {
+        ccteam_core::config::load(&paths.root)
+            .map(|cfg| {
+                cfg.projects
+                    .into_iter()
+                    .filter(|p| p.host == ccteam_core::LOCAL_HOST)
+                    .map(|p| (p.slug, p.path))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Render the operator folder browser at `rel`/`page`, and the CLAMPED
+    /// `FsNav` [`fs_browser::list`] actually rendered (its `page` is clamped
+    /// into `1..=pages`; callers persist THIS value, not the requested one,
+    /// so the next `fs:pg:` tap starts from where the user actually landed).
+    /// `None` only when `rel` no longer resolves AT ALL (escaped the root, or
+    /// vanished — §3.7); a directory that resolves but fails to `read_dir`
+    /// (permission denied) still renders, with [`im_views::FsBrowserView::error`]
+    /// set instead of entries.
+    ///
+    /// FS-SEC-4 — `resolve`+`list` (canonicalize + `read_dir`, unbounded by
+    /// directory size) run in [`fs_resolve_and_list`], off the tokio runtime
+    /// thread, so a slow/huge directory doesn't stall every other chat this
+    /// gateway serves while its mutex is held.
+    async fn render_fs_page(
+        &self,
+        chat: &ChatKey,
+        paths: &CcteamPaths,
+        rel: &Path,
+        page: usize,
+        chat_project: Option<String>,
+    ) -> Option<(RichReply, FsNav)> {
+        let root_display = paths.projects_root.display().to_string();
+        let registered = self.fs_browser_registered(paths);
+        // FS-SEC-R2-1 — visibility is layered on top of `registered`
+        // (unfiltered by ACL) here, per-entry, rather than by hiding a
+        // hidden project's registration from `fs_browser::list` itself.
+        let visible: BTreeSet<String> = self.visible_project_slugs(chat).into_iter().collect();
+        let outcome = fs_resolve_and_list(
+            paths.projects_root.clone(),
+            rel.to_path_buf(),
+            registered,
+            page,
+        )
+        .await?;
+        let (nav, view) = match outcome {
+            Ok(listed) => {
+                // F9/SPEC-4 — never reached on this branch (error is None),
+                // computed here so it's available before `listed.entries`
+                // moves into the view below.
+                let page_fingerprint = fs_browser::fingerprint(&listed.rel, &listed.entries);
+                (
+                    FsNav {
+                        rel: listed.rel.clone(),
+                        page: listed.page,
+                    },
+                    im_views::FsBrowserView {
+                        root_display,
+                        rel: listed.rel,
+                        entries: listed
+                            .entries
+                            .into_iter()
+                            .map(|e| {
+                                let entry_visible =
+                                    e.slug.as_deref().is_none_or(|slug| visible.contains(slug));
+                                im_views::FsEntryView {
+                                    name: e.name,
+                                    visible: entry_visible,
+                                    slug: e.slug,
+                                }
+                            })
+                            .collect(),
+                        page: listed.page,
+                        pages: listed.pages,
+                        current_slug: listed.current_slug,
+                        chat_project,
+                        error: None,
+                        page_fingerprint,
+                    },
+                )
+            }
+            Err(err) => (
+                FsNav {
+                    rel: rel.to_path_buf(),
+                    page: 1,
+                },
+                im_views::FsBrowserView {
+                    root_display,
+                    rel: rel.to_path_buf(),
+                    entries: Vec::new(),
+                    page: 1,
+                    pages: 1,
+                    current_slug: None,
+                    chat_project,
+                    // F9/SPEC-4 — the full anyhow chain (e.g. the underlying
+                    // `io::Error` text), not just the outermost `with_context`
+                    // wrapper (`err.to_string()` would drop "Permission
+                    // denied (os error 13)" entirely).
+                    error: Some(format!("{err:#}")),
+                    page_fingerprint: String::new(),
+                },
+            ),
+        };
+        Some((im_views::render_fs_browser(&view), nav))
+    }
+
+    /// The operator folder browser at the chat's current [`FsNav`] cursor
+    /// (`/projects` and bare `/cd`, §3.2/§3.3/§3.6) — `None` only when
+    /// project creation isn't wired ([`Gateway::enable_project_creation`]).
+    /// A vanished/escaped `rel` resets `fs_nav` to the root and renders that
+    /// instead of failing the command outright.
+    async fn render_operator_fs_browser(&mut self, chat: &ChatKey) -> Option<RichReply> {
+        let paths = self.project_paths.clone()?;
+        let nav = self.fs_nav.get(chat).cloned().unwrap_or_default();
+        let chat_project = self.current_project_for(chat);
+        let (reply, nav) = match self
+            .render_fs_page(chat, &paths, &nav.rel, nav.page, chat_project.clone())
+            .await
+        {
+            Some(rendered) => rendered,
+            None => {
+                self.render_fs_page(chat, &paths, Path::new(""), 1, chat_project)
+                    .await?
+            }
+        };
+        self.fs_nav.insert(chat.clone(), nav);
+        Some(reply)
+    }
+
+    /// Render+deliver the browser page at `rel`/`page` (a `fs:*` callback
+    /// outcome), editing the tapped message in place via [`Self::emit_fs_reply`]
+    /// and persisting the rendered (clamped) `rel`/`page` into `fs_nav`. A
+    /// `rel` that no longer resolves at all falls back to the root page,
+    /// prefixed "папка недоступна" (§3.7). `notice`, when given, prefixes a
+    /// successfully rendered page too — the "list changed, tap again" nudge
+    /// (§3.3) a stale `fs:i:`/`fs:pick:` index re-render carries.
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_fs_page(
+        &mut self,
+        chat: &ChatKey,
+        paths: &CcteamPaths,
+        message_id: &str,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+        rel: &Path,
+        page: usize,
+        notice: Option<&str>,
+    ) {
+        let chat_project = self.current_project_for(chat);
+        let (mut reply, nav, prefix) = match self
+            .render_fs_page(chat, paths, rel, page, chat_project.clone())
+            .await
+        {
+            Some((reply, nav)) => (reply, nav, notice.map(str::to_string)),
+            None => match self
+                .render_fs_page(chat, paths, Path::new(""), 1, chat_project)
+                .await
+            {
+                Some((reply, nav)) => (
+                    reply,
+                    nav,
+                    Some(match notice {
+                        Some(notice) => format!("{notice}\n\nпапка недоступна"),
+                        None => "папка недоступна".to_string(),
+                    }),
+                ),
+                None => {
+                    self.fs_nav.remove(chat);
+                    self.emit_fs_reply(
+                        chat,
+                        message_id,
+                        callback,
+                        RichReply::plain("папка недоступна"),
+                    );
+                    return;
+                }
+            },
+        };
+        self.fs_nav.insert(chat.clone(), nav);
+        if let Some(prefix) = prefix {
+            reply.markdown = format!("{prefix}\n\n{}", reply.markdown);
+            reply.plain = format!("{prefix}\n\n{}", reply.plain);
+        }
+        self.emit_fs_reply(chat, message_id, callback, reply);
+    }
+
+    /// Deliver one `fs:*` outcome (§3.5 "редактируется на месте, как список
+    /// сессий") — edits the tapped message in place when a Telegram platform
+    /// id resolves and no ephemeral callback is in play (the common
+    /// private-chat case; mirrors [`Self::route_callback_replies`]'s own
+    /// edit-vs-ephemeral split for `nav:cd:`/`nav:use:`), else falls back to
+    /// [`Self::emit_button_rows`]'s send/ephemeral path.
+    ///
+    /// F2/SPEC-3 — `button_rows` always rides along now (never zeroed): the
+    /// classic fallback needs it for its own keyboard regardless of what the
+    /// rich markdown embeds, and `inline_buttons` (carried on the edit event
+    /// itself, F2 fix) is what tells the RICH leg alone to skip re-appending
+    /// it as a trailing block. F5 — `reply.plain` is `content` (never
+    /// `reply.markdown`, which may embed `<tg-button>` source tags): the
+    /// ephemeral/non-Telegram fallback path never renders Rich Messages
+    /// markdown, so sending it there only risks leaking the tags as literal
+    /// text; `reply.markdown` still rides separately into the edit path,
+    /// where a rich-capable channel alone reads it.
+    fn emit_fs_reply(
+        &self,
+        chat: &ChatKey,
+        message_id: &str,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+        reply: RichReply,
+    ) {
+        let cid = crate::transport::safe_correlation_id(message_id);
+        if callback.is_none() {
+            if let Some(platform_message_id) = telegram_callback_message_id(message_id) {
+                self.emit_fs_edit(
+                    chat,
+                    &cid,
+                    platform_message_id,
+                    reply.plain,
+                    Some(reply.markdown),
+                    reply.inline_buttons,
+                    reply.button_rows,
+                );
+                return;
+            }
+        }
+        self.emit_button_rows(chat, &cid, reply.plain, reply.button_rows, callback);
+    }
+
+    /// Edit an arbitrary already-sent message with fresh content AND button
+    /// rows — the `fs:*` twin of [`Self::emit_confirmation_edit`], which
+    /// hardcodes an empty row set (and no separate rich markdown) because its
+    /// only callers (the `cmd:!`/`cmd:x` acknowledgement) never need either.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fs_edit(
+        &self,
+        chat: &ChatKey,
+        cid: &str,
+        platform_message_id: String,
+        content: String,
+        rich_markdown: Option<String>,
+        inline_buttons: bool,
+        button_rows: Vec<Vec<MessageOption>>,
+    ) {
+        self.emit_user_signal(GatewayEvent {
+            id: format!("gateway-fs-edit-{}-{platform_message_id}", chat.chat_id),
+            cid: Some(cid.to_string()),
+            channel: chat.channel.clone(),
+            chat_id: chat.chat_id.clone(),
+            thread_ts: None,
+            content,
+            kind: GatewayEventKind::EditMessage {
+                message_id: platform_message_id,
+                rich_markdown,
+                inline_buttons,
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            button_rows,
+            sid: None,
+            slug: None,
+        });
+    }
+
+    /// The post-switch/-create acknowledgement (§3.5 "После создания…") —
+    /// same two-button footer for switching into an already-registered
+    /// folder and for one just created; only `status_line` differs
+    /// ("текущий проект" vs "проект создан и выбран").
+    fn fs_switch_reply(&self, slug: &str, abs: &Path, status_line: &str) -> RichReply {
+        // FS-SEC-3 — `abs` names a directory an attacker with write access
+        // under `projects_root` chose (any `<`/`>` in it, legal on Linux,
+        // would otherwise ride unescaped into Rich Messages markdown, unlike
+        // every other browser line, which goes through
+        // `escape_status_markdown`).
+        let abs_display = abs.display().to_string();
+        let plain = format!("✅ {slug} · {abs_display}\n{status_line}");
+        let markdown = format!(
+            "✅ {slug} · {}\n{status_line}",
+            im_views::escape_status_markdown(&abs_display)
+        );
+        RichReply {
+            markdown,
+            plain,
+            button_rows: vec![vec![
+                MessageOption {
+                    data: "cmd:/sessions".to_string(),
+                    label: "💬 Сессии".to_string(),
+                    id: "sessions".to_string(),
+                    style: None,
+                },
+                MessageOption {
+                    data: "cmd:?/new".to_string(),
+                    label: "✏️ Новая".to_string(),
+                    id: "new".to_string(),
+                    style: None,
+                },
+            ]],
+            inline_buttons: false,
+            reply_keyboard: None,
+        }
+    }
+
+    /// Resolve one `nav:fs:*` callback (§3.3) — folder-browser navigation,
+    /// pick, and create-here. Operator-only (§3.6: every other principal
+    /// gets "недоступно" and touches no filesystem). Every branch delivers
+    /// via [`Self::emit_fs_page`]/[`Self::emit_fs_reply`] directly, so this
+    /// never returns anything through the normal reply list — the caller
+    /// ([`Self::resolve_nav_selection`]) always gets an empty one back.
+    async fn resolve_fs_nav(
+        &mut self,
+        chat: &ChatKey,
+        action: &str,
+        message_id: &str,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+    ) {
+        if !matches!(self.principal(chat), Principal::Operator) {
+            self.emit_fs_reply(chat, message_id, callback, RichReply::plain("недоступно"));
+            return;
+        }
+        let Some(paths) = self.project_paths.clone() else {
+            self.emit_fs_reply(
+                chat,
+                message_id,
+                callback,
+                RichReply::plain("Создание проектов не настроено в этом daemon"),
+            );
+            return;
+        };
+        let nav = self.fs_nav.get(chat).cloned().unwrap_or_default();
+
+        if let Some(fp) = action.strip_prefix("up:") {
+            // R2-3 — validate against a FRESH render of `nav.rel`/`nav.page`
+            // before walking up, the same staleness contract `i:`/`pick:`
+            // already apply: a tap on an OLDER browser message (this chat
+            // navigated a newer one elsewhere since) must not silently act
+            // on whatever directory the shared `fs_nav` cursor now points
+            // at instead of the folder that message actually displays.
+            let registered = self.fs_browser_registered(&paths);
+            let fresh = fs_resolve_and_list(
+                paths.projects_root.clone(),
+                nav.rel.clone(),
+                registered,
+                nav.page,
+            )
+            .await
+            .and_then(Result::ok)
+            .filter(|listed| fs_browser::fingerprint(&listed.rel, &listed.entries) == fp);
+            if fresh.is_none() {
+                self.emit_fs_page(
+                    chat,
+                    &paths,
+                    message_id,
+                    callback,
+                    &nav.rel,
+                    nav.page,
+                    Some(FS_STALE_NOTICE),
+                )
+                .await;
+                return;
+            }
+            // `parent(root) == None` doubles as the "already at root" no-op
+            // signal — the Up button never renders there, but a stale tap
+            // (race) just re-shows the same page rather than erroring.
+            let target = fs_browser::parent(&nav.rel).unwrap_or_else(|| nav.rel.clone());
+            self.emit_fs_page(chat, &paths, message_id, callback, &target, 1, None)
+                .await;
+            return;
+        }
+
+        if let Some(rest) = action.strip_prefix("i:") {
+            // FS-SEC-2/F7/F8 — `<n>:<fp>`: `<fp>` is the fingerprint of the
+            // exact page THIS button was rendered from (§3.3's "index
+            // checked against a fresh list" contract), not just an
+            // in-range check against whatever the chat's nav cursor
+            // currently points at (which may by now be a different
+            // directory, or the same directory shrunk to a different page —
+            // both change the fingerprint, neither changes whether `idx` is
+            // in-range of the FRESH list).
+            let (idx, fp) = match parse_idx_fp(rest) {
+                Some(parsed) => parsed,
+                None => {
+                    self.emit_fs_page(
+                        chat,
+                        &paths,
+                        message_id,
+                        callback,
+                        &nav.rel,
+                        nav.page,
+                        Some(FS_STALE_NOTICE),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let registered = self.fs_browser_registered(&paths);
+            let entry = fs_resolve_and_list(
+                paths.projects_root.clone(),
+                nav.rel.clone(),
+                registered,
+                nav.page,
+            )
+            .await
+            .and_then(Result::ok)
+            .filter(|listed| fs_browser::fingerprint(&listed.rel, &listed.entries) == fp)
+            .and_then(|listed| {
+                listed
+                    .entries
+                    .into_iter()
+                    .nth(idx)
+                    .map(|entry| (listed.rel, entry))
+            });
+            match entry {
+                Some((base_rel, entry)) if entry.slug.is_none() => {
+                    let target = base_rel.join(&entry.name);
+                    self.emit_fs_page(chat, &paths, message_id, callback, &target, 1, None)
+                        .await;
+                }
+                _ => {
+                    self.emit_fs_page(
+                        chat,
+                        &paths,
+                        message_id,
+                        callback,
+                        &nav.rel,
+                        nav.page,
+                        Some(FS_STALE_NOTICE),
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
+
+        if let Some(rest) = action.strip_prefix("pick:") {
+            let (idx, fp) = match parse_idx_fp(rest) {
+                Some(parsed) => parsed,
+                None => {
+                    self.emit_fs_page(
+                        chat,
+                        &paths,
+                        message_id,
+                        callback,
+                        &nav.rel,
+                        nav.page,
+                        Some(FS_STALE_NOTICE),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let registered = self.fs_browser_registered(&paths);
+            // FS-SEC-R2-1 — `registered` is unfiltered, so a hidden
+            // project's directory now correctly renders `slug = Some(_)`
+            // (inert, no button — `im_views::render_fs_browser`); this
+            // filter is the belt to that suspenders' braces, refusing to
+            // switch into a slug this chat can't see even if a callback
+            // for it is crafted by hand.
+            let visible: BTreeSet<String> = self.visible_project_slugs(chat).into_iter().collect();
+            let slug = fs_resolve_and_list(
+                paths.projects_root.clone(),
+                nav.rel.clone(),
+                registered,
+                nav.page,
+            )
+            .await
+            .and_then(Result::ok)
+            .filter(|listed| fs_browser::fingerprint(&listed.rel, &listed.entries) == fp)
+            .and_then(|listed| listed.entries.into_iter().nth(idx).and_then(|e| e.slug))
+            .filter(|slug| visible.contains(slug));
+            let Some(slug) = slug else {
+                self.emit_fs_page(
+                    chat,
+                    &paths,
+                    message_id,
+                    callback,
+                    &nav.rel,
+                    nav.page,
+                    Some(FS_STALE_NOTICE),
+                )
+                .await;
+                return;
+            };
+            self.switch_or_report(chat, message_id, callback, &slug);
+            return;
+        }
+
+        if let Some(rest) = action.strip_prefix("pg:") {
+            let target_page = rest.parse::<usize>().unwrap_or(nav.page).max(1);
+            self.emit_fs_page(
+                chat,
+                &paths,
+                message_id,
+                callback,
+                &nav.rel,
+                target_page,
+                None,
+            )
+            .await;
+            return;
+        }
+
+        if let Some(fp) = action.strip_prefix("here:") {
+            self.resolve_fs_here(chat, &paths, &nav, fp, message_id, callback)
+                .await;
+            return;
+        }
+
+        self.emit_fs_reply(
+            chat,
+            message_id,
+            callback,
+            RichReply::plain("Некорректный выбор"),
+        );
+    }
+
+    /// `fs:pick:`/`fs:here` on an already-registered folder — switch and
+    /// acknowledge, or surface `change_project`'s error verbatim (e.g. a
+    /// race where the project was retired between render and tap).
+    fn switch_or_report(
+        &mut self,
+        chat: &ChatKey,
+        message_id: &str,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+        slug: &str,
+    ) {
+        match self.change_project(chat, slug) {
+            Ok(_) => {
+                self.fs_nav.remove(chat);
+                let abs = self.projects.get(slug).cloned().unwrap_or_default();
+                let reply = self.fs_switch_reply(slug, &abs, "текущий проект");
+                self.emit_fs_reply(chat, message_id, callback, reply);
+            }
+            Err(err) => {
+                self.emit_fs_reply(
+                    chat,
+                    message_id,
+                    callback,
+                    RichReply::plain(err.to_string()),
+                );
+            }
+        }
+    }
+
+    /// `nav:fs:here` (§3.4): the listed folder is either already a project
+    /// (switch, same as `fs:pick:`) or not (raise the `cmd:?` confirmation
+    /// gate, carrying the resolved `(slug, rel, abs)` directly — see
+    /// [`Self::register_create_project_confirmation`]/FS-SEC-R2-2 — whose
+    /// `cmd:!`/`cmd:x` resolution is [`Self::resolve_cmd_callback`]'s
+    /// `Confirmed`/`Cancelled` arms). The root can never be made a project.
+    ///
+    /// R2-3 — `fp` is the fingerprint the button that triggered this carried
+    /// (the page it was rendered from); like `i:`/`pick:`, a fresh render of
+    /// `nav.rel`/`nav.page` that no longer matches it means a tap on a
+    /// stale/older browser message, and gets the same [`FS_STALE_NOTICE`]
+    /// re-render every other branch gives it — checked AFTER the root
+    /// refusal (a stale root tap should still read as "root", not "stale").
+    async fn resolve_fs_here(
+        &mut self,
+        chat: &ChatKey,
+        paths: &CcteamPaths,
+        nav: &FsNav,
+        fp: &str,
+        message_id: &str,
+        callback: Option<&crate::transport::CallbackEphemeral>,
+    ) {
+        if nav.rel.as_os_str().is_empty() {
+            self.emit_fs_page(
+                chat,
+                paths,
+                message_id,
+                callback,
+                &nav.rel,
+                nav.page,
+                Some("⛔ корень нельзя сделать проектом"),
+            )
+            .await;
+            return;
+        }
+        let registered = self.fs_browser_registered(paths);
+        let listed = match fs_resolve_and_list(
+            paths.projects_root.clone(),
+            nav.rel.clone(),
+            registered,
+            nav.page,
+        )
+        .await
+        {
+            Some(Ok(listed)) if fs_browser::fingerprint(&listed.rel, &listed.entries) == fp => {
+                listed
+            }
+            Some(Ok(_)) => {
+                self.emit_fs_page(
+                    chat,
+                    paths,
+                    message_id,
+                    callback,
+                    &nav.rel,
+                    nav.page,
+                    Some(FS_STALE_NOTICE),
+                )
+                .await;
+                return;
+            }
+            Some(Err(_)) | None => {
+                self.emit_fs_page(chat, paths, message_id, callback, &nav.rel, nav.page, None)
+                    .await;
+                return;
+            }
+        };
+        if let Some(slug) = listed.current_slug.clone() {
+            self.switch_or_report(chat, message_id, callback, &slug);
+            return;
+        }
+        let abs_display = listed.abs.display().to_string();
+        let base = ccteam_core::projects::slugify(
+            listed
+                .abs
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("project"),
+        );
+        let slug = match ccteam_core::config::pick_unused_project_slug(&paths.root, &base) {
+            Ok(slug) => slug,
+            Err(err) => {
+                self.emit_fs_reply(
+                    chat,
+                    message_id,
+                    callback,
+                    RichReply::plain(err.to_string()),
+                );
+                return;
+            }
+        };
+        // FS-SEC-3 — `abs_display` names a directory an attacker with write
+        // access under `projects_root` chose; escape it the same way every
+        // other browser line does before it rides into Rich Messages
+        // markdown.
+        let prompt = format!(
+            "Сделать проектом {} ?\nслаг: {slug}",
+            im_views::escape_status_markdown(&abs_display)
+        );
+        let cid = crate::transport::safe_correlation_id(message_id);
+        // FS-SEC-R2-2 — `rel`/`abs` ride the confirmation as PathBufs, not
+        // a whitespace-tokenized command string: a directory name with
+        // leading/trailing whitespace (legal on Linux) would otherwise be
+        // silently mangled by the generic `/newproject` parser's `trim()`,
+        // landing the eventual write on a DIFFERENT directory than the one
+        // this very prompt names.
+        let token =
+            self.register_create_project_confirmation(chat.clone(), slug, listed.rel, listed.abs);
+        let rows = confirm_cmd_button_rows(&token);
+        self.emit_button_rows(chat, &cid, prompt, rows, callback);
     }
 
     /// Reconcile live `ccteam-chat-*` process names against tracked sessions.
@@ -19817,16 +21107,6 @@ fn strip_vendor_prefix<'a>(vendor: &str, model: &'a str) -> &'a str {
     }
 }
 
-fn activity_marker(activity: &str) -> &'static str {
-    match activity {
-        "working" => "🟡 работает",
-        "idle" => "🟢 ожидание",
-        "stale" => "🟠 устарело",
-        "stuck" => "🔴 зависание",
-        _ => "⚪ неизвестно",
-    }
-}
-
 /// Split a `/rename` argument into an explicit `[<sid>] <title>` pair. A
 /// leading `s<N>` token counts as a TARGET only when a title follows it, so
 /// `/rename s3` still titles the current session `s3` rather than trying to
@@ -20994,85 +22274,30 @@ fn gateway_turn_timeout_duration() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
-/// Humanize a [`Duration`](std::time::Duration) for the `/status` fleet line:
-/// `45s`, `1m12s`, `6m`, `2h3m`. Compact (no leading-zero noise); seconds are
-/// dropped once the span is ≥ 1h to keep the line tidy. Sub-second rounds to
-/// `0s`.
-/// Render the `/status` running-task block — claude's own task lifecycle
-/// mirrored verbatim (NOT a fold), oldest first (longest-running on top).
-/// Empty string when nothing runs. Three buckets by `task_type`: subagents
-/// (`local_agent`, turn-scoped), workflows (`local_workflow`) and background
-/// shells (`local_bash` = Bash run_in_background + Monitor watches) — the
-/// latter two outlive the spawning turn, so an idle session still shows its
-/// in-flight `make test` here instead of a bare `🟢 idle`.
-fn format_running_tasks(running: &[RunningTask]) -> String {
-    if running.is_empty() {
-        return String::new();
-    }
-    let workflows = running
-        .iter()
-        .filter(|t| t.task_type == "local_workflow")
-        .count();
-    let bg_shells = running
-        .iter()
-        .filter(|t| t.task_type == "local_bash")
-        .count();
-    let subagents = running.len() - workflows - bg_shells;
-    let mut kinds: Vec<String> = Vec::new();
-    if subagents > 0 {
-        kinds.push(format!("subagent ({subagents})"));
-    }
-    if workflows > 0 {
-        kinds.push(format!("workflow ({workflows})"));
-    }
-    if bg_shells > 0 {
-        kinds.push(format!("фоновые задачи ({bg_shells})"));
-    }
-    let mut out = format!("\n   🤖 Выполняется: {}", kinds.join(" + "));
-    let mut tasks: Vec<&RunningTask> = running.iter().collect();
-    tasks.sort_by_key(|t| t.started);
-    for t in tasks {
-        let kind = match t.task_type.as_str() {
-            "local_workflow" => "workflow",
-            "local_bash" => "фон",
-            _ if t.kind.is_empty() => "subagent",
-            _ => t.kind.as_str(),
-        };
-        let elapsed = humanize_dur(t.started.elapsed());
-        let desc = t.description.trim();
-        if desc.is_empty() {
-            out.push_str(&format!("\n      · {kind} · {elapsed}"));
-        } else {
-            let shown: String = if desc.chars().count() > 40 {
-                format!("{}…", desc.chars().take(39).collect::<String>())
-            } else {
-                desc.to_string()
-            };
-            out.push_str(&format!("\n      · {kind}「{shown}」· {elapsed}"));
-        }
-    }
-    out
-}
-
 /// Render the account-usage payload after its vendor label:
 /// `5h 17% (19:00) · неделя 78% (06/29) · max`. Each field is omitted when
 /// the vendor didn't report it; an empty result means no usage line.
 fn format_account_usage(u: &AccountUsage) -> Option<String> {
+    format_account_usage_in(u, *chrono::Local::now().offset())
+}
+
+/// `tz` = the offset reset stamps are shown in (the daemon host's local zone
+/// in production). Vendors report UTC; printing the raw clock digits read as
+/// local time to an operator three hours east (audit 2026-09-03 R12).
+fn format_account_usage_in(u: &AccountUsage, tz: chrono::FixedOffset) -> Option<String> {
     // Short reset hint from an ISO-8601 `resets_at`: HH:MM for the 5-hour window,
-    // MM/DD for the weekly. Empty when unparseable.
-    fn reset_hm(iso: &Option<String>) -> String {
-        iso.as_deref()
-            .and_then(|s| s.split('T').nth(1))
-            .map(|t| format!(" ({})", &t[..t.len().min(5)]))
-            .unwrap_or_default()
+    // MM/DD for the weekly, both in `tz`. An unparseable stamp is shown raw.
+    fn reset_at(iso: &Option<String>, tz: chrono::FixedOffset, fmt: &str) -> String {
+        let Some(s) = iso.as_deref() else {
+            return String::new();
+        };
+        match chrono::DateTime::parse_from_rfc3339(s) {
+            Ok(t) => format!(" ({})", t.with_timezone(&tz).format(fmt)),
+            Err(_) => format!(" ({s})"),
+        }
     }
-    fn reset_md(iso: &Option<String>) -> String {
-        iso.as_deref()
-            .and_then(|s| s.split('T').next())
-            .and_then(|d| d.get(5..)) // "06-29" from "2026-06-29"
-            .map(|md| format!(" ({})", md.replace('-', "/")))
-            .unwrap_or_default()
-    }
+    let reset_hm = |iso: &Option<String>| reset_at(iso, tz, "%H:%M");
+    let reset_md = |iso: &Option<String>| reset_at(iso, tz, "%m/%d");
     let mut parts: Vec<String> = Vec::new();
     if let Some(p) = u.five_hour_pct {
         parts.push(format!("5h {p}%{}", reset_hm(&u.five_hour_resets_at)));
@@ -21110,6 +22335,39 @@ fn format_token_volume(tokens: u64) -> String {
     }
 }
 
+/// Humanize a [`Duration`](std::time::Duration) with Russian unit words, for
+/// the `/status` expandable quote's `Запущено: <…> назад` (§3.5d mock:
+/// `Запущено: 2 ч назад`). SPEC-3.5D-R2-1 fix — `launched` used to reuse the
+/// compact-English [`humanize_dur`] (`2h` etc), so a Russian card carried an
+/// English abbreviation on its one human-facing timestamp. Same compact
+/// shape as `humanize_dur` (drop seconds once ≥ 1h, drop the smaller unit
+/// once it's zero), just spelled `ч`/`мин`/`с`.
+fn humanize_dur_ru(d: std::time::Duration) -> String {
+    let total = d.as_secs();
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        if m > 0 {
+            format!("{h} ч {m} мин")
+        } else {
+            format!("{h} ч")
+        }
+    } else if m > 0 {
+        if s > 0 {
+            format!("{m} мин {s} с")
+        } else {
+            format!("{m} мин")
+        }
+    } else {
+        format!("{s} с")
+    }
+}
+
+/// Humanize a [`Duration`](std::time::Duration) for the `/status` fleet line:
+/// `45s`, `1m12s`, `6m`, `2h3m`. Compact (no leading-zero noise); seconds are
+/// dropped once the span is ≥ 1h to keep the line tidy. Sub-second rounds to
+/// `0s`.
 fn humanize_dur(d: std::time::Duration) -> String {
     let total = d.as_secs();
     let h = total / 3600;
@@ -21565,6 +22823,22 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
+
+    /// F1 — any test that reaches `bootstrap_project_at_dir` (the fs-browser
+    /// confirm-and-create flow does, via `create_project_at`) must disable
+    /// the `~/.claude.json` trust-entry write first, or it pollutes the
+    /// REAL developer file with tempdir paths (confirmed: two such entries
+    /// were found in `~/.claude.json` before this fix). Monotonic + safe to
+    /// call from parallel lib tests (unlike `HOME`/`CCTEAM_HOME`
+    /// repointing, which is process-global and NOT attempted here —
+    /// `bootstrap_project_at_dir` takes its `CcteamPaths` explicitly and
+    /// never derives them from `HOME`, so disabling this one write is
+    /// sufficient; see `crates/ccteam-core/src/projects.rs`'s own
+    /// `ensure_isolation` for the same pattern).
+    static DISABLE_TOOL_SURFACE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    fn ensure_tool_surface_bootstrap_disabled() {
+        DISABLE_TOOL_SURFACE.get_or_init(ccteam_core::disable_tool_surface_bootstrap_for_tests);
+    }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex as StdMutex, OnceLock};
@@ -23967,6 +25241,10 @@ mod tests {
         /// Off by default so the sync-drain tests (which only take the first
         /// text-bearing event) don't leave a stale `TurnCompleted` queued.
         emit_turn_boundary: bool,
+        /// Audit 2026-09-03 R1 — when set, `submit_turn` emits NO
+        /// `AgentMessage` before the boundary (a codex turn whose only items
+        /// degraded to empty messages): the parent must still be notified.
+        answerless: bool,
         /// E1 — events queued BEFORE the answer on each submit (e.g. a
         /// `ToolCall` item), so the pump observes mid-turn tool activity
         /// ahead of the terminal boundary.
@@ -24063,6 +25341,7 @@ mod tests {
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
                 spawn_tunings: Arc::new(Mutex::new(Vec::new())),
                 emit_turn_boundary: false,
+                answerless: false,
                 pre_answer_events: Vec::new(),
                 emit_turn_started: false,
                 turn_failure: None,
@@ -24086,6 +25365,12 @@ mod tests {
         /// (v0.8.11 E4 — drives the stream-json pump's progress.jsonl mirror).
         fn with_turn_boundary(mut self) -> Self {
             self.emit_turn_boundary = true;
+            self
+        }
+
+        /// Emit the turn boundary with NO text answer before it (R1).
+        fn answerless(mut self) -> Self {
+            self.answerless = true;
             self
         }
 
@@ -24418,18 +25703,20 @@ mod tests {
                         .await
                         .push_back((h.identity.clone(), evt.clone()));
                 }
-                self.events.lock().await.push_back((
-                    h.identity.clone(),
-                    ThreadEvent::ItemCompleted {
-                        item: ThreadItem {
-                            id: "msg-1".to_string(),
-                            details: ThreadItemDetails::AgentMessage(format!(
-                                "{} echo: {text}",
-                                h.identity
-                            )),
+                if !self.answerless {
+                    self.events.lock().await.push_back((
+                        h.identity.clone(),
+                        ThreadEvent::ItemCompleted {
+                            item: ThreadItem {
+                                id: "msg-1".to_string(),
+                                details: ThreadItemDetails::AgentMessage(format!(
+                                    "{} echo: {text}",
+                                    h.identity
+                                )),
+                            },
                         },
-                    },
-                ));
+                    ));
+                }
                 // A real adapter also emits a turn boundary (carrying usage); the
                 // stream-json pump mirrors it to progress.jsonl for paneless
                 // sessions (v0.8.11 E4). Opt-in (`with_turn_boundary`) so the
@@ -31612,7 +32899,11 @@ mod tests {
         assert!(!rendered.contains("73%"), "{rendered}");
         assert!(!rendered.contains("stale-effort"), "{rendered}");
         assert!(!rendered.contains("stale-running-task"), "{rendered}");
-        assert!(rendered.contains("· — · — · ctx —"), "{rendered}");
+        // §3.5d — an honest `model`/`effort` placeholder header, and an
+        // honest `ctx —` placeholder rather than leaking the stale
+        // generation's own `73%`.
+        assert!(rendered.contains("· claude · — · —"), "{rendered}");
+        assert!(rendered.contains("ctx —"), "{rendered}");
     }
 
     /// v0.8.7 review-fix (R-M3) — `session_resolve(sid).project` is the value
@@ -32282,9 +33573,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replies.len(), 1);
+        // F4/SPEC-2 — one icon per line now (was `🟢 **s1** · … · 🟢 ожидание`,
+        // the exact contradiction-when-working bug the palette unification
+        // fixed): the leading icon and the state word are no longer both
+        // separately carrying their own icon.
         assert!(replies[0]
             .markdown
-            .contains("**s1** · claude/— · 🟢 ожидание"));
+            .contains("🟢 **s1** · claude/— · ожидание"));
         assert!(replies[0].markdown.contains("data=\"cmd:?/stop s1\""));
         assert!(replies[0].markdown.contains("data=\"cmd:/use s1\""));
         assert!(!replies[0].plain.contains("<tg-button-row>"));
@@ -32320,7 +33615,7 @@ mod tests {
         let reply = gateway.render_sessions(&chat, false).await;
         assert!(reply.markdown.contains("data=\"cmd:/use s2\""));
         assert!(reply.markdown.contains("data=\"cmd:/use s1\""));
-        assert_eq!(reply.button_rows[2][0].data, "cmd:/sessions");
+        assert_eq!(reply.button_rows[2][0].data, "cmd:~/sessions");
         assert_eq!(reply.button_rows[2][1].data, "cmd:?/new");
 
         let typed = gateway
@@ -32397,7 +33692,14 @@ mod tests {
                 .map(|index| SessionRow {
                     sid: format!("s{index}"),
                     vendor_model: "claude.—".into(),
-                    status: "🟢 ожидание".into(),
+                    // R2-4/R2-2 (2nd) — `status` is a RAW activity
+                    // classification (`working`/`idle`/`stale`/`stuck`),
+                    // rendered through `activity_badge`, not a pre-rendered
+                    // display string; the pre-§3.5b `"🟢 ожидание"` literal
+                    // used to silently render `⚪ неизвестно` here without
+                    // this test (which only counts button-row lengths)
+                    // ever noticing.
+                    status: "idle".into(),
                     context: "—".into(),
                     title: None,
                     current: false,
@@ -32417,6 +33719,17 @@ mod tests {
             .iter()
             .flatten()
             .all(|button| button.data.len() <= 64));
+        // R2-4 — the fixture claims every session is `idle`; assert the
+        // rendered state actually says so (🟢 ожидание, never the `⚪
+        // неизвестно` fallback an un-migrated display-string `status` would
+        // silently produce), so a future regression back to a display
+        // string can't hide behind a test that only counts button rows.
+        assert!(
+            reply.markdown.matches("🟢").count() >= 9,
+            "{}",
+            reply.markdown
+        );
+        assert!(!reply.markdown.contains('⚪'), "{}", reply.markdown);
     }
 
     /// Tapping a picker button switches project / session through the SAME
@@ -32534,6 +33847,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(via_button, typed);
+    }
+
+    /// SPEC-3.5c/R2-1/R2-2 — a `cmd:~/sessions` tap (the `/sessions`
+    /// screen's OWN "🔄 Обновить" button) FROM a Telegram callback (a
+    /// resolvable `tg-cb-<id>` message id, no group ephemeral context) edits
+    /// the tapped message in place instead of appending a new one: no reply
+    /// comes back through the normal channel, and the fake transport
+    /// records an `EditMessage` targeting the SAME platform message id the
+    /// tap came from.
+    #[tokio::test]
+    async fn cmd_sessions_callback_edits_the_tapped_message_in_place() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "tg-cb-999",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:~/sessions".to_string(),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "edited in place — nothing comes back as a fresh reply: {replies:?}"
+        );
+
+        let edit = events.try_recv().expect("expected an edit event");
+        match edit.kind {
+            GatewayEventKind::EditMessage {
+                ref message_id,
+                ref rich_markdown,
+                inline_buttons,
+            } => {
+                assert_eq!(message_id, "999");
+                // R2-1 — the empty `/sessions` state used to edit in place
+                // with `button_rows` empty, stripping the tapped message of
+                // its only entry points back into a session (no keyboard on
+                // either the classic `reply_markup` or Rich Messages leg).
+                // `plain_with_refresh` now attaches the same "🔄 Обновить" /
+                // "✏️ Новая" footer every non-empty screen ends with, on
+                // BOTH the classic leg (`button_rows`, checked below) and
+                // the Rich Messages leg (`inline_buttons` + the embedded
+                // `<tg-button-row>` tag, checked here).
+                assert!(inline_buttons, "rich edit leg must still carry a keyboard");
+                assert!(
+                    rich_markdown
+                        .as_deref()
+                        .is_some_and(|md| md.contains("<tg-button-row>")),
+                    "{rich_markdown:?}"
+                );
+            }
+            other => panic!("expected EditMessage, got {other:?}"),
+        }
+        assert!(edit.content.contains("Нет сессий"), "{}", edit.content);
+        assert_eq!(
+            edit.button_rows[0][0].data, "cmd:~/sessions",
+            "the classic (reply_markup) leg must also keep its refresh button: {:?}",
+            edit.button_rows
+        );
+    }
+
+    /// R2-2 — a plain `cmd:/sessions` tap (e.g. the "📋 Сессии" cross-screen
+    /// nav button rendered on the `/status` card, or "💬 Сессии" on the
+    /// fs-browser switch acknowledgement) must NEVER edit the tapped
+    /// message in place, even though it runs the exact same `/sessions`
+    /// command the `/sessions` screen's own `cmd:~/sessions` "🔄 Обновить"
+    /// button does. Redraw-in-place is reserved for the `~`-namespaced
+    /// self-refresh callback ([`im_callbacks::CallbackAction::Redraw`]);
+    /// every other `cmd:` tap — action commands and cross-screen nav alike —
+    /// sends a fresh message so the screen the button was tapped from
+    /// survives the tap. Regression test for the bug
+    /// `cmd_sessions_callback_edits_the_tapped_message_in_place` above would
+    /// NOT have caught: before the `~` namespace existed, this exact
+    /// `cmd:/sessions` payload redrew in place unconditionally.
+    #[tokio::test]
+    async fn cmd_sessions_plain_callback_never_redraws_the_tapped_message() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "42",
+                "42",
+                "tg-cb-777",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/sessions".to_string(),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !replies.is_empty(),
+            "a cross-screen nav tap must come back as a normal reply, not vanish into an in-place edit: {replies:?}"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "a plain (non-`~`) cmd: tap must never fire an EditMessage event"
+        );
     }
 
     /// `cmd:?<command>` renders a Russian confirmation with `[✅ Да][❌
@@ -32681,7 +34109,7 @@ mod tests {
         let mut map: BTreeMap<String, PendingCommandConfirmation> = BTreeMap::new();
         let mk = |chat: &ChatKey, offset_secs: u64| PendingCommandConfirmation {
             chat: chat.clone(),
-            command: "/status".to_string(),
+            payload: PendingConfirmationPayload::Command("/status".to_string()),
             created_at: base + Duration::from_secs(offset_secs),
             ttl: Duration::from_secs(300),
         };
@@ -32906,7 +34334,7 @@ mod tests {
         assert_eq!(edit.content, "✅ /status");
         assert!(edit.button_rows.is_empty());
         match edit.kind {
-            GatewayEventKind::EditMessage { ref message_id } => assert_eq!(message_id, "777"),
+            GatewayEventKind::EditMessage { ref message_id, .. } => assert_eq!(message_id, "777"),
             other => panic!("expected EditMessage, got {other:?}"),
         }
     }
@@ -33091,7 +34519,7 @@ mod tests {
         let edit = events.try_recv().expect("edit event");
         assert_eq!(edit.content, "Отменено");
         match edit.kind {
-            GatewayEventKind::EditMessage { ref message_id } => assert_eq!(message_id, "42"),
+            GatewayEventKind::EditMessage { ref message_id, .. } => assert_eq!(message_id, "42"),
             other => panic!("expected EditMessage, got {other:?}"),
         }
     }
@@ -33423,11 +34851,13 @@ mod tests {
     }
 
     /// v0.8.23 review §1.3-D item 9 — IM `/sessions` pins a session with an
-    /// outstanding HITL approval to the top of the live list (a ⏳ marker
-    /// prefixes its row), even when it is LESS recent than its siblings.
-    /// `s2` (qa) is created after `s1` (reviewer) so the default recency
-    /// order is `s2` then `s1`; tagging `s1` with a pending approval must
-    /// invert that.
+    /// outstanding HITL approval to the top of the live list, even when it
+    /// is LESS recent than its siblings. `s2` (qa) is created after `s1`
+    /// (reviewer) so the default recency order is `s2` then `s1`; tagging
+    /// `s1` with a pending approval must invert that. SPEC-3.5b-waiting-arm
+    /// — the pin is a SORT order only, not a distinct activity icon: s1's
+    /// row still reads its real classification (idle, no live turn), `🟢
+    /// ожидание` — the palette has no separate `waiting` state.
     #[tokio::test]
     async fn gateway_sessions_pins_waiting_approval_to_top_with_marker() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -33471,7 +34901,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after.len(), 1);
-        let s1 = after[0].find("s1 | claude.— | ⏳ ожидание | —").unwrap();
+        let s1 = after[0].find("s1 | claude.— | 🟢 ожидание | —").unwrap();
         let s2 = after[0].find("s2 | claude.—").unwrap();
         assert!(s1 < s2, "s1 pinned to the top: {}", after[0]);
     }
@@ -33555,8 +34985,7 @@ mod tests {
         assert_eq!(idle.len(), 1, "one message: {idle:?}");
         // /status remains the CURRENT session's card, not the fleet table.
         assert!(
-            idle[0]
-                .contains("🧭 s1 · alpha · claude\n🟢 ожидание · claude-opus-4-8 · max · ctx 41%"),
+            idle[0].contains("🧭 s1 · claude · claude-opus-4-8 · max\n🟢 ожидание · ctx 41%"),
             "current-session header: {idle:?}"
         );
 
@@ -33599,13 +35028,31 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
             .unwrap();
+        // §3.5d — the compact line-2 badge carries just the icon + label;
+        // the silent-duration phrase rides the expandable quote folded into
+        // the SAME "Запущено: …" part as a comma suffix — never instead of
+        // the real launch time (R1 fix: `Запущено:` used to be fed this
+        // phrase directly; SPEC-3.5D-R2-2 fix: it used to ride as its own
+        // extra `·`-joined part, growing the quote past the spec's four).
+        assert!(stuck[0].contains("🔴 зависание"), "stuck badge: {stuck:?}");
+        // review-fix F3 — the label must come FROM `activity_badge`, so a
+        // future palette rename shows up here without editing this test.
         assert!(
-            stuck[0].contains("🔴 ЗАВИСАНИЕ: нет событий "),
-            "stuck state: {stuck:?}"
+            stuck[0].contains(&format!("🔴 {}", im_views::activity_badge("stuck").1)),
+            "/status label must match the activity_badge palette: {stuck:?}"
         );
         assert!(
-            stuck[0].contains("нет событий 6m"),
-            "silent duration: {stuck:?}"
+            stuck[0].contains("Запущено:") && stuck[0].contains("назад"),
+            "an honest launch time, not the activity phrase: {stuck:?}"
+        );
+        assert!(
+            stuck[0].contains("Запущено:") && stuck[0].contains("назад, зависание: нет событий 6m"),
+            "silent duration folded into the SAME Запущено part, comma-joined: {stuck:?}"
+        );
+        assert_eq!(
+            stuck[0].matches("Запущено:").count(),
+            1,
+            "exactly one Запущено part in the quote, not a second `·`-joined one: {stuck:?}"
         );
 
         // (4) A FRESHLY submitted turn whose `last_event_at` still holds the
@@ -33679,7 +35126,7 @@ mod tests {
             .unwrap();
         assert!(
             out[0].contains(
-                "👥 Дочерние (1):\n  • s2 · claude · opus-4-8[1m] · 🟡 работает · delegated investigation"
+                "👥 Дочерние 1 · сессий проекта 2 · проектов 1\n  • s2 · claude · opus-4-8[1m] · 🔵 работает — delegated investiga…"
             ),
             "working child is visible from its root status: {out:?}"
         );
@@ -33755,7 +35202,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            torn[0].contains(&format!("{child} · claude · — · 🟡 работает ·")),
+            torn[0].contains(&format!("{child} · claude · — · 🔵 работает")),
             "a torn line elsewhere in the stream must not blind the child row: {torn:?}"
         );
 
@@ -33774,7 +35221,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            silent[0].contains(&format!("{child} · claude · — · 🟡 работает ·")),
+            silent[0].contains(&format!("{child} · claude · — · 🔵 работает")),
             "an in-flight turn outranks a stream that says nothing: {silent:?}"
         );
 
@@ -33789,7 +35236,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            idle[0].contains(&format!("{child} · claude · — · 🟢 ожидание ·")),
+            idle[0].contains(&format!("{child} · claude · — · 🟢 ожидание")),
             "no open turn ⇒ the file verdict stands: {idle:?}"
         );
     }
@@ -33810,7 +35257,7 @@ mod tests {
             .unwrap();
         assert!(
             out[0].contains(&format!(
-                "🧭 s1 · alpha · claude\n🟢 ожидание · — · — · ctx —\n📁 {}\n\n",
+                "🧭 s1 · claude · — · —\n🟢 ожидание · ctx — · 💰 24ч нет данных\n📁 alpha · {}\n\n",
                 proj.path().display()
             )),
             "status card header changed: {out:?}"
@@ -33818,7 +35265,7 @@ mod tests {
         assert!(out[0].contains("Роль: reviewer"), "role missing: {out:?}");
         assert!(out[0].contains("resume —"), "resume fact missing: {out:?}");
         assert!(
-            out[0].contains("💰 Расход проекта 24ч: нет данных"),
+            out[0].contains("💰 24ч нет данных"),
             "honest missing ledger state missing: {out:?}"
         );
     }
@@ -33852,7 +35299,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("💰 Расход проекта 24ч: $1.25 · 13.1M токенов"),
+            out[0].contains("💰 24ч $1.25 · 13.1M токенов"),
             "project ledger cost missing: {out:?}"
         );
     }
@@ -33887,7 +35334,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("💰 Расход проекта 24ч: $— · 1.2k токенов"),
+            out[0].contains("💰 24ч $— · 1.2k токенов"),
             "unknown cost must remain unknown while tokens stay visible: {out:?}"
         );
     }
@@ -33935,7 +35382,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("💰 Расход проекта 24ч: ≥$1.25 (+1 без цены) · 2.0k токенов"),
+            out[0].contains("💰 24ч ≥$1.25 (+1 без цены) · 2.0k токенов"),
             "mixed window must be shown as a lower bound: {out:?}"
         );
     }
@@ -33957,11 +35404,11 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
+            out[0].contains("🧭 s1 · claude · — · —\n🟢 ожидание"),
             "roleless session remains a usable status card: {out:?}"
         );
         assert!(
-            out[0].contains("🟢 ожидание · — · — · ctx —"),
+            out[0].contains("🟢 ожидание · ctx —"),
             "statusless fields stay honest placeholders: {out:?}"
         );
     }
@@ -33983,7 +35430,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].starts_with("🧭 s1 · alpha · claude\n"),
+            out[0].starts_with("🧭 s1 · claude · — · —\n"),
             "leads with the you-are-here header before the existing body: {out:?}"
         );
     }
@@ -34013,12 +35460,32 @@ mod tests {
             weekly_severity: Some("warning".into()),
             credits_pct: Some(46),
         };
-        let s = format_account_usage(&u).unwrap();
-        assert!(s.contains("5h 17% (19:00)"), "{s}");
+        // Reset stamps come from the vendor in UTC and are shown in the
+        // operator's zone (here pinned to +03:00 so the test is host-agnostic).
+        let msk = chrono::FixedOffset::east_opt(3 * 3600).unwrap();
+        let s = format_account_usage_in(&u, msk).unwrap();
+        assert!(s.contains("5h 17% (22:00)"), "{s}");
         assert!(s.contains("неделя 78%⚠ (06/29)"), "{s}");
         assert!(s.contains("лимит 46%"), "{s}");
         assert!(s.ends_with("· max"), "{s}");
         assert_eq!(format_account_usage(&AccountUsage::default()), None);
+        // A day boundary moves with the zone too.
+        let late = AccountUsage {
+            weekly_pct: Some(1),
+            weekly_resets_at: Some("2026-06-29T22:30:00+00:00".into()),
+            ..AccountUsage::default()
+        };
+        let s = format_account_usage_in(&late, msk).unwrap();
+        assert!(s.contains("неделя 1% (06/30)"), "{s}");
+        // An unparseable stamp is shown raw, never silently dropped.
+        let raw = AccountUsage {
+            five_hour_pct: Some(5),
+            five_hour_resets_at: Some("soon".into()),
+            ..AccountUsage::default()
+        };
+        assert!(format_account_usage_in(&raw, msk)
+            .unwrap()
+            .contains("5h 5% (soon)"));
     }
 
     #[test]
@@ -34028,60 +35495,109 @@ mod tests {
         assert_eq!(format_token_volume(13_100_000), "13.1M");
     }
 
-    /// `/status` running-task block — background workflows (`local_workflow`)
-    /// are counted and labeled separately from subagents; a workflow's empty
-    /// `subagent_type` must NOT fall back to the "subagent" label.
-    #[test]
-    fn format_running_tasks_distinguishes_workflows_from_subagents() {
-        fn task(id: &str, kind: &str, desc: &str, task_type: &str) -> RunningTask {
+    /// §3.5d R1-1 fix — the `▶` row is built directly from the OLDEST
+    /// `RunningTask` (kind/description + elapsed, `"desc, elapsed"`,
+    /// matching the spec mock `▶ cargo test --workspace, 2 мин`), never
+    /// from `format_running_tasks`' rendered text (whose first line is only
+    /// the aggregate `🤖 Выполняется: …` counts header, never a task). This
+    /// exercises the same task-picking + label logic through the real
+    /// `/status` path rather than a standalone formatter.
+    #[tokio::test]
+    async fn gateway_status_running_task_row_shows_oldest_task_not_the_counts_header() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-running-task-row");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let older = std::time::Instant::now() - std::time::Duration::from_secs(120);
+        fake.set_running_tasks(vec![
             RunningTask {
-                task_id: id.into(),
-                kind: kind.into(),
-                description: desc.into(),
-                task_type: task_type.into(),
+                task_id: "older".into(),
+                kind: "code-reviewer".into(),
+                description: "cargo test --workspace".into(),
+                task_type: "local_agent".into(),
+                started: older,
+                backgrounded: false,
+            },
+            RunningTask {
+                task_id: "newer".into(),
+                kind: "code-reviewer".into(),
+                description: "a second, newer task".into(),
+                task_type: "local_agent".into(),
                 started: std::time::Instant::now(),
                 backgrounded: false,
-            }
-        }
-        // Nothing running → nothing rendered.
-        assert_eq!(format_running_tasks(&[]), "");
-        // Subagents only → the pre-workflow header, kind from subagent_type.
-        let subs = [task("a1", "code-reviewer", "review auth", "local_agent")];
-        let s = format_running_tasks(&subs);
-        assert!(s.contains("Выполняется: subagent (1)"), "{s}");
-        assert!(s.contains("code-reviewer「review auth」"), "{s}");
-        // Mixed → both kinds counted in the header; the workflow row is labeled
-        // "workflow" even though its subagent_type is empty.
-        let mixed = [
-            task("a1", "", "find bugs", "local_agent"),
-            task("w1", "", "audit the codebase", "local_workflow"),
-        ];
-        let s = format_running_tasks(&mixed);
+            },
+        ])
+        .await;
+
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
         assert!(
-            s.contains("Выполняется: subagent (1) + workflow (1)"),
-            "{s}"
+            out[0].contains("▶ cargo test --workspace, 2m"),
+            "the OLDEST task's own description + elapsed, not the aggregate header: {out:?}"
         );
-        assert!(s.contains("subagent「find bugs」"), "{s}");
-        assert!(s.contains("workflow「audit the codebase」"), "{s}");
-        // Workflows only (e.g. an idle session with a background run).
-        let wf = [task("w1", "", "migrate call sites", "local_workflow")];
-        let s = format_running_tasks(&wf);
-        assert!(s.contains("Выполняется: workflow (1)"), "{s}");
-        // Background shells (`local_bash` — Bash run_in_background / Monitor)
-        // get their own bucket + row label; an idle session with an in-flight
-        // `make test` renders it instead of a bare `🟢 idle`.
-        let bg = [
-            task("b1", "", "make test full suite", "local_bash"),
-            task("b2", "", "watch /tmp/maketest.log", "local_bash"),
-            task("a1", "code-reviewer", "review auth", "local_agent"),
-        ];
-        let s = format_running_tasks(&bg);
         assert!(
-            s.contains("Выполняется: subagent (1) + фоновые задачи (2)"),
-            "{s}"
+            !out[0].contains("Выполняется"),
+            "the aggregate counts header text must never appear on the compact card: {out:?}"
         );
-        assert!(s.contains("фон「make test full suite」"), "{s}");
-        assert!(s.contains("фон「watch /tmp/maketest.log」"), "{s}");
+    }
+
+    /// R2-1 fix — a long-lived TURN-OUTLIVING background task (older than
+    /// everything else) must never mask a turn-scoped subagent that is
+    /// actually driving the CURRENT turn: the `▶` row picks the oldest
+    /// TURN-SCOPED task first, and admits more are running via a `(+N)`
+    /// suffix rather than silently dropping the count.
+    #[tokio::test]
+    async fn gateway_status_running_task_row_prefers_turn_scoped_over_older_background() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway =
+            Gateway::new(fake.clone(), "alpha", "/tmp/alpha-running-task-turn-scoped");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let ancient = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        let recent = std::time::Instant::now() - std::time::Duration::from_secs(120);
+        fake.set_running_tasks(vec![
+            // Outlives the turn (background shell) and is OLDER — must be
+            // passed over in favor of the turn-scoped subagent below.
+            RunningTask {
+                task_id: "bg-shell".into(),
+                kind: "".into(),
+                description: "tail -f build.log".into(),
+                task_type: "local_bash".into(),
+                started: ancient,
+                backgrounded: false,
+            },
+            // Turn-scoped (blocking `local_agent`, not backgrounded) and
+            // NEWER than the background shell, but is the one actually
+            // driving the current turn.
+            RunningTask {
+                task_id: "subagent".into(),
+                kind: "code-reviewer".into(),
+                description: "cargo test --workspace".into(),
+                task_type: "local_agent".into(),
+                started: recent,
+                backgrounded: false,
+            },
+        ])
+        .await;
+
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            out[0].contains("▶ cargo test --workspace, 2m (+1)"),
+            "the turn-scoped subagent leads, with a (+1) admitting the background shell is also running: {out:?}"
+        );
+        assert!(
+            !out[0].contains("tail -f build.log"),
+            "the older background task must not be the lead row: {out:?}"
+        );
     }
 
     /// The outlives-turn vocabulary the working-signal check shares with the
@@ -34146,7 +35662,7 @@ mod tests {
             .unwrap();
         assert_eq!(owner.len(), 1);
         assert!(
-            owner[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
+            owner[0].contains("🧭 s1 · claude · — · —\n🟢 ожидание"),
             "got: {owner:?}"
         );
     }
@@ -34172,7 +35688,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("🧭 s1 · alpha · claude\n🟢 ожидание"),
+            out[0].contains("🧭 s1 · claude · — · —\n🟢 ожидание"),
             "got: {out:?}"
         );
         assert!(out[0].contains(uuid), "resume UUID missing from: {out:?}");
@@ -36690,6 +38206,1196 @@ mod tests {
             .expect_err("expected not-configured error");
         assert!(format!("{err:#}").contains("не настроено"));
         assert!(Gateway::is_gateway_command("/newproject demo /x"));
+    }
+
+    /// Shared fs-browser test rig: a fresh `CcteamPaths` under a tempdir
+    /// (both `.ccteam` and `projects_root` real, empty dirs) plus a gateway
+    /// with project creation enabled and NO operator allowlist bound — the
+    /// "telegram" channel then falls into `is_operator_chat`'s documented
+    /// unconfigured-channel default (legacy single-operator assumption), so
+    /// `chat-1` reads as `Principal::Operator` without extra setup. Callers
+    /// use `"telegram"` (not `"mock"`) because the browser only renders on a
+    /// button-capable channel (F6, `Gateway::channel_supports_buttons`).
+    fn fs_browser_test_rig() -> (tempfile::TempDir, ccteam_core::CcteamPaths, Gateway) {
+        ensure_tool_surface_bootstrap_disabled();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join(".ccteam"),
+            projects_root: tmp.path().join("projects"),
+        };
+        std::fs::create_dir_all(&paths.root).unwrap();
+        std::fs::create_dir_all(&paths.projects_root).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "default-project", "/tmp/default-project");
+        gateway.enable_project_creation(paths.clone());
+        (tmp, paths, gateway)
+    }
+
+    /// The fingerprint a `fs_browser::list(projects_root, rel, ..)` render
+    /// at page 1 would embed in its `nav:fs:i:<n>:<fp>`/`nav:fs:pick:<n>:<fp>`
+    /// buttons (FS-SEC-2/F7/F8) — lets a test hand-craft a callback payload
+    /// that the staleness check accepts, without threading a real button
+    /// through the render. `registered` never affects the fingerprint (it
+    /// only hashes `rel` + entry NAMES), so `&[]` is always fine here even
+    /// when the directory holds a registered project.
+    fn fs_fp(projects_root: &std::path::Path, rel: &str) -> String {
+        let page = fs_browser::list(projects_root, std::path::Path::new(rel), &[], 1).unwrap();
+        fs_browser::fingerprint(&page.rel, &page.entries)
+    }
+
+    #[tokio::test]
+    async fn fs_browser_projects_renders_root_and_marks_registered() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("alpha")).unwrap();
+        std::fs::create_dir_all(paths.projects_root.join("beta")).unwrap();
+        upsert_project(
+            &paths.root,
+            ProjectEntry {
+                slug: "alpha".to_string(),
+                path: paths.projects_root.join("alpha"),
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+        // FS-SEC-1 — the browser now marks a folder registered only when
+        // it's ACL-visible to the caller (`visible_project_slugs`), which
+        // reads the in-memory roster `register_project` maintains (a bare
+        // `upsert_project` config.yaml write alone, with no `state.json`,
+        // doesn't satisfy the disk-catalog half of that union — matching
+        // real registration, which always calls both).
+        gateway.register_project("alpha".to_string(), paths.projects_root.join("alpha"));
+
+        let reply = gateway
+            .handle_text("telegram", "chat-1", "alice", "/projects")
+            .await
+            .unwrap()
+            .join("\n");
+        assert!(reply.contains("alpha"), "expected alpha listed: {reply}");
+        assert!(reply.contains("beta"), "expected beta listed: {reply}");
+        assert!(
+            reply.contains('✅'),
+            "expected the registered row marked: {reply}"
+        );
+        assert!(
+            reply.contains('📁'),
+            "expected the unregistered row marked: {reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_browser_nav_i_enters_a_folder_and_updates_fs_nav() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("child")).unwrap();
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+
+        let _ = gateway
+            .handle_text("telegram", "chat-1", "alice", "/projects")
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "1",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:i:0:{}", fs_fp(&paths.projects_root, "")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let nav = gateway
+            .fs_nav
+            .get(&chat)
+            .expect("fs_nav must be set after entering a folder");
+        assert_eq!(nav.rel, std::path::PathBuf::from("child"));
+        assert_eq!(nav.page, 1);
+    }
+
+    /// SPEC-3.5c regression — the SAME edit-in-place fix applies to fs
+    /// browser navigation (`nav:fs:i:*`, e.g. a pagination tap), not just
+    /// `cmd:/sessions`: a resolvable `tg-cb-<id>` message id edits the
+    /// tapped message via `emit_fs_page`'s `emit_fs_reply` call, the exact
+    /// path `resolve_cmd_callback`/`handle_message_shared` now reuse rather
+    /// than inventing a second edit mechanism.
+    #[tokio::test]
+    async fn fs_browser_nav_i_callback_edits_the_tapped_message_in_place() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("child")).unwrap();
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-cb-321",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:i:0:{}", fs_fp(&paths.projects_root, "")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "edited in place — nothing comes back as a fresh reply: {replies:?}"
+        );
+
+        let edit = events.try_recv().expect("expected an edit event");
+        match edit.kind {
+            GatewayEventKind::EditMessage { ref message_id, .. } => {
+                assert_eq!(message_id, "321");
+            }
+            other => panic!("expected EditMessage, got {other:?}"),
+        }
+        assert!(edit.content.contains("child"), "{}", edit.content);
+    }
+
+    #[tokio::test]
+    async fn fs_browser_nav_up_at_root_is_a_no_op() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("child")).unwrap();
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "1",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:up:{}", fs_fp(&paths.projects_root, "")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let evt = events.try_recv().expect("expected a re-rendered root page");
+        assert!(evt.content.contains("child"), "content: {}", evt.content);
+        let nav = gateway.fs_nav.get(&chat).expect("fs_nav set to root");
+        assert_eq!(nav.rel, std::path::PathBuf::new());
+    }
+
+    #[tokio::test]
+    async fn fs_browser_nav_pick_switches_project() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("proj")).unwrap();
+        upsert_project(
+            &paths.root,
+            ProjectEntry {
+                slug: "proj".to_string(),
+                path: paths.projects_root.join("proj"),
+                host: ccteam_core::LOCAL_HOST.to_string(),
+                remote_slug: None,
+                remote_path: None,
+                team: "dev".to_string(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+        // FS-SEC-1 — see `fs_browser_projects_renders_root_and_marks_registered`.
+        gateway.register_project("proj".to_string(), paths.projects_root.join("proj"));
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+
+        let _ = gateway
+            .handle_text("telegram", "chat-1", "alice", "/projects")
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "1",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:pick:0:{}", fs_fp(&paths.projects_root, "")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            gateway.current_project.get(&chat).map(String::as_str),
+            Some("proj")
+        );
+        assert!(
+            !gateway.fs_nav.contains_key(&chat),
+            "a successful pick leaves the browser cursor cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_browser_nav_here_at_root_is_refused() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "1",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    // The root refusal is checked before the fingerprint, so
+                    // any well-formed `here:<fp>` reaches it.
+                    data: format!("nav:fs:here:{}", fs_fp(&paths.projects_root, "")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let evt = events.try_recv().expect("expected a refusal reply");
+        assert!(
+            evt.content.contains("корень нельзя сделать проектом"),
+            "content: {}",
+            evt.content
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_browser_nav_here_on_unregistered_creates_after_confirmation() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("newproj")).unwrap();
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let mut events = gateway.subscribe_events();
+
+        // Enter the one unregistered folder, then ask to make it a project.
+        let _ = gateway
+            .handle_text("telegram", "chat-1", "alice", "/projects")
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "1",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:i:0:{}", fs_fp(&paths.projects_root, "")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let _ = events.try_recv();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "2",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:here:{}", fs_fp(&paths.projects_root, "newproj")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let confirm = events.try_recv().expect("expected a confirmation prompt");
+        assert!(
+            confirm.content.contains("Сделать проектом"),
+            "content: {}",
+            confirm.content
+        );
+        let token = confirm
+            .button_rows
+            .iter()
+            .flatten()
+            .find_map(|opt| opt.data.strip_prefix("cmd:!").map(str::to_string))
+            .expect("expected a cmd:!<token> confirm button");
+
+        let confirmed_replies = gateway
+            .handle_message_rich(
+                "telegram",
+                "chat-1",
+                "alice",
+                "3",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("cmd:!{token}"),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        // SPEC-1 — the confirmed create gets the SAME two-button footer a
+        // switch does (`§3.5 "После создания"`), not `create_project_at`'s
+        // own plain "✅ Создан и выбран проект …" acknowledgement text.
+        let ack = confirmed_replies
+            .iter()
+            .find(|reply| reply.plain.starts_with('✅') && reply.plain.contains("создан"))
+            .expect("expected the post-create ack among the confirmed replies");
+        assert!(
+            ack.plain.contains("проект создан и выбран"),
+            "plain: {}",
+            ack.plain
+        );
+        assert_eq!(ack.button_rows.len(), 1);
+        assert_eq!(ack.button_rows[0][0].data, "cmd:/sessions");
+        assert_eq!(ack.button_rows[0][1].data, "cmd:?/new");
+
+        let cfg = ccteam_core::config::load(&paths.root).unwrap();
+        let created = cfg
+            .projects
+            .iter()
+            .find(|p| p.path == paths.projects_root.join("newproj"))
+            .expect("expected the folder registered as a project");
+        let state = ccteam_core::ProjectState::load(&ccteam_core::CcteamPaths::project_state_in(
+            &created.path,
+        ))
+        .expect("expected a readable state.json for the created project");
+        assert_eq!(state.slug, created.slug);
+        assert!(
+            ack.plain.contains(&created.slug),
+            "ack should name the created slug: {}",
+            ack.plain
+        );
+        assert_eq!(
+            gateway.current_project.get(&chat),
+            Some(&created.slug),
+            "expected the chat switched into the newly created project"
+        );
+    }
+
+    /// FS-SEC-R2-2 — a directory name with trailing whitespace (legal on
+    /// Linux) used to be silently mangled by the generic `/newproject`
+    /// command-string re-parse (`str::trim()` strips it), landing the
+    /// confirmed create on a DIFFERENT directory than the one the
+    /// confirmation prompt named. Carrying the resolved `PathBuf` directly
+    /// (not a whitespace-tokenized command string) through the
+    /// confirmation means the create lands on the EXACT directory shown.
+    #[tokio::test]
+    async fn fs_browser_here_confirm_creates_at_directory_with_trailing_whitespace() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        let dir_name = "trailing "; // trailing space — legal, easy to mangle
+        std::fs::create_dir_all(paths.projects_root.join(dir_name)).unwrap();
+        let mut events = gateway.subscribe_events();
+
+        let _ = gateway
+            .handle_text("telegram", "chat-1", "alice", "/projects")
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "1",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:i:0:{}", fs_fp(&paths.projects_root, "")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let _ = events.try_recv();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "2",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:here:{}", fs_fp(&paths.projects_root, dir_name)),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let confirm = events.try_recv().expect("expected a confirmation prompt");
+        let token = confirm
+            .button_rows
+            .iter()
+            .flatten()
+            .find_map(|opt| opt.data.strip_prefix("cmd:!").map(str::to_string))
+            .expect("expected a cmd:!<token> confirm button");
+
+        let confirmed_replies = gateway
+            .handle_message_rich(
+                "telegram",
+                "chat-1",
+                "alice",
+                "3",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("cmd:!{token}"),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let ack = confirmed_replies
+            .iter()
+            .find(|reply| reply.plain.contains("создан"))
+            .expect("expected the post-create ack");
+
+        let expected_abs = paths.projects_root.join(dir_name);
+        assert!(
+            ack.plain.contains(&expected_abs.display().to_string()),
+            "ack must name the EXACT (trailing-whitespace) directory the prompt showed: {}",
+            ack.plain
+        );
+        let cfg = ccteam_core::config::load(&paths.root).unwrap();
+        let created = cfg
+            .projects
+            .iter()
+            .find(|p| p.path == expected_abs)
+            .expect("registered at the exact directory, trailing space included");
+        assert!(ccteam_core::CcteamPaths::project_state_in(&created.path).exists());
+    }
+
+    /// FS-SEC-R2-2 — the confirmed create re-resolves `rel` against
+    /// `projects_root` right before acting; a directory removed (or,
+    /// equivalently to a symlink swap, no longer resolving to the SAME
+    /// canonical path) between the render and the `cmd:!` tap must be
+    /// refused, not silently create/register anything.
+    #[tokio::test]
+    async fn fs_browser_here_confirm_refuses_when_directory_vanished_before_confirming() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("ephemeral")).unwrap();
+        let mut events = gateway.subscribe_events();
+
+        let _ = gateway
+            .handle_text("telegram", "chat-1", "alice", "/projects")
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "1",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:i:0:{}", fs_fp(&paths.projects_root, "")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let _ = events.try_recv();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "2",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:here:{}", fs_fp(&paths.projects_root, "ephemeral")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let confirm = events.try_recv().expect("expected a confirmation prompt");
+        let token = confirm
+            .button_rows
+            .iter()
+            .flatten()
+            .find_map(|opt| opt.data.strip_prefix("cmd:!").map(str::to_string))
+            .expect("expected a cmd:!<token> confirm button");
+
+        // The directory vanishes between the prompt and the confirm tap.
+        std::fs::remove_dir(paths.projects_root.join("ephemeral")).unwrap();
+
+        let confirmed_replies = gateway
+            .handle_message_rich(
+                "telegram",
+                "chat-1",
+                "alice",
+                "3",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("cmd:!{token}"),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !confirmed_replies
+                .iter()
+                .any(|reply| reply.plain.contains("создан")),
+            "must not report success: {confirmed_replies:?}"
+        );
+        let cfg = ccteam_core::config::load(&paths.root).unwrap();
+        assert!(
+            !cfg.projects.iter().any(|p| p.slug == "ephemeral"),
+            "config.yaml must stay untouched: {:?}",
+            cfg.projects
+        );
+    }
+
+    /// SPEC-3.5 — a failed `create_project_at` (bootstrap error, e.g. no
+    /// write permission) gets the init-error screen: the anyhow chain as
+    /// text (names the abs path) plus a `[⬆️ Вверх][🔁 Повторить]` row,
+    /// not a bare error string with no way back into the browser.
+    /// `config.yaml` stays untouched (registration happens only after a
+    /// successful bootstrap) — pre-creating `.ccteam` as a plain FILE makes
+    /// `bootstrap_project_at_dir`'s own `create_dir_all(.ccteam)` fail
+    /// deterministically, no OS permission trick needed.
+    #[tokio::test]
+    async fn fs_browser_here_confirm_failed_bootstrap_shows_retry_error_screen() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        let target = paths.projects_root.join("blocked");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(".ccteam"), b"not a directory").unwrap();
+        let mut events = gateway.subscribe_events();
+
+        let _ = gateway
+            .handle_text("telegram", "chat-1", "alice", "/projects")
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "1",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:i:0:{}", fs_fp(&paths.projects_root, "")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let _ = events.try_recv();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "2",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:here:{}", fs_fp(&paths.projects_root, "blocked")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let confirm = events.try_recv().expect("expected a confirmation prompt");
+        let token = confirm
+            .button_rows
+            .iter()
+            .flatten()
+            .find_map(|opt| opt.data.strip_prefix("cmd:!").map(str::to_string))
+            .expect("expected a cmd:!<token> confirm button");
+
+        let confirmed_replies = gateway
+            .handle_message_rich(
+                "telegram",
+                "chat-1",
+                "alice",
+                "3",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("cmd:!{token}"),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let error_reply = confirmed_replies
+            .iter()
+            .find(|reply| !reply.plain.starts_with('✅'))
+            .expect("expected an error reply among the confirmed replies");
+        assert!(
+            error_reply.plain.contains(&target.display().to_string()),
+            "error text should name the abs path: {}",
+            error_reply.plain
+        );
+        assert_eq!(error_reply.button_rows.len(), 1, "{error_reply:?}");
+        let row = &error_reply.button_rows[0];
+        assert_eq!(row.len(), 2);
+        assert!(row[0].data.starts_with("nav:fs:up:"), "{row:?}");
+        assert!(row[1].data.starts_with("nav:fs:here:"), "{row:?}");
+
+        let cfg = ccteam_core::config::load(&paths.root).unwrap();
+        assert!(
+            !cfg.projects.iter().any(|p| p.path == target),
+            "config.yaml must stay untouched on a failed bootstrap: {:?}",
+            cfg.projects
+        );
+    }
+
+    /// FS-SEC-R2-1 — a tenant-owned project this operator cannot SEE (ACL)
+    /// must still be recognized as REGISTERED by the folder browser: no
+    /// "📁 Открыть" (→ descend) / "📌 Сделать проектом" (→ bootstrap) path
+    /// that would let the operator take over the tenant's directory. Before
+    /// the fix, `fs_browser_registered` was itself ACL-filtered, so this
+    /// exact directory rendered as an EMPTY, unregistered, enterable folder.
+    #[tokio::test]
+    async fn fs_browser_hidden_tenant_project_is_inert_and_not_bootstrappable() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        seed_owned_project(&paths, "tenant-secret", Some("user:ualice"));
+        let operator = ChatKey::new("telegram", "chat-1", "alice-op");
+
+        let root = gateway
+            .handle_text("telegram", "chat-1", "alice-op", "/projects")
+            .await
+            .unwrap();
+        assert_eq!(root.len(), 1);
+        assert!(root[0].contains("tenant-secret"), "{}", root[0]);
+        assert!(root[0].contains('🔒'), "{}", root[0]);
+        assert!(
+            !root[0].contains("fs:pick:") && !root[0].contains("fs:i:"),
+            "a hidden-registered entry must offer no nav button at all: {}",
+            root[0]
+        );
+
+        let fp = fs_fp(&paths.projects_root, "");
+        let mut events = gateway.subscribe_events();
+
+        // A hand-crafted `fs:i:0:<fp>` (the UI never rendered this button)
+        // must not be honored as "open this folder".
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice-op",
+                "1",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:i:0:{fp}"),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let evt = events
+            .try_recv()
+            .expect("expected a stale/refusal re-render");
+        assert!(evt.content.contains("список обновился"), "{}", evt.content);
+
+        // Nor as "switch me into it".
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice-op",
+                "2",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:pick:0:{fp}"),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let evt = events
+            .try_recv()
+            .expect("expected a stale/refusal re-render");
+        assert!(evt.content.contains("список обновился"), "{}", evt.content);
+        assert_ne!(
+            gateway.current_project.get(&operator).map(String::as_str),
+            Some("tenant-secret"),
+            "must never switch into a hidden project via a crafted pick"
+        );
+
+        // Defense in depth: even a direct create attempt naming the SAME
+        // directory under a fresh slug is refused (path-collision guard),
+        // not a silent re-bootstrap of the tenant's `.ccteam/state.json`.
+        let err = gateway
+            .create_project_at(
+                &operator,
+                "operator-steal",
+                paths.projects_root.join("tenant-secret"),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("уже зарегистрирован"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fs_browser_nav_from_non_operator_chat_is_refused() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("child")).unwrap();
+        // Name a DIFFERENT chat as the operator, so `chat-1` reads as Guest.
+        gateway.bind_operator_allowlist("telegram", ["operator-chat".to_string()]);
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let mut events = gateway.subscribe_events();
+
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "1",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:i:0:{}", fs_fp(&paths.projects_root, "")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let evt = events.try_recv().expect("expected a refusal reply");
+        assert_eq!(evt.content, "недоступно");
+        assert!(
+            !gateway.fs_nav.contains_key(&chat),
+            "a refused callback must not touch fs_nav"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_browser_nav_i_with_stale_index_re_renders_without_acting() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("only-one")).unwrap();
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let mut events = gateway.subscribe_events();
+
+        // Index 5 doesn't exist on a one-entry root page — must re-render,
+        // not panic or silently enter some unrelated folder.
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "1",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "nav:fs:i:5".to_string(),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let evt = events.try_recv().expect("expected a re-rendered page");
+        assert!(
+            evt.content.contains("список обновился"),
+            "content: {}",
+            evt.content
+        );
+        let nav = gateway.fs_nav.get(&chat).expect("fs_nav set to root");
+        assert_eq!(
+            nav.rel,
+            std::path::PathBuf::new(),
+            "a stale index must leave the browser cursor where it was (root)"
+        );
+    }
+
+    /// R2-3 — `nav:fs:up:<fp>` now carries the SAME page-fingerprint
+    /// staleness contract `i:`/`pick:` already had: a tap whose `<fp>`
+    /// doesn't match a FRESH render of the chat's current `fs_nav` cursor
+    /// (e.g. a tap on an older, still-displayed browser message, after this
+    /// chat navigated a NEWER message elsewhere) must re-render with
+    /// [`FS_STALE_NOTICE`] rather than blindly walking up from wherever the
+    /// shared cursor happens to point now.
+    #[tokio::test]
+    async fn fs_browser_nav_up_with_stale_fingerprint_re_renders_without_acting() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("child")).unwrap();
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let mut events = gateway.subscribe_events();
+
+        let _ = gateway
+            .handle_text("telegram", "chat-1", "alice", "/projects")
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "1",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:i:0:{}", fs_fp(&paths.projects_root, "")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let _ = events.try_recv();
+
+        // A wrong/stale fingerprint on "up" (as an older message's button
+        // would carry once the shared cursor has moved) must not walk up.
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "2",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "nav:fs:up:0000".to_string(),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let evt = events.try_recv().expect("expected a stale re-render");
+        assert!(evt.content.contains("список обновился"), "{}", evt.content);
+        let nav = gateway.fs_nav.get(&chat).expect("fs_nav must still be set");
+        assert_eq!(
+            nav.rel,
+            std::path::PathBuf::from("child"),
+            "a stale `up` tap must leave the browser cursor where it was"
+        );
+    }
+
+    /// R2-3 — same staleness contract for `nav:fs:here:<fp>`: a wrong `<fp>`
+    /// must not raise the "make this a project" confirmation at all.
+    #[tokio::test]
+    async fn fs_browser_nav_here_with_stale_fingerprint_re_renders_without_confirming() {
+        let (_tmp, paths, mut gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("child")).unwrap();
+        let mut events = gateway.subscribe_events();
+
+        let _ = gateway
+            .handle_text("telegram", "chat-1", "alice", "/projects")
+            .await
+            .unwrap();
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "1",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: format!("nav:fs:i:0:{}", fs_fp(&paths.projects_root, "")),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let _ = events.try_recv();
+
+        gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "2",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "nav:fs:here:0000".to_string(),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let evt = events.try_recv().expect("expected a stale re-render");
+        assert!(evt.content.contains("список обновился"), "{}", evt.content);
+        assert!(
+            !evt.content.contains("Сделать проектом"),
+            "a stale `here` tap must not raise the confirmation prompt: {}",
+            evt.content
+        );
+    }
+
+    /// Production Telegram traffic runs `nav:` callbacks through
+    /// [`Gateway::handle_message_shared`] (the `Arc<Mutex<Gateway>>` path
+    /// `daemon.rs` actually calls), not the `&mut self` [`Gateway::handle_message`]
+    /// every other test in this file uses — so the `fs:` branch wired into
+    /// THAT function's own `nav:` dispatch needs its own coverage.
+    #[tokio::test]
+    async fn fs_browser_nav_works_through_handle_message_shared() {
+        let (_tmp, paths, gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("child")).unwrap();
+        let chat = ChatKey::new("telegram", "chat-1", "alice");
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let mut events = gateway.lock().await.subscribe_events();
+
+        Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-1",
+            "alice",
+            "1",
+            "",
+            &[],
+            Some(&ChoiceReply {
+                data: format!("nav:fs:i:0:{}", fs_fp(&paths.projects_root, "")),
+                callback_ephemeral: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let evt = events.try_recv().expect("expected a rendered folder page");
+        assert!(evt.content.contains('📂'), "content: {}", evt.content);
+        let nav = gateway
+            .lock()
+            .await
+            .fs_nav
+            .get(&chat)
+            .cloned()
+            .expect("fs_nav set after entering a folder");
+        assert_eq!(nav.rel, std::path::PathBuf::from("child"));
+    }
+
+    /// SPEC-3.5c/R2-1/R2-2 — the SAME edit-in-place fix, through the
+    /// production `Arc<Mutex<Gateway>>`-locked entry point
+    /// `handle_message_shared` daemon.rs actually calls (as opposed to
+    /// `handle_message`'s single-`&mut self` twin, covered by
+    /// `cmd_sessions_callback_edits_the_tapped_message_in_place` above) —
+    /// the two dispatch this finding named separately (gateway.rs's
+    /// `resolve_cmd_callback` AND `handle_message_shared`'s own
+    /// `CallbackAction::Redraw` arm). Uses `cmd:~/sessions` — the
+    /// `/sessions` screen's OWN self-refresh button — not plain
+    /// `cmd:/sessions`, which R2-2 made a non-redraw since it also serves
+    /// cross-screen nav buttons that must never edit the tapped screen away.
+    #[tokio::test]
+    async fn cmd_sessions_callback_edits_in_place_through_handle_message_shared() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let gateway = Gateway::new(fake, "alpha", proj.path());
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let mut events = gateway.lock().await.subscribe_events();
+
+        let replies = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "42",
+            "42",
+            "tg-cb-888",
+            "",
+            &[],
+            Some(&ChoiceReply {
+                data: "cmd:~/sessions".to_string(),
+                callback_ephemeral: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            replies.is_empty(),
+            "edited in place — nothing comes back as a fresh reply: {replies:?}"
+        );
+
+        let edit = events.try_recv().expect("expected an edit event");
+        match edit.kind {
+            GatewayEventKind::EditMessage { ref message_id, .. } => {
+                assert_eq!(message_id, "888");
+            }
+            other => panic!("expected EditMessage, got {other:?}"),
+        }
+        assert!(edit.content.contains("Нет сессий"), "{}", edit.content);
+    }
+
+    /// review-fix F1 — a `cmd:/use <sid>` tap is an ACTION, not a redraw of
+    /// the screen it was tapped from (`/sessions`): editing the tapped
+    /// message in place would destroy the session list the button lives
+    /// on. Both dispatch copies (`resolve_cmd_callback`, exercised via
+    /// `handle_message`, and `handle_message_shared`'s own
+    /// `CallbackAction::Command` arm) must fall through to a normal reply
+    /// — no `EditMessage` — even with a resolvable `tg-cb-<id>` message id.
+    #[tokio::test]
+    async fn cmd_use_callback_does_not_edit_the_tapped_message() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "telegram",
+                "chat-1",
+                "alice",
+                "tg-cb-999",
+                "",
+                &[],
+                Some(&ChoiceReply {
+                    data: "cmd:/use s1".to_string(),
+                    callback_ephemeral: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replies,
+            vec!["Используется сессия s1"],
+            "an action command still comes back as a reply, not an edit"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "no EditMessage should be emitted for an action command"
+        );
+    }
+
+    /// review-fix F1, production path — the same guarantee as
+    /// `cmd_use_callback_does_not_edit_the_tapped_message` through the
+    /// `Arc<Mutex<Gateway>>`-locked entry point `daemon.rs` actually calls.
+    #[tokio::test]
+    async fn cmd_use_callback_does_not_edit_through_handle_message_shared() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway
+            .handle_text("telegram", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let mut events = gateway.lock().await.subscribe_events();
+
+        let replies = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-1",
+            "alice",
+            "tg-cb-999",
+            "",
+            &[],
+            Some(&ChoiceReply {
+                data: "cmd:/use s1".to_string(),
+                callback_ephemeral: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replies,
+            vec![RichReply::plain("Используется сессия s1")],
+            "an action command still comes back as a reply, not an edit"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "no EditMessage should be emitted for an action command"
+        );
+    }
+
+    /// R2-2, production path — the same guarantee as
+    /// `cmd_sessions_plain_callback_never_redraws_the_tapped_message`
+    /// through the `Arc<Mutex<Gateway>>`-locked entry point `daemon.rs`
+    /// actually calls: a plain `cmd:/sessions` tap (a cross-screen nav
+    /// button, e.g. "📋 Сессии" on the `/status` card) must never edit the
+    /// tapped message in place, even though `handle_message_shared`'s own
+    /// `CallbackAction::Command | CallbackAction::Redraw` arm runs the exact
+    /// same `/sessions` command the screen's `cmd:~/sessions` self-refresh
+    /// button does.
+    #[tokio::test]
+    async fn cmd_sessions_plain_callback_never_redraws_through_handle_message_shared() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let gateway = Gateway::new(fake, "alpha", proj.path());
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let mut events = gateway.lock().await.subscribe_events();
+
+        let replies = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "42",
+            "42",
+            "tg-cb-777",
+            "",
+            &[],
+            Some(&ChoiceReply {
+                data: "cmd:/sessions".to_string(),
+                callback_ephemeral: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !replies.is_empty(),
+            "a cross-screen nav tap must come back as a normal reply, not vanish into an in-place edit: {replies:?}"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "a plain (non-`~`) cmd: tap must never fire an EditMessage event"
+        );
+    }
+
+    /// review-fix F2 — the fs browser nav (`nav:fs:i:*`) edit-in-place
+    /// behaviour, through the SAME production `Arc<Mutex<Gateway>>` entry
+    /// point `daemon.rs` actually calls, with a resolvable `tg-cb-<id>`
+    /// message id (`fs_browser_nav_works_through_handle_message_shared`
+    /// above uses a bare "1" id, which never resolves to a callback and so
+    /// never exercises the edit-in-place branch at all).
+    #[tokio::test]
+    async fn fs_browser_nav_callback_edits_in_place_through_handle_message_shared() {
+        let (_tmp, paths, gateway) = fs_browser_test_rig();
+        std::fs::create_dir_all(paths.projects_root.join("child")).unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        let mut events = gateway.lock().await.subscribe_events();
+
+        let replies = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "telegram",
+            "chat-1",
+            "alice",
+            "tg-cb-321",
+            "",
+            &[],
+            Some(&ChoiceReply {
+                data: format!("nav:fs:i:0:{}", fs_fp(&paths.projects_root, "")),
+                callback_ephemeral: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            replies.is_empty(),
+            "edited in place — nothing comes back as a fresh reply: {replies:?}"
+        );
+
+        let edit = events.try_recv().expect("expected an edit event");
+        match edit.kind {
+            GatewayEventKind::EditMessage { ref message_id, .. } => {
+                assert_eq!(message_id, "321");
+            }
+            other => panic!("expected EditMessage, got {other:?}"),
+        }
+        assert!(edit.content.contains("child"), "{}", edit.content);
     }
 
     #[test]
@@ -41230,5 +43936,118 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(resume.contains("retired"), "{resume}");
+    }
+
+    /// Audit 2026-09-03 R1 — a child turn that completes WITHOUT a text
+    /// answer (codex items the adapter cannot name degrade to empty
+    /// messages) must still wake the parent: the boundary happened, and a
+    /// parent waiting on it is the same stall as a swallowed boundary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegation_answerless_completed_turn_still_notifies_parent() {
+        use ccteam_harness::execution::turns_mirror::read_all_turns;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
+            Arc::new(FakeAdapter::new(vendor).with_turn_boundary().answerless())
+                as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        let gateway = delegation_gateway_with_factory(&project_dir, factory, true).await;
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        gateway.lock().await.enable_project_creation(paths.clone());
+        let (parent_sid, child_sid) = {
+            let mut gw = gateway.lock().await;
+            let parent = gw
+                .create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap()
+                .sid;
+            let child = gw
+                .create_delegated_session(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Codex,
+                    PermissionMode::Skip,
+                    SessionProtocol::StreamJson,
+                    "web-api".into(),
+                    SpawnTuning::default(),
+                    Some(DelegationParent {
+                        sid: parent.clone(),
+                        depth: 0,
+                        role: String::new(),
+                    }),
+                    Some("silent task".into()),
+                )
+                .await
+                .unwrap()
+                .sid;
+            gw.arm_delegation_watch(
+                &child,
+                &parent,
+                ccteam_harness::NotifyMode::Final,
+                Some("silent task".into()),
+                None,
+            );
+            gw.submit_to_sid(&child, "do it quietly".into())
+                .await
+                .unwrap();
+            (parent, child)
+        };
+
+        let mut notification = None;
+        for _ in 0..200 {
+            let turns = read_all_turns(&project_dir, &parent_sid).unwrap_or_default();
+            if let Some(t) = turns
+                .iter()
+                .find(|t| t.user.contains("[ccteam] делегированная сессия"))
+            {
+                notification = Some(t.user.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let notification = notification
+            .expect("a completed turn with no text answer must still notify the parent");
+        assert!(notification.contains(&child_sid), "{notification}");
+        assert!(
+            notification.contains("без текстового ответа"),
+            "the placeholder tail says honestly that no text came back: {notification}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_status_background_task_without_turn_reads_working() {
+        // Audit 2026-09-03 R5 — no turn in flight, a background shell still
+        // running: the badge must say 🔵 работает, not 🟢 ожидание, or the
+        // card contradicts its own `▶` row.
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-bg-task-no-turn");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        fake.set_running_tasks(vec![RunningTask {
+            task_id: "bg-shell".into(),
+            kind: "".into(),
+            description: "cargo test --workspace".into(),
+            task_type: "local_bash".into(),
+            started: std::time::Instant::now() - std::time::Duration::from_secs(120),
+            backgrounded: true,
+        }])
+        .await;
+        let out = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(out[0].contains("🔵 работает"), "{out:?}");
+        assert!(out[0].contains("фоновая задача"), "{out:?}");
+        assert!(!out[0].contains("🟢 ожидание"), "{out:?}");
     }
 }

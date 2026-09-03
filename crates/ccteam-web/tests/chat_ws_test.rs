@@ -281,6 +281,13 @@ async fn chat_ws_binds_to_the_authenticated_identity_not_the_query() {
         let mut st = ccteam_core::ProjectState::initial_for_team(slug.into(), "dev".into());
         st.owner = Some(owner);
         st.save(&path).unwrap();
+        ccteam_core::config::register_local_project(
+            &paths.root,
+            slug,
+            paths.project_dir(slug),
+            "dev",
+        )
+        .unwrap();
     }
 
     let (in_tx, _in_rx) = mpsc::channel(8);

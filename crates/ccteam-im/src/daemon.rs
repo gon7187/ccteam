@@ -2147,9 +2147,20 @@ fn spawn_gateway_event_consumer(
                 // platform id. A failed edit (message gone/too old) falls
                 // back to the pre-W8 behavior: send the resolution as a
                 // new message, so it is never silently dropped.
-                GatewayEventKind::EditMessage { message_id } => {
+                GatewayEventKind::EditMessage {
+                    message_id,
+                    rich_markdown,
+                    inline_buttons,
+                } => {
                     match channel
-                        .edit_message(&evt.chat_id, &message_id, &evt.content, &evt.button_rows)
+                        .edit_message(
+                            &evt.chat_id,
+                            &message_id,
+                            &evt.content,
+                            rich_markdown.as_deref(),
+                            inline_buttons,
+                            &evt.button_rows,
+                        )
                         .await
                     {
                         Ok(_) => tracing::info!(
@@ -2160,6 +2171,22 @@ fn spawn_gateway_event_consumer(
                             len = evt.content.len(),
                             "ccteam-im: confirmation edit delivered"
                         ),
+                        // F3 — Telegram rejects an edit whose content is
+                        // byte-identical to what's already on screen with
+                        // "message is not modified"; that's not a delivery
+                        // failure (the right content IS showing), so treat it
+                        // as success instead of appending a duplicate message
+                        // (same guard the Progress path already applies).
+                        Err(err) if err.to_string().contains("message is not modified") => {
+                            tracing::info!(
+                                cid = %log_cid,
+                                channel = crate::transport::platform_of(&evt.channel),
+                                outcome = "ok",
+                                kind = "edit",
+                                len = evt.content.len(),
+                                "ccteam-im: edit was already up to date"
+                            );
+                        }
                         Err(_) => {
                             tracing::info!(
                                 cid = %log_cid,
@@ -2170,9 +2197,16 @@ fn spawn_gateway_event_consumer(
                                 len = evt.content.len(),
                                 "ccteam-im: confirmation edit failed, falling back to a new message"
                             );
-                            let out = SendMessage::new(evt.content, evt.chat_id)
+                            let mut out = SendMessage::new(evt.content, evt.chat_id)
                                 .in_thread(evt.thread_ts)
                                 .with_button_rows(evt.button_rows);
+                            if channel.supports_rich_messages() {
+                                if let Some(markdown) = rich_markdown {
+                                    out = out
+                                        .with_rich_markdown(markdown)
+                                        .with_inline_buttons(inline_buttons);
+                                }
+                            }
                             send_gateway_outbound(
                                 &evt.id,
                                 &log_cid,
@@ -2328,6 +2362,8 @@ fn spawn_gateway_event_consumer(
                                         &evt.chat_id,
                                         &message_id,
                                         &evt.content,
+                                        None,
+                                        false,
                                         &evt.button_rows,
                                     )
                                     .await
@@ -2616,6 +2652,8 @@ async fn deliver_progress(
                 &handle.recipient,
                 &handle.message_id,
                 &content,
+                None,
+                false,
                 &button_rows,
             )
             .await
@@ -3958,6 +3996,8 @@ mod tests {
                 _recipient: &str,
                 message_id: &str,
                 _content: &str,
+                _rich_markdown: Option<&str>,
+                _inline_buttons: bool,
                 _button_rows: &[Vec<crate::transport::MessageOption>],
             ) -> anyhow::Result<Option<String>> {
                 self.ordinary_edits
@@ -4495,6 +4535,8 @@ mod tests {
                 _recipient: &str,
                 message_id: &str,
                 _content: &str,
+                _rich_markdown: Option<&str>,
+                _inline_buttons: bool,
                 _button_rows: &[Vec<crate::transport::MessageOption>],
             ) -> anyhow::Result<Option<String>> {
                 self.edits.lock().unwrap().push(message_id.to_string());
@@ -4569,6 +4611,8 @@ mod tests {
                 _recipient: &str,
                 message_id: &str,
                 _content: &str,
+                _rich_markdown: Option<&str>,
+                _inline_buttons: bool,
                 _button_rows: &[Vec<crate::transport::MessageOption>],
             ) -> anyhow::Result<Option<String>> {
                 self.edits.lock().unwrap().push(message_id.to_string());

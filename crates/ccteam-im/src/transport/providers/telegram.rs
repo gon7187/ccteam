@@ -555,7 +555,9 @@ impl TelegramChannel {
     async fn log_rich_fallback_once(&self, reason: &str) {
         let mut seen = self.rich_fallback_logged.lock().await;
         if seen.insert(reason.to_string()) {
-            tracing::debug!(
+            // warn, not debug: a fallback silently swaps the layout the user
+            // sees and feeds the circuit breaker — it must be visible.
+            tracing::warn!(
                 channel = %self.name,
                 reason,
                 "telegram: rich message send/edit failed, falling back to classic HTML"
@@ -643,7 +645,11 @@ impl TelegramChannel {
                 self.log_ephemeral_fallback_once(&format!("http_{}", status.as_u16()))
                     .await;
             }
-            return Err(format!("http_{}", status.as_u16()));
+            return Err(format!(
+                "http_{}:{}",
+                status.as_u16(),
+                short_description(&text)
+            ));
         }
         if body_reports_failure(&text) {
             if message.callback_ephemeral.is_some() {
@@ -661,10 +667,12 @@ impl TelegramChannel {
         recipient: &str,
         message_id: &str,
         markdown: &str,
+        inline_buttons: bool,
         button_rows: &[Vec<MessageOption>],
     ) -> Result<Option<String>, String> {
         let url = self.api_url("editMessageText");
-        let body = build_rich_edit_body(recipient, message_id, markdown, button_rows);
+        let body =
+            build_rich_edit_body(recipient, message_id, markdown, inline_buttons, button_rows);
         let resp = self
             .http
             .post(&url)
@@ -674,8 +682,16 @@ impl TelegramChannel {
             .map_err(|err| format!("network_error:{err}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        if edit_not_modified(status, &text) {
+            // Nothing to change — the rich card is already what we would draw.
+            return Ok(Some(message_id.to_string()));
+        }
         if !status.is_success() {
-            return Err(format!("http_{}", status.as_u16()));
+            return Err(format!(
+                "http_{}:{}",
+                status.as_u16(),
+                short_description(&text)
+            ));
         }
         if body_reports_failure(&text) {
             return Err("ok_false".to_string());
@@ -882,6 +898,9 @@ impl TelegramChannel {
             let resp = self.http.post(&url).json(&plain_body).send().await?;
             status = resp.status();
             text = resp.text().await.unwrap_or_default();
+        }
+        if edit_not_modified(status, &text) {
+            return Ok(Some(message_id.to_string()));
         }
         if !status.is_success() {
             anyhow::bail!("telegram editMessageText {recipient}#{message_id} → {status}: {text}");
@@ -1648,6 +1667,12 @@ fn plain_body(mut body: serde_json::Value, text: &str) -> serde_json::Value {
 }
 
 fn plain_text_for_request(source: &str) -> String {
+    // F5 — this is the LAST resort when Telegram rejects the HTML attempt:
+    // sent as-is with no `parse_mode`, so any Rich Messages markup left in
+    // `source` (a caller may have embedded `<tg-button>`/`<tg-button-row>`
+    // tags in markdown, expecting `render_markdown` to strip them — which
+    // this retry bypasses) would otherwise leak as literal text.
+    let source = &crate::telegram_html::strip_rich_tags(source);
     if source.encode_utf16().count() > MAX_MESSAGE_UTF16 {
         truncate_plain_message(source)
     } else {
@@ -1669,6 +1694,30 @@ fn caption_payload(caption: &str) -> CaptionPayload {
 /// a bare `status.is_success()` check treats that as delivered. Missing or
 /// unparseable `ok` is NOT treated as failure (matches every other Bot API
 /// call site here, which only inspects the HTTP status).
+/// Bot API `editMessageText` answers HTTP 400 `message is not modified` when
+/// the new content and markup equal the current ones. That is a no-op, not a
+/// failure: treating it as one made a `🔄 Обновить` tap on an unchanged card
+/// "fail" the rich edit, fall back to a classic `text` edit (the old layout
+/// suddenly back), and count towards the 3-strikes rich circuit breaker —
+/// three taps degraded EVERY message of the bot to classic for 50 sends
+/// (live probe 2026-09-03).
+fn edit_not_modified(status: reqwest::StatusCode, text: &str) -> bool {
+    status.as_u16() == 400 && text.contains("message is not modified")
+}
+
+/// `description` of a Bot API error body, shortened for a log reason.
+fn short_description(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| {
+            v.get("description")
+                .and_then(|d| d.as_str())
+                .map(str::to_string)
+        })
+        .map(|d| d.chars().take(120).collect())
+        .unwrap_or_default()
+}
+
 fn body_reports_failure(text: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(text)
         .ok()
@@ -1923,9 +1972,18 @@ fn build_rich_edit_body(
     recipient: &str,
     message_id: &str,
     markdown: &str,
+    inline_buttons: bool,
     button_rows: &[Vec<MessageOption>],
 ) -> serde_json::Value {
-    let buttons_html = button_rows_to_tg_html(button_rows);
+    // F2/SPEC-3 — `inline_buttons` means every button already rides inline
+    // `<tg-button>` tags inside `markdown` (mirrors `build_rich_send_body`'s
+    // same check); appending `button_rows` again here would render each
+    // button twice.
+    let buttons_html = if inline_buttons {
+        String::new()
+    } else {
+        button_rows_to_tg_html(button_rows)
+    };
     let full_markdown = if buttons_html.is_empty() {
         markdown.to_string()
     } else {
@@ -2376,15 +2434,22 @@ impl Channel for TelegramChannel {
         recipient: &str,
         message_id: &str,
         content: &str,
+        rich_markdown: Option<&str>,
+        inline_buttons: bool,
         button_rows: &[Vec<MessageOption>],
     ) -> anyhow::Result<Option<String>> {
         // TG-GATE-V2 W1/W5 — same rich→classic ladder as `send` (see there
         // for the fallback contract + once-per-reason-kind logging), now
         // carrying `button_rows` (e.g. the progress edit's `[⛔ Прервать]`)
-        // through both legs.
+        // through both legs. F5/F2 — the rich attempt reads `rich_markdown`
+        // when given (falling back to `content` for every pre-existing
+        // caller, which never set it) and, when `inline_buttons` is set,
+        // must NOT also append `button_rows` as a trailing block — the
+        // markdown already embeds every button as inline `<tg-button>` tags.
         if !self.rich_circuit_open() {
+            let markdown = rich_markdown.unwrap_or(content);
             match self
-                .try_edit_rich(recipient, message_id, content, button_rows)
+                .try_edit_rich(recipient, message_id, markdown, inline_buttons, button_rows)
                 .await
             {
                 Ok(id) => {
@@ -3393,13 +3458,13 @@ mod tests {
 
     #[test]
     fn rich_edit_body_has_no_buttons_and_parses_message_id() {
-        let body = build_rich_edit_body("42", "tg-99", "**edited**", &[]);
+        let body = build_rich_edit_body("42", "tg-99", "**edited**", false, &[]);
         assert_eq!(body["chat_id"], "42");
         assert_eq!(body["message_id"].as_i64(), None, "tg-99 isn't numeric");
         assert_eq!(body["rich_message"]["markdown"], "**edited**");
         assert!(body.get("text").is_none());
 
-        let body = build_rich_edit_body("42", "99", "**edited**", &[]);
+        let body = build_rich_edit_body("42", "99", "**edited**", false, &[]);
         assert_eq!(body["message_id"], 99);
     }
 
@@ -3409,10 +3474,29 @@ mod tests {
     #[test]
     fn rich_edit_body_appends_button_rows() {
         let rows = vec![vec![opt("cmd:?/interrupt", "⛔ Прервать", None)]];
-        let body = build_rich_edit_body("42", "99", "working...", &rows);
+        let body = build_rich_edit_body("42", "99", "working...", false, &rows);
         let markdown = body["rich_message"]["markdown"].as_str().unwrap();
         assert!(markdown.starts_with("working...\n\n<tg-button-row>"));
         assert!(markdown.contains(">⛔ Прервать</tg-button>"));
+    }
+
+    /// F2/SPEC-3 — `inline_buttons: true` must NOT append `button_rows` as a
+    /// trailing block: the markdown already embeds every button as inline
+    /// `<tg-button>` tags (the fs-browser page render), so appending them
+    /// again would show each button twice.
+    #[test]
+    fn rich_edit_body_skips_button_rows_when_inline_buttons_set() {
+        let rows = vec![vec![opt("nav:fs:up", "⬆️ Вверх", None)]];
+        let body = build_rich_edit_body(
+            "42",
+            "99",
+            "📂 /root <tg-button type=\"callback_data\" data=\"nav:fs:up\">⬆️ Вверх</tg-button>",
+            true,
+            &rows,
+        );
+        let markdown = body["rich_message"]["markdown"].as_str().unwrap();
+        assert!(!markdown.contains("<tg-button-row>"));
+        assert_eq!(markdown.matches("nav:fs:up").count(), 1);
     }
 
     /// The classic edit fallback attaches the same `inline_keyboard` shape
@@ -3867,6 +3951,24 @@ mod tests {
     /// (`edit_classic`), not just the rich Bot API calls: a Telegram 200 with
     /// `{"ok":false}` must read as a failure everywhere this crate treats an
     /// HTTP 200 as delivered.
+    #[test]
+    fn edit_not_modified_is_a_no_op_not_a_failure() {
+        // Verbatim Bot API answer to editing a rich message with itself
+        // (live probe 2026-09-03).
+        let body = r#"{"ok":false,"error_code":400,"description":"Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"}"#;
+        assert!(edit_not_modified(reqwest::StatusCode::BAD_REQUEST, body));
+        assert!(!edit_not_modified(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: message to edit not found"}"#
+        ));
+        assert!(!edit_not_modified(reqwest::StatusCode::OK, body));
+        assert_eq!(
+            short_description(r#"{"ok":false,"description":"Bad Request: x"}"#),
+            "Bad Request: x"
+        );
+        assert_eq!(short_description("not json"), "");
+    }
+
     #[test]
     fn body_reports_failure_flags_200_with_ok_false() {
         assert!(body_reports_failure(

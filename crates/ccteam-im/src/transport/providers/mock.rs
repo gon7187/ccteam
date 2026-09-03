@@ -244,6 +244,8 @@ impl Channel for MockChannel {
         _recipient: &str,
         message_id: &str,
         content: &str,
+        _rich_markdown: Option<&str>,
+        _inline_buttons: bool,
         button_rows: &[Vec<MessageOption>],
     ) -> anyhow::Result<Option<String>> {
         self.edits.lock().await.push((

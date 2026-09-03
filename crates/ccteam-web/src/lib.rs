@@ -486,6 +486,13 @@ mod tests {
             serde_json::to_vec_pretty(&ccteam_core::ProjectState::initial("demo".into())).unwrap(),
         )
         .unwrap();
+        ccteam_core::config::register_local_project(
+            &paths.root,
+            "demo",
+            paths.project_dir("demo"),
+            "dev",
+        )
+        .unwrap();
         let progress = paths.progress_jsonl("demo");
         std::fs::create_dir_all(progress.parent().unwrap()).unwrap();
         let archive = ccteam_harness::execution::progress_bridge::progress_archive_path(&progress);
