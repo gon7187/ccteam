@@ -56,6 +56,15 @@ pub const PI_RPC_ADAPTER_NAME: &str = "pi-rpc";
 const MIN_PI_VERSION: (u64, u64, u64) = (0, 83, 0);
 static PI_TURN_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// Process-wide incarnation nonce for synthesized pi turn ids
+/// (`pi-<sid>-<nonce>-<seq>`): `PI_TURN_SEQ` restarts with the daemon and
+/// `turn_id` is the durable dedup key of the terminal boundary — see
+/// [`crate::execution::incarnation_nonce`].
+fn pi_incarnation() -> &'static str {
+    static NONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NONCE.get_or_init(crate::execution::incarnation_nonce)
+}
+
 #[derive(Clone)]
 pub struct PiRpcAdapter {
     live: Arc<StdMutex<HashMap<String, Arc<LiveSession>>>>,
@@ -1209,7 +1218,7 @@ impl HarnessAdapter for PiRpcAdapter {
                 )
             } else {
                 let seq = PI_TURN_SEQ.fetch_add(1, Ordering::Relaxed);
-                let turn_id = format!("pi-{}-{seq}", live.sid);
+                let turn_id = format!("pi-{}-{}-{seq}", live.sid, pi_incarnation());
                 let (gate, permit) = CompletionGate::new_reserved();
                 state
                     .translator

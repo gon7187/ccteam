@@ -26,10 +26,20 @@ use super::protocol::{MessageEnvelope, Outbound, ResultMsg};
 use crate::{ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails, UnifiedTokenUsage};
 
 /// Per-session translation state. One per live stream-json session.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StreamTranslator {
-    /// Monotonic per-session turn counter (synthesizes turn ids; the pump
-    /// keys turns.jsonl off its OWN seq, so these need only be unique).
+    /// Incarnation nonce baked into every turn id this translator mints
+    /// (`sj-<nonce>-<n>`). A `--resume` (or a pump re-attach) builds a NEW
+    /// translator for the same sid, and the durable terminal dedup
+    /// (`append_terminal_turn_if_absent` / `append_chat_turn_completed_if_absent`)
+    /// keys on `turn_id` across the sid's whole turns.jsonl history: a bare
+    /// `sj-{n}` restarting at 1 made every post-resume `TurnCompleted` read
+    /// as a replay of the pre-resume turn with the same number, so the
+    /// boundary was dropped (no `completed` row, no `chat_turn_completed`,
+    /// no completion notification to the parent, turn live until the next
+    /// inbound message). Unique by construction instead.
+    incarnation: String,
+    /// Monotonic per-incarnation turn counter.
     turn_seq: u64,
     /// `Some` while a turn is in flight (between first assistant block and
     /// its `result`).
@@ -48,9 +58,29 @@ pub struct StreamTranslator {
     turn_model: Option<String>,
 }
 
+impl Default for StreamTranslator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamTranslator {
+    /// A translator whose turn ids carry a fresh process-wide nonce.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_incarnation(crate::execution::incarnation_nonce())
+    }
+
+    /// A translator with an explicit incarnation nonce (tests; callers that
+    /// already own a per-spawn nonce).
+    pub fn with_incarnation(incarnation: impl Into<String>) -> Self {
+        Self {
+            incarnation: incarnation.into(),
+            turn_seq: 0,
+            active_turn: None,
+            acc_text: String::new(),
+            item_seq: 0,
+            turn_model: None,
+        }
     }
 
     /// Ingest one outbound message, returning the neutral events it
@@ -72,7 +102,7 @@ impl StreamTranslator {
     fn ensure_turn_started(&mut self, out: &mut Vec<ThreadEvent>) {
         if self.active_turn.is_none() {
             self.turn_seq += 1;
-            let id = format!("sj-{}", self.turn_seq);
+            let id = format!("sj-{}-{}", self.incarnation, self.turn_seq);
             self.active_turn = Some(id.clone());
             self.acc_text.clear();
             self.item_seq = 0;
@@ -84,8 +114,8 @@ impl StreamTranslator {
     fn next_item_id(&mut self) -> String {
         self.item_seq += 1;
         format!(
-            "sj-{}-{}",
-            self.active_turn.as_deref().unwrap_or("0"),
+            "{}-{}",
+            self.active_turn.as_deref().unwrap_or("sj-0"),
             self.item_seq
         )
     }
@@ -170,7 +200,7 @@ impl StreamTranslator {
         let turn_id = self
             .active_turn
             .take()
-            .unwrap_or_else(|| "sj-0".to_string());
+            .unwrap_or_else(|| format!("sj-{}-0", self.incarnation));
         let usage = r
             .usage
             .as_ref()
@@ -521,5 +551,47 @@ mod tests {
             })
         };
         assert_ne!(id(&a), id(&b));
+    }
+
+    /// A resumed session gets a fresh translator (new child process, new
+    /// incarnation); its turn ids must never collide with the previous
+    /// incarnation's. The durable terminal dedup keys on `turn_id` across
+    /// the sid's whole history, so a collision silently swallows the
+    /// boundary: no `completed` row, no parent notification, turn stuck
+    /// "live" until the next inbound message (s412/s413, 2026-09-02).
+    #[test]
+    fn turn_ids_never_collide_across_incarnations() {
+        fn first_turn_id(t: &mut StreamTranslator) -> String {
+            let events = t.ingest(assistant(json!([{"type": "text", "text": "hi"}])));
+            match events.first() {
+                Some(ThreadEvent::TurnStarted { turn_id }) => turn_id.clone(),
+                other => panic!("expected TurnStarted, got {other:?}"),
+            }
+        }
+        let mut before = StreamTranslator::with_incarnation("a1");
+        let mut after = StreamTranslator::with_incarnation("b2");
+        assert_eq!(first_turn_id(&mut before), "sj-a1-1");
+        assert_eq!(first_turn_id(&mut after), "sj-b2-1");
+
+        // `new()` mints its own nonce: two back-to-back translators (the
+        // pre-resume and post-resume incarnations) disagree on their first
+        // id, and the boundary carries the same id the start did.
+        let mut fresh = StreamTranslator::new();
+        let mut resumed = StreamTranslator::new();
+        let fresh_id = first_turn_id(&mut fresh);
+        let resumed_id = first_turn_id(&mut resumed);
+        assert!(fresh_id.starts_with("sj-"));
+        assert_ne!(fresh_id, resumed_id);
+        let boundary = fresh.ingest(Outbound::TurnResult(ResultMsg {
+            subtype: "success".into(),
+            result: Some("ok".into()),
+            is_error: false,
+            total_cost_usd: None,
+            usage: None,
+            session_id: "u-1".into(),
+        }));
+        assert!(boundary.iter().any(
+            |e| matches!(e, ThreadEvent::TurnCompleted { turn_id, .. } if *turn_id == fresh_id)
+        ));
     }
 }

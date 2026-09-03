@@ -334,12 +334,25 @@ pub fn render_status(view: &StatusView) -> RichReply {
     // placeholder, not a silent drop (SPEC-3.5d-roleless — "never
     // fabricated" extends to "never silently missing" too).
     let (icon, label) = activity_badge(&view.activity);
+    // An idle parent whose children still run reads as "nothing happening"
+    // while a child is grinding the test suite — say so, derived from the
+    // children already on this card (no new data, no guessing).
+    let working_children = view
+        .children
+        .iter()
+        .filter(|child| child.activity == "working")
+        .count();
+    let waiting_hint = if view.activity == "idle" && working_children > 0 {
+        format!(" · в работе дочерних: {working_children}")
+    } else {
+        String::new()
+    };
     let line2_plain = format!(
-        "{icon} {label} · ctx {} · 💰 24ч {}",
+        "{icon} {label}{waiting_hint} · ctx {} · 💰 24ч {}",
         view.context, view.cost_24h
     );
     let line2_markdown = format!(
-        "{icon} {label} · ctx {} · 💰 24ч {}",
+        "{icon} {label}{waiting_hint} · ctx {} · 💰 24ч {}",
         escape_status_markdown(&view.context),
         escape_status_markdown(&view.cost_24h)
     );
@@ -389,7 +402,8 @@ pub fn render_status(view: &StatusView) -> RichReply {
 
     // Children — header always renders (it carries the counters even with
     // no children); its "⛔ все" only when there IS a direct child to stop.
-    markdown_lines.push(String::new());
+    // Plain keeps a blank separator line; rich markdown needs none — every
+    // line there is already its own paragraph (see the join below).
     plain_lines.push(String::new());
     let children_header = format!(
         "👥 Дочерние {} · сессий проекта {} · проектов {}",
@@ -469,16 +483,6 @@ pub fn render_status(view: &StatusView) -> RichReply {
         format!("resume {}", view.resume),
     ]
     .join(" · ");
-    // R2-2 fix — this blank line must separate the quote from whatever
-    // precedes it UNCONDITIONALLY (children header, or the last child row):
-    // every other block-level splice in this file (`render_sessions`,
-    // `append_inline_rows`, `build_rich_send_body`) uses `\n\n`, and making
-    // this one conditional on `!view.children.is_empty()` was the sole
-    // exception — the minimal (childless) card packed the quote into the
-    // SAME paragraph as the counters line, so whether it opened a real
-    // block depended on how a downstream Markdown-agnostic renderer
-    // happened to treat a lone `\n`.
-    markdown_lines.push(String::new());
     plain_lines.push(String::new());
     markdown_lines.push(format!(
         "<blockquote expandable>{}</blockquote>",
@@ -486,7 +490,12 @@ pub fn render_status(view: &StatusView) -> RichReply {
     ));
     plain_lines.push(details_line);
 
-    let mut markdown = markdown_lines.join("\n");
+    // Rich markdown is GFM: a lone `\n` is a soft break and Telegram renders
+    // it as a SPACE, which packed the whole card into one run-on paragraph
+    // (live 2026-09-03). Every line is its own paragraph (`\n\n`) — the same
+    // splice `render_sessions` uses and Telegram is proven to honor; plain
+    // (classic parse_mode) keeps single newlines plus blank separators.
+    let mut markdown = markdown_lines.join("\n\n");
     let plain = plain_lines.join("\n");
 
     let bottom_row = command_row([
@@ -1277,14 +1286,13 @@ mod tests {
         }
     }
 
-    /// SPEC-3.5d — no children, no optional lines: exactly 3 header lines +
-    /// one blank + the children counter line + one more blank + the
-    /// expandable quote, then one bottom button row. Pins the whole compact
-    /// markdown byte-for-byte so a future edit can't silently drop or
-    /// reorder a section. R2-2 fix — the blank before the quote is now
-    /// unconditional (was only present with children present), so the
-    /// quote opens its OWN block in the minimal case too, matching every
-    /// other block-level splice in this file (`\n\n`, never a lone `\n`).
+    /// SPEC-3.5d — no children, no optional lines: 3 header lines, the
+    /// children counter line, the expandable quote, then one bottom button
+    /// row. Pins the whole compact markdown byte-for-byte so a future edit
+    /// can't silently drop or reorder a section. Every rich line is its own
+    /// paragraph (`\n\n`): rich markdown is GFM, where a lone `\n` is a soft
+    /// break that Telegram renders as a space (the live run-on `/status`
+    /// card, 2026-09-03). Plain keeps single newlines + blank separators.
     #[test]
     fn status_minimal_card_has_exact_compact_layout() {
         let reply = render_status(&minimal_status_view());
@@ -1293,8 +1301,8 @@ mod tests {
             reply.markdown,
             concat!(
                 "🧭 s42 · claude · opus · high ",
-                "<tg-button type=\"callback_data\" data=\"cmd:?/stop s42\" style=\"danger\">⛔</tg-button>\n",
-                "🟢 ожидание · ctx 38% · 💰 24ч $1.23 · 45k токенов\n",
+                "<tg-button type=\"callback_data\" data=\"cmd:?/stop s42\" style=\"danger\">⛔</tg-button>\n\n",
+                "🟢 ожидание · ctx 38% · 💰 24ч $1.23 · 45k токенов\n\n",
                 "📁 ccteam · /root/projects/ccteam\n\n",
                 "👥 Дочерние 0 · сессий проекта 1 · проектов 1\n\n",
                 "<blockquote expandable>Запущено: 2 ч назад · Роль: — · host: local · resume 123e4567-e89b-12d3-a456-426614174000</blockquote>\n\n",
@@ -1364,6 +1372,46 @@ mod tests {
             "Запущено: 2 ч назад, работает 2m · Роль: — · host: local · resume 123e4567-e89b-12d3-a456-426614174000",
             "activity_detail rides the Запущено part as a comma suffix, quote still has exactly the spec's four `·`-joined parts"
         );
+    }
+
+    /// An idle parent whose children are still working says so on line 2:
+    /// "ожидание" alone reads as "nothing happening" while a child grinds
+    /// the test suite. Derived from the children already on the card; a
+    /// parent that is itself working gets no hint (its own badge wins).
+    #[test]
+    fn status_idle_parent_names_working_children_on_line_two() {
+        let mut view = minimal_status_view();
+        view.children = vec![
+            StatusChild {
+                sid: "s56".into(),
+                vendor: "codex".into(),
+                model: "terra".into(),
+                activity: "working".into(),
+                title: None,
+            },
+            StatusChild {
+                sid: "s57".into(),
+                vendor: "codex".into(),
+                model: "luna".into(),
+                activity: "idle".into(),
+                title: None,
+            },
+        ];
+        let reply = render_status(&view);
+        let line2 = reply.plain.lines().nth(1).expect("line 2");
+        assert!(
+            line2.starts_with("🟢 ожидание · в работе дочерних: 1 · ctx 38%"),
+            "{line2}"
+        );
+        assert!(reply
+            .markdown
+            .contains("🟢 ожидание · в работе дочерних: 1 · ctx 38%"));
+        // Rich card: no lone `\n` between lines — each is its own paragraph.
+        assert!(!reply.markdown.contains("</tg-button>\n🟢"));
+
+        view.activity = "working".into();
+        let reply = render_status(&view);
+        assert!(!reply.plain.contains("в работе дочерних"));
     }
 
     /// SPEC-3.5d — two children render two `⛔ <sid>` rows and the header

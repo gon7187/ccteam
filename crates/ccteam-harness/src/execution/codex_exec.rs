@@ -66,8 +66,13 @@ const EVENT_CHANNEL_BUFFER: usize = 256;
 /// CLI. Combines a tmux long-session container (for the cost-status
 /// pane) with per-turn `codex exec --json` subprocesses (for the
 /// actual prompting + structured event stream).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CodexExecAdapter {
+    /// Incarnation nonce baked into synthesized turn ids
+    /// (`codex-exec-<nonce>-<n>`): the counter below restarts at 0 with the
+    /// daemon, and `turn_id` is the durable dedup key of the terminal
+    /// boundary — see [`crate::execution::incarnation_nonce`].
+    incarnation: String,
     /// Per-thread broadcast — populated lazily on the first
     /// `submit_turn` (or `events()` call) for a given thread identity.
     /// `Arc<Mutex<...>>` so `Clone` + `Send + Sync` constraints from
@@ -84,9 +89,19 @@ impl std::fmt::Debug for CodexExecAdapter {
     }
 }
 
+impl Default for CodexExecAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CodexExecAdapter {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            incarnation: crate::execution::incarnation_nonce(),
+            threads: Arc::default(),
+            turn_seq: Arc::default(),
+        }
     }
 
     /// Resolve the codex binary path. Honors `CCTEAM_CODEX_BIN` env
@@ -109,7 +124,7 @@ impl CodexExecAdapter {
     /// Mint the next synthetic turn id.
     fn next_turn_id(&self) -> TurnId {
         let n = self.turn_seq.fetch_add(1, Ordering::SeqCst);
-        TurnId(format!("codex-exec-{n}"))
+        TurnId(format!("codex-exec-{}-{n}", self.incarnation))
     }
 
     /// Resolve `~/.ccteam/codex/<sid>/state.json` for a session.

@@ -10745,10 +10745,17 @@ impl Gateway {
                             if canonical == TerminalCanonicalOutcome::AlreadyCanonical
                                 && !terminal_closes_active
                             {
-                                tracing::debug!(
+                                // Loud on purpose: a legitimate replay (startup
+                                // reconcile) is rare, while an adapter reusing
+                                // turn ids across incarnations looks EXACTLY like
+                                // this and silently loses every boundary (no
+                                // `completed` row, no completion notification).
+                                tracing::warn!(
                                     session = %session_id,
                                     turn_id = %terminal.turn_id,
-                                    "pump: ignored durable duplicate terminal boundary"
+                                    "pump: dropped terminal boundary as a durable duplicate — \
+                                     turn id already canonical in turns.jsonl; if this turn was \
+                                     started in this incarnation the adapter is reusing turn ids"
                                 );
                                 continue;
                             }
