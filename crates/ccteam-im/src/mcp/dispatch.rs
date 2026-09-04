@@ -1555,10 +1555,16 @@ async fn execute_status(
     };
 
     let hub_models = crate::hub::load_models_catalog(&crate::hub::hub_base(), paths, false).await;
+    let quotas = crate::vendor_quota_probe::global().quotas().await;
     let paths_owned = paths.clone();
     let slug_owned = project.clone();
     let section = tokio::task::spawn_blocking(move || {
-        super::vendor_panel::render_section(&paths_owned, slug_owned.as_deref(), &hub_models)
+        super::vendor_panel::render_section(
+            &paths_owned,
+            slug_owned.as_deref(),
+            &hub_models,
+            &quotas,
+        )
     })
     .await
     .unwrap_or_else(|_| "vendors: panel unavailable (probe worker failed)".to_string());
@@ -1600,6 +1606,7 @@ async fn execute_user_status(
     }
 
     let hub_models = crate::hub::load_models_catalog(&crate::hub::hub_base(), paths, false).await;
+    let quotas = crate::vendor_quota_probe::global().quotas().await;
     let paths_owned = paths.clone();
     let sections = tokio::task::spawn_blocking(move || {
         projects
@@ -1609,6 +1616,7 @@ async fn execute_user_status(
                     &paths_owned,
                     Some(project.as_str()),
                     &hub_models,
+                    &quotas,
                 )
             })
             .collect::<Vec<_>>()
