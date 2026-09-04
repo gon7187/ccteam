@@ -889,6 +889,43 @@ mod tests {
             .unwrap();
         }
 
+        // alice's project spends on "claude"; bob's (invisible to alice)
+        // spends on "codex" — the aggregate fold runs inside the
+        // visibility filter, so a hidden project's vendor must never leak
+        // into a tenant's `vendors_24h`.
+        let now = chrono::Utc::now();
+        std::fs::create_dir_all(paths.progress_jsonl("alice").parent().unwrap()).unwrap();
+        std::fs::write(
+            paths.progress_jsonl("alice"),
+            serde_json::to_string(&serde_json::json!({
+                "event": "agent_done",
+                "session_id": "s-alice",
+                "turn_id": "t-alice",
+                "vendor": "claude",
+                "cost_usd": 2.0,
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "ts": now.to_rfc3339(),
+            }))
+            .unwrap()
+                + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            paths.progress_jsonl("bob"),
+            serde_json::to_string(&serde_json::json!({
+                "event": "agent_done",
+                "session_id": "s-bob",
+                "turn_id": "t-bob",
+                "vendor": "codex",
+                "cost_usd": 1.0,
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "ts": now.to_rfc3339(),
+            }))
+            .unwrap()
+                + "\n",
+        )
+        .unwrap();
+
         let body: Value = serde_json::from_str(&tool_ls_for_user(&paths, "ualice").unwrap())
             .expect("tenant status base is JSON");
         let slugs: Vec<&str> = body["projects"]
@@ -898,6 +935,15 @@ mod tests {
             .filter_map(|project| project["slug"].as_str())
             .collect();
         assert_eq!(slugs, vec!["alice"]);
+        let vendors_24h = body["vendors_24h"].as_object().unwrap();
+        assert!(
+            vendors_24h.contains_key("claude"),
+            "visible project's vendor must appear: {vendors_24h:?}"
+        );
+        assert!(
+            !vendors_24h.contains_key("codex"),
+            "hidden project's vendor must not leak into tenant vendors_24h: {vendors_24h:?}"
+        );
     }
 
     #[test]

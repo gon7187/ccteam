@@ -556,13 +556,15 @@ fn local_rows(
 /// Satellite-host vendor rows: from the host's LAST control-channel report
 /// (never the local machine's probe). Budget posture still comes from the
 /// project's caps + the daemon's own cost ledger (recorded under the catalog
-/// slug regardless of execution host).
+/// slug regardless of execution host). Quota is always `None` here: the
+/// subscription-quota probe only ever reads the daemon host's own local
+/// credential files, so it cannot speak for a satellite's vendor accounts —
+/// showing it would silently attribute the wrong machine's usage.
 fn satellite_rows(
     rec: &HostRecord,
     budgets: Option<&ccteam_cost::Budgets>,
     spend_24h: &BTreeMap<String, f64>,
     tokens_24h: &BTreeMap<String, u64>,
-    quotas: &[ccteam_core::vendor_quota::VendorQuota],
 ) -> Vec<PanelRow> {
     rec.agents
         .iter()
@@ -575,7 +577,7 @@ fn satellite_rows(
             spend_24h_usd: vendor_is_priced(&a.vendor)
                 .then(|| spend_24h.get(&a.vendor).copied().unwrap_or(0.0)),
             tokens_24h: tokens_24h.get(&a.vendor).copied().unwrap_or(0),
-            quota: quotas.iter().find(|q| q.vendor == a.vendor).cloned(),
+            quota: None,
         })
         .collect()
 }
@@ -767,7 +769,6 @@ fn build_project_panel(
             budgets.as_ref(),
             &spend_24h,
             &tokens_24h,
-            quotas,
         )
     }
 }
@@ -829,7 +830,6 @@ fn satellite_panel(
     budgets: Option<&ccteam_cost::Budgets>,
     spend_24h: &BTreeMap<String, f64>,
     tokens_24h: &BTreeMap<String, u64>,
-    quotas: &[ccteam_core::vendor_quota::VendorQuota],
 ) -> (PanelHeader, Vec<PanelRow>) {
     let rec = ccteam_core::HostRegistry::load(&paths.host_registry_path())
         .ok()
@@ -847,10 +847,7 @@ fn satellite_panel(
                     format!("host `{host}` is offline — showing its last report; NOT the local machine's capabilities")
                 }),
             };
-            (
-                header,
-                satellite_rows(&rec, budgets, spend_24h, tokens_24h, quotas),
-            )
+            (header, satellite_rows(&rec, budgets, spend_24h, tokens_24h))
         }
         None => {
             let header = PanelHeader {
@@ -1152,6 +1149,41 @@ mod tests {
         assert!(out.contains("stale=true"));
         assert!(out.contains("offline"));
         assert!(out.contains("no vendor snapshot available"));
+    }
+
+    /// A satellite row must never show the *local* daemon host's
+    /// subscription-quota probe result — that probe only ever reads the
+    /// local machine's own credential files, so it cannot speak for a
+    /// remote host's vendor accounts. `satellite_rows` must render
+    /// `quota=n/a` for every agent even when the local probe has an
+    /// `Available` quota on file for that same vendor name.
+    #[test]
+    fn satellite_rows_never_show_local_quota() {
+        let rec = HostRecord {
+            id: "sat-lab".to_string(),
+            hostname: "sat-lab".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            ccteam_version: "0.10.5".to_string(),
+            agent_token: "deadbeef".to_string(),
+            last_heartbeat_unix: 0,
+            agents: vec![ccteam_core::host_registry::HostAgentReport {
+                vendor: "claude".to_string(),
+                installed: true,
+                version: Some("1.2.3".to_string()),
+                status: "ready".to_string(),
+            }],
+            projects: Vec::new(),
+            joined_at: "2026-09-04T00:00:00Z".to_string(),
+        };
+        let rows = satellite_rows(&rec, None, &BTreeMap::new(), &BTreeMap::new());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].quota, None,
+            "satellite row must never carry a quota"
+        );
+        let out = render_panel(&header(), &rows);
+        assert!(out.contains("quota=n/a"), "{out}");
     }
 
     #[test]

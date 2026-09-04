@@ -1171,6 +1171,10 @@ mod tests {
         assert_eq!(snapshot.cost.session_count_24h, 1);
         assert_eq!(snapshot.cost.cost_24h_by_vendor["claude"], 7.0);
         assert_eq!(snapshot.tokens_24h, 1_000_000);
+        // The superseded chat-hook row's tokens must be unfolded from the
+        // per-vendor map too, not just the scalar total — else a hook row
+        // superseded by its own agent_done double-counts that vendor.
+        assert_eq!(snapshot.tokens_24h_by_vendor["claude"], 1_000_000);
     }
 
     #[test]
