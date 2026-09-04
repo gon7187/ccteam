@@ -75,7 +75,7 @@
 
 挑谁干活靠三层,刻意分开:
 
-- **事实,探测出来。** 一次 `status` 调用返回**厂商面板**——按你项目绑定的主机出:各 vendor 装没装、版本,诚实的 auth 信号(`ready` / `not_ready` / `unknown`——躺在 PATH 里绝不冒充已登录,`unknown` 也绝不拦 spawn),预算态,主机在线还是快照已过期。远程主机经卫星通道上报;主机离线时给你最后一份快照并标 `stale`,绝不拿本机能力顶替。
+- **事实,探测出来。** 一次 `status` 调用返回**厂商面板**——按你项目绑定的主机出:各 vendor 装没装、版本,诚实的 auth 信号(`ready` / `not_ready` / `unknown`——躺在 PATH 里绝不冒充已登录,`unknown` 也绝不拦 spawn),预算态,主机在线还是快照已过期。每行 vendor 还带 `tokens_24h` / `spend_24h_usd` / 订阅 `quota` 窗口(基础 JSON 里是 `vendors_24h`)——总控靠这些数字给灵活任务做负载均衡。远程主机经卫星通道上报;主机离线时给你最后一份快照并标 `stale`,绝不拿本机能力顶替。
 - **目录,advisory。** 模型 id、显示名、别名档位,两个来源分开标注:**runtime 最近所见**(adapter 白拿的目录,带观测时间)和 hub **`models.json`**(社区维护)。每个 vendor 的 spawn 配方旁边还挂着它自己的**思考强度梯**——它自报的档位,没自报就是 ccteam 用 CLI 实测钉死的那套。各家的梯**真不一样**(claude `low…max`、codex `low…xhigh`、grok `low|medium|high`、kimi `low|high|max`,opencode 干脆不公告共享梯,pi 的梯**按模型**走——它自报你选的那个模型到底支持哪几档),所以别拿另一家的拼写去猜,读一眼就是了。目录是参考,永不当 spawn 白名单:`model`/`effort` 在 spawn 时原文透传,不在目录里的模型照样能传,目录过期最坏是推荐过时——挡不住任何东西。但它也**绝不吞掉你的选择**:点名了 vendor 拒绝的模型或强度,spawn 直接报错,而不是悄悄按默认档跑起来。
 - **观点,你的文本。** 全局分工写在 `~/.ccteam/routing.md`(缺失时由统一 home 初始化生成中立模板,绝不覆盖),可选的项目级覆盖写在 `<project>/.ccteam/routing.md`。项目文件存在时完整取代全局文件,二者不合并。它们都是 dumb markdown,无 schema。`status` 把选中的一份原文带给任何开口问的会话(注明来源/sha/是否截断)——任何 vendor、任何主机上的规划者拿到同一份——ccteam 永不解析、不执行。
 
@@ -110,7 +110,7 @@
 
 六个起手式在 web 控制台做成了卡片(首页,以及 团队 → 分工)——点「起手」预填 vendor 阵容;怎么打仍然是你一句人话的事:
 
-- **总控-工班** —— 强推理总控做拆解/分工/监控/验收;每个顶层任务:只读 OpenCode GLM(`zai-coding-plan/glm-5.3-flash`)侦察员回报 2–5 个钉版 GitHub 先例(URL、commit/tag、路径、license;仅当没有可用 GLM 会话时才有恰好一次 Codex Luna 侦察兜底),Claude Fable 把计划写进 `.ccteam/plans/`(每任务 id / 执行者 / 依赖 / 文件 / 完成标准,批准后的修改进 Amendments 段),Codex Sol 评审计划(上限两轮,之后给人三段报告)并留任执行者的顾问,Luna/Terra/Sonnet/Haiku 各在自己的 git worktree 里执行,Sonnet git 代理在全新 Opus + Sol 批准同一修订且本地检查为绿后集成并合并,总控在每个决策点检查主机负载与会话存活。贵模型只花在拆解、把关与验收上,量活走便宜的专长工。
+- **总控-工班** —— Claude Fable effort `high` 做拆解/分工/监控/验收,先给每个顶层任务定size:小(≤3 个文件、无硬指标)走一条 lane → GLM 预审 → 一次 Codex Sol 终审、Claude 全程不上场;中等给一页 Fable 计划、一轮 Sol 评审、按 lane 分派执行、单一全新 Sol 终审;大的走全流程——只读 OpenCode GLM(`zai-coding-plan/glm-5.3-flash`)侦察员回报 2–5 个钉版 GitHub 先例(URL、commit/tag、路径、license;仅当没有可用 GLM 会话时才有恰好一次 Codex Luna 侦察兜底),Fable 把计划写进 `.ccteam/plans/`(每任务 id / 执行者 / 依赖 / 文件 / 完成标准 / lane / 硬性还是灵活 / 起始 effort,批准后的修改进 Amendments 段),全新 Codex Sol 评审计划(上限两轮,之后给人三段报告)并留任执行者的顾问,三条 vendor lane(Codex Luna 管后端/资金/ETL,Claude Sonnet 管前端/路由/胶水,GLM 管测试/文档/boilerplate)各在自己的 git worktree 里执行,并发上限 3 Claude / 3 Codex / 5 GLM,每条分支先过 GLM 预审(lint、相关测试、密钥扫描、计划检查表),再由 GLM git 代理集成,在全新 Fable + Sol 双人终审(小/中等任务是单一全新 Sol 终审)批准同一修订且本地检查为绿后合并。effort 顶到 `status` 宣告的上限,每次打回升一级,硬性任务不低于 `high`;灵活任务(多数中等任务)按 `status` 里 `tokens_24h` 占比最小的 vendor 分配(15% 相对偏差阈值,订阅配额窗口超 80% 时优先),四类典型触发(能力错误、连续两次 `server_overloaded`、静默 30 分钟、报告缺 `Статус: готово` 首行)让角色切换一次 fallback vendor。总控在每个决策点检查主机负载与会话存活。贵模型只花在定 size、拆解、把关与验收上,量活走便宜的专长工。
 - **主力-顾问** —— grok/codex 日常主力;卡壳时在同一仓库 spawn 一个顾问会话,拿到方案让主力执行,顾问用完即停。贵模型只为难的那几分钟付费。
 - **交叉互审** —— A 家写码,换 B 家冷眼 review diff,分歧回总控裁。不同模型的错误互不相关,交叉能兜住自审看不见的。
 - **并行竞标** —— 同一道难题并行派给 2–3 家,对比择优、好点子合流。解空间宽的时候最值。
