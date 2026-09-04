@@ -293,8 +293,8 @@ describe("HomeView (landing page)", () => {
         vendor: "claude",
         permission_mode: "skip",
         protocol: "stream-json",
-        model: "opus",
-        effort: "max",
+        model: "fable",
+        effort: "high",
       },
     ]);
     expect(createSession.mock.calls[1]).toEqual([
@@ -361,7 +361,7 @@ describe("HomeView (landing page)", () => {
     expect(submit).toHaveBeenCalledWith("s43", "task", []);
   });
 
-  it("launches Commander at the highest Opus effort advertised by the live catalog", async () => {
+  it("launches Commander at high effort even when the live catalog advertises a higher Fable rung", async () => {
     const createSession = vi.fn().mockResolvedValue({ sid: "s44" });
     const submit = vi.fn().mockResolvedValue(undefined);
 
@@ -374,8 +374,8 @@ describe("HomeView (landing page)", () => {
             vendor: "claude",
             permission_mode: "skip",
             protocol: "stream-json",
-            model: "opus",
-            effort: "max",
+            model: "fable",
+            effort: "xhigh",
           },
           text: "task",
           attachments: [],
@@ -383,8 +383,8 @@ describe("HomeView (landing page)", () => {
           installedVendors: ["claude", "codex"],
           catalog: {
             claude: {
-              models: [{ id: "opus", efforts: ["low", "high"] }],
-              efforts: ["low", "medium", "high", "max"],
+              models: [{ id: "fable", efforts: ["low", "medium", "high", "xhigh"] }],
+              efforts: ["low", "medium", "high", "xhigh"],
             },
           },
         },
@@ -393,7 +393,7 @@ describe("HomeView (landing page)", () => {
     ).resolves.toEqual({
       sid: "s44",
       vendor: "claude",
-      model: "opus",
+      model: "fable",
       effort: "high",
       fallback: false,
     });
@@ -404,13 +404,13 @@ describe("HomeView (landing page)", () => {
       vendor: "claude",
       permission_mode: "skip",
       protocol: "stream-json",
-      model: "opus",
+      model: "fable",
       effort: "high",
     });
     expect(submit).toHaveBeenCalledWith("s44", "task", []);
   });
 
-  it("does not apply a cold Opus effort when the live catalog observed only other models", async () => {
+  it("does not apply a cold Fable effort when the live catalog observed only other models", async () => {
     const createSession = vi.fn().mockResolvedValue({ sid: "s45" });
     const submit = vi.fn().mockResolvedValue(undefined);
 
@@ -422,8 +422,8 @@ describe("HomeView (landing page)", () => {
           vendor: "claude",
           permission_mode: "skip",
           protocol: "stream-json",
-          model: "opus",
-          effort: "max",
+          model: "fable",
+          effort: "high",
         },
         text: "task",
         attachments: [],
@@ -444,7 +444,7 @@ describe("HomeView (landing page)", () => {
       vendor: "claude",
       permission_mode: "skip",
       protocol: "stream-json",
-      model: "opus",
+      model: "fable",
     });
   });
 
@@ -481,8 +481,8 @@ describe("HomeView (landing page)", () => {
       vendor: "claude",
       permission_mode: "skip",
       protocol: "stream-json",
-      model: "opus",
-      effort: "max",
+      model: "fable",
+      effort: "high",
     });
     expect(submit).not.toHaveBeenCalled();
   });

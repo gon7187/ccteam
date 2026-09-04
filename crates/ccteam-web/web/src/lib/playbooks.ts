@@ -35,8 +35,8 @@ export const PLAYBOOKS: ReadonlyArray<Playbook> = [
     key: "tplCommander",
     Icon: Crown,
     vendors: ["claude", "codex", "opencode"],
-    model: "opus",
-    effort: "max",
+    model: "fable",
+    effort: "high",
   },
   { id: "advisor", key: "tplAdvisor", Icon: Lightbulb, vendors: ["grok", "claude"] },
   { id: "crossreview", key: "tplCrossreview", Icon: ShieldCheck, vendors: ["claude", "codex"] },
@@ -70,29 +70,31 @@ export interface CommanderSpawnPosture {
 
 interface CommanderClaudePosture {
   vendor: "claude";
-  model: "opus";
+  model: "fable";
   effort?: string;
 }
 
 function commanderClaudePosture(catalog: VendorCatalog): CommanderClaudePosture {
   const claude = catalog.claude;
-  const opus = claude?.models.find((model) => model.id === "opus");
+  const fable = claude?.models.find((model) => model.id === "fable");
   let efforts: string[];
-  if (opus?.efforts !== undefined) {
-    efforts = opus.efforts;
-  } else if (opus && claude?.efforts.length) {
+  if (fable?.efforts !== undefined) {
+    efforts = fable.efforts;
+  } else if (fable && claude?.efforts.length) {
     efforts = claude.efforts;
   } else if (!claude || claude.models.length === 0) {
     // No live evidence exists yet. Use the same CLI-verified cold ladder as
-    // the composer; once the catalog says anything about Opus, never guess.
-    efforts = effortRowsFor("claude", null, "opus").slice(1);
+    // the composer; once the catalog says anything about Fable, never guess.
+    efforts = effortRowsFor("claude", null, "fable").slice(1);
   } else {
     efforts = [];
   }
-  const effort = efforts.at(-1);
+  // v3: the commander runs on high; fall back to the top advertised rung
+  // only when high is not advertised.
+  const effort = efforts.includes("high") ? "high" : efforts.at(-1);
   return {
     vendor: "claude",
-    model: "opus",
+    model: "fable",
     ...(effort ? { effort } : {}),
   };
 }
@@ -134,7 +136,7 @@ export function isCommanderBootstrapCapabilityError(
   error: unknown,
   posture: { vendor?: string; model?: string; effort?: string },
 ): boolean {
-  if (posture.vendor !== "claude" || posture.model !== "opus") {
+  if (posture.vendor !== "claude" || posture.model !== "fable") {
     return false;
   }
 
@@ -178,7 +180,7 @@ interface HomeTurnLaunchDeps {
 
 /** The posture that actually created the session. This is deliberately not a
  * copy of the user's initial draft: Commander may have taken its one allowed
- * Codex fallback, and the UI must report that fact instead of implying Opus. */
+ * Codex fallback, and the UI must report that fact instead of implying Fable. */
 export interface HomeTurnLaunchReceipt {
   sid: string;
   vendor: string;
@@ -248,7 +250,7 @@ export function completeHomeLaunch(
 /** Create the lazy session and submit its first user turn.
  *
  * Commander gets one tightly-classified bootstrap fallback: when its exact
- * Claude/Opus posture is rejected as unavailable, retry once through an
+ * Claude/Fable posture is rejected as unavailable, retry once through an
  * installed Codex posture derived from the live catalog. The first user turn
  * is sent only after one of those creates succeeds, so it reaches exactly the
  * session returned to the caller. */
