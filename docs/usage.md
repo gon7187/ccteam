@@ -364,7 +364,7 @@ A session deciding whom to spawn never has to guess. One `status` call (the MCP 
 
 ```text
 claude  installed=yes claude 2.1.4      auth=unknown  budget=ok  spend_24h=$1.23  tokens_24h=123456  quota=five_hour:42%,reset=2026-09-04T18:00Z;weekly:10%
-grok    installed=yes grok 1.0.0        auth=unknown  budget=unpriced  spend_24h=n/a  tokens_24h=77  quota=n/a
+opencode installed=yes opencode 1.3.0  auth=unknown  budget=unpriced  spend_24h=n/a  tokens_24h=77  quota=n/a
 ```
 
 The base JSON carries the same numbers as `vendors_24h: {"<vendor>": {"tokens": <n>, "spend_usd": <f>|null}}`, alongside a `tokens_24h_by_vendor` breakdown on each project entry. Alongside it comes an **advisory model catalog** — runtime last-seen data and the hub `models.json`, each labeled with its source and never consulted as a spawn allowlist — plus your **routing notes**, transported verbatim.
