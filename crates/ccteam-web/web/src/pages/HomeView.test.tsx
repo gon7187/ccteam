@@ -410,6 +410,52 @@ describe("HomeView (landing page)", () => {
     expect(submit).toHaveBeenCalledWith("s44", "task", []);
   });
 
+  it("falls back to the top advertised rung when the live catalog does not advertise high", async () => {
+    const createSession = vi.fn().mockResolvedValue({ sid: "s44b" });
+    const submit = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      createAndSubmitHomeTurn(
+        {
+          slug: "ccteam",
+          options: {
+            role: "",
+            vendor: "claude",
+            permission_mode: "skip",
+            protocol: "stream-json",
+          },
+          text: "task",
+          attachments: [],
+          commander: true,
+          installedVendors: ["claude", "codex"],
+          catalog: {
+            claude: {
+              models: [{ id: "fable", efforts: ["low", "medium"] }],
+              efforts: ["low", "medium"],
+            },
+          },
+        },
+        { createSession, submitTurn: submit },
+      ),
+    ).resolves.toEqual({
+      sid: "s44b",
+      vendor: "claude",
+      model: "fable",
+      effort: "medium",
+      fallback: false,
+    });
+
+    expect(createSession).toHaveBeenCalledWith("ccteam", {
+      role: "",
+      vendor: "claude",
+      permission_mode: "skip",
+      protocol: "stream-json",
+      model: "fable",
+      effort: "medium",
+    });
+    expect(submit).toHaveBeenCalledWith("s44b", "task", []);
+  });
+
   it("does not apply a cold Fable effort when the live catalog observed only other models", async () => {
     const createSession = vi.fn().mockResolvedValue({ sid: "s45" });
     const submit = vi.fn().mockResolvedValue(undefined);

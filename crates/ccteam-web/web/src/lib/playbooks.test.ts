@@ -182,7 +182,7 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
         "3 Claude, 3 Codex, 5 GLM", "密钥扫描", "gitleaks", "计划清单", "退回执行者一次",
         "integration/", "merge commit", "两位终审都批准同一修订且全量本地检查为绿", "CI 只有在项目里存在", "tag 与 release 不在本任务内",
         "只看 diff", "顾问不参与验收",
-        "error_kind=server_overloaded", "连续两次", "session limit", "30 分钟", "立即切换", "状态：完成», 退回一次后", "每个任务只切换一次", "spawn 后备之前先 session_stop",
+        "error_kind=server_overloaded", "连续两次", "session limit", "30 分钟", "立即切换", "状态：完成", "退回一次后", "每个任务只切换一次", "spawn 后备之前先 session_stop",
         "Fable → Codex Sol", "Sol → 全新的 Claude Fable", "Luna → Claude Sonnet", "Sonnet → Codex Terra", "GLM → Codex Luna", "同一厂商",
         "session_list", "free -m", "15%", "waiting_approval: true 不算挂起", "delegation.max_children", "用 session_stop 停止侦察员", "git init",
         "首次运行", "各厂商 token 占比",
@@ -228,17 +228,18 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
       for (const phrase of phrases) expect(prompt, `${lang}: ${phrase}`).toContain(phrase);
       // Порядок фаз держится во всех языках.
       const order = lang === "zh"
-        ? ["第 1 步", "第 2 步", "第 3 步", "第 4 步", "第 5 步", "第 6 步", "监控"]
+        ? ["任务大小：", "泳道与 effort：", "均衡：", "第 1 步", "第 2 步", "第 3 步", "第 4 步", "第 5 步", "第 6 步", "后备：", "监控"]
         : lang === "ru"
-          ? ["Шаг 1", "Шаг 2", "Шаг 3", "Шаг 4", "Шаг 5", "Шаг 6", "Мониторинг"]
-          : ["Step 1", "Step 2", "Step 3", "Step 4", "Step 5", "Step 6", "Monitoring"];
+          ? ["Размер задачи:", "Полосы и effort:", "Балансировка:", "Шаг 1", "Шаг 2", "Шаг 3", "Шаг 4", "Шаг 5", "Шаг 6", "Фолбек:", "Мониторинг:"]
+          : ["Task size:", "Lanes and effort:", "Balancing:", "Step 1", "Step 2", "Step 3", "Step 4", "Step 5", "Step 6", "Fallback:", "Monitoring"];
       let last = -1;
       for (const marker of order) {
         const at = prompt.indexOf(marker);
         expect(at, `${lang}: ${marker}`).toBeGreaterThan(last);
         last = at;
       }
-      const gate = prompt.slice(prompt.indexOf(order[5]));
+      const gateHeading = lang === "zh" ? "第 6 步" : lang === "ru" ? "Шаг 6" : "Step 6";
+      const gate = prompt.slice(prompt.indexOf(gateHeading));
       const gatePhrases = lang === "zh"
         ? ["上限 2 轮", "三段报告", "只看 diff"]
         : lang === "ru"
@@ -247,6 +248,11 @@ describe("PLAYBOOKS (shared home/team formation definitions)", () => {
       for (const phrase of gatePhrases) expect(gate, `${lang} final gate: ${phrase}`).toContain(phrase);
       expect(I18N[lang].tplCommanderD).toContain("Fable");
       expect(I18N[lang].tplCommanderD).toContain("Sol");
+      // Fable's v3 posture must not leave any bare "Opus" behind, in either
+      // the prefill or the card description (the "Claude Opus" lock above
+      // only ever checked the prefill, and only that one two-word phrase).
+      expect(prompt, `${lang}: no bare Opus`).not.toContain("Opus");
+      expect(I18N[lang].tplCommanderD, `${lang} D: no bare Opus`).not.toContain("Opus");
     }
   });
 
