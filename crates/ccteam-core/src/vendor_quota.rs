@@ -1,8 +1,8 @@
 //! VENDOR-QUOTA-1 — the normalized vendor subscription-quota model plus the
 //! PURE parsers (fixture-testable, zero I/O). The thin HTTP layer, per-vendor
-//! credential file reads, the 5-minute cache, and the
-//! `GET /api/v1/vendors/quota` endpoint live in
-//! `ccteam_web::routes::vendor_quota`.
+//! credential file reads, and the 5-minute cache live in
+//! `ccteam_im::vendor_quota_probe`; the `GET /api/v1/vendors/quota` REST
+//! handler in `ccteam_web::routes::vendor_quota` calls it.
 //!
 //! Same registry philosophy as [`crate::host_registry::AGENT_PROBE_SPECS`]:
 //! a vendor's probe is one [`AgentProbeSpec::quota_probe`] entry, and the UI
@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::host_registry::AgentProbeSpec;
 
 /// Which quota probe a vendor has. Implementations + credentials live in
-/// `ccteam_web::routes::vendor_quota`; this enum is the registry token the
+/// `ccteam_im::vendor_quota_probe`; this enum is the registry token the
 /// dispatch matches on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaProbeKind {

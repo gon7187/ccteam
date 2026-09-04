@@ -92,4 +92,4 @@ whatsapp = []
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 # vendor_quota_probe tests spin up a local mock HTTP server.
-axum = { workspace = true, features = ["ws"] }
+axum = { workspace = true }
