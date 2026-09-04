@@ -161,7 +161,7 @@ pub(crate) struct PanelHeader {
 }
 
 /// One vendor row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PanelRow {
     pub vendor: String,
     pub installed: bool,
@@ -170,6 +170,13 @@ pub(crate) struct PanelRow {
     /// derivable. `None` → render the bare honest `auth=unknown`.
     pub last_session_ok: Option<String>,
     pub budget: BudgetState,
+    /// Trailing-24h USD from the daemon ledger; `None` for unpriced vendors.
+    pub spend_24h_usd: Option<f64>,
+    /// Trailing-24h input+output tokens from the daemon ledger (all vendors).
+    pub tokens_24h: u64,
+    /// Subscription quota windows when this vendor has a probe (claude /
+    /// codex / kimi); `None` = no probe surface.
+    pub quota: Option<ccteam_core::vendor_quota::VendorQuota>,
 }
 
 /// Render the vendor panel: a header line + one aligned line per vendor.
@@ -207,15 +214,50 @@ pub(crate) fn render_panel(header: &PanelHeader, rows: &[PanelRow]) -> String {
             Some(ts) => format!("auth=unknown(last_session_ok {ts})"),
             None => "auth=unknown".to_string(),
         };
+        let spend = match row.spend_24h_usd {
+            Some(v) => format!("${v:.2}"),
+            None => "n/a".to_string(),
+        };
         out.push_str(&format!(
-            "\n  {:<vendor_w$}  {:<28}  {}  budget={}",
+            "\n  {:<vendor_w$}  {:<28}  {}  budget={}  spend_24h={}  tokens_24h={}  quota={}",
             row.vendor,
             installed_seg,
             auth,
             row.budget.render(),
+            spend,
+            row.tokens_24h,
+            render_quota(row.quota.as_ref()),
         ));
     }
     out
+}
+
+/// `five_hour:42%,reset=2026-09-04T18:00Z;weekly:10%` or `n/a` when the vendor
+/// has no probe, is not a subscription, or the probe failed.
+fn render_quota(quota: Option<&ccteam_core::vendor_quota::VendorQuota>) -> String {
+    use ccteam_core::vendor_quota::QuotaState;
+    let Some(quota) = quota else {
+        return "n/a".to_string();
+    };
+    if quota.state != QuotaState::Available || quota.windows.is_empty() {
+        return "n/a".to_string();
+    }
+    quota
+        .windows
+        .iter()
+        .map(|w| {
+            let kind = serde_json::to_value(w.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("{:?}", w.kind).to_lowercase());
+            let mut seg = format!("{kind}:{}%", w.used_percent.round() as i64);
+            if let Some(reset) = w.resets_at {
+                seg.push_str(&format!(",reset={}", reset.format("%Y-%m-%dT%H:%MZ")));
+            }
+            seg
+        })
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 // ── advisory model catalogs (pure) ─────────────────────────────────────────
@@ -492,6 +534,8 @@ fn local_rows(
     availability: &[VendorAvailability],
     budgets: Option<&ccteam_cost::Budgets>,
     spend_24h: &BTreeMap<String, f64>,
+    tokens_24h: &BTreeMap<String, u64>,
+    quotas: &[ccteam_core::vendor_quota::VendorQuota],
 ) -> Vec<PanelRow> {
     availability
         .iter()
@@ -501,6 +545,10 @@ fn local_rows(
             version: a.version.clone(),
             last_session_ok: None,
             budget: budget_row(a.vendor, budgets, spend_24h),
+            spend_24h_usd: vendor_is_priced(a.vendor)
+                .then(|| spend_24h.get(a.vendor).copied().unwrap_or(0.0)),
+            tokens_24h: tokens_24h.get(a.vendor).copied().unwrap_or(0),
+            quota: quotas.iter().find(|q| q.vendor == a.vendor).cloned(),
         })
         .collect()
 }
@@ -508,11 +556,15 @@ fn local_rows(
 /// Satellite-host vendor rows: from the host's LAST control-channel report
 /// (never the local machine's probe). Budget posture still comes from the
 /// project's caps + the daemon's own cost ledger (recorded under the catalog
-/// slug regardless of execution host).
+/// slug regardless of execution host). Quota is always `None` here: the
+/// subscription-quota probe only ever reads the daemon host's own local
+/// credential files, so it cannot speak for a satellite's vendor accounts —
+/// showing it would silently attribute the wrong machine's usage.
 fn satellite_rows(
     rec: &HostRecord,
     budgets: Option<&ccteam_cost::Budgets>,
     spend_24h: &BTreeMap<String, f64>,
+    tokens_24h: &BTreeMap<String, u64>,
 ) -> Vec<PanelRow> {
     rec.agents
         .iter()
@@ -522,6 +574,10 @@ fn satellite_rows(
             version: a.version.clone(),
             last_session_ok: None,
             budget: budget_row(&a.vendor, budgets, spend_24h),
+            spend_24h_usd: vendor_is_priced(&a.vendor)
+                .then(|| spend_24h.get(&a.vendor).copied().unwrap_or(0.0)),
+            tokens_24h: tokens_24h.get(&a.vendor).copied().unwrap_or(0),
+            quota: None,
         })
         .collect()
 }
@@ -541,10 +597,11 @@ pub(crate) fn render_section(
     paths: &CcteamPaths,
     slug: Option<&str>,
     hub: &crate::hub::HubModelsState,
+    quotas: &[ccteam_core::vendor_quota::VendorQuota],
 ) -> String {
     let (header, rows) = match slug {
-        Some(slug) => build_project_panel(paths, slug),
-        None => build_local_panel(paths, None, Some("no project resolved — showing the local host; pass `project` or run inside a registered project directory".to_string())),
+        Some(slug) => build_project_panel(paths, slug, quotas),
+        None => build_local_panel(paths, None, Some("no project resolved — showing the local host; pass `project` or run inside a registered project directory".to_string()), quotas),
     };
     let notes = read_routing_file(paths, slug);
     let runtime = ccteam_core::model_catalog::load_model_catalog_in(&paths.root);
@@ -659,7 +716,11 @@ fn render_tuning_axes(
 
 /// Panel for a resolved project: local vs satellite by its catalog host
 /// binding.
-fn build_project_panel(paths: &CcteamPaths, slug: &str) -> (PanelHeader, Vec<PanelRow>) {
+fn build_project_panel(
+    paths: &CcteamPaths,
+    slug: &str,
+    quotas: &[ccteam_core::vendor_quota::VendorQuota],
+) -> (PanelHeader, Vec<PanelRow>) {
     let entry = ccteam_core::config::lookup_project(&paths.root, slug)
         .ok()
         .flatten();
@@ -675,10 +736,10 @@ fn build_project_panel(paths: &CcteamPaths, slug: &str) -> (PanelHeader, Vec<Pan
         .unwrap_or_else(|| LOCAL_HOST.to_string());
     let project_dir = entry.as_ref().map(|e| e.path.clone());
     let budgets = project_dir.as_deref().and_then(budgets_for_project);
-    let spend_24h = crate::progress_projection::ProgressProjection::new(paths.clone())
-        .project_snapshot(slug)
-        .cost
-        .cost_24h_by_vendor;
+    let snapshot =
+        crate::progress_projection::ProgressProjection::new(paths.clone()).project_snapshot(slug);
+    let spend_24h = snapshot.cost.cost_24h_by_vendor;
+    let tokens_24h = snapshot.tokens_24h_by_vendor;
 
     if host == LOCAL_HOST {
         let availability = ccteam_core::host_registry::probe_availability(false);
@@ -692,10 +753,23 @@ fn build_project_panel(paths: &CcteamPaths, slug: &str) -> (PanelHeader, Vec<Pan
         };
         (
             header,
-            local_rows(&availability, budgets.as_ref(), &spend_24h),
+            local_rows(
+                &availability,
+                budgets.as_ref(),
+                &spend_24h,
+                &tokens_24h,
+                quotas,
+            ),
         )
     } else {
-        satellite_panel(paths, slug, &host, budgets.as_ref(), &spend_24h)
+        satellite_panel(
+            paths,
+            slug,
+            &host,
+            budgets.as_ref(),
+            &spend_24h,
+            &tokens_24h,
+        )
     }
 }
 
@@ -704,9 +778,10 @@ fn build_local_panel(
     paths: &CcteamPaths,
     slug: Option<&str>,
     note: Option<String>,
+    quotas: &[ccteam_core::vendor_quota::VendorQuota],
 ) -> (PanelHeader, Vec<PanelRow>) {
     let availability = ccteam_core::host_registry::probe_availability(false);
-    let (budgets, spend_24h) = match slug {
+    let (budgets, spend_24h, tokens_24h) = match slug {
         Some(slug) => {
             let entry = ccteam_core::config::lookup_project(&paths.root, slug)
                 .ok()
@@ -716,13 +791,15 @@ fn build_local_panel(
                 .map(|e| e.path.clone())
                 .as_deref()
                 .and_then(budgets_for_project);
-            let spend = crate::progress_projection::ProgressProjection::new(paths.clone())
-                .project_snapshot(slug)
-                .cost
-                .cost_24h_by_vendor;
-            (budgets, spend)
+            let snapshot = crate::progress_projection::ProgressProjection::new(paths.clone())
+                .project_snapshot(slug);
+            (
+                budgets,
+                snapshot.cost.cost_24h_by_vendor,
+                snapshot.tokens_24h_by_vendor,
+            )
         }
-        None => (None, BTreeMap::new()),
+        None => (None, BTreeMap::new(), BTreeMap::new()),
     };
     let header = PanelHeader {
         project: slug.unwrap_or("(none)").to_string(),
@@ -734,7 +811,13 @@ fn build_local_panel(
     };
     (
         header,
-        local_rows(&availability, budgets.as_ref(), &spend_24h),
+        local_rows(
+            &availability,
+            budgets.as_ref(),
+            &spend_24h,
+            &tokens_24h,
+            quotas,
+        ),
     )
 }
 
@@ -746,6 +829,7 @@ fn satellite_panel(
     host: &str,
     budgets: Option<&ccteam_cost::Budgets>,
     spend_24h: &BTreeMap<String, f64>,
+    tokens_24h: &BTreeMap<String, u64>,
 ) -> (PanelHeader, Vec<PanelRow>) {
     let rec = ccteam_core::HostRegistry::load(&paths.host_registry_path())
         .ok()
@@ -763,7 +847,7 @@ fn satellite_panel(
                     format!("host `{host}` is offline — showing its last report; NOT the local machine's capabilities")
                 }),
             };
-            (header, satellite_rows(&rec, budgets, spend_24h))
+            (header, satellite_rows(&rec, budgets, spend_24h, tokens_24h))
         }
         None => {
             let header = PanelHeader {
@@ -839,6 +923,9 @@ mod tests {
             version: None,
             last_session_ok: None,
             budget: BudgetState::NotConfigured,
+            spend_24h_usd: None,
+            tokens_24h: 0,
+            quota: None,
         }
     }
 
@@ -950,12 +1037,31 @@ mod tests {
     #[test]
     fn panel_renders_installed_and_missing_rows() {
         let rows = vec![
+            // claude: priced, с квотой
             PanelRow {
                 vendor: "claude".to_string(),
                 installed: true,
                 version: Some("claude 1.2.3".to_string()),
                 last_session_ok: None,
                 budget: BudgetState::Ok,
+                spend_24h_usd: Some(1.23),
+                tokens_24h: 123_456,
+                quota: Some(ccteam_core::vendor_quota::VendorQuota::available(
+                    "claude",
+                    Some("max".into()),
+                    vec![
+                        ccteam_core::vendor_quota::QuotaWindow {
+                            kind: ccteam_core::vendor_quota::QuotaWindowKind::FiveHour,
+                            used_percent: 42.0,
+                            resets_at: Some("2026-09-04T18:00:00Z".parse().unwrap()),
+                        },
+                        ccteam_core::vendor_quota::QuotaWindow {
+                            kind: ccteam_core::vendor_quota::QuotaWindowKind::Weekly,
+                            used_percent: 10.0,
+                            resets_at: None,
+                        },
+                    ],
+                )),
             },
             PanelRow {
                 vendor: "codex".to_string(),
@@ -963,6 +1069,9 @@ mod tests {
                 version: None,
                 last_session_ok: None,
                 budget: BudgetState::Disabled { approx_hours: 3 },
+                spend_24h_usd: Some(9.0),
+                tokens_24h: 5,
+                quota: None,
             },
             PanelRow {
                 vendor: "grok".to_string(),
@@ -970,6 +1079,9 @@ mod tests {
                 version: None,
                 last_session_ok: None,
                 budget: BudgetState::NotConfigured,
+                spend_24h_usd: None,
+                tokens_24h: 0,
+                quota: None,
             },
             PanelRow {
                 vendor: "kimi".to_string(),
@@ -977,6 +1089,9 @@ mod tests {
                 version: Some("kimi 0.1".to_string()),
                 last_session_ok: None,
                 budget: BudgetState::Unpriced,
+                spend_24h_usd: None,
+                tokens_24h: 77,
+                quota: Some(ccteam_core::vendor_quota::VendorQuota::unavailable("kimi")),
             },
         ];
         let out = render_panel(&header(), &rows);
@@ -989,10 +1104,37 @@ mod tests {
         let grok_line = out.lines().find(|l| l.contains("grok")).unwrap();
         assert!(grok_line.contains("installed=no"));
         assert!(!grok_line.contains("auth="));
+        assert!(!grok_line.contains("tokens_24h"));
         // Unpriced vendor renders unpriced, never $0.
         assert!(out.contains("budget=unpriced"));
         // NEVER fakes ready.
         assert!(!out.contains("auth=ready"));
+
+        let claude_line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("claude"))
+            .unwrap();
+        assert!(claude_line.contains("spend_24h=$1.23"));
+        assert!(claude_line.contains("tokens_24h=123456"));
+        assert!(claude_line.contains("quota=five_hour:42%,reset=2026-09-04T18:00Z;weekly:10%"));
+        let codex_line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("codex"))
+            .unwrap();
+        assert!(
+            codex_line.contains("spend_24h=$9.00")
+                && codex_line.contains("tokens_24h=5")
+                && codex_line.contains("quota=n/a")
+        );
+        let kimi_line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("kimi"))
+            .unwrap();
+        assert!(
+            kimi_line.contains("spend_24h=n/a")
+                && kimi_line.contains("tokens_24h=77")
+                && kimi_line.contains("quota=n/a")
+        );
     }
 
     #[test]
@@ -1007,6 +1149,41 @@ mod tests {
         assert!(out.contains("stale=true"));
         assert!(out.contains("offline"));
         assert!(out.contains("no vendor snapshot available"));
+    }
+
+    /// A satellite row must never show the *local* daemon host's
+    /// subscription-quota probe result — that probe only ever reads the
+    /// local machine's own credential files, so it cannot speak for a
+    /// remote host's vendor accounts. `satellite_rows` must render
+    /// `quota=n/a` for every agent even when the local probe has an
+    /// `Available` quota on file for that same vendor name.
+    #[test]
+    fn satellite_rows_never_show_local_quota() {
+        let rec = HostRecord {
+            id: "sat-lab".to_string(),
+            hostname: "sat-lab".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            ccteam_version: "0.10.5".to_string(),
+            agent_token: "deadbeef".to_string(),
+            last_heartbeat_unix: 0,
+            agents: vec![ccteam_core::host_registry::HostAgentReport {
+                vendor: "claude".to_string(),
+                installed: true,
+                version: Some("1.2.3".to_string()),
+                status: "ready".to_string(),
+            }],
+            projects: Vec::new(),
+            joined_at: "2026-09-04T00:00:00Z".to_string(),
+        };
+        let rows = satellite_rows(&rec, None, &BTreeMap::new(), &BTreeMap::new());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].quota, None,
+            "satellite row must never carry a quota"
+        );
+        let out = render_panel(&header(), &rows);
+        assert!(out.contains("quota=n/a"), "{out}");
     }
 
     #[test]

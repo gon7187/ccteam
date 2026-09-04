@@ -89,6 +89,7 @@ pub struct AgentProbeSpec {
     pub manual_install_url: Option<&'static str>,
     /// VENDOR-QUOTA-1 — which subscription-quota probe this vendor has, if
     /// any (`ccteam_core::vendor_quota`; implementations in
+    /// `ccteam_im::vendor_quota_probe`, surfaced via the REST handler in
     /// `ccteam_web::routes::vendor_quota`). `None` = no surface, the UI
     /// renders nothing (opencode/pi/dsh).
     pub quota_probe: Option<crate::vendor_quota::QuotaProbeKind>,

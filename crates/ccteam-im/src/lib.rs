@@ -85,6 +85,7 @@ mod session_catalog;
 pub(crate) mod telegram_html;
 pub mod three_layer_sec;
 pub mod transport;
+pub mod vendor_quota_probe;
 
 use std::collections::HashMap;
 use std::fs;

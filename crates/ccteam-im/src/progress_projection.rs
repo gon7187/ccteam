@@ -121,6 +121,10 @@ pub struct ProjectProjectionSnapshot {
     pub sessions: HashMap<String, SessionProjection>,
     /// Raw input+output tokens in the trailing 24-hour window.
     pub tokens_24h: u64,
+    /// Raw input+output tokens in the trailing 24-hour window, keyed by the
+    /// event's `vendor` string. Present for unpriced vendors too (opencode,
+    /// pi, dsh) — this is the only per-vendor spend signal they have.
+    pub tokens_24h_by_vendor: BTreeMap<String, u64>,
     /// Whether at least one 24-hour row has a trustworthy USD amount.
     pub cost_24h_priced: bool,
     /// Turns in the trailing 24-hour window that carried tokens but no
@@ -202,6 +206,7 @@ struct CostBucket {
     unpriced: u32,
     tokens: u64,
     by_vendor: BTreeMap<String, f64>,
+    tokens_by_vendor: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -680,13 +685,21 @@ fn recent_event_minute(event: &Value, now: DateTime<Utc>) -> Option<i64> {
 fn fold_turn(state: &mut SlugState, event: &Value, source: TurnSource, now: DateTime<Utc>) {
     let cost = progress_bridge::progress_cost_contribution(event);
     let tokens = event_tokens(event);
+    let event_vendor = event.get("vendor").and_then(Value::as_str);
     let Some(identity) = turn_identity(event) else {
         if let Some(cost) = cost {
             fold_cost(state, cost, event, now);
         }
         if tokens > 0 {
             let priced = cost.as_ref().is_some_and(|value| value.is_priced);
-            fold_tokens(state, tokens, priced, recent_event_minute(event, now), now);
+            fold_tokens(
+                state,
+                tokens,
+                event_vendor,
+                priced,
+                recent_event_minute(event, now),
+                now,
+            );
         }
         return;
     };
@@ -704,9 +717,7 @@ fn fold_turn(state: &mut SlugState, event: &Value, source: TurnSource, now: Date
             .as_ref()
             .filter(|value| value.is_priced)
             .map(|value| value.cost_usd),
-        vendor: cost
-            .as_ref()
-            .and_then(|value| value.vendor.map(str::to_string)),
+        vendor: event_vendor.map(str::to_string),
         tokens,
         event_minute: recent_event_minute(event, now),
     };
@@ -717,6 +728,7 @@ fn fold_turn(state: &mut SlugState, event: &Value, source: TurnSource, now: Date
         fold_tokens(
             state,
             tokens,
+            event_vendor,
             folded.cost_usd.is_some(),
             folded.event_minute,
             now,
@@ -749,6 +761,11 @@ fn unfold_turn(state: &mut SlugState, turn: &FoldedTurn) {
         if let Some(event_minute) = turn.event_minute {
             if let Some(bucket) = state.minute_cost.get_mut(&event_minute) {
                 bucket.tokens = bucket.tokens.saturating_sub(turn.tokens);
+                if let Some(vendor) = turn.vendor.as_deref() {
+                    if let Some(slot) = bucket.tokens_by_vendor.get_mut(vendor) {
+                        *slot = slot.saturating_sub(turn.tokens);
+                    }
+                }
                 if turn.cost_usd.is_none() {
                     bucket.unpriced = bucket.unpriced.saturating_sub(1);
                 }
@@ -795,6 +812,7 @@ fn fold_cost(
 fn fold_tokens(
     state: &mut SlugState,
     tokens: u64,
+    vendor: Option<&str>,
     priced: bool,
     event_minute: Option<i64>,
     now: DateTime<Utc>,
@@ -804,6 +822,13 @@ fn fold_tokens(
     if let Some(event_minute) = event_minute {
         let bucket = state.minute_cost.entry(event_minute).or_default();
         bucket.tokens = bucket.tokens.saturating_add(tokens);
+        if let Some(vendor) = vendor {
+            let slot = bucket
+                .tokens_by_vendor
+                .entry(vendor.to_string())
+                .or_insert(0);
+            *slot = slot.saturating_add(tokens);
+        }
         if !priced {
             bucket.unpriced = bucket.unpriced.saturating_add(1);
         }
@@ -915,6 +940,13 @@ fn snapshot(state: &SlugState, now: DateTime<Utc>) -> ProjectProjectionSnapshot 
         delegations.notified_24h = delegations.notified_24h.saturating_add(bucket.notified);
         delegations.denied_24h = delegations.denied_24h.saturating_add(bucket.denied);
     }
+    let mut tokens_24h_by_vendor: BTreeMap<String, u64> = BTreeMap::new();
+    for bucket in state.minute_cost.range(oldest..).map(|(_, bucket)| bucket) {
+        for (vendor, tokens) in &bucket.tokens_by_vendor {
+            let slot = tokens_24h_by_vendor.entry(vendor.clone()).or_insert(0);
+            *slot = slot.saturating_add(*tokens);
+        }
+    }
     ProjectProjectionSnapshot {
         offset: state.offset,
         corrupt_count: state.corrupt_count,
@@ -927,6 +959,7 @@ fn snapshot(state: &SlugState, now: DateTime<Utc>) -> ProjectProjectionSnapshot 
             .range(oldest..)
             .map(|(_, bucket)| bucket.tokens)
             .sum(),
+        tokens_24h_by_vendor,
         cost_24h_priced: state
             .minute_cost
             .range(oldest..)
@@ -1138,6 +1171,10 @@ mod tests {
         assert_eq!(snapshot.cost.session_count_24h, 1);
         assert_eq!(snapshot.cost.cost_24h_by_vendor["claude"], 7.0);
         assert_eq!(snapshot.tokens_24h, 1_000_000);
+        // The superseded chat-hook row's tokens must be unfolded from the
+        // per-vendor map too, not just the scalar total — else a hook row
+        // superseded by its own agent_done double-counts that vendor.
+        assert_eq!(snapshot.tokens_24h_by_vendor["claude"], 1_000_000);
     }
 
     #[test]
@@ -1165,6 +1202,55 @@ mod tests {
         assert_eq!(snapshot.cost.cost_24h_usd, 30.0);
         assert_eq!(snapshot.cost.session_count_24h, 1);
         assert_eq!(snapshot.tokens_24h, 1_000_000);
+    }
+
+    #[test]
+    fn tokens_24h_split_by_vendor_including_unpriced_opencode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        let now = fixed_now();
+        write_lines(
+            &paths.progress_jsonl("by-vendor"),
+            &[
+                json!({
+                    "event": AGENT_DONE,
+                    "session_id": "s1",
+                    "turn_id": "t1",
+                    "vendor": "codex",
+                    "cost_usd": 1.0,
+                    "usage": {"input_tokens": 100, "output_tokens": 50},
+                    "ts": now.to_rfc3339(),
+                }),
+                json!({
+                    "event": CHAT_TURN_COMPLETED,
+                    "sid": "s2",
+                    "turn_id": "t2",
+                    "vendor": "opencode",
+                    "model": "zai-coding-plan/glm-5.3-flash",
+                    "usage": {"input_tokens": 1000, "output_tokens": 0},
+                    "ts": now.to_rfc3339(),
+                }),
+                json!({
+                    "event": CHAT_TURN_COMPLETED,
+                    "sid": "s3",
+                    "turn_id": "t3",
+                    "vendor": "opencode",
+                    "model": "zai-coding-plan/glm-5.3-flash",
+                    "usage": {"input_tokens": 7, "output_tokens": 0},
+                    "ts": (now - Duration::hours(25)).to_rfc3339(),
+                }),
+            ],
+        );
+        let projection = projection(paths);
+        projection.hydrate_now(&["by-vendor".to_string()]).unwrap();
+        let snapshot = projection.project_snapshot("by-vendor");
+        assert_eq!(snapshot.tokens_24h, 1150);
+        assert_eq!(snapshot.tokens_24h_by_vendor["codex"], 150);
+        assert_eq!(snapshot.tokens_24h_by_vendor["opencode"], 1000);
+        assert!(
+            !snapshot.cost.cost_24h_by_vendor.contains_key("opencode"),
+            "opencode stays unpriced in USD"
+        );
     }
 
     #[test]

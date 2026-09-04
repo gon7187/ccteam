@@ -332,20 +332,36 @@ fn tool_ls_matching(
 ) -> Result<String> {
     let projects = collect_projects(paths)?;
     let projection = crate::progress_projection::ProgressProjection::new(paths.clone());
+    let mut vendors_24h: std::collections::BTreeMap<String, (u64, Option<f64>)> =
+        std::collections::BTreeMap::new();
     let arr: Vec<Value> = projects
         .iter()
         .filter(|project| visible(&project.state))
         .map(|p| {
-            let cost = projection.project_snapshot(&p.state.slug).cost;
+            let snapshot = projection.project_snapshot(&p.state.slug);
+            for (vendor, tokens) in &snapshot.tokens_24h_by_vendor {
+                let slot = vendors_24h.entry(vendor.clone()).or_insert((0, None));
+                slot.0 = slot.0.saturating_add(*tokens);
+            }
+            for (vendor, usd) in &snapshot.cost.cost_24h_by_vendor {
+                let slot = vendors_24h.entry(vendor.clone()).or_insert((0, None));
+                slot.1 = Some(slot.1.unwrap_or(0.0) + usd);
+            }
             json!({
                 "slug": p.state.slug,
-                "cost_24h_usd": cost.cost_24h_usd,
+                "cost_24h_usd": snapshot.cost.cost_24h_usd,
+                "tokens_24h_by_vendor": snapshot.tokens_24h_by_vendor,
             })
         })
+        .collect();
+    let vendors_24h: serde_json::Map<String, Value> = vendors_24h
+        .into_iter()
+        .map(|(vendor, (tokens, usd))| (vendor, json!({"tokens": tokens, "spend_usd": usd})))
         .collect();
     let health = check_daemon_health(paths);
     let body = json!({
         "projects": arr,
+        "vendors_24h": vendors_24h,
         "daemon": daemon_health_json(&health),
     });
     Ok(serde_json::to_string_pretty(&body)?)
@@ -873,6 +889,43 @@ mod tests {
             .unwrap();
         }
 
+        // alice's project spends on "claude"; bob's (invisible to alice)
+        // spends on "codex" — the aggregate fold runs inside the
+        // visibility filter, so a hidden project's vendor must never leak
+        // into a tenant's `vendors_24h`.
+        let now = chrono::Utc::now();
+        std::fs::create_dir_all(paths.progress_jsonl("alice").parent().unwrap()).unwrap();
+        std::fs::write(
+            paths.progress_jsonl("alice"),
+            serde_json::to_string(&serde_json::json!({
+                "event": "agent_done",
+                "session_id": "s-alice",
+                "turn_id": "t-alice",
+                "vendor": "claude",
+                "cost_usd": 2.0,
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "ts": now.to_rfc3339(),
+            }))
+            .unwrap()
+                + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            paths.progress_jsonl("bob"),
+            serde_json::to_string(&serde_json::json!({
+                "event": "agent_done",
+                "session_id": "s-bob",
+                "turn_id": "t-bob",
+                "vendor": "codex",
+                "cost_usd": 1.0,
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "ts": now.to_rfc3339(),
+            }))
+            .unwrap()
+                + "\n",
+        )
+        .unwrap();
+
         let body: Value = serde_json::from_str(&tool_ls_for_user(&paths, "ualice").unwrap())
             .expect("tenant status base is JSON");
         let slugs: Vec<&str> = body["projects"]
@@ -882,6 +935,15 @@ mod tests {
             .filter_map(|project| project["slug"].as_str())
             .collect();
         assert_eq!(slugs, vec!["alice"]);
+        let vendors_24h = body["vendors_24h"].as_object().unwrap();
+        assert!(
+            vendors_24h.contains_key("claude"),
+            "visible project's vendor must appear: {vendors_24h:?}"
+        );
+        assert!(
+            !vendors_24h.contains_key("codex"),
+            "hidden project's vendor must not leak into tenant vendors_24h: {vendors_24h:?}"
+        );
     }
 
     #[test]
@@ -924,7 +986,8 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect();
-            assert_eq!(top, BTreeSet::from(["daemon", "projects"]));
+            assert_eq!(top, BTreeSet::from(["daemon", "projects", "vendors_24h"]));
+            assert!(body.get("vendors_24h").is_some());
             let project = body["projects"].as_array().unwrap().first().unwrap();
             let project_keys: BTreeSet<_> = project
                 .as_object()
@@ -932,7 +995,10 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect();
-            assert_eq!(project_keys, BTreeSet::from(["cost_24h_usd", "slug"]));
+            assert_eq!(
+                project_keys,
+                BTreeSet::from(["cost_24h_usd", "slug", "tokens_24h_by_vendor"])
+            );
             let daemon_keys: BTreeSet<_> = body["daemon"]
                 .as_object()
                 .unwrap()
