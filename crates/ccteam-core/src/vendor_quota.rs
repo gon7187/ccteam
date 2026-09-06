@@ -1,6 +1,6 @@
 //! VENDOR-QUOTA-1 — the normalized vendor subscription-quota model plus the
 //! PURE parsers (fixture-testable, zero I/O). The thin HTTP layer, per-vendor
-//! credential file reads, and the 5-minute cache live in
+//! credential file reads, and the 60-second cache live in
 //! `ccteam_im::vendor_quota_probe`; the `GET /api/v1/vendors/quota` REST
 //! handler in `ccteam_web::routes::vendor_quota` calls it.
 //!
@@ -13,13 +13,13 @@
 //! - claude: `GET https://api.anthropic.com/api/oauth/usage`, Bearer = OAuth
 //!   `accessToken` from `~/.claude/.credentials.json` (`claudeAiOauth`,
 //!   `user:profile` scope required) + `anthropic-beta: oauth-2025-04-20`.
-//!   API-key accounts get `{}` → [`QuotaVerdict::NotSubscription`].
+//!   Unreadable/empty usage is unknown, never proof of no subscription.
 //! - codex: `GET https://chatgpt.com/backend-api/wham/usage`, Bearer =
 //!   `tokens.access_token` from `~/.codex/auth.json` + `ChatGPT-Account-Id:
-//!   tokens.account_id`. ApiKey auth (no `tokens`) → NotSubscription.
+//!   tokens.account_id`. Missing ChatGPT credentials leave usage unknown.
 //! - kimi: `GET https://api.kimi.com/coding/v1/usages`, Bearer = managed
 //!   OAuth token from `$KIMI_CODE_HOME/credentials/kimi-code.json`.
-//!   Non-managed (API key) provider → NotSubscription.
+//!   Without managed credentials the probe cannot measure usage.
 //! - grok: UNPROBED — see [`QuotaProbeKind::GrokBillingUnavailable`].
 //! - opencode / pi / dsh: no surface (`quota_probe: None`; dsh's
 //!   balance-only `/user/balance` is deliberately not a quota window).
@@ -51,14 +51,14 @@ pub enum QuotaProbeKind {
     GrokBillingUnavailable,
 }
 
-/// The quota windows ccteam renders. Vendors report at most the first two
-/// today; `Monthly` keeps the model open without a shape change.
+/// A window's duration, never its position in the vendor response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaWindowKind {
     FiveHour,
     Weekly,
     Monthly,
+    Unknown,
 }
 
 /// One normalized quota window: how much of the window is consumed and when
@@ -70,6 +70,11 @@ pub struct QuotaWindow {
     pub used_percent: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<u64>,
+    /// A model-specific pool. None means the subscription-wide pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 /// Wire state of one vendor's quota probe.
@@ -78,10 +83,10 @@ pub struct QuotaWindow {
 pub enum QuotaState {
     Available,
     /// The vendor has no subscription meter for this credential (API-key
-    /// account, missing credential file) — the UI renders nothing.
+    /// account). Missing or unreadable credentials are Unavailable.
     NotSubscription,
     /// The probe could not find out (network / 401 / timeout / shape
-    /// drift) — the UI renders nothing, no error styling.
+    /// drift) — readers must keep the remaining capacity unknown.
     Unavailable,
 }
 
@@ -98,6 +103,13 @@ pub struct VendorQuota {
     pub plan: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub windows: Vec<QuotaWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Safe diagnostic code, never a raw HTTP body or credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl VendorQuota {
@@ -107,6 +119,9 @@ impl VendorQuota {
             state: QuotaState::Available,
             plan,
             windows,
+            observed_at: None,
+            source: None,
+            reason: None,
         }
     }
 
@@ -116,6 +131,9 @@ impl VendorQuota {
             state: QuotaState::NotSubscription,
             plan: None,
             windows: Vec::new(),
+            observed_at: None,
+            source: None,
+            reason: None,
         }
     }
 
@@ -125,13 +143,14 @@ impl VendorQuota {
             state: QuotaState::Unavailable,
             plan: None,
             windows: Vec::new(),
+            observed_at: None,
+            source: None,
+            reason: None,
         }
     }
 }
 
-/// What a successful HTTP parse can conclude. `Unavailable` is deliberately
-/// NOT here: it is the transport layer's verdict (401/timeout/shape drift),
-/// never a parser's.
+/// A successful HTTP response may still have an unreadable usage payload.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QuotaVerdict {
     Available {
@@ -139,6 +158,7 @@ pub enum QuotaVerdict {
         windows: Vec<QuotaWindow>,
     },
     NotSubscription,
+    Unavailable,
 }
 
 impl QuotaVerdict {
@@ -146,6 +166,7 @@ impl QuotaVerdict {
         match self {
             Self::Available { plan, windows } => VendorQuota::available(vendor, plan, windows),
             Self::NotSubscription => VendorQuota::not_subscription(vendor),
+            Self::Unavailable => VendorQuota::unavailable(vendor),
         }
     }
 }
@@ -155,7 +176,7 @@ impl QuotaVerdict {
 /// claude: the OAuth bearer + plan from `~/.claude/.credentials.json`.
 /// Requires the `user:profile` scope (the usage endpoint's minimum, per the
 /// claude codebase's own gate); an API-key-only file has no `claudeAiOauth`
-/// block at all → `None` → NotSubscription.
+/// block at all → `None`; this probe cannot measure its subscription.
 pub fn claude_oauth_from_credentials(body: &str) -> Option<(String, Option<String>)> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let oauth = v.get("claudeAiOauth")?;
@@ -179,7 +200,7 @@ pub fn claude_oauth_from_credentials(body: &str) -> Option<(String, Option<Strin
 }
 
 /// codex: the ChatGPT bearer + account id from `~/.codex/auth.json`. ApiKey
-/// auth has no `tokens` block → `None` → NotSubscription.
+/// auth has no `tokens` block → `None`; the subscription remains unknown.
 pub fn codex_chatgpt_from_auth(body: &str) -> Option<(String, String)> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let tokens = v.get("tokens")?;
@@ -193,7 +214,7 @@ pub fn codex_chatgpt_from_auth(body: &str) -> Option<(String, String)> {
 
 /// kimi: the managed OAuth bearer from `$KIMI_CODE_HOME/credentials/
 /// kimi-code.json`. A machine using a plain API-key provider has no such
-/// file → `None` → NotSubscription.
+/// file → `None`; the subscription remains unknown.
 pub fn kimi_managed_token_from_credentials(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let token = v.get("access_token")?.as_str()?;
@@ -232,14 +253,20 @@ fn window(
         kind,
         used_percent: clamp_percent(used_percent),
         resets_at,
+        duration_seconds: match kind {
+            QuotaWindowKind::FiveHour => Some(18_000),
+            QuotaWindowKind::Weekly => Some(604_800),
+            _ => None,
+        },
+        scope: None,
     }
 }
 
 /// claude `GET /api/oauth/usage`: `{five_hour?: {utilization, resets_at},
-/// seven_day?: same, …}`. An API-key account gets `{}` → NotSubscription.
+/// seven_day?: same, limits?: typed windows, …}`. Empty usage is unknown.
 pub fn parse_claude_usage(body: &str, plan: Option<String>) -> QuotaVerdict {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return QuotaVerdict::NotSubscription;
+        return QuotaVerdict::Unavailable;
     };
     let mut windows = Vec::new();
     for (key, kind) in [
@@ -247,26 +274,105 @@ pub fn parse_claude_usage(body: &str, plan: Option<String>) -> QuotaVerdict {
         ("seven_day", QuotaWindowKind::Weekly),
     ] {
         let Some(rate) = v.get(key) else { continue };
-        let Some(utilization) = rate.get("utilization").and_then(|u| u.as_f64()) else {
+        let Some(utilization) = rate
+            .get("utilization")
+            .and_then(|u| u.as_f64())
+            .filter(|v| *v >= 0.0)
+        else {
             continue;
         };
         let resets_at = parse_iso(rate.get("resets_at").and_then(|r| r.as_str()));
         windows.push(window(kind, utilization, resets_at));
     }
+    // The typed list reports scoped pools (including Fable) that have no
+    // stable top-level field. Common pools above remain single entries.
+    for limit in v
+        .get("limits")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let kind = match limit.get("group").and_then(|v| v.as_str()) {
+            Some("session") => QuotaWindowKind::FiveHour,
+            Some("weekly") => QuotaWindowKind::Weekly,
+            _ => QuotaWindowKind::Unknown,
+        };
+        let Some(used) = limit
+            .get("percent")
+            .and_then(|v| v.as_f64())
+            .filter(|v| *v >= 0.0)
+        else {
+            continue;
+        };
+        let scope = limit
+            .pointer("/scope/model/display_name")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                limit
+                    .pointer("/scope/model/id")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+            })
+            .map(str::to_string);
+        // Unknown scoped limits must never masquerade as the general pool.
+        let scoped = limit.get("kind").and_then(|v| v.as_str()) == Some("weekly_scoped");
+        let scope = scope.or_else(|| scoped.then(|| "unknown_scope".to_string()));
+        if windows.iter().any(|w| w.kind == kind && w.scope == scope) {
+            continue;
+        }
+        let mut w = window(
+            kind,
+            used,
+            parse_iso(limit.get("resets_at").and_then(|v| v.as_str())),
+        );
+        w.scope = scope;
+        windows.push(w);
+    }
+    // Older payloads can expose additional model windows by name.
+    if let Some(fields) = v.as_object() {
+        for (key, rate) in fields {
+            let Some(scope) = key.strip_prefix("seven_day_") else {
+                continue;
+            };
+            let Some(used) = rate
+                .get("utilization")
+                .and_then(|v| v.as_f64())
+                .filter(|v| *v >= 0.0)
+            else {
+                continue;
+            };
+            if windows.iter().any(|w| {
+                w.scope
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(scope))
+            }) {
+                continue;
+            }
+            let mut w = window(
+                QuotaWindowKind::Weekly,
+                used,
+                parse_iso(rate.get("resets_at").and_then(|v| v.as_str())),
+            );
+            w.scope = Some(scope.to_string());
+            windows.push(w);
+        }
+    }
     if windows.is_empty() {
-        return QuotaVerdict::NotSubscription;
+        return QuotaVerdict::Unavailable;
     }
     QuotaVerdict::Available { plan, windows }
 }
 
 /// codex `GET /backend-api/wham/usage`: `{plan_type, rate_limit:
 /// {primary_window: {used_percent, reset_at(unix secs)}, secondary_window:
-/// same}}` (primary = 5h, secondary = weekly). Tolerates the
+/// same, limit_window_seconds}}`. Window duration is supplied by the API;
+/// the general primary window can be weekly with no secondary. Tolerates the
 /// `{"rate_limits": {…}}` wrapper spelling too — the two shapes disagree
 /// across codex releases and both parse.
 pub fn parse_codex_wham_usage(body: &str) -> QuotaVerdict {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return QuotaVerdict::NotSubscription;
+        return QuotaVerdict::Unavailable;
     };
     let rate_limit = v
         .get("rate_limit")
@@ -279,24 +385,69 @@ pub fn parse_codex_wham_usage(body: &str) -> QuotaVerdict {
         .map(|p| p.to_string());
     let mut windows = Vec::new();
     if let Some(rate_limit) = rate_limit {
-        for (key, kind) in [
-            ("primary_window", QuotaWindowKind::FiveHour),
-            ("secondary_window", QuotaWindowKind::Weekly),
-        ] {
-            let Some(w) = rate_limit.get(key) else {
-                continue;
-            };
-            let Some(used) = w.get("used_percent").and_then(|u| u.as_f64()) else {
-                continue;
-            };
-            let resets_at = parse_unix(w.get("reset_at").and_then(|r| r.as_i64()));
-            windows.push(window(kind, used, resets_at));
+        append_codex_windows(&mut windows, rate_limit, None);
+    }
+    for limit in v
+        .get("additional_rate_limits")
+        .or_else(|| v.pointer("/rate_limits/additional_rate_limits"))
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let scope = limit
+            .get("limit_name")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                limit
+                    .get("metered_feature")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+            })
+            .unwrap_or("unknown_scope")
+            .to_string();
+        if let Some(rate) = limit.get("rate_limit") {
+            append_codex_windows(&mut windows, rate, Some(scope));
         }
     }
     if windows.is_empty() && plan.is_none() {
-        return QuotaVerdict::NotSubscription;
+        return QuotaVerdict::Unavailable;
     }
     QuotaVerdict::Available { plan, windows }
+}
+
+fn append_codex_windows(
+    windows: &mut Vec<QuotaWindow>,
+    rate: &serde_json::Value,
+    scope: Option<String>,
+) {
+    for key in ["primary_window", "secondary_window"] {
+        let Some(raw) = rate.get(key) else { continue };
+        let Some(used) = raw
+            .get("used_percent")
+            .and_then(|v| v.as_f64())
+            .filter(|v| *v >= 0.0)
+        else {
+            continue;
+        };
+        let duration = raw
+            .get("limit_window_seconds")
+            .and_then(|v| v.as_u64())
+            .filter(|v| *v > 0);
+        let kind = match duration {
+            Some(18_000) => QuotaWindowKind::FiveHour,
+            Some(604_800) => QuotaWindowKind::Weekly,
+            _ => QuotaWindowKind::Unknown,
+        };
+        let mut w = window(
+            kind,
+            used,
+            parse_unix(raw.get("reset_at").and_then(|v| v.as_i64())),
+        );
+        w.duration_seconds = duration;
+        w.scope = scope.clone();
+        windows.push(w);
+    }
 }
 
 /// kimi `GET /coding/v1/usages`: `{usage: {used, limit, resetTime}, limits:
@@ -305,7 +456,7 @@ pub fn parse_codex_wham_usage(body: &str) -> QuotaVerdict {
 /// `usage` = weekly; the 300-minute limit entry = 5h.
 pub fn parse_kimi_usages(body: &str) -> QuotaVerdict {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return QuotaVerdict::NotSubscription;
+        return QuotaVerdict::Unavailable;
     };
     let mut windows = Vec::new();
     if let Some(usage) = v.get("usage") {
@@ -334,7 +485,7 @@ pub fn parse_kimi_usages(body: &str) -> QuotaVerdict {
         }
     }
     if windows.is_empty() {
-        return QuotaVerdict::NotSubscription;
+        return QuotaVerdict::Unavailable;
     }
     QuotaVerdict::Available {
         plan: None,
@@ -343,11 +494,14 @@ pub fn parse_kimi_usages(body: &str) -> QuotaVerdict {
 }
 
 /// kimi's `{used, limit, resetTime}` row → a percent window. `used`/`limit`
-/// arrive as decimal strings (proto JSON); numbers are accepted too.
+/// arrive as decimal strings (proto JSON); numbers are accepted too. A row
+/// with missing fields, negative used, non-finite values, or non-positive
+/// limit is unusable → `None` (the window drops; an all-dropped payload
+/// stays unknown upstream, never misread as a full window).
 fn kimi_ratio_window(kind: QuotaWindowKind, row: &serde_json::Value) -> Option<QuotaWindow> {
     let used = kimi_number(row.get("used"))?;
     let limit = kimi_number(row.get("limit"))?;
-    if limit <= 0.0 {
+    if !used.is_finite() || !limit.is_finite() || used < 0.0 || limit <= 0.0 {
         return None;
     }
     let resets_at = parse_iso(row.get("resetTime").and_then(|r| r.as_str()));
@@ -435,7 +589,7 @@ mod tests {
             panic!("expected available");
         };
         assert_eq!(plan.as_deref(), Some("max"));
-        assert_eq!(windows.len(), 2);
+        assert_eq!(windows.len(), 3);
         assert_eq!(windows[0].kind, QuotaWindowKind::FiveHour);
         assert_eq!(windows[0].used_percent, 42.0);
         assert_eq!(
@@ -447,20 +601,16 @@ mod tests {
     }
 
     #[test]
-    fn claude_usage_empty_object_is_not_subscription() {
-        // The API-key account response.
-        assert_eq!(
-            parse_claude_usage("{}", None),
-            QuotaVerdict::NotSubscription
-        );
+    fn claude_usage_without_meters_is_unknown() {
+        assert_eq!(parse_claude_usage("{}", None), QuotaVerdict::Unavailable);
         // Null windows (subscriber with no active limits) also normalize away.
         assert_eq!(
             parse_claude_usage(r#"{"five_hour":null,"seven_day":null}"#, None),
-            QuotaVerdict::NotSubscription
+            QuotaVerdict::Unavailable
         );
         assert_eq!(
             parse_claude_usage("not json", None),
-            QuotaVerdict::NotSubscription
+            QuotaVerdict::Unavailable
         );
     }
 
@@ -475,6 +625,59 @@ mod tests {
     }
 
     // ── codex wham parse ─────────────────────────────────────────────────
+
+    #[test]
+    fn subscription_windows_keep_the_reported_duration_and_model_scope() {
+        let codex = parse_codex_wham_usage(r#"{
+            "plan_type":"pro","rate_limit":{
+                "primary_window":{"used_percent":81,"limit_window_seconds":604800,"reset_at":1789106484},
+                "secondary_window":null},
+            "additional_rate_limits":[{"limit_name":"GPT-5.3-Codex-Spark","metered_feature":"codex_bengalfox",
+                "rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000},"secondary_window":null}}]
+        }"#).into_quota("codex");
+        assert_eq!(codex.windows[0].kind, QuotaWindowKind::Weekly);
+        assert_eq!(codex.windows[0].used_percent, 81.0);
+        assert_eq!(codex.windows.len(), 2);
+        let json = serde_json::to_value(&codex).unwrap();
+        assert_eq!(json["windows"][1]["scope"], "GPT-5.3-Codex-Spark");
+        assert_eq!(codex.windows[1].kind, QuotaWindowKind::FiveHour);
+
+        let claude = parse_claude_usage(r#"{
+            "five_hour":{"utilization":6,"resets_at":"2026-09-06T13:40:00Z"},
+            "seven_day":{"utilization":33,"resets_at":"2026-09-11T18:00:00Z"},
+            "limits":[
+                {"kind":"session","group":"session","percent":6},
+                {"kind":"weekly_all","group":"weekly","percent":33},
+                {"kind":"weekly_scoped","group":"weekly","percent":58,
+                 "scope":{"model":{"id":null,"display_name":"Fable"}},"resets_at":"2026-09-11T18:00:00Z"}]
+        }"#, Some("max".into())).into_quota("claude");
+        assert_eq!(
+            claude.windows.len(),
+            3,
+            "keep Fable without duplicating common windows"
+        );
+        let json = serde_json::to_value(&claude).unwrap();
+        assert_eq!(json["windows"][2]["scope"], "Fable");
+        assert_eq!(claude.windows[2].used_percent, 58.0);
+    }
+
+    #[test]
+    fn unreadable_usage_is_unknown_not_a_non_subscriber() {
+        for quota in [
+            parse_codex_wham_usage("not json").into_quota("codex"),
+            parse_claude_usage("not json", Some("max".into())).into_quota("claude"),
+            parse_codex_wham_usage(r#"{"rate_limit":{"primary_window":{"used_percent":-1}}}"#)
+                .into_quota("codex"),
+            parse_claude_usage(r#"{"five_hour":{"utilization":-1}}"#, None).into_quota("claude"),
+            parse_claude_usage(r#"{"limits":[{"group":"weekly","percent":-1}]}"#, None)
+                .into_quota("claude"),
+            parse_claude_usage(r#"{"seven_day_fable":{"utilization":-1}}"#, None)
+                .into_quota("claude"),
+        ] {
+            assert_eq!(quota.state, QuotaState::Unavailable);
+            assert!(quota.windows.is_empty());
+        }
+    }
 
     #[test]
     fn codex_wham_parses_primary_and_secondary_windows() {
@@ -507,14 +710,19 @@ mod tests {
         };
         assert_eq!(plan.as_deref(), Some("team"));
         assert_eq!(windows.len(), 1);
+        assert_eq!(
+            windows[0].kind,
+            QuotaWindowKind::Unknown,
+            "missing duration is not five hours"
+        );
     }
 
     #[test]
-    fn codex_wham_empty_payload_is_not_subscription() {
-        assert_eq!(parse_codex_wham_usage("{}"), QuotaVerdict::NotSubscription);
+    fn codex_wham_empty_payload_is_unknown() {
+        assert_eq!(parse_codex_wham_usage("{}"), QuotaVerdict::Unavailable);
         assert_eq!(
             parse_codex_wham_usage("not json"),
-            QuotaVerdict::NotSubscription
+            QuotaVerdict::Unavailable
         );
     }
 
@@ -561,12 +769,46 @@ mod tests {
             panic!("expected available");
         };
         assert_eq!(windows[0].used_percent, 25.0);
-        assert_eq!(parse_kimi_usages("{}"), QuotaVerdict::NotSubscription);
-        // limit 0 would divide by zero — dropped, leaving nothing.
+    }
+
+    #[test]
+    fn kimi_unusable_usage_is_unknown_never_no_subscription() {
+        // Malformed JSON / empty usage: unknown, like claude/codex.
+        assert_eq!(parse_kimi_usages("not json"), QuotaVerdict::Unavailable);
+        assert_eq!(parse_kimi_usages("{}"), QuotaVerdict::Unavailable);
         assert_eq!(
-            parse_kimi_usages(r#"{"usage":{"used":"1","limit":"0"}}"#),
-            QuotaVerdict::NotSubscription
+            parse_kimi_usages(r#"{"usage":null,"limits":null}"#),
+            QuotaVerdict::Unavailable
         );
+        // Missing fields, negative used, non-finite values, non-positive
+        // limit: every row drops, leaving unknown — never no subscription
+        // or full capacity.
+        for body in [
+            r#"{"usage":{}}"#,
+            r#"{"usage":{"used":"1","limit":"0"}}"#,
+            r#"{"usage":{"used":"1","limit":"-5"}}"#,
+            r#"{"usage":{"used":"-1","limit":"100"}}"#,
+            r#"{"usage":{"used":"NaN","limit":"100"}}"#,
+            r#"{"usage":{"used":"inf","limit":"100"}}"#,
+            r#"{"usage":{"used":1,"limit":"NaN"}}"#,
+        ] {
+            assert_eq!(
+                parse_kimi_usages(body),
+                QuotaVerdict::Unavailable,
+                "body: {body}"
+            );
+        }
+        // A bad row drops without poisoning its valid siblings.
+        let mixed = parse_kimi_usages(
+            r#"{"usage":{"used":"40","limit":"1000"},
+                "limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},
+                "detail":{"used":"-1","limit":"100"}}]}"#,
+        );
+        let QuotaVerdict::Available { windows, .. } = mixed else {
+            panic!("expected available");
+        };
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].kind, QuotaWindowKind::Weekly);
     }
 
     // ── registry wiring ──────────────────────────────────────────────────

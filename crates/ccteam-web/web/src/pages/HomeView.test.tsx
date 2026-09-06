@@ -280,8 +280,8 @@ describe("HomeView (landing page)", () => {
     ).resolves.toEqual({
       sid: "s42",
       vendor: "codex",
-      model: "gpt-5.6-codex",
-      effort: "xhigh",
+      model: "gpt-5.6-sol",
+      effort: "high",
       fallback: true,
     });
 
@@ -293,8 +293,8 @@ describe("HomeView (landing page)", () => {
         vendor: "claude",
         permission_mode: "skip",
         protocol: "stream-json",
-        model: "fable",
-        effort: "high",
+        model: "opus",
+        effort: "medium",
       },
     ]);
     expect(createSession.mock.calls[1]).toEqual([
@@ -304,8 +304,8 @@ describe("HomeView (landing page)", () => {
         vendor: "codex",
         permission_mode: "skip",
         protocol: "stream-json",
-        model: "gpt-5.6-codex",
-        effort: "xhigh",
+        model: "gpt-5.6-sol",
+        effort: "high",
       },
     ]);
     expect(submit).toHaveBeenCalledOnce();
@@ -344,8 +344,8 @@ describe("HomeView (landing page)", () => {
     ).resolves.toEqual({
       sid: "s43",
       vendor: "codex",
-      model: "gpt-5.6-codex",
-      effort: "xhigh",
+      model: "gpt-5.6-sol",
+      effort: "high",
       fallback: true,
     });
 
@@ -355,13 +355,13 @@ describe("HomeView (landing page)", () => {
       vendor: "codex",
       permission_mode: "skip",
       protocol: "stream-json",
-      model: "gpt-5.6-codex",
-      effort: "xhigh",
+      model: "gpt-5.6-sol",
+      effort: "high",
     });
     expect(submit).toHaveBeenCalledWith("s43", "task", []);
   });
 
-  it("launches Commander at high effort even when the live catalog advertises a higher Fable rung", async () => {
+  it("launches Commander at medium effort when Opus advertises higher rungs", async () => {
     const createSession = vi.fn().mockResolvedValue({ sid: "s44" });
     const submit = vi.fn().mockResolvedValue(undefined);
 
@@ -374,7 +374,7 @@ describe("HomeView (landing page)", () => {
             vendor: "claude",
             permission_mode: "skip",
             protocol: "stream-json",
-            model: "fable",
+            model: "opus",
             effort: "xhigh",
           },
           text: "task",
@@ -383,7 +383,7 @@ describe("HomeView (landing page)", () => {
           installedVendors: ["claude", "codex"],
           catalog: {
             claude: {
-              models: [{ id: "fable", efforts: ["low", "medium", "high", "xhigh"] }],
+              models: [{ id: "opus", efforts: ["low", "medium", "high", "xhigh"] }],
               efforts: ["low", "medium", "high", "xhigh"],
             },
           },
@@ -393,8 +393,8 @@ describe("HomeView (landing page)", () => {
     ).resolves.toEqual({
       sid: "s44",
       vendor: "claude",
-      model: "fable",
-      effort: "high",
+      model: "opus",
+      effort: "medium",
       fallback: false,
     });
 
@@ -404,13 +404,24 @@ describe("HomeView (landing page)", () => {
       vendor: "claude",
       permission_mode: "skip",
       protocol: "stream-json",
-      model: "fable",
-      effort: "high",
+      model: "opus",
+      effort: "medium",
     });
     expect(submit).toHaveBeenCalledWith("s44", "task", []);
   });
 
-  it("falls back to the top advertised rung when the live catalog does not advertise high", async () => {
+  it("does not select max when Opus lacks medium", async () => {
+    const createSession = vi.fn().mockResolvedValue({ sid: "s-no-max" });
+    const submit = vi.fn().mockResolvedValue(undefined);
+    await createAndSubmitHomeTurn({
+      slug: "ccteam", options: { role: "", vendor: "claude", permission_mode: "skip", protocol: "stream-json" },
+      text: "task", attachments: [], commander: true, installedVendors: ["claude", "codex"],
+      catalog: { claude: { models: [{ id: "opus", efforts: ["high", "max"] }], efforts: ["high", "max"] } },
+    }, { createSession, submitTurn: submit });
+    expect(createSession).toHaveBeenCalledWith("ccteam", expect.objectContaining({ model: "opus", effort: "high" }));
+  });
+
+  it("omits effort when no Opus effort is advertised", async () => {
     const createSession = vi.fn().mockResolvedValue({ sid: "s44b" });
     const submit = vi.fn().mockResolvedValue(undefined);
 
@@ -430,8 +441,8 @@ describe("HomeView (landing page)", () => {
           installedVendors: ["claude", "codex"],
           catalog: {
             claude: {
-              models: [{ id: "fable", efforts: ["low", "medium"] }],
-              efforts: ["low", "medium"],
+              models: [{ id: "opus", efforts: [] }],
+              efforts: [],
             },
           },
         },
@@ -440,8 +451,7 @@ describe("HomeView (landing page)", () => {
     ).resolves.toEqual({
       sid: "s44b",
       vendor: "claude",
-      model: "fable",
-      effort: "medium",
+      model: "opus",
       fallback: false,
     });
 
@@ -450,13 +460,12 @@ describe("HomeView (landing page)", () => {
       vendor: "claude",
       permission_mode: "skip",
       protocol: "stream-json",
-      model: "fable",
-      effort: "medium",
+      model: "opus",
     });
     expect(submit).toHaveBeenCalledWith("s44b", "task", []);
   });
 
-  it("does not apply a cold Fable effort when the live catalog observed only other models", async () => {
+  it("does not apply a cold Opus effort when the live catalog observed only other models", async () => {
     const createSession = vi.fn().mockResolvedValue({ sid: "s45" });
     const submit = vi.fn().mockResolvedValue(undefined);
 
@@ -468,7 +477,7 @@ describe("HomeView (landing page)", () => {
           vendor: "claude",
           permission_mode: "skip",
           protocol: "stream-json",
-          model: "fable",
+          model: "opus",
           effort: "high",
         },
         text: "task",
@@ -490,7 +499,7 @@ describe("HomeView (landing page)", () => {
       vendor: "claude",
       permission_mode: "skip",
       protocol: "stream-json",
-      model: "fable",
+      model: "opus",
     });
   });
 
@@ -527,8 +536,8 @@ describe("HomeView (landing page)", () => {
       vendor: "claude",
       permission_mode: "skip",
       protocol: "stream-json",
-      model: "fable",
-      effort: "high",
+      model: "opus",
+      effort: "medium",
     });
     expect(submit).not.toHaveBeenCalled();
   });

@@ -758,6 +758,94 @@ async fn a_user_scoped_credential_binds_the_project_it_names() {
     );
 }
 
+#[tokio::test]
+#[serial]
+async fn first_status_binds_only_an_explicit_authorized_project() {
+    let tmp = TempDir::new().unwrap();
+    let _env = isolate(&tmp);
+    let paths = fake_paths(tmp.path());
+    let app = state_with_project(&paths).await;
+    seed_project(&paths, "foreign", "user:alice");
+    seed_project(&paths, "second", "user:web-api");
+    let bindings = Arc::clone(&app.native_bindings);
+    let addr = spawn_server(app).await;
+    let cred = mint(&paths, EnrollScope::User);
+    for tool in ["status", ccteam_im::mcp::STATUS_BEACON_TOOL_NAME] {
+        let id = initialize(addr, &cred.bearer()).await;
+        let discovery: Value = post_mcp(
+            addr,
+            &cred.bearer(),
+            Some(&id),
+            call_body(1, tool, json!({})),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(discovery["result"]["isError"], false);
+        let text = discovery["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(SLUG), "name addressable projects");
+        assert!(
+            !text.contains("foreign"),
+            "unbound discovery must not expose another owner's project: {text}"
+        );
+        assert!(
+            text.contains("project_required"),
+            "explain how to read quotas: {text}"
+        );
+        assert!(bindings.resolve(&id, &cred.id).unwrap().sid.is_none());
+        let denied: Value = post_mcp(
+            addr,
+            &cred.bearer(),
+            Some(&id),
+            call_body(2, tool, json!({"project":"foreign"})),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(
+            denied["result"]["isError"], true,
+            "foreign quota must be denied: {denied}"
+        );
+        assert!(bindings.resolve(&id, &cred.id).unwrap().sid.is_none());
+        let body: Value = post_mcp(
+            addr,
+            &cred.bearer(),
+            Some(&id),
+            call_body(3, tool, json!({"project":SLUG})),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(body["result"]["isError"], false, "{body}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains(&format!("vendors (project={SLUG}")),
+            "first status must expose its project panel: {text}"
+        );
+        let binding = bindings.resolve(&id, &cred.id).unwrap();
+        assert!(binding.sid.is_some());
+        assert_eq!(binding.project.as_deref(), Some(SLUG));
+        let switched: Value = post_mcp(
+            addr,
+            &cred.bearer(),
+            Some(&id),
+            call_body(4, tool, json!({"project":"second"})),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(
+            switched["result"]["isError"], true,
+            "status must not switch identity: {switched}"
+        );
+        assert_eq!(bindings.resolve(&id, &cred.id).unwrap().sid, binding.sid);
+    }
+}
+
 /// One MCP session is one workspace for its whole life — the guard that stops a
 /// mid-conversation switch from smuggling a caller into another project.
 #[tokio::test]

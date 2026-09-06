@@ -155,16 +155,26 @@ fn tools_list_response() -> Value {
 /// `status` (1) + its bare-name beacon alias (1) + `chat_send_file` (1) +
 /// session (5) = **8 total**.
 pub fn tool_definitions() -> Vec<Value> {
+    let status_schema = json!({
+        "type": "object",
+        "properties": {
+            "project": {
+                "type": "string",
+                "description": "Project slug explicitly selected by the user. For an enrolled session, the first authorized project binds its identity for its lifetime. While unbound, omit it to list visible project choices. Never infer a project from cwd."
+            }
+        },
+        "required": []
+    });
     let mut tools: Vec<Value> = vec![
         json!({
             "name": "status",
             "description": "Discovery + health: which of claude / codex / grok / opencode / kimi / pi / dsh are installed on your project's host, plus per-vendor session_spawn recipes, daemon health, cost/budget, advisory models, and routing notes. Managed Pi sessions get the bridge; plain shell pi does not. Managed DSH sessions get the ccteam plugin; plain shell dsh needs @ccteam/dsh-client.",
-            "inputSchema": object_schema(&[]),
+            "inputSchema": status_schema,
         }),
         json!({
             "name": STATUS_BEACON_TOOL_NAME,
             "description": "Alias of status (discovery beacon for hosts that surface tool names only). Which agents this machine can spawn — claude / codex / grok / kimi / opencode / pi / dsh — with install/auth state and per-vendor session_spawn recipes. Identical response to status.",
-            "inputSchema": object_schema(&[]),
+            "inputSchema": status_schema,
         }),
     ];
     tools.extend(chat_tool_definitions());
@@ -279,20 +289,6 @@ pub fn session_tool_definitions() -> Vec<Value> {
             }),
         }),
     ]
-}
-
-fn object_schema(props: &[(&str, &str, &str)]) -> Value {
-    let mut p = serde_json::Map::new();
-    let mut required = Vec::new();
-    for (name, ty, desc) in props {
-        p.insert((*name).into(), json!({ "type": ty, "description": desc }));
-        required.push(*name);
-    }
-    json!({
-        "type": "object",
-        "properties": Value::Object(p),
-        "required": required,
-    })
 }
 
 /// Local-only `tools/call` dispatch (`status` + its beacon alias).
@@ -563,13 +559,19 @@ mod tests {
         );
 
         // Listed, admin-grouped, schema-identical to status.
-        let defs = tool_definitions();
+        let list = tools_list_response();
+        let defs = list["tools"].as_array().unwrap();
         let beacon = defs
             .iter()
             .find(|t| t["name"] == STATUS_BEACON_TOOL_NAME)
             .expect("beacon listed");
         let status = defs.iter().find(|t| t["name"] == "status").unwrap();
         assert_eq!(beacon["inputSchema"], status["inputSchema"]);
+        assert_eq!(
+            status["inputSchema"]["properties"]["project"]["type"],
+            "string"
+        );
+        assert_eq!(status["inputSchema"]["required"], json!([]));
 
         // Pure alias: tools/call returns the same body as status.
         let tmp = tempfile::TempDir::new().unwrap();

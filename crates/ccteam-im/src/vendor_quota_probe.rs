@@ -1,5 +1,5 @@
 //! Vendor subscription-quota probe (claude / codex / kimi usage APIs): the
-//! process-lifetime, per-vendor 5-minute cache shared by the REST route
+//! process-lifetime, per-vendor 60-second cache shared by the REST route
 //! `GET /api/v1/vendors/quota` (ccteam-web) and the MCP `status` panel.
 //! Read-only credential files, no OAuth refresh; every failure is an
 //! `unavailable` row. Pure parsers live in `ccteam_core::vendor_quota`.
@@ -16,9 +16,9 @@ use ccteam_core::vendor_quota::{
     QuotaVerdict, VendorQuota,
 };
 
-/// Per-vendor result cache TTL — quota windows move on a 5h/weekly clock;
-/// 5 minutes is far fresher than anything the bars can show.
-const CACHE_TTL: Duration = Duration::from_secs(300);
+/// Bounded reuse for repeated status calls; a snapshot retains its actual
+/// observation time so a commander cannot mistake cached usage for live use.
+const CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Per-request budget for one vendor's usage API.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
@@ -98,7 +98,20 @@ impl VendorQuotaService {
         }
         let probed = futures::future::join_all(misses.iter().map(|(spec, kind)| {
             let client = &self.client;
-            async move { (spec.vendor, probe_one(client, spec, *kind).await) }
+            async move {
+                let mut quota = probe_one(client, spec, *kind).await;
+                quota.observed_at = Some(chrono::Utc::now());
+                quota.source = Some(
+                    match kind {
+                        QuotaProbeKind::ClaudeOauthUsage => "claude_oauth_usage",
+                        QuotaProbeKind::CodexWhamUsage => "codex_wham_usage",
+                        QuotaProbeKind::KimiManagedUsages => "kimi_managed_usages",
+                        QuotaProbeKind::GrokBillingUnavailable => "unavailable",
+                    }
+                    .to_string(),
+                );
+                (spec.vendor, quota)
+            }
         }))
         .await;
         for (vendor, quota) in probed {
@@ -139,15 +152,17 @@ fn kimi_credentials_path() -> Option<PathBuf> {
     Some(dir.join("credentials").join("kimi-code.json"))
 }
 
-/// Read + extract one credential file. A missing/unreadable file or a
-/// credential of the wrong KIND (API-key account) reads as `None` → the
-/// caller maps it to `not_subscription` — never an error, never a guess.
-fn read_credential<T>(path: Option<PathBuf>, extract: impl FnOnce(&str) -> Option<T>) -> Option<T> {
-    let body = std::fs::read_to_string(path?).ok()?;
-    extract(&body)
+/// Failure to read subscription credentials proves nothing about the plan.
+fn read_credential<T>(
+    path: Option<PathBuf>,
+    extract: impl FnOnce(&str) -> Option<T>,
+) -> Result<T, String> {
+    let path = path.ok_or("credentials_missing")?;
+    let body = std::fs::read_to_string(path).map_err(|_| "credentials_unreadable")?;
+    extract(&body).ok_or_else(|| "subscription_credentials_unavailable".to_string())
 }
 
-// ── HTTP layer (thin; every failure → None → `unavailable`) ─────────────────
+// ── HTTP layer (safe diagnostic codes, no response bodies) ─────────────────
 
 fn claude_usage_request(
     client: &reqwest::Client,
@@ -185,23 +200,39 @@ fn kimi_usage_request(
 }
 
 /// Execute one probe request and parse the 2xx body. ANY transport or HTTP
-/// failure — connect, timeout, 401/403/5xx — is `None` (→ `unavailable`):
-/// the UI hides the zone and nothing is error-styled.
+/// failure has an explicit safe diagnostic. Unknown is never no subscription.
 async fn execute_and_parse(
     client: &reqwest::Client,
     request: Option<reqwest::Request>,
     parse: impl FnOnce(&str) -> QuotaVerdict,
-) -> Option<QuotaVerdict> {
-    let resp = client.execute(request?).await.ok()?;
+) -> Result<QuotaVerdict, String> {
+    let resp = client
+        .execute(request.ok_or("invalid_request")?)
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                "request_timeout"
+            } else {
+                "network_error"
+            }
+        })?;
     if !resp.status().is_success() {
-        return None;
+        return Err(format!("http_{}", resp.status().as_u16()));
     }
-    let body = resp.text().await.ok()?;
-    Some(parse(&body))
+    let body = resp.text().await.map_err(|_| "unreadable_response")?;
+    match parse(&body) {
+        QuotaVerdict::Unavailable => Err("usage_unreadable".to_string()),
+        verdict => Ok(verdict),
+    }
 }
 
-/// Probe one vendor. Never fails: every unhappy path is a `not_subscription`
-/// / `unavailable` row.
+fn unavailable(vendor: &str, reason: String) -> VendorQuota {
+    let mut quota = VendorQuota::unavailable(vendor);
+    quota.reason = Some(reason);
+    quota
+}
+
+/// Probe one vendor. Failures retain an `unavailable` row with a safe reason.
 async fn probe_one(
     client: &reqwest::Client,
     spec: &'static AgentProbeSpec,
@@ -212,42 +243,49 @@ async fn probe_one(
         // The four-header billing coupling cannot be derived cleanly from
         // `~/.grok/` (refresh-keyed token, internal proxy base) — stubbed
         // unavailable by construction; see QuotaProbeKind's doc comment.
-        QuotaProbeKind::GrokBillingUnavailable => VendorQuota::unavailable(vendor),
+        QuotaProbeKind::GrokBillingUnavailable => {
+            unavailable(vendor, "probe_unsupported".to_string())
+        }
         QuotaProbeKind::ClaudeOauthUsage => {
-            let Some((token, plan)) =
-                read_credential(claude_credentials_path(), claude_oauth_from_credentials)
-            else {
-                return VendorQuota::not_subscription(vendor);
-            };
+            let (token, plan) =
+                match read_credential(claude_credentials_path(), claude_oauth_from_credentials) {
+                    Ok(auth) => auth,
+                    Err(reason) => return unavailable(vendor, reason),
+                };
             let request = claude_usage_request(client, CLAUDE_USAGE_URL, &token);
-            execute_and_parse(client, request, |body| parse_claude_usage(body, plan))
-                .await
-                .map(|verdict| verdict.into_quota(vendor))
-                .unwrap_or_else(|| VendorQuota::unavailable(vendor))
+            let mut quota = execute_and_parse(client, request, |body| {
+                parse_claude_usage(body, plan.clone())
+            })
+            .await
+            .map(|verdict| verdict.into_quota(vendor))
+            .unwrap_or_else(|reason| unavailable(vendor, reason));
+            quota.plan = plan;
+            quota
         }
         QuotaProbeKind::CodexWhamUsage => {
-            let Some((token, account_id)) =
-                read_credential(codex_auth_path(), codex_chatgpt_from_auth)
-            else {
-                return VendorQuota::not_subscription(vendor);
-            };
+            let (token, account_id) =
+                match read_credential(codex_auth_path(), codex_chatgpt_from_auth) {
+                    Ok(auth) => auth,
+                    Err(reason) => return unavailable(vendor, reason),
+                };
             let request = codex_usage_request(client, CODEX_WHAM_USAGE_URL, &token, &account_id);
             execute_and_parse(client, request, parse_codex_wham_usage)
                 .await
                 .map(|verdict| verdict.into_quota(vendor))
-                .unwrap_or_else(|| VendorQuota::unavailable(vendor))
+                .unwrap_or_else(|reason| unavailable(vendor, reason))
         }
         QuotaProbeKind::KimiManagedUsages => {
-            let Some(token) =
-                read_credential(kimi_credentials_path(), kimi_managed_token_from_credentials)
-            else {
-                return VendorQuota::not_subscription(vendor);
-            };
+            let token =
+                match read_credential(kimi_credentials_path(), kimi_managed_token_from_credentials)
+                {
+                    Ok(auth) => auth,
+                    Err(reason) => return unavailable(vendor, reason),
+                };
             let request = kimi_usage_request(client, KIMI_USAGES_URL, &token);
             execute_and_parse(client, request, parse_kimi_usages)
                 .await
                 .map(|verdict| verdict.into_quota(vendor))
-                .unwrap_or_else(|| VendorQuota::unavailable(vendor))
+                .unwrap_or_else(|reason| unavailable(vendor, reason))
         }
     }
 }
@@ -340,7 +378,7 @@ mod tests {
         let url = format!("http://{addr}/usage");
         let req = claude_usage_request(&client, &url, "tok");
         let verdict = execute_and_parse(&client, req, |body| parse_claude_usage(body, None)).await;
-        assert!(verdict.is_none(), "401 → None → unavailable row");
+        assert_eq!(verdict.unwrap_err(), "http_401");
     }
 
     #[tokio::test]
@@ -366,7 +404,7 @@ mod tests {
         let url = format!("http://{addr}/usage");
         let req = kimi_usage_request(&client, &url, "tok");
         let verdict = execute_and_parse(&client, req, parse_kimi_usages).await;
-        assert!(verdict.is_none(), "timeout → None → unavailable row");
+        assert_eq!(verdict.unwrap_err(), "request_timeout");
     }
 
     #[tokio::test]

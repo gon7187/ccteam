@@ -232,32 +232,69 @@ pub(crate) fn render_panel(header: &PanelHeader, rows: &[PanelRow]) -> String {
     out
 }
 
-/// `five_hour:42%,reset=2026-09-04T18:00Z;weekly:10%` or `n/a` when the vendor
-/// has no probe, is not a subscription, or the probe failed.
+/// Subscription observations, separately scoped windows and honest failures.
+/// `n/a` is reserved for a vendor/host for which no probe is attached.
 fn render_quota(quota: Option<&ccteam_core::vendor_quota::VendorQuota>) -> String {
     use ccteam_core::vendor_quota::QuotaState;
     let Some(quota) = quota else {
         return "n/a".to_string();
     };
-    if quota.state != QuotaState::Available || quota.windows.is_empty() {
-        return "n/a".to_string();
+    let state = match quota.state {
+        QuotaState::Available => "available",
+        QuotaState::NotSubscription => "not_subscription",
+        QuotaState::Unavailable => "unknown",
+    };
+    let mut parts = vec![state.to_string()];
+    if let Some(plan) = &quota.plan {
+        parts.push(format!(
+            "plan={}",
+            serde_json::to_string(plan).unwrap_or_default()
+        ));
     }
-    quota
-        .windows
-        .iter()
-        .map(|w| {
+    parts.push(format!(
+        "source={}",
+        quota.source.as_deref().unwrap_or("unknown")
+    ));
+    parts.push(format!(
+        "observed_at={}",
+        quota
+            .observed_at
+            .map(|at| at.to_rfc3339())
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    if let Some(reason) = &quota.reason {
+        parts.push(format!("reason={reason}"));
+    }
+    if quota.state == QuotaState::Available {
+        if quota.windows.is_empty() {
+            parts.push("remaining_percent=unknown".to_string());
+        }
+        parts.extend(quota.windows.iter().map(|w| {
             let kind = serde_json::to_value(w.kind)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_else(|| format!("{:?}", w.kind).to_lowercase());
-            let mut seg = format!("{kind}:{}%", w.used_percent.round() as i64);
+            let mut seg = format!(
+                "{kind}:used_percent={:.1}%,remaining_percent={:.1}%",
+                w.used_percent,
+                100.0 - w.used_percent
+            );
+            if let Some(scope) = &w.scope {
+                seg.push_str(&format!(
+                    ",scope={}",
+                    serde_json::to_string(scope).unwrap_or_default()
+                ));
+            }
+            if let Some(seconds) = w.duration_seconds {
+                seg.push_str(&format!(",duration_seconds={seconds}"));
+            }
             if let Some(reset) = w.resets_at {
-                seg.push_str(&format!(",reset={}", reset.format("%Y-%m-%dT%H:%MZ")));
+                seg.push_str(&format!(",resets_at={}", reset.to_rfc3339()));
             }
             seg
-        })
-        .collect::<Vec<_>>()
-        .join(";")
+        }));
+    }
+    parts.join(";")
 }
 
 // ── advisory model catalogs (pure) ─────────────────────────────────────────
@@ -1053,12 +1090,16 @@ mod tests {
                         ccteam_core::vendor_quota::QuotaWindow {
                             kind: ccteam_core::vendor_quota::QuotaWindowKind::FiveHour,
                             used_percent: 42.0,
+                            duration_seconds: Some(18_000),
+                            scope: None,
                             resets_at: Some("2026-09-04T18:00:00Z".parse().unwrap()),
                         },
                         ccteam_core::vendor_quota::QuotaWindow {
                             kind: ccteam_core::vendor_quota::QuotaWindowKind::Weekly,
                             used_percent: 10.0,
                             resets_at: None,
+                            duration_seconds: Some(604_800),
+                            scope: None,
                         },
                     ],
                 )),
@@ -1116,7 +1157,10 @@ mod tests {
             .unwrap();
         assert!(claude_line.contains("spend_24h=$1.23"));
         assert!(claude_line.contains("tokens_24h=123456"));
-        assert!(claude_line.contains("quota=five_hour:42%,reset=2026-09-04T18:00Z;weekly:10%"));
+        assert!(claude_line.contains("quota=available"));
+        assert!(claude_line.contains("five_hour:used_percent=42.0%,remaining_percent=58.0%"));
+        assert!(claude_line.contains("resets_at=2026-09-04T18:00:00+00:00"));
+        assert!(claude_line.contains("weekly:used_percent=10.0%,remaining_percent=90.0%"));
         let codex_line = out
             .lines()
             .find(|l| l.trim_start().starts_with("codex"))
@@ -1133,7 +1177,7 @@ mod tests {
         assert!(
             kimi_line.contains("spend_24h=n/a")
                 && kimi_line.contains("tokens_24h=77")
-                && kimi_line.contains("quota=n/a")
+                && kimi_line.contains("quota=unknown")
         );
     }
 
@@ -1149,6 +1193,38 @@ mod tests {
         assert!(out.contains("stale=true"));
         assert!(out.contains("offline"));
         assert!(out.contains("no vendor snapshot available"));
+    }
+
+    #[test]
+    fn subscription_panel_preserves_weekly_only_and_scoped_remaining_usage() {
+        use ccteam_core::vendor_quota::{parse_claude_usage, parse_codex_wham_usage};
+        let mut codex = parse_codex_wham_usage(r#"{"plan_type":"pro","rate_limit":{
+            "primary_window":{"used_percent":81,"limit_window_seconds":604800,"reset_at":1789106484},
+            "secondary_window":null}}"#).into_quota("codex");
+        codex.observed_at = Some(chrono::DateTime::from_timestamp(1788700000, 0).unwrap());
+        codex.source = Some("codex_wham_usage".to_string());
+        let text = render_quota(Some(&codex));
+        assert!(
+            text.contains("weekly:used_percent=81.0%,remaining_percent=19.0%"),
+            "{text}"
+        );
+        assert!(!text.contains("five_hour"), "{text}");
+        assert!(
+            text.contains("source=codex_wham_usage") && !text.contains("observed_at=unknown"),
+            "{text}"
+        );
+        let claude = parse_claude_usage(
+            r#"{"limits":[{"kind":"weekly_scoped","group":"weekly",
+            "percent":58,"scope":{"model":{"display_name":"Fable"}}}]}"#,
+            Some("max".into()),
+        )
+        .into_quota("claude");
+        let text = render_quota(Some(&claude));
+        assert!(
+            text.contains("remaining_percent=42.0%,scope=\"Fable\""),
+            "{text}"
+        );
+        assert!(text.contains("plan=\"max\""), "{text}");
     }
 
     /// A satellite row must never show the *local* daemon host's
