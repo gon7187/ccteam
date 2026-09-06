@@ -280,6 +280,7 @@ describe("HomeView (landing page)", () => {
     ).resolves.toEqual({
       sid: "s42",
       vendor: "codex",
+      model: "gpt-5.6-sol",
       effort: "high",
       fallback: true,
     });
@@ -303,6 +304,7 @@ describe("HomeView (landing page)", () => {
         vendor: "codex",
         permission_mode: "skip",
         protocol: "stream-json",
+        model: "gpt-5.6-sol",
         effort: "high",
       },
     ]);
@@ -342,6 +344,7 @@ describe("HomeView (landing page)", () => {
     ).resolves.toEqual({
       sid: "s43",
       vendor: "codex",
+      model: "gpt-5.6-sol",
       effort: "high",
       fallback: true,
     });
@@ -352,6 +355,7 @@ describe("HomeView (landing page)", () => {
       vendor: "codex",
       permission_mode: "skip",
       protocol: "stream-json",
+      model: "gpt-5.6-sol",
       effort: "high",
     });
     expect(submit).toHaveBeenCalledWith("s43", "task", []);

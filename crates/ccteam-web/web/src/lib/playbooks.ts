@@ -64,8 +64,8 @@ export function applyPlaybook(
 
 export interface CommanderSpawnPosture {
   vendor: "codex";
-  model?: string;
-  effort?: string;
+  model: string;
+  effort: "high";
 }
 
 interface CommanderClaudePosture {
@@ -97,9 +97,8 @@ function commanderClaudePosture(catalog: VendorCatalog): CommanderClaudePosture 
   };
 }
 
-/** Prefer observed Sol at high for a confirmed Commander capability fallback.
- * Installation is required; missing model evidence uses Codex's own default
- * and the composer's documented effort ladder, never maximum by default. */
+/** Keep the prescribed Sol high fallback explicit. The advisory catalog can
+ * supply its model id; the vendor validates missing/stale capability evidence. */
 export function bestCommanderCodexPosture(
   installedVendors: readonly VendorId[] | null,
   catalog: VendorCatalog,
@@ -107,15 +106,10 @@ export function bestCommanderCodexPosture(
   if (!installedVendors?.includes("codex")) return null;
 
   const preferredModel = catalog.codex?.models.find((model) => /(^|[-_/])sol($|[-_/])/i.test(model.id));
-  const efforts =
-    preferredModel?.efforts !== undefined
-      ? preferredModel.efforts
-      : effortRowsFor("codex", catalog, preferredModel?.id ?? null).slice(1);
-  const effort = efforts.includes("high") ? "high" : undefined;
   return {
     vendor: "codex",
-    ...(preferredModel ? { model: preferredModel.id } : {}),
-    ...(effort ? { effort } : {}),
+    model: preferredModel?.id ?? "gpt-5.6-sol",
+    effort: "high",
   };
 }
 

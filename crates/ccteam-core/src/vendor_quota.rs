@@ -456,7 +456,7 @@ fn append_codex_windows(
 /// `usage` = weekly; the 300-minute limit entry = 5h.
 pub fn parse_kimi_usages(body: &str) -> QuotaVerdict {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return QuotaVerdict::NotSubscription;
+        return QuotaVerdict::Unavailable;
     };
     let mut windows = Vec::new();
     if let Some(usage) = v.get("usage") {
@@ -485,7 +485,7 @@ pub fn parse_kimi_usages(body: &str) -> QuotaVerdict {
         }
     }
     if windows.is_empty() {
-        return QuotaVerdict::NotSubscription;
+        return QuotaVerdict::Unavailable;
     }
     QuotaVerdict::Available {
         plan: None,
@@ -494,11 +494,14 @@ pub fn parse_kimi_usages(body: &str) -> QuotaVerdict {
 }
 
 /// kimi's `{used, limit, resetTime}` row → a percent window. `used`/`limit`
-/// arrive as decimal strings (proto JSON); numbers are accepted too.
+/// arrive as decimal strings (proto JSON); numbers are accepted too. A row
+/// with missing fields, negative used, non-finite values, or non-positive
+/// limit is unusable → `None` (the window drops; an all-dropped payload
+/// stays unknown upstream, never misread as a full window).
 fn kimi_ratio_window(kind: QuotaWindowKind, row: &serde_json::Value) -> Option<QuotaWindow> {
     let used = kimi_number(row.get("used"))?;
     let limit = kimi_number(row.get("limit"))?;
-    if limit <= 0.0 {
+    if !used.is_finite() || !limit.is_finite() || used < 0.0 || limit <= 0.0 {
         return None;
     }
     let resets_at = parse_iso(row.get("resetTime").and_then(|r| r.as_str()));
@@ -766,12 +769,46 @@ mod tests {
             panic!("expected available");
         };
         assert_eq!(windows[0].used_percent, 25.0);
-        assert_eq!(parse_kimi_usages("{}"), QuotaVerdict::NotSubscription);
-        // limit 0 would divide by zero — dropped, leaving nothing.
+    }
+
+    #[test]
+    fn kimi_unusable_usage_is_unknown_never_no_subscription() {
+        // Malformed JSON / empty usage: unknown, like claude/codex.
+        assert_eq!(parse_kimi_usages("not json"), QuotaVerdict::Unavailable);
+        assert_eq!(parse_kimi_usages("{}"), QuotaVerdict::Unavailable);
         assert_eq!(
-            parse_kimi_usages(r#"{"usage":{"used":"1","limit":"0"}}"#),
-            QuotaVerdict::NotSubscription
+            parse_kimi_usages(r#"{"usage":null,"limits":null}"#),
+            QuotaVerdict::Unavailable
         );
+        // Missing fields, negative used, non-finite values, non-positive
+        // limit: every row drops, leaving unknown — never no subscription
+        // or full capacity.
+        for body in [
+            r#"{"usage":{}}"#,
+            r#"{"usage":{"used":"1","limit":"0"}}"#,
+            r#"{"usage":{"used":"1","limit":"-5"}}"#,
+            r#"{"usage":{"used":"-1","limit":"100"}}"#,
+            r#"{"usage":{"used":"NaN","limit":"100"}}"#,
+            r#"{"usage":{"used":"inf","limit":"100"}}"#,
+            r#"{"usage":{"used":1,"limit":"NaN"}}"#,
+        ] {
+            assert_eq!(
+                parse_kimi_usages(body),
+                QuotaVerdict::Unavailable,
+                "body: {body}"
+            );
+        }
+        // A bad row drops without poisoning its valid siblings.
+        let mixed = parse_kimi_usages(
+            r#"{"usage":{"used":"40","limit":"1000"},
+                "limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},
+                "detail":{"used":"-1","limit":"100"}}]}"#,
+        );
+        let QuotaVerdict::Available { windows, .. } = mixed else {
+            panic!("expected available");
+        };
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].kind, QuotaWindowKind::Weekly);
     }
 
     // ── registry wiring ──────────────────────────────────────────────────

@@ -82,7 +82,7 @@ describe("PLAYBOOKS", () => {
     }
   });
 
-  it("uses Sol high only when catalog evidence identifies Sol", () => {
+  it("keeps Sol high when the advisory catalog omits Sol", () => {
     expect(bestCommanderCodexPosture(["claude", "codex"], {
       codex: {
         models: [
@@ -97,15 +97,15 @@ describe("PLAYBOOKS", () => {
         models: [{ id: "gpt-5.6-codex", efforts: ["low", "high", "xhigh"] }],
         efforts: ["low", "medium", "high", "xhigh"],
       },
-    })).toEqual({ vendor: "codex", effort: "high" });
+    })).toEqual({ vendor: "codex", model: "gpt-5.6-sol", effort: "high" });
     expect(bestCommanderCodexPosture(null, {})).toBeNull();
   });
 
-  it("uses a documented Codex high posture without inventing a model or effort", () => {
-    expect(bestCommanderCodexPosture(["codex"], {})).toEqual({ vendor: "codex", effort: "high" });
+  it("sends the prescribed Sol high request for vendor validation despite missing advisory effort", () => {
+    expect(bestCommanderCodexPosture(["codex"], {})).toEqual({ vendor: "codex", model: "gpt-5.6-sol", effort: "high" });
     expect(bestCommanderCodexPosture(["codex"], {
       codex: { models: [{ id: "gpt-5.6-sol", efforts: [] }], efforts: [] },
-    })).toEqual({ vendor: "codex", model: "gpt-5.6-sol" });
+    })).toEqual({ vendor: "codex", model: "gpt-5.6-sol", effort: "high" });
   });
 
   it("permits the one fallback only for a typed Opus capability error", () => {
