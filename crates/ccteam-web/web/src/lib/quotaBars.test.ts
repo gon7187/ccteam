@@ -1,6 +1,6 @@
 // VENDOR-QUOTA-1 — the quota mini-bar presentation helpers: bar cells,
 // compact durations, reset hints (relative < 24h / weekday < 7d / date
-// beyond), and the per-vendor line selection (available only, max two).
+// beyond), and the per-vendor line selection.
 
 import { describe, expect, it } from "vitest";
 import {
@@ -72,29 +72,46 @@ describe("quotaLines / quotaPlan (row selection)", () => {
     ],
   };
 
-  it("available with two windows → two lines, 5h first", () => {
+  it("renders every reported window with scope, usage, remaining, and reset", () => {
     const lines = quotaLines(available, NOW, "en");
-    expect(lines).toHaveLength(2);
-    expect(lines[0]).toBe("5h ▓▓░░░ 42% · resets in 3h12m");
-    expect(lines[1]).toContain("Week ▓░░░░ 15% · resets");
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toBe("5h ▓▓░░░ 42% used · 58% remaining · resets in 3h12m");
+    expect(lines[1]).toContain("Week ▓░░░░ 15% used · 85% remaining · resets");
+    expect(lines[2]).toContain("observation time unknown");
   });
 
-  it("single-window vendors render exactly one line", () => {
+  it("renders a scoped unknown-duration bucket without inventing a five-hour window", () => {
     const one: VendorQuota = {
       vendor: "kimi",
       state: "available",
-      windows: [{ kind: "weekly", used_percent: 4, resets_at: null }],
+      windows: [{ kind: "unknown", scope: "GPT-5.3-Codex-Spark", used_percent: 4, resets_at: null }],
     };
-    expect(quotaLines(one, NOW, "en")).toEqual(["Week ░░░░░ 4%"]);
+    expect(quotaLines(one, NOW, "en")).toEqual([
+      "GPT-5.3-Codex-Spark · duration unknown ░░░░░ 4% used · 96% remaining",
+      "observation time unknown",
+    ]);
   });
 
-  it("not_subscription / unavailable / missing render NOTHING", () => {
-    expect(quotaLines({ vendor: "codex", state: "not_subscription" }, NOW, "en")).toEqual([]);
-    expect(quotaLines({ vendor: "grok", state: "unavailable" }, NOW, "en")).toEqual([]);
+  it("does not disguise unavailable quota as no subscription", () => {
+    expect(quotaLines({ vendor: "codex", state: "not_subscription" }, NOW, "en")).toEqual([
+      "no subscription",
+      "observation time unknown",
+    ]);
+    expect(quotaLines({
+      vendor: "grok",
+      state: "unavailable",
+      source: "vendor API",
+      reason: "probe timed out",
+      observed_at: "2026-08-17T11:00:00Z",
+    }, NOW, "en")).toEqual([
+      "quota unavailable: probe timed out",
+      "source: vendor API · stale since 2026-08-17T11:00:00.000Z",
+    ]);
     expect(quotaLines(null, NOW, "en")).toEqual([]);
     expect(quotaLines(undefined, NOW, "en")).toEqual([]);
-    // Available but windowless (plan-only subscriber) renders no bar either.
-    expect(quotaLines({ vendor: "codex", state: "available", plan: "go" }, NOW, "en")).toEqual([]);
+    expect(quotaLines({ vendor: "codex", state: "available", plan: "go" }, NOW, "en")).toEqual([
+      "observation time unknown",
+    ]);
   });
 
   it("the plan badge shows only for an available row with a plan", () => {
@@ -111,6 +128,6 @@ describe("quotaLines / quotaPlan (row selection)", () => {
         NOW,
         "zh",
       ),
-    ).toBe("5h ▓▓░░░ 42% · 3h12m后重置");
+    ).toBe("5h ▓▓░░░ 42% 已用 · 剩余 58% · 3h12m后重置");
   });
 });

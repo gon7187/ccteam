@@ -17,7 +17,37 @@ export function quotaBar(usedPercent: number): string {
 function windowLabel(kind: QuotaWindowKind, lang: Lang): string {
   if (kind === "five_hour") return "5h";
   if (kind === "weekly") return lang === "ru" ? "Неделя" : lang === "en" ? "Week" : "周";
-  return lang === "ru" ? "Месяц" : lang === "en" ? "Month" : "月";
+  if (kind === "monthly") return lang === "ru" ? "Месяц" : lang === "en" ? "Month" : "月";
+  return lang === "ru" ? "длительность неизвестна" : lang === "en" ? "duration unknown" : "时长未知";
+}
+
+function durationLabel(seconds: number | null | undefined, lang: Lang): string | null {
+  if (!Number.isFinite(seconds) || !seconds || seconds < 0) return null;
+  const duration = compactDuration(seconds * 1_000);
+  return lang === "ru" ? `длительность ${duration}` : lang === "en" ? `duration ${duration}` : `时长${duration}`;
+}
+
+function usageLabel(usedPercent: number, lang: Lang): string {
+  const used = Math.max(0, Math.min(100, Math.round(usedPercent)));
+  const remaining = 100 - used;
+  if (lang === "ru") return `${used}% использовано · осталось ${remaining}%`;
+  if (lang === "zh") return `${used}% 已用 · 剩余 ${remaining}%`;
+  return `${used}% used · ${remaining}% remaining`;
+}
+
+function observationLine(quota: VendorQuota, now: Date, lang: Lang): string {
+  const source = quota.source?.trim();
+  const observed = quota.observed_at ? new Date(quota.observed_at) : null;
+  const validObserved = observed && !Number.isNaN(observed.getTime());
+  const timestamp = validObserved ? observed.toISOString() : null;
+  const stale = validObserved && now.getTime() - observed.getTime() > 5 * 60_000;
+  const observation = !timestamp
+    ? lang === "ru" ? "время наблюдения неизвестно" : lang === "zh" ? "观测时间未知" : "observation time unknown"
+    : stale
+      ? lang === "ru" ? `устарело с ${timestamp}` : lang === "zh" ? `自 ${timestamp} 起已过期` : `stale since ${timestamp}`
+      : lang === "ru" ? `наблюдалось ${timestamp}` : lang === "zh" ? `观测于 ${timestamp}` : `observed ${timestamp}`;
+  if (!source) return observation;
+  return lang === "ru" ? `источник: ${source} · ${observation}` : lang === "zh" ? `来源：${source} · ${observation}` : `source: ${source} · ${observation}`;
 }
 
 /** Compact duration: `42m` / `3h12m` / `2d05h`; negative clamps to `0m`. */
@@ -61,20 +91,33 @@ export function resetHint(
   return lang === "ru" ? `сброс ${date}` : lang === "en" ? `resets ${date}` : `${date}重置`;
 }
 
-/** One window's render line: `5h ▓▓░░░ 42% · resets in 3h12m`. */
+/** One window's render line, preserving provider scope and only reported duration. */
 export function quotaWindowLine(w: QuotaWindow, now: Date, lang: Lang): string {
-  const pct = `${Math.round(w.used_percent)}%`;
-  const head = `${windowLabel(w.kind, lang)} ${quotaBar(w.used_percent)} ${pct}`;
+  const scope = w.scope?.trim();
+  const duration = w.kind === "unknown" ? durationLabel(w.duration_seconds, lang) : null;
+  const label = [scope, duration ?? windowLabel(w.kind, lang)].filter(Boolean).join(" · ");
+  const head = `${label} ${quotaBar(w.used_percent)} ${usageLabel(w.used_percent, lang)}`;
   const hint = resetHint(w.resets_at, now, lang);
   return hint ? `${head} · ${hint}` : head;
 }
 
-/** The lines a vendor row renders for its quota: up to two window bars when
- *  `available`, otherwise NOTHING (`not_subscription` / `unavailable` /
- *  missing row all collapse to the empty list — the zone hides). */
+/** The lines a vendor row renders for its quota. Missing data stays missing;
+ * unavailable data must not masquerade as no subscription. */
 export function quotaLines(quota: VendorQuota | null | undefined, now: Date, lang: Lang): string[] {
-  if (!quota || quota.state !== "available") return [];
-  return (quota.windows ?? []).slice(0, 2).map((w) => quotaWindowLine(w, now, lang));
+  if (!quota) return [];
+  if (quota.state === "not_subscription") {
+    return [lang === "ru" ? "нет подписки" : lang === "zh" ? "无订阅" : "no subscription", observationLine(quota, now, lang)];
+  }
+  if (quota.state === "unavailable") {
+    const reason = quota.reason?.trim();
+    const unavailable = lang === "ru"
+      ? `квота недоступна${reason ? `: ${reason}` : ""}`
+      : lang === "zh"
+        ? `配额不可用${reason ? `：${reason}` : ""}`
+        : `quota unavailable${reason ? `: ${reason}` : ""}`;
+    return [unavailable, observationLine(quota, now, lang)];
+  }
+  return [...(quota.windows ?? []).map((w) => quotaWindowLine(w, now, lang)), observationLine(quota, now, lang)];
 }
 
 /** The plan badge text, only for an available row that carries one. */

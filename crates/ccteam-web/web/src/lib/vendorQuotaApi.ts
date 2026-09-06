@@ -11,7 +11,7 @@
 
 import { httpError } from "./httpError";
 
-export type QuotaWindowKind = "five_hour" | "weekly" | "monthly";
+export type QuotaWindowKind = "five_hour" | "weekly" | "monthly" | "unknown";
 
 /** One normalized quota window (`QuotaWindow`). */
 export interface QuotaWindow {
@@ -20,6 +20,10 @@ export interface QuotaWindow {
   used_percent: number;
   /** ISO timestamp; absent when the vendor does not report one. */
   resets_at?: string | null;
+  /** Exact window length when the vendor exposes one; never inferred. */
+  duration_seconds?: number | null;
+  /** Provider bucket such as a plan or model family. */
+  scope?: string | null;
 }
 
 export type QuotaState = "available" | "not_subscription" | "unavailable";
@@ -30,6 +34,12 @@ export interface VendorQuota {
   state: QuotaState;
   plan?: string | null;
   windows?: QuotaWindow[];
+  /** ISO probe time, absent when the backend cannot establish it. */
+  observed_at?: string | null;
+  /** Probe/provider provenance. */
+  source?: string | null;
+  /** Honest reason for an unavailable observation. */
+  reason?: string | null;
 }
 
 /** `GET /api/v1/vendors/quota` — every probe-bearing vendor's quota row

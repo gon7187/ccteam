@@ -451,7 +451,7 @@ describe("VendorManageRow quota bars (VENDOR-QUOTA-1)", () => {
     };
   }
 
-  it("available: up to two mini bars + plan badge on the vendor row", () => {
+  it("available: renders every quota bucket plus its plan badge on the vendor row", () => {
     const detail = quotaDetail([
       agent({ vendor: "claude", mcp_registered: true }),
       agent({ vendor: "kimi", mcp_registered: true }),
@@ -464,6 +464,7 @@ describe("VendorManageRow quota bars (VENDOR-QUOTA-1)", () => {
         windows: [
           { kind: "five_hour" as const, used_percent: 42, resets_at: null },
           { kind: "weekly" as const, used_percent: 15, resets_at: null },
+          { kind: "unknown" as const, scope: "Fable", used_percent: 7, resets_at: null },
         ],
       },
       kimi: {
@@ -485,15 +486,16 @@ describe("VendorManageRow quota bars (VENDOR-QUOTA-1)", () => {
     expect(html).toContain('data-testid="quota-bars-claude"');
     expect(html).toContain('data-testid="quota-plan-claude"');
     expect(html).toContain("max");
-    expect(html).toContain("5h ▓▓░░░ 42%");
-    expect(html).toContain("周 ▓░░░░ 15%");
-    // Single-window vendor renders exactly one bar and no badge.
+    expect(html).toContain("5h ▓▓░░░ 42% 已用 · 剩余 58%");
+    expect(html).toContain("周 ▓░░░░ 15% 已用 · 剩余 85%");
+    expect(html).toContain("Fable · 时长未知 ░░░░░ 7% 已用 · 剩余 93%");
+    // Single-window vendor renders its one bucket and no badge.
     expect(html).toContain('data-testid="quota-bars-kimi"');
-    expect(html).toContain("周 ░░░░░ 4%");
+    expect(html).toContain("周 ░░░░░ 4% 已用 · 剩余 96%");
     expect(html).not.toContain('data-testid="quota-plan-kimi"');
   });
 
-  it("not_subscription / unavailable / absent vendors render no quota zone", () => {
+  it("labels no subscription and unavailable quota differently", () => {
     const detail = quotaDetail([
       agent({ vendor: "codex", mcp_registered: true }),
       agent({ vendor: "grok", mcp_registered: true }),
@@ -501,7 +503,7 @@ describe("VendorManageRow quota bars (VENDOR-QUOTA-1)", () => {
     ]);
     const quotas = {
       codex: { vendor: "codex", state: "not_subscription" as const },
-      grok: { vendor: "grok", state: "unavailable" as const },
+      grok: { vendor: "grok", state: "unavailable" as const, reason: "probe timed out" },
       // opencode: absent from the map entirely (no probe surface).
     };
     const html = renderToString(
@@ -514,7 +516,11 @@ describe("VendorManageRow quota bars (VENDOR-QUOTA-1)", () => {
         onImport={() => {}}
       />,
     );
-    expect(html).not.toContain("quota-bars-");
+    expect(html).toContain('data-testid="quota-bars-codex"');
+    expect(html).toContain("无订阅");
+    expect(html).toContain('data-testid="quota-bars-grok"');
+    expect(html).toContain("配额不可用：probe timed out");
+    expect(html).not.toContain('data-testid="quota-bars-opencode"');
     expect(html).not.toContain("quota-plan-");
   });
 
