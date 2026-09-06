@@ -232,8 +232,8 @@ fn unavailable(vendor: &str, reason: String) -> VendorQuota {
     quota
 }
 
-/// Probe one vendor. Never fails: every unhappy path is a `not_subscription`
-/// / `unavailable` row.
+/// Probe one vendor. Never fails: every unhappy path is an `unavailable`
+/// (or `not_subscription`) row.
 async fn probe_one(
     client: &reqwest::Client,
     spec: &'static AgentProbeSpec,
