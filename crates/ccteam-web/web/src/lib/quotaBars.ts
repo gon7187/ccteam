@@ -117,12 +117,17 @@ export function quotaLines(quota: VendorQuota | null | undefined, now: Date, lan
         : `quota unavailable${reason ? `: ${reason}` : ""}`;
     return [unavailable, observationLine(quota, now, lang)];
   }
-  return [...(quota.windows ?? []).map((w) => quotaWindowLine(w, now, lang)), observationLine(quota, now, lang)];
+  const windows = quota.windows ?? [];
+  if (windows.length === 0) {
+    const unknown = lang === "ru" ? "доступный остаток неизвестен" : lang === "zh" ? "剩余额度未知" : "remaining unknown";
+    return [unknown, observationLine(quota, now, lang)];
+  }
+  return [...windows.map((w) => quotaWindowLine(w, now, lang)), observationLine(quota, now, lang)];
 }
 
-/** The plan badge text, only for an available row that carries one. */
+/** Preserve any known plan even if the freshest quota observation failed. */
 export function quotaPlan(quota: VendorQuota | null | undefined): string | null {
-  if (!quota || quota.state !== "available") return null;
+  if (!quota) return null;
   const plan = quota.plan?.trim();
   return plan ? plan : null;
 }

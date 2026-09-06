@@ -110,6 +110,7 @@ describe("quotaLines / quotaPlan (row selection)", () => {
     expect(quotaLines(null, NOW, "en")).toEqual([]);
     expect(quotaLines(undefined, NOW, "en")).toEqual([]);
     expect(quotaLines({ vendor: "codex", state: "available", plan: "go" }, NOW, "en")).toEqual([
+      "remaining unknown",
       "observation time unknown",
     ]);
   });
@@ -118,6 +119,7 @@ describe("quotaLines / quotaPlan (row selection)", () => {
     expect(quotaPlan(available)).toBe("max");
     expect(quotaPlan({ vendor: "kimi", state: "available", windows: [] })).toBeNull();
     expect(quotaPlan({ vendor: "grok", state: "unavailable" })).toBeNull();
+    expect(quotaPlan({ vendor: "claude", state: "unavailable", plan: "max" })).toBe("max");
     expect(quotaPlan(null)).toBeNull();
   });
 
