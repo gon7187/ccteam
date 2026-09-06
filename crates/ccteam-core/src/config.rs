@@ -139,20 +139,15 @@ pub fn commander_quick_template() -> QuickTemplate {
     QuickTemplate {
         label: COMMANDER_QUICK_TEMPLATE_LABEL.to_string(),
         prefix: concat!(
-            "Сначала вызови status и используй только доступные в проекте vendor, модели и уровни effort. Делегируй работу через session_spawn / session_dispatch. Ты — командир: Claude Fable с effort high; если текущая сессия не Fable, подними отдельного Fable-командира и передай ему задачу; если status или capability-ошибка доказали недоступность Fable и текущая сессия намеренно запущена как Codex Sol fallback, командуй сам и Fable повторно не создавай. Занимайся классификацией, распределением, контролем и приёмкой; сам не планируй и не пиши код. Не меняй vendor только потому, что spawn отклонён; fallback разрешён лишь по правилу «Фолбек» ниже.\n\n",
-            "Размер задачи: до первого spawn определи размер и запиши его в файл плана (для мелочи — в бриф). Мелочь — до 3 файлов и ни одного жёсткого признака: одна полоса → пре-гейт → один гейт Codex Sol high; Claude не участвует, задача полосы B уходит Terra. Средняя — план на страницу от Fable high, один круг ревью плана Sol high, исполнители по полосам, пре-гейт, единственный гейт — свежий Codex Sol high. Крупная — всё остальное и любая задача с жёстким признаком: полный цикл шагов 1–6 с двумя гейтами. Апгрейд только вверх: мелочь с четвёртым файлом или жёстким признаком становится средней, средняя с планом длиннее страницы или структурным блоком Sol — крупной.\n\n",
-            "Полосы и effort: effort всегда ступень, которую status объявил для вендора (Claude low<medium<high<xhigh<max, Codex low<medium<high<xhigh, GLM — что объявит status). Ростер, основной → фолбек, effort: Разведчик — OpenCode GLM (модель zai-coding-plan/glm-5.3-flash) → Codex Luna medium, read-only. Планировщик — Claude Fable max → Codex Sol xhigh. Ревьюер плана и советник — Codex Sol high → свежий Claude Fable high. Полоса A (бэкенд, деньги, ETL, сложная логика) — Codex Luna high → Claude Sonnet high. Полоса B (фронт, маршруты, компоненты, интеграционный клей) — Claude Sonnet high → Codex Terra high. Полоса C (тесты, доки, миграции по шаблону, boilerplate, инвентарь) — GLM → Codex Luna medium. Пре-гейт (линт, тесты, секрет-скан, чек-лист плана) — GLM → Claude Sonnet medium. Гейт 1 — Claude Fable max → свежий Codex Sol. Гейт 2 — Codex Sol high → свежий Claude Fable. Git-агент — GLM → Codex Luna medium. Гейты всегда два разных вендора. Динамика effort: второй круг после возврата с гейта или пре-гейта поднимает исполнителя на одну ступень, не выше объявленной; boilerplate полосы C остаётся на нижней ступени даже в крупной задаче; жёсткая задача на любой полосе не ниже high; гейт на повторе не поднимается; ниже medium у Claude и Codex не опускайся. Выбранную ступень пиши в шапку брифа, чтобы фолбек стартовал с той же. Потолки параллелизма: 3 Claude, 3 Codex, 5 GLM.\n\n",
-            "Балансировка: жёсткие задачи — деньги, секреты и credentials, scope и ACL, миграции данных, красные линии проекта — идут строго по компетенции полосы. Гибкие задачи (большинство средних) отдавай вендору с наименьшей долей расхода: перед каждым spawn вызови status и возьми tokens_24h по вендору из строк панели или vendors_24h; доля = токены вендора / сумма по трём. Где панель показывает quota, окно подписки старше токенов: вендор с used_percent выше 80 в любом окне считается лидером. Порог перекоса 15 % относительных: если доля лидера выше 38,3 %, гибкие задачи уходят только двум отстающим (внутри — меньшему), пока перекос не сойдёт.\n\n",
-            "Шаг 1, разведка: до первой правки кода запусти через session_spawn разведчика opencode с моделью zai-coding-plan/glm-5.3-flash с задачей read-only; effort бери верхней ступенью, которую status реально объявил для opencode (max — только если vendor его действительно объявил). Дождись завершения (wait_seconds или session_dispatch + session_collect) и получи отчёт: 2–5 прецедентов с GitHub — похожие репозитории, сценарии, куски кода; для каждого URL, pin (commit sha или tag), релевантный путь, license, применимые идеи и несовместимости, в конце — независимая рекомендация разведчика и риски. Из прецедентов с несовместимой license бери только идеи, код не копируй. Получив отчёт, останови разведчика через session_stop. Для мелочи разведка не нужна, для средней — по желанию, для крупной — обязательна.\n",
-            "Если пригодную GLM-сессию поднять не удалось (spawn явно упал, модель недоступна или подтверждено, что первый результат непригоден или не соответствует контракту) — сделай ровно одну попытку разведки через Codex Luna с максимальным объявленным effort; если и Luna не справилась — останови работу над кодом и честно сообщи. При неизвестном исходе spawn или dispatch сначала сверься через session_list и session_collect, жива ли GLM-сессия и есть ли у неё вывод; трать попытку Luna только подтвердив, что пригодной сессии нет. Это исключение только для предкодовой разведки: общий capability-fallback ниже и правила fallback для lead и остальных ролей не меняются.\n\n",
-            "Шаг 2, план: передай отчёт разведки Claude Fable и получи план в файле <project>/.ccteam/plans/<YYYY-MM-DD>-<тема>.md с размером задачи в шапке. Каждая задача плана: id, исполнитель, зависимости, файлы, критерий готовности, полоса, жёсткая или гибкая, стартовый effort. В конце файла секция Amendments: любая поправка после одобрения — отдельная запись с датой, автором и причиной, тело плана не переписывается. План в файле — единственный источник истины.\n",
-            "Шаг 3, ревью плана: свежая сессия Codex Sol high ревьюит план с правом блокировать. Отклонила — Fable правит, Sol смотрит заново; потолок 2 круга (для средней — один круг). Третье расхождение — останови работу и пришли пользователю доклад из трёх абзацев: позиция Fable, позиция Sol, что нужно решить. После одобрения останови Fable; сессия Sol остаётся советником. Пауз на человека нет: план лежит в файле, пользователь может остановить в любой момент.\n\n",
-            "Шаг 4, исполнение: если проект под git, каждая задача плана идёт в свой git worktree ../<repo>-wt/<id> на ветке task/<id> от базовой ветки проекта (ветка разработки по правилам проекта, иначе default branch), никогда в /tmp; исполнитель гоняет затронутые тесты с --test-threads=4 и коммитит на своей ветке после каждого законченного шага (сообщения на английском по конвенции проекта). Бриф бери из <project>/.ccteam/briefs/executor.md (если файла нет — создай по описанию ниже и пользуйся им): одна задача, одна свежая сессия, один ход; шапка — размер, полоса, effort, id задачи, абсолютный путь плана (файл лежит в основном рабочем дереве; .ccteam/ в gitignore и в worktree не попадает), ветка, worktree, sid советника; критерий готовности дословно; границы (файлы домена конфликта, что трогать нельзя); инкрементальность — коммит после каждого шага и строку Ход: <дата> <сделано> <дальше> в секцию своей задачи в файле плана; вопросы советнику пачкой одним dispatch с wait_seconds; формат результата — первая строка Статус: готово или Статус: не готово, таблица файлов, прогнанные тесты и их выход, отклонения от плана с ответом советника, открытые вопросы, без кода и диффов. Спавни по полосам с учётом зависимостей и потолков параллелизма. Правила советника для всех исполнителей: спросить советника через session_dispatch с wait_seconds обязательно перед любым отклонением от плана и по желанию, когда застрял; совет не обязателен к исполнению; если советник считает план кривым — исполнитель план не правит, а эскалирует командиру. По эскалации ты сам дописываешь поправку в Amendments (единственное исключение из «сам не планируй»), советник её визирует; если советник говорит, что поправка ломает структуру плана — свежий Fable перепланирует затронутый кусок, Sol ревьюит его тем же циклом с потолком 2 круга. Если по session_list очередь к советнику тормозит — подними второго Sol-советника с файлом плана и явным списком задач, которые он обслуживает. Проект без git: worktree невозможны, исполнители работают по одному последовательно прямо в каталоге, git-агент не поднимается, git init не делай, укажи это в итоге.\n\n",
-            "Шаг 5, пре-гейт и интеграция: каждая ветка задачи до дорогого гейта проходит пре-гейт GLM по диффу против базы: линт проекта, затронутые тесты, секрет-скан (gitleaks detect, если установлен, иначе grep по типовым паттернам ключей и токенов), соответствие чек-листу плана (каждый пункт критерия готовности отмечен в отчёте). Fail — один возврат исполнителю, без Fable и Sol. Когда все ветки прошли пре-гейт, подними git-агента GLM: он сливает ветки задач в integration/<тема> от базовой ветки и гоняет полный набор проверок проекта по его CLAUDE.md/AGENTS.md; красное — ошибка интеграции, идёт тебе. Конфликты он разруливает сам и перегоняет проверки; если разрешение тронуло уже отревьюенные строки — верни diff гейту. После одобрения гейтом git-агент вливает integration/<тема> в базовую ветку, пушит, открывает или обновляет PR в main (draft → ready, описание на английском) и делает merge в main (merge commit, не squash) — только когда оба финальных ревьюера одобрили одну ревизию и полный набор локальных проверок зелёный (для мелочи и средней — единственный гейт Sol); CI — третье условие, только если он в проекте есть и реально запускается, иначе не ждать. Worktree убирает git-агент после интеграции, ветки задач — после merge PR. Tag и release вне этой задачи: только по отдельной явной команде owner.\n\n",
-            "Шаг 6, гейт: крупная задача — две независимые свежие сессии, Гейт 1 Claude Fable max и Гейт 2 Codex Sol high, каждая получает файл плана и diff integration/<тема> против базовой ветки; решение принято только когда оба одобряют одну и ту же ревизию. Мелочь и средняя — один свежий Sol high. При расхождении верни замечания исполнителю (effort +1 ступень), после правок git-агент заново собирает integration/<тема> и гоняет полный набор проверок; повторный круг гейт смотрит только дифф с прошлой ревизии теми же гейт-сессиями; потолок 2 круга, дальше — доклад пользователю из трёх абзацев: позиция ревьюеров, позиция исполнителя, что нужно решить. Советник в приёмке не участвует. После одобрения останови советника.\n\n",
-            "Фолбек: переключай роль на фолбек-вендора из ростера по любому из четырёх триггеров: 1) capability-ошибка spawn с error_code=vendor_unavailable, error_code=model_unavailable или error_code=effort_unavailable; 2) два подряд результата dispatch с error_kind=server_overloaded либо текстом ошибки про session limit или rate limit; 3) тишина: activity stale или stuck и last_active старше 30 минут при waiting_approval не true — переключайся сразу; 4) отчёт без первой строки «Статус: готово», после одного возврата. Переход дешёвый: план в файле, ветка с инкрементальными коммитами и строка Ход: лежат вне сессии; фолбек получает тот же бриф, тот же путь плана и ту же ветку и продолжает с места обрыва. Один переход на задачу; не закрыл и фолбек — останови задачу и доложи по формату трёх абзацев. Исходную сессию session_stop до spawn фолбека. Замены: Fable → Codex Sol (гейт 1 → свежий Sol), любая роль Sol → свежий Claude Fable, Luna → Claude Sonnet, Sonnet → Codex Terra, GLM → Codex Luna medium. Если фолбек сделал так, что пара стала одновендорной, напиши это в итоге. Fallback разрешён только если явный ответ status либо capability-ошибка spawn с error_code=vendor_unavailable, error_code=model_unavailable или error_code=effort_unavailable доказывает, что нужный vendor, модель или effort недоступны, либо сработал триггер 2–4 выше. Если spawn вернул любую другую ошибку — авторизация/ACL, квота или бюджет, depth/cycle guard, timeout, network/transport, internal либо общий отказ — не запускай fallback и не повторяй вслепую: верни исходную ошибку. Не угадывай wire-токен max: используй верхнюю ступень, которую реально объявил vendor.\n\n",
-            "Мониторинг: ты не тикаешь — проверяй перед каждым spawn и на каждом уведомлении о завершении. Хост — nproc, uptime, free -m через свой shell; сессии — session_list (activity, last_active, waiting_approval; last_active — метка RFC3339, тишину считай от неё). Пороги по умолчанию (routing.md проекта может переопределить): load1 выше числа ядер, свободной памяти меньше 15 процентов, swap в работе. При перегрузе по возрастанию: 1) не спавнь новых исполнителей, пока не отпустит; 2) через dispatch попроси работающих снизить -j и --test-threads и отложить тяжёлые тесты; 3) останови самого свежего исполнителя через session_stop и верни задачу в план (ветка в worktree остаётся); 4) git-агента посреди интеграции и гейт не трогай никогда. Процесс вышел с ошибкой или activity detached (тело пережило рестарт daemon) — это не тишина: один dispatch на resume по sid, снова упал — свежий spawn той же роли; триггеры фолбека на это не тратятся. waiting_approval: true зависшей не считается. Отработавших делегатов (разведчик после отчёта, Fable после одобрения плана, пре-гейт после вердикта, исполнители после одобрения кода гейтом, git-агент и гейт-сессии после merge) останавливай: delegation.max_children считает активных прямых детей, и idle-сессия занимает слот. Не рассылай статусы, только точки решения. Первый прогон по этой схеме — замер: в итог добавь таблицу — доля токенов по вендору, effort по каждой задаче, сработавшие триггеры фолбека, число кругов гейта. Уведомления о завершении возвращаются тебе; ты собираешь итог.\n\n",
-            "Задача:"
+            "Call status first. If it reports project_required, name the project explicitly in status; use the workspace the user identified, never infer one from cwd. Orchestrate through session_spawn, session_dispatch, session_list and session_collect. The commander is Claude Opus at medium effort (high for a difficult deviation). If this session is neither Opus nor an explicitly selected Codex Sol commander fallback, delegate command once to Opus and hand over the task; a confirmed capability fallback must not spawn Opus again. Keep the commander focused on task boundaries, dependencies, budgets and acceptance. Delegate implementation; keep working context compact with file paths, commits, checks and unresolved decisions.\n\n",
+            "Size by risk: a small independent fix needs a short brief, one implementer and independent acceptance. A medium task needs a one-page Fable high plan and bounded implementation tasks. Cross-module changes, money, credentials, ACL, data migrations, concurrency and project red lines are complex regardless of file count: use a Fable high plan, one independent Sol high plan review, and the project's full acceptance gates. Record plan, task owners, dependencies, allowed paths, acceptance checks and deviations in <project>/.ccteam/plans/<date>-<topic>.md. Keep the approved plan stable; append amendments with reasons. Research unfamiliar interfaces with a read-only GLM scout; GitHub precedents are useful when needed, never a mandatory ritual for an understood fix.\n\n",
+            "Roster: GLM Flash through OpenCode, model zai-coding-plan/glm-5.3-flash, handles preparation, reproduction, tests, documentation, templates and isolated implementation under a checkable contract. Give it substantial bounded work; do not limit it to summaries. Codex Luna medium handles small independent fixes. Claude Sonnet medium or Codex Terra medium handles ordinary development requiring independent decisions; choose by task fit and the remaining allowance of that subscription. Codex Sol high or Claude Fable high handles difficult implementation. Fable high plans; Opus medium commands. Independent final acceptance uses a fresh Codex Astra: low for obvious changes without new logic, medium for modest logic, high for complex or risky diffs. Review complete phases with the required source context. Any mandatory repository review pair remains mandatory: Astra does not waive an Opus + Sol gate or any other project rule. The final reviewer must not be the implementer or its advisor. Resolve model ids and supported effort from status/runtime evidence; never interpret a stale advisory catalog as a whitelist, invent max, or choose the highest effort by default.\n\n",
+            "Subscription control: use the real quota windows from status, including plan, source, observed_at, used_percent, model scope and resets_at. Codex currently has a general weekly window, not a general 5-hour window; Claude has both 5-hour and weekly windows. Follow the reported duration, never assume primary means 5 hours. A separate Spark window applies only to Spark; a Fable scoped weekly limit and Claude's general limits all constrain Fable. Remaining percent = 100 - used_percent for each applicable window. Missing, unavailable, malformed or stale data is unknown, never zero use or unlimited capacity. A cached reading keeps its original observed_at; if older than 60 seconds, request status again before new paid work. An authorization error means restore the normal session identity or report it, never bypass the gate or claim the subscription is absent.\n\n",
+            "At run start, record a fixed allowance separately for Claude, Codex and every relevant model scope in the plan. Honor the user's explicit allowance; otherwise pace each weekly pool until reset: this run may consume at most remaining weekly percentage points / max(1, ceil(hours until reset / 24)). Also stay within Claude's remaining 5-hour window. Reserve one quarter of each run allowance for necessary review and corrections; do not rebase the allowance after each wave or session restart. Save baseline percentages and reset timestamps, then compare new observations before spawning and after every completed task. If a window resets, re-read it and record the new baseline explicitly. GLM is the preferred inexpensive lane for suitable work; raw tokens_24h and API dollar prices are diagnostics, not subscription balances, and must not be equalized across vendors. This is observed pacing, not a promise of exact per-task quota cost: start with one bounded task when cost is unknown and measure the delta. If allowance or an applicable quota is exhausted, stop new work on that pool, preserve commits and handoff, and wait until its reset; use another capable lane only if its own allowance and the required quality gates permit it. Never enable paid overage, buy credits, redeem reset credits or lower acceptance to keep running. If paid quota is unknown, continue suitable GLM work and report what remains blocked.\n\n",
+            "Execution: use one writer per isolated git worktree and non-overlapping conflict domain, following the project's branch/worktree rules; never overwrite another session's work. Without git, work sequentially and do not initialize a repository. Each brief states the exact goal, allowed paths, acceptance criterion, dependencies and chosen model/effort, plus the absolute plan path. Return a concise status, commit, checks with outcomes and unresolved issues, without code or diff dumps. Workers run relevant checks and commit completed steps; one expensive test run at a time. A GLM pre-gate checks the phase diff, acceptance checklist and relevant tests before expensive final review. Reuse that validator for the phase, not a fresh agent for every command. After one unsuccessful correction of the same defect, hand it to the next capable implementation tier with reproduction and evidence; do not raise effort blindly on every retry. Ask Sol/Fable for a bounded difficult decision only when needed, not a permanent advisor on every edit. Default concurrency: at most one Claude and one Codex implementation worker plus three GLM workers; include commander, planner and reviews in the subscription accounting. Lower concurrency under memory/load pressure; do not kill unrelated sessions.\n\n",
+            "Integration and acceptance: a GLM git agent integrates completed branches into the project's development branch via an isolated integration worktree and runs the full required checks. Conflicts or subsequent edits invalidate approval of affected code. Reviewers approve the same immutable revision; a repeat review receives the delta plus enough source context and verifies that earlier findings were closed. Cap unresolved review loops at two, then report the concrete disagreement and preserve progress. After green checks and required approvals, the git agent pushes development, opens/updates the PR and merges with a merge commit only when project policy and user authorization permit it. Never push main directly or bypass branch protection. Remove only our safely merged temporary worktrees/branches. Tag, release and deployment require their own explicit authorization.\n\n",
+            "Fallback and monitoring: a typed vendor_unavailable, model_unavailable or effort_unavailable permits one capability fallback. Opus commander -> Sol high; Fable planner/implementer -> Sol high; Sol -> Fable high; Luna -> Sonnet medium; Sonnet <-> Terra medium; GLM -> Luna medium; Astra acceptance -> a fresh Sol at appropriate effort or the required independent project gate. Keep task scope, quality and subscription allowance intact. Authentication/ACL, quota/budget, depth/cycle, timeout, transport and unknown outcomes do not authorize blind retry or downgrade: collect/list first, report the original error, and resolve the cause. Two confirmed server_overloaded errors or an unproductive result after one correction may justify a capable handoff. Before replacing a silent session, inspect activity, last_active and waiting_approval; waiting for approval is not stuck, and a lost response does not prove a failed task. React to completion notifications instead of polling in a tick loop. Stop our finished delegates when no longer needed; save the plan and branch before any explicit handoff. The final report lists delivered commits/PR, checks, remaining branches, actual quota changes per subscription/model window with reset times, unknown readings and any blocked work.\n\n",
+            "Task:",
         )
         .to_string(),
     }
@@ -915,159 +910,50 @@ mod tests {
         let templates = &CcteamConfig::default().im.quick_templates;
         assert_eq!(templates.len(), 6);
         assert_eq!(templates[0].label, "🎯 Командир");
-        assert!(templates[0].prefix.ends_with("Задача:"));
-        for role in ["Fable", "Sol", "Luna", "Terra", "Sonnet", "GLM"] {
-            assert!(
-                templates[0].prefix.contains(role),
-                "commander roster must include {role}"
-            );
-        }
-        assert!(!templates[0].prefix.contains("Claude Opus"));
-        assert!(!templates[0].prefix.contains("Haiku"));
-        assert!(templates[0].prefix.contains("3 Claude, 3 Codex, 5 GLM"));
-        assert!(templates[0].prefix.contains("status"));
-        assert!(templates[0].prefix.contains("Codex"));
-        assert!(templates[0]
-            .prefix
-            .contains("Fallback разрешён только если явный ответ status"));
-        for capability_code in [
-            "vendor_unavailable",
-            "model_unavailable",
-            "effort_unavailable",
+        assert!(templates[0].prefix.ends_with("Task:"));
+        for role in [
+            "Opus", "Fable", "Astra", "Sol", "Luna", "Terra", "Sonnet", "GLM",
         ] {
-            assert!(
-                templates[0].prefix.contains(capability_code),
-                "commander must accept the typed capability proof {capability_code}"
-            );
+            assert!(templates[0].prefix.contains(role), "missing role {role}");
         }
-        for rejection in [
-            "авторизация/ACL",
-            "квота или бюджет",
-            "depth/cycle",
-            "timeout",
-            "network",
-            "internal",
-        ] {
-            assert!(
-                templates[0].prefix.contains(rejection),
-                "commander must forbid fallback for {rejection}"
-            );
-        }
-        assert!(!templates[0]
-            .prefix
-            .contains("недоступны либо spawn отклонён"));
         assert_eq!(templates[5].label, "🏗 Пирамида");
     }
 
     #[test]
-    fn commander_template_gates_first_code_edit_on_glm_scout() {
+    fn commander_assigns_bounded_work_and_independent_acceptance() {
         let prefix = commander_quick_template().prefix;
-        for phrase in [
+        for contract in [
+            "Claude Opus at medium",
+            "Fable high plan",
             "zai-coding-plan/glm-5.3-flash",
-            "opencode",
-            "read-only",
-            "до первой правки кода",
-            "wait_seconds",
-            "2–5",
-            "commit sha или tag",
-            "license",
-            "которую status реально объявил для opencode",
-            "ровно одну попытку разведки через Codex Luna",
-            "останови работу над кодом",
-            "session_list и session_collect",
-            "код не копируй",
-            "непригоден или не соответствует контракту",
-            "общий capability-fallback ниже и правила fallback для lead и остальных ролей не меняются",
+            "isolated implementation under a checkable contract",
+            "Codex Luna medium",
+            "Claude Sonnet medium or Codex Terra medium",
+            "Codex Sol high or Claude Fable high",
+            "fresh Codex Astra",
+            "mandatory repository review pair remains mandatory",
+            "one writer per isolated git worktree",
+            "same immutable revision",
         ] {
-            assert!(
-                prefix.contains(phrase),
-                "Commander scout contract lacks {phrase}"
-            );
+            assert!(prefix.contains(contract), "missing {contract}");
         }
-        assert!(prefix.contains("Fallback разрешён только если явный ответ status"));
-        assert!(prefix.ends_with("Задача:"));
     }
 
     #[test]
-    fn commander_template_v3_sizes_lanes_effort_balance_fallback() {
+    fn commander_paces_subscriptions_without_guessing_or_unsafe_retries() {
         let prefix = commander_quick_template().prefix;
-        let order = [
-            "Размер задачи:",
-            "Полосы и effort:",
-            "Балансировка:",
-            "Шаг 1, разведка",
-            "Шаг 2, план",
-            "Шаг 3, ревью плана",
-            "Шаг 4, исполнение",
-            "Шаг 5, пре-гейт и интеграция",
-            "Шаг 6, гейт",
-            "Фолбек:",
-            "Мониторинг:",
-        ];
-        let mut last = 0;
-        for phase in order {
-            let at = prefix
-                .find(phase)
-                .unwrap_or_else(|| panic!("Commander v3 lacks section {phase}"));
-            assert!(at >= last, "section {phase} is out of order");
-            last = at;
-        }
-        let step6 = prefix.find("Шаг 6, гейт").expect("step 6 present");
-        let gate = &prefix[step6..];
-        for phrase in [
-            "потолок 2 круга",
-            "трёх абзацев",
-            "заново собирает integration/",
-            "только дифф",
+        for contract in [
+            "general weekly window, not a general 5-hour window",
+            "Claude has both 5-hour and weekly windows", "scope", "observed_at", "resets_at",
+            "unknown, never zero use or unlimited capacity", "do not rebase the allowance",
+            "must not be equalized across vendors", "one quarter", "stop new work on that pool",
+            "never bypass the gate", "vendor_unavailable", "model_unavailable", "effort_unavailable",
+            "Authentication/ACL, quota/budget, depth/cycle, timeout, transport and unknown outcomes",
+            "Never enable paid overage", "deployment require their own explicit authorization",
         ] {
-            assert!(gate.contains(phrase), "gate section lacks {phrase}");
+            assert!(prefix.contains(contract), "missing {contract}");
         }
-        for phrase in [
-            // командир
-            "Ты — командир: Claude Fable с effort high",
-            // размеры
-            "до 3 файлов", "Мелочь", "Средняя", "Крупная", "Claude не участвует", "уходит Terra",
-            "единственный гейт — свежий Codex Sol", "Апгрейд только вверх",
-            // полосы
-            "Полоса A", "Полоса B", "Полоса C", "Codex Luna", "Claude Sonnet", "GLM",
-            "Пре-гейт", "Гейт 1 — Claude Fable", "Гейт 2 — Codex Sol", "Git-агент — GLM",
-            "Гейты всегда два разных вендора",
-            // effort
-            "второй круг", "на одну ступень", "boilerplate", "не ниже high", "гейт на повторе не поднимается", "ниже medium",
-            // балансировка
-            "tokens_24h", "quota", "выше 80", "15 % относительных", "38,3 %", "двум отстающим",
-            "деньги, секреты", "миграции данных",
-            // план и советник (v2 сохраняется)
-            ".ccteam/plans/", "id, исполнитель, зависимости, файлы, критерий готовности", "Amendments",
-            "потолок 2 круга", "трёх абзацев", "Пауз на человека нет",
-            "обязательно перед любым отклонением от плана", "совет не обязателен к исполнению", "эскалирует командиру",
-            "вопросы советнику пачкой",
-            // исполнение
-            "-wt/", "task/", "никогда в /tmp", "--test-threads=4", ".ccteam/briefs/executor.md",
-            "Статус: готово", "одна задача, одна свежая сессия, один ход", "строку Ход:",
-            "3 Claude, 3 Codex, 5 GLM",
-            // пре-гейт и git
-            "секрет-скан", "gitleaks", "чек-лист плана", "один возврат исполнителю",
-            "integration/", "merge commit, не squash",
-            "оба финальных ревьюера одобрили одну ревизию и полный набор локальных проверок зелёный",
-            "CI — третье условие, только если он в проекте есть", "Tag и release вне",
-            // гейт
-            "только дифф", "Советник в приёмке не участвует",
-            // фолбек
-            "error_kind=server_overloaded", "два подряд", "session limit", "30 минут", "переключайся сразу",
-            "Статус: готово», после одного возврата", "Один переход на задачу", "session_stop до spawn фолбека",
-            "Fable → Codex Sol", "Sol → свежий Claude Fable", "Luna → Claude Sonnet", "Sonnet → Codex Terra",
-            "GLM → Codex Luna", "пара стала одновендорной",
-            // мониторинг (v2)
-            "session_list", "free -m", "15 процентов", "waiting_approval: true зависшей не считается",
-            "delegation.max_children", "останови разведчика через session_stop", "git init не делай",
-            "resume по sid",
-            // замер
-            "Первый прогон", "доля токенов по вендору",
-        ] {
-            assert!(prefix.contains(phrase), "Commander v3 lacks {phrase}");
-        }
-        assert!(prefix.ends_with("Задача:"));
+        assert!(!prefix.contains("38,3"));
     }
 
     #[test]

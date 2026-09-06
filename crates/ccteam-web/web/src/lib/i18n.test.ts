@@ -51,7 +51,7 @@ describe("I18N dictionary", () => {
   });
 
   it("keeps long-form Russian copy in the core surfaces", () => {
-    expect(t("ru", "tplCommanderP")).toContain("session_spawn / session_dispatch");
+    expect(t("ru", "tplCommanderP")).toContain("session_spawn, session_dispatch");
     expect(t("ru", "accessMcpDesc")).toContain("MCP");
     expect(t("ru", "scheduleTzNote")).toContain("daemon");
     expect(t("ru", "dshDesc")).toContain("DeepSeek Harness");

@@ -35,8 +35,8 @@ export const PLAYBOOKS: ReadonlyArray<Playbook> = [
     key: "tplCommander",
     Icon: Crown,
     vendors: ["claude", "codex", "opencode"],
-    model: "fable",
-    effort: "high",
+    model: "opus",
+    effort: "medium",
   },
   { id: "advisor", key: "tplAdvisor", Icon: Lightbulb, vendors: ["grok", "claude"] },
   { id: "crossreview", key: "tplCrossreview", Icon: ShieldCheck, vendors: ["claude", "codex"] },
@@ -70,55 +70,48 @@ export interface CommanderSpawnPosture {
 
 interface CommanderClaudePosture {
   vendor: "claude";
-  model: "fable";
+  model: string;
   effort?: string;
 }
 
 function commanderClaudePosture(catalog: VendorCatalog): CommanderClaudePosture {
   const claude = catalog.claude;
-  const fable = claude?.models.find((model) => model.id === "fable");
+  const opus = claude?.models.find((model) => model.id === "opus" || /^opus\[[^\]]+\]$/.test(model.id));
   let efforts: string[];
-  if (fable?.efforts !== undefined) {
-    efforts = fable.efforts;
-  } else if (fable && claude?.efforts.length) {
+  if (opus?.efforts !== undefined) {
+    efforts = opus.efforts;
+  } else if (opus && claude?.efforts.length) {
     efforts = claude.efforts;
   } else if (!claude || claude.models.length === 0) {
     // No live evidence exists yet. Use the same CLI-verified cold ladder as
-    // the composer; once the catalog says anything about Fable, never guess.
-    efforts = effortRowsFor("claude", null, "fable").slice(1);
+    // the composer; once the catalog says anything about Opus, never guess.
+    efforts = effortRowsFor("claude", null, "opus").slice(1);
   } else {
     efforts = [];
   }
-  // v3: the commander runs on high; fall back to the top advertised rung
-  // only when high is not advertised.
-  const effort = efforts.includes("high") ? "high" : efforts.at(-1);
+  const effort = ["medium", "high"].find((value) => efforts.includes(value));
   return {
     vendor: "claude",
-    model: "fable",
+    model: opus?.id ?? "opus",
     ...(effort ? { effort } : {}),
   };
 }
 
-/** Pick the best Codex posture ccteam can substantiate for this host.
- *
- * Host installation is a hard prerequisite: an absent/failed host probe must
- * not trigger a speculative second spawn. The live catalog's first model is
- * the vendor-preferred model (the catalog preserves vendor order), and the
- * last effort is the highest advertised rung. If no model has been observed,
- * omit it and let Codex resolve its own default; the pinned Codex effort ladder
- * remains the honest cold-start fallback used by the composer itself. */
+/** Prefer observed Sol at high for a confirmed Commander capability fallback.
+ * Installation is required; missing model evidence uses Codex's own default
+ * and the composer's documented effort ladder, never maximum by default. */
 export function bestCommanderCodexPosture(
   installedVendors: readonly VendorId[] | null,
   catalog: VendorCatalog,
 ): CommanderSpawnPosture | null {
   if (!installedVendors?.includes("codex")) return null;
 
-  const preferredModel = catalog.codex?.models[0];
+  const preferredModel = catalog.codex?.models.find((model) => /(^|[-_/])sol($|[-_/])/i.test(model.id));
   const efforts =
     preferredModel?.efforts !== undefined
       ? preferredModel.efforts
       : effortRowsFor("codex", catalog, preferredModel?.id ?? null).slice(1);
-  const effort = efforts.at(-1);
+  const effort = efforts.includes("high") ? "high" : undefined;
   return {
     vendor: "codex",
     ...(preferredModel ? { model: preferredModel.id } : {}),
@@ -136,7 +129,7 @@ export function isCommanderBootstrapCapabilityError(
   error: unknown,
   posture: { vendor?: string; model?: string; effort?: string },
 ): boolean {
-  if (posture.vendor !== "claude" || posture.model !== "fable") {
+  if (posture.vendor !== "claude" || !/^opus(?:\[[^\]]+\])?$/.test(posture.model ?? "")) {
     return false;
   }
 

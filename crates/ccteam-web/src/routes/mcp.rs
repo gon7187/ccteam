@@ -501,7 +501,7 @@ async fn handle_enroll_post(
         binding
     };
     // Rung 2 of the project ladder, resolved BEFORE the identity is read: a
-    // `session_*` call that NAMES a project may turn a nodeless binding into a
+    // session or status call that NAMES a project may turn a nodeless binding into a
     // ledger node, and on a binding that already has one the naming is checked
     // against it rather than silently ignored.
     let binding = match bind_named_project(app, credential, binding, &req).await {
@@ -550,6 +550,26 @@ async fn handle_enroll_post(
         }
         None => {
             log_tier_call(&format!("enroll:{}", credential.id), &req);
+            if matches!(
+                called_tool(&req),
+                Some("status" | ccteam_im::mcp::STATUS_BEACON_TOOL_NAME)
+            ) {
+                let projects = addressable_projects(app, &credential.owner).await;
+                let discovery = json!({
+                    "projects": projects.into_iter().map(|slug| json!({"slug": slug})).collect::<Vec<_>>(),
+                    "quota": {"state": "unknown", "reason": "project_required"}
+                });
+                let text = format!(
+                    "{discovery}\n\nstatus: the vendor panel is scoped to your own project. \
+                     Call status with project: \"<slug>\" to read subscription quotas; \
+                     the first authorized project you name binds this MCP session for its lifetime."
+                );
+                return Json(json!({
+                    "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
+                    "result": {"content": [{"type": "text", "text": text}], "isError": false}
+                }))
+                .into_response();
+            }
             if let Some(refusal) = refuse_projectless_call(app, credential, &binding, &req).await {
                 return refusal;
             }
@@ -687,11 +707,11 @@ async fn try_provenance_attach(
 /// machine-wide credential in every vendor's global config could do nothing but
 /// discovery, because a file shared by every process cannot name a project.
 ///
-/// Runs for EVERY `session_*` call, bound or not, so the naming is honoured once
+/// Runs for EVERY session/status call, bound or not, so naming is honoured once
 /// and enforced forever: [`NativeBindings::bind_project`] refuses a later switch,
 /// which is what keeps one MCP session to one workspace for its whole life. A
-/// call that names nothing, or is not a `session_*` call, passes through
-/// untouched — discovery and `status` must keep working unbound.
+/// call that names nothing passes through untouched — discovery still works
+/// unbound. Explicit status project names use the same ACL and binding gate.
 ///
 /// `Ok` = the binding as it stands afterwards (freshly noded, or unchanged);
 /// `Err` = the refusal to answer with.
@@ -704,9 +724,9 @@ async fn bind_named_project(
     let Some(tool) = called_tool(req) else {
         return Ok(binding);
     };
-    // The `session_*` face is the only one that takes a workspace argument;
-    // `status`/discovery name a project nowhere and must not bind one.
-    if !tool.starts_with("session_") {
+    if !tool.starts_with("session_")
+        && !matches!(tool, "status" | ccteam_im::mcp::STATUS_BEACON_TOOL_NAME)
+    {
         return Ok(binding);
     }
     let Some(slug) = named_project(req) else {

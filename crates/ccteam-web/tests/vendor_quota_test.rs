@@ -5,7 +5,7 @@
 //!    credential files — owner-scoped)
 //! 2. with all credential homes pointed at an EMPTY tempdir, every probe
 //!    resolves locally without any network call: claude/codex/kimi report
-//!    `not_subscription` (no credential file), grok `unavailable` (stubbed
+//!    `unavailable` (missing credentials prove no plan), grok `unavailable` (stubbed
 //!    by construction), and opencode/pi/dsh are absent from the list
 //! 3. a repeat GET rides the per-vendor cache (same rows, still 200)
 //!
@@ -77,7 +77,7 @@ async fn empty_credential_homes_yield_local_only_rows_and_cache_repeats() {
     let _guard = ENV_LOCK.lock().await;
     let tmp = tempfile::TempDir::new().unwrap();
     // Point every credential home at an empty sandbox: no credential files →
-    // no HTTP request is ever attempted (NotSubscription), and grok is
+    // no HTTP request is ever attempted (Unavailable), and grok is
     // unavailable by construction. This is what keeps the test offline.
     let sandbox = tmp.path().join("homes");
     std::fs::create_dir_all(&sandbox).unwrap();
@@ -112,6 +112,24 @@ async fn empty_credential_homes_yield_local_only_rows_and_cache_repeats() {
         }
     }
     let quotas = rows.unwrap();
+    for quota in &quotas {
+        assert!(
+            quota["observed_at"].as_str().is_some(),
+            "observations must be dated"
+        );
+        assert!(
+            quota["source"].as_str().is_some(),
+            "observations must identify their source"
+        );
+        assert!(
+            quota["reason"].as_str().is_some(),
+            "unavailable must explain why"
+        );
+        assert!(
+            quota.get("windows").is_none(),
+            "unknown usage must not become zero"
+        );
+    }
 
     let by_vendor: std::collections::BTreeMap<String, String> = quotas
         .iter()
@@ -124,15 +142,15 @@ async fn empty_credential_homes_yield_local_only_rows_and_cache_repeats() {
         .collect();
     assert_eq!(
         by_vendor.get("claude").map(String::as_str),
-        Some("not_subscription")
+        Some("unavailable")
     );
     assert_eq!(
         by_vendor.get("codex").map(String::as_str),
-        Some("not_subscription")
+        Some("unavailable")
     );
     assert_eq!(
         by_vendor.get("kimi").map(String::as_str),
-        Some("not_subscription")
+        Some("unavailable")
     );
     assert_eq!(
         by_vendor.get("grok").map(String::as_str),

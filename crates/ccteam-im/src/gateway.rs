@@ -23603,9 +23603,7 @@ mod tests {
         let gateway = Gateway::new(Arc::new(FakeAdapter::default()), "alpha", tmp.path());
 
         let reply = gateway.render_quick_templates();
-        assert!(reply.plain.contains(
-            "• 🎯 Командир\n  Сначала вызови status и используй только доступные в проекте vendor, модели"
-        ));
+        assert!(reply.plain.contains("• 🎯 Командир\n  Call status first."));
     }
 
     #[tokio::test]
